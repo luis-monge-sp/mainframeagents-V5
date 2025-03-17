@@ -1,0 +1,1708 @@
+/* REXX */                                                              00010000
+/********************************************************/              00020000
+/*  It serves as a source code binder . It :            */              00030000
+/*  1. Builds a program from library members as parts.  */              00040000
+/*     Each such part referred by ++INC . Nesting is    */              00050000
+/*     supported.                                       */              00060000
+/*  2. Injects dynamic values of current source lib ,   */              00070000
+/*     message level and external parms from SYSTSIN.   */              00080000
+/*  3. Since pipe stage/cmd REXX destroys ISPF env.     */              00090000
+/*     it builds a program aside in a temporary file    */              00100000
+/*     and then EXECs it from the file.                 */              00110000
+/*  4. Appends itself to the called program as routine  */              00120000
+/*     in order to call it from the current REXX and    */              00130000
+/*     pass regular and external parms to the higher    */              00140000
+/*     level REXX by prepending them to the 2nd+ LVL    */              00150000
+/*     program.                                         */              00160000
+/*  5. Supports dynamic external parameters from  DD    */              00170000
+/*     SYSTGIN. It passes them to 2nd+ level routines   */              00180000
+/*     by creating GETPROLOG routine with parameters    */              00190000
+/*     assignments dynamically on-the-fly.              */              00200000
+/*                                                      */              00210000
+/*  How it works :                                      */              00220000
+/*  We should distinguish between the 1st level program */              00230000
+/*  that is called by TSO EXEC and the 2nd and hiigher  */              00240000
+/*  (2nd+) levels program that called form the 1st or   */              00250000
+/*  lower level program.                                */              00260000
+/*  1st LVL :  the program entered and then calls       */              00270000
+/*             injector (INJREXX). INJREXX performs     */              00280000
+/*             the above written actions.The program    */              00290000
+/*             immediately exits after injector return. */              00300000
+/*             HOW_PARM is not passed via EXPOSE        */              00310011
+/*             ad it's set to LIT ,since INJREXX called */              00320011
+/*             as external routine                      */              00330011
+/*                                                      */              00340011
+/*  2nd+ LVL:  It's called via CALLEXEC routine. This   */              00350000
+/*             routine directly calls injector and it   */              00360000
+/*             prepares the 2nd+ LVL program to run as  */              00370000
+/*             written in above (1-4).                  */              00380000
+/*             HOW_PARM passed via EXPOSE will contain  */              00390011
+/*             the proper value                         */              00400011
+/*                                                      */              00410000
+/*  1st LVL can get external parameters from SYSTSIN.   */              00420000
+/*  It passes them to the 2nd level injector in arg(2). */              00430000
+/*  External parameters are supported in TSO BACKGROUND */              00440000
+/*  only.                                               */              00450000
+/*  sysvar('SYSENV') is used to query the TSO run in    */              00460000
+/*         FOREGROUND or BACKGROUND                     */              00470000
+                                                                        00480000
+                                                                        00490012
+/*  Consider invocation method       */                                 00500012
+if symbol('how_parm') = "LIT"                                           00510014
+  then do       /* 1st LVL */                                           00520011
+       parse source . . . . . . how_parm .                              00530011
+       end      /* 1st LVL */                                           00540011
+if how_parm = 'TSO'                                                     00550012
+  then                                                                  00560012
+    CMDPIPE_CONSTANT="PIPE"                                             00570012
+  else                                                                  00580012
+    CMDPIPE_CONSTANT="CALLPIPE"                                         00590012
+                                                                        00600086
+parms = arg(1)                                                          00610000
+parse var parms rexxname  rexxlib  msg_level  exec_parm                 00620000
+                                                                        00630000
+injector  = "INJREXX"                                                   00640000
+                                                                        00650038
+exec_file_mode = "PERM"   /* keep the built source in disk        */    00660038
+exec_file_mode = "TEMP"   /* do not keep the built source in disk */    00670038
+                                                                        00680000
+pipemode = 0                   /* 1 - with PL , 0 - without PL */       00690099
+if pipemode = 1                                                         00700046
+  then                                                                  00710046
+    say "SUMRX v2.01 INJECTOR started in PIPE mode"                     00720099
+  else                                                                  00730046
+    say "SUMRX v2.01 INJECTOR started in NOPIPE mode"                   00740099
+                                                                        00750000
+/* REXX PROGRAM can be traced by either one of the following :     */   00760000
+/*   1. by REXX SAY command to TSO TERMINAL in FOREGROUND.         */   00770000
+/*   2. by REXX SAY command to TSO SYSTSPRT DD in BACKGROUND.      */   00780000
+/*   3. We added an option for 3270 screen application             */   00790000
+/*      to be traced into TSO DD TRM3270. For that we use the 2nd  */   00800000
+/*      parameter of INJECTOR which was already in use earlier.    */   00810000
+/* In earlier phases of the development the 2nd PARM of INJECTOR   */   00820000
+/* was used to pass EXTERNAL PARMS to subsequent REXX calls with   */   00830000
+/* the INJECTOR (so-called 2nd+ call level).                       */   00840000
+/* Now we overcharged 2ND PARM to have also indicate trace to      */   00850000
+/* TSO DD TRM3270.                                                 */   00860000
+/* Thus, 2nd INJECTOR parameter finally will serve to either one:  */   00870000
+/* 1.Pass EXTERNAL PARMS from SYSTGIN or to 2nd+ level via stem    */   00880000
+/*   PROLOG by GETPROLOG routine.                                  */   00890000
+/*   Used only in TSO BAKGROUND MODE.                              */   00900000
+/* 2.Pass trace mode BATCH or ONLINE to the INJECTOR.              */   00910000
+/*   Used only in TSO FOREGROUND mode.                             */   00920000
+/*   EXTERNAL PARMS do not have meaning in FOREGROUND mode !!!     */   00930000
+/* 3.Since SUMRX 2.01 2nd Parm possible values                     */   00940059
+/*   In word 1 :                                                   */   00950059
+/*   - 3270 ,   1st level of 3270 application                      */   00960044
+/*   - ONLINE , 2nd level of 3270 application                      */   00970044
+/*   - not either of 2 above , 2nd level of BATCH application      */   00980044
+/*   In word 2 :                                                   */   00990059
+/*   - "heap share mode"_"heap image filename"                     */   01000091
+/*   Possible cases :                                              */   01010091
+/*   SHR_<filename>    -  levels share HEAP                        */   01020091
+/*   SEP_<filename>    -  levels have separate HEAPs               */   01030091
+/*   CPY_<filename>    -  changes made in callee not visible to    */   01040091
+/*                        caller                                   */   01050091
+/*                                                                 */   01060091
+                                                                        01070000
+mode = "BATCH"                                                          01080000
+if arg(2) <> ""                                                         01090000
+  then   /* BG-FG 2nd+ level or FG 1st level 3270 */                    01100044
+    do                                                                  01110000
+    if sysvar('SYSENV')  = "BACK"                                       01120000
+      then      /* External parameter in BATCH */                       01130000
+         do                                                             01140000
+         run_level = 2                                                  01150043
+         HEAP_SHR   = GET_HEAP_SHARE_MODE(arg(2))                       01160091
+         HEAP_IMAGE = GET_HEAP_IMAGE_FILE(arg(2))                       01170091
+         call GETPROLOG                                                 01180000
+         end                                                            01190000
+      else      /* ONLINE mode or 2nd level BATCH FG */                 01200044
+         do                                                             01210000
+         prolog.0 = 0                                                   01220044
+         if word(arg(2),1) = "3270"                                     01230059
+          then  /* 3270 1st level */                                    01240044
+           do                                                           01250044
+           mode = "ONLINE"                                              01260044
+           run_level = 1                                                01270044
+           end                                                          01280044
+          else                                                          01290044
+           if word(arg(2),1) = "ONLINE"                                 01300059
+            then  /* 3270 2nd level */                                  01310044
+             do                                                         01320044
+             mode = "ONLINE"                                            01330044
+             run_level = 2                                              01340044
+             HEAP_SHR   = GET_HEAP_SHARE_MODE(arg(2))                   01350091
+             HEAP_IMAGE = GET_HEAP_IMAGE_FILE(arg(2))                   01360061
+             end                                                        01370044
+            else  /* BATCH FG 2nd Level */                              01380044
+             do                                                         01390044
+             mode = "BATCH"                                             01400044
+             run_level = 2                                              01410044
+             HEAP_SHR   = GET_HEAP_SHARE_MODE(arg(2))                   01420091
+             HEAP_IMAGE = GET_HEAP_IMAGE_FILE(arg(2))                   01430061
+             end                                                        01440044
+         end                                                            01450000
+     /* store parms in routine for next nesting call */                 01460000
+     call INJ_FILL_PROLOG_SOURCE                                        01470000
+    end                                                                 01480000
+  else   /* 1st LVL */                                                  01490044
+   do                                                                   01500000
+    HEAP_IMAGE = "NO_HEAP_IMAGE"                                        01510063
+    /* prepare command from TSO SYSTSIN file  */                        01520000
+    if sysvar('SYSENV')  = "BACK"                                       01530000
+      then   /* BG , get external parameters */                         01540044
+       do                                                               01550000
+       run_level = 1                                                    01560043
+       "EXECIO * DISKR SYSTGIN (STEM prolog. FINIS"                     01570000
+       if prolog.0 <> 0                                                 01580000
+        then                                                            01590000
+         do                                                             01600000
+          do i = 1 to prolog.0                                          01610000
+          prolog.i = substr(prolog.i,1,72)                              01620000
+          end                                                           01630000
+         end                                                            01640000
+       end                                                              01650000
+      else   /* FG , no external parameters */                          01660044
+        do                                                              01670043
+        run_level = 1                                                   01680043
+        prolog.0 = 0                                                    01690000
+        end                                                             01700058
+                                                                        01710000
+     /* store parms in routine for 1st nesting call */                  01720000
+     call INJ_FILL_PROLOG_SOURCE                                        01730000
+   end                                                                  01740000
+                                                                        01750000
+if run_level = 1                                                        01760099
+ then do                                                                01770099
+g=' '                                                                   01780099
+say g                                                                   01790099
+g='SummeRx framework for REXX in z/OS,ver 2.01. Sailpoint Technologies,'01800099
+say g                                                                   01810099
+g='www.sailpoint.com'                                                   01811099
+say g                                                                   01812099
+g='--------------------------------------------------------------------'01820099
+say g                                                                   01830099
+g='2018-2020. Author: Gennady Lapidus, summerexx@gmail.com             '01840099
+say g                                                                   01850099
+g='This program is free software: you can redistribute it and/or modify'01860099
+say g                                                                   01870099
+g='it under the terms of the APACHE LICENSE 2.0.                       '01880099
+say g                                                                   01890099
+g='This program is distributed in the hope that it will be useful,     '01940099
+say g                                                                   01950099
+g='but WITHOUT ANY WARRANTY; without even the implied warranty of      '01960099
+say g                                                                   01970099
+g='MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.                '01980099
+say g                                                                   01990099
+g='For more details see the APACHE LICENSE 2.0 by                      '02000099
+say g                                                                   02010099
+g='<http://www.apache.org/licenses/LICENSE-2.0>                        '02020099
+say g                                                                   02030099
+g=' '                                                                   02060099
+say g                                                                   02070099
+end                                                                     02080099
+                                                                        02090099
+/* enable both invoke methods: EXEC from FORE and BACKGROUND */         02100000
+if rexxlib="?"                                                          02110000
+   then do                                                              02120000
+        'PROFILE NOPREFIX'                                              02130000
+        RET = LISTDSI('SYSEXEC' ' FILE')                                02140000
+  /*    rexxlib = "'"SYSDSNAME"'" */                                    02150000
+        rexxlib =    SYSDSNAME                                          02160000
+        end                                                             02170000
+                                                                        02180041
+/* get name of user search library COPYLIB */                           02190041
+copylib   = INJ_GET_VAR_FROM_SETBASE('COPYLIB',rexxlib,rexxname)        02200041
+if copylib = ''                                                         02210041
+   then                                                                 02220041
+     copylib = rexxlib                                                  02230041
+                                                                        02240000
+/* get name of user search library SUMRXLIB */                          02250041
+sumrxlib = INJ_GET_VAR_FROM_SETBASE('SUMRXLIB',rexxlib,rexxname)        02260041
+if sumrxlib = ''                                                        02270041
+   then                                                                 02280000
+     sumrxlib = copylib                                                 02290041
+                                                                        02300041
+/* reset ALTLIB to COPYLIB at 1st level of FG */                        02310044
+if sysvar('SYSENV')  = "FORE" &  run_level = 1                          02320044
+ then                                                                   02330042
+   do                                                                   02340042
+   "ALTLIB reset"                                                       02350042
+    x =  outtrap('stats.')                                              02360045
+    address tso "listalc status"                                        02370045
+    x =  outtrap('OFF')                                                 02380045
+   /* check if copylib is in SYSEXEC */                                 02390042
+   copylib_found_in_list = 0                                            02400042
+   do i = 1 to stats.0                                                  02410042
+   line = stats.i                                                       02420042
+   if word(line,1) = "SYSEXEC"                                          02430042
+      then                                                              02440042
+        do                                                              02450042
+        i = i + 1                                                       02460042
+        line = stats.i                                                  02470042
+        if word(line,1) = copylib                                       02480042
+         then                                                           02490042
+           do                                                           02500042
+           copylib_found_in_list = 1                                    02510042
+           leave                                                        02520042
+           end                                                          02530042
+        end                                                             02540042
+   end                                                                  02550042
+                                                                        02560042
+   if copylib <> rexxlib & copylib_found_in_list = 0                    02570042
+     then                                                               02580042
+      "altlib activate appl(exec) da("copylib")"                        02590042
+   end                                                                  02600042
+                                                                        02610042
+                                                                        02620000
+/* resolve ++INC dependencies  */                                       02630000
+if INJ_RESOLVE_INC() <> 0                                               02640000
+  then                                                                  02650000
+    return 8                                                            02660000
+                                                                        02670000
+/* care of 3270 session if requested  */                                02680000
+if mode = "ONLINE" /* 3270 session ? */                                 02690000
+   then                                                                 02700000
+     do /* 3270 */                                                      02710000
+     /* prepare 3270 session */                                         02720000
+     if INJ_PREPARE_3270() <> 0                                         02730000
+       then                                                             02740000
+         return 8                                                       02750000
+     end /* 3270 */                                                     02760000
+   else                                                                 02770000
+     do  /* not 3270 */                                                 02780000
+     if sysvar('SYSENV')  = "BACK"                                      02790000
+      then                                                              02800000
+       do                                                               02810000
+       x = outtrap(hole.)                                               02820000
+       "ALLOCATE DD(SYSFWPRT) SYSOUT"                                   02830000
+       "ALLOCATE DD(SYSEXPRT) SYSOUT"                                   02840039
+       x = outtrap("OFF")                                               02850000
+       end                                                              02860000
+     insert_trc_pl =""                                                  02870000
+     end /* not 3270 */                                                 02880000
+                                                                        02890000
+                                                                        02900000
+ /* inject code dynamically */                                          02910000
+ if INJ_INS_CODE() <> 0                                                 02920000
+   then                                                                 02930000
+     return 8                                                           02940000
+                                                                        02950004
+ /* get value of parameter INJRDY */                                    02960007
+ INJRDY   = INJ_GET_VAR_FROM_SETBASE('INJRDY',rexxlib,rexxname)         02970010
+ if  symbol('INJRDY')  <> "LIT"    & ,                                  02980010
+     INJRDY            <> "INJRDY" & ,                                  02990010
+     translate(INJRDY) <> "NO"     & ,                                  03000010
+     strip(INJRDY)     <> ''                                            03010010
+   then   /* save ready source in file */                               03020007
+     do                                                                 03030007
+     retcode = INJ_SAVE_REXX_IN_FILE(INJRDY)                            03040010
+     return retcode                                                     03050007
+     end                                                                03060007
+   else   /* execute created source  */                                 03070007
+     do                                                                 03080007
+     /* execute created REXX program from stem CONTENT. */              03090007
+     retcode=INJ_EXEC_REXX_FROM_STEM(exec_parm)                         03100007
+                                                                        03110000
+     if mode <> "ONLINE"                                                03120007
+       then                                                             03130007
+         say "=== User REXX "rexxname" Completed with code" retcode     03140007
+                                                                        03150000
+    /* the injected program returns control */                          03160007
+    if mode = "ONLINE"                                                  03170007
+       then                                                             03180007
+         do                                                             03190007
+          if INJ_DESTROY_3270() <> 0                                    03200007
+            then                                                        03210007
+              return 8                                                  03220007
+         end                                                            03230007
+    /* INJECTOR returns control to the caller */                        03240099
+    return retcode                                                      03250099
+    end                                                                 03260007
+                                                                        03270000
+                                                                        03280000
+                                                                        03290000
+/***********************************************************/           03300000
+/*                                                         */           03310000
+/*  Resolve ++INC dependencies and suppress call INJECTOR  */           03320000
+/*                                                         */           03330000
+/***********************************************************/           03340000
+INJ_RESOLVE_INC : procedure expose rexxlib copylib sumrxlib prolog.    ,03350099
+                                   rexxname injector content. pipemode ,03360099
+                                   exec_file_mode                       03370099
+fw_anchor = GET_SMRX_ANCHOR_HELPER_NAME()                               03380078
+setbase = strip(INJ_FIND_SETBASE(rexxlib,rexxname))                     03381099
+if setbase = ''                                                         03382099
+  then                                                                  03383099
+    do                                                                  03383199
+    say "SUMRX: Could not find base configuration element"              03384099
+    exit 8                                                              03385099
+    end                                                                 03386099
+                                                                        03387099
+if pipemode = 1                                                         03390000
+ then                                                                   03400000
+   do /* pipemode on */                                                 03410000
+    source_start= "  members"  rexxlib  rexxname            ||,         03420099
+                  "| drop last 1                          " ||,         03430085
+                  "| change /INJ"||"STUB/INJ"||"STUB_NA/  " ||,         03440085
+                  "| append literal ++INC" fw_anchor        ||,         03450085
+                  "| l:nlocate w2 /"setbase",ENV/         " ||,         03460099
+                  "| f:faninany                           " ||,         03470099
+                  "| s:fanout                             " ||,         03480085
+                  "| hole                                 " ||,         03490085
+                  "?"                                       ||,         03500085
+                  "l:"                                      ||,         03510099
+                  "| specs                                " ||,         03520099
+                  "   /callpipe (stagesep $ endchar @)/ 1 " ||,         03530099
+                  "     /  stem prolog./               nw " ||,         03540099
+                  "     /$ append literal/ nw w1-* nw     " ||,         03550099
+                  "     /$ *.output:/                  nw " ||,         03560099
+                  "| pipcmd                               " ||,         03570099
+                  "| f:                                   " ||,         03580099
+                  "?"                                       ||,         03590085
+                  "s:"                                                  03600000
+    source_cont = " stem content_copy. "                                03610000
+                                                                        03620000
+    source_eyecatcher = source_start                                    03630000
+    /* resolve ++INC */                                                 03640000
+    /* search of ++INC members in order REXXLIB COPYLIB SUMRXLIB  */    03650041
+    do forever   /*  loop until all ++INC are resolved */               03660000
+    inccount=0                                                          03670000
+    LPIPE() "(endchar ?)                                          " ||, 03680040
+            source_eyecatcher                                       ||, 03690040
+            "| chop 72                                            " ||, 03700040
+            "| a: not locate w1 /++INC/                           " ||, 03710040
+            "| m: faninany                                        " ||, 03720040
+            "| stem content.                                      " ||, 03730040
+            "? "                                                    ||, 03740040
+            "a:"                                                    ||, 03750040
+            "| b:count lines                                      " ||, 03760040
+            "| change /,ENV//                                     " ||, 03770040
+            "| specs w2 1  /'/ 16  w2 17  /'/ 25                  " ||, 03780054
+            "| ndyn:find &"                                         ||, 03790051
+            "| specs 2-* 1                                        " ||, 03800051
+            "| xlate upper                                        " ||, 03810040
+            "| specs /callpipe (stagesep $ endchar @)/ 1          " ||, 03820051
+            "        /  members "rexxlib  setbase"/            nw " ||, 03830051
+            "        /$ drop last 1/                           nw " ||, 03840051
+            "        /$ append literal 'output'/               nw " ||, 03850053
+            "           /injstm./ nw w1 n w1 nw                   " ||, 03860053
+            "        /$ append literal EXIT/                   nw " ||, 03870053
+            "        /$ append literal MSG: PROCEDURE/         nw " ||, 03880053
+            "        /$ append literal RETURN 0/               nw " ||, 03890053
+            "        ,$ literal /* REXX */,                    nw " ||, 03900053
+            "        /$ change 1.4  ,MSG(, MSG(,/              nw " ||, 03910099
+            "        /$ change     ,;MSG(,; MSG(,/             nw " ||, 03911099
+            "        /$ change     ,.MSG(,. MSG(,/             nw " ||, 03912099
+            "        /$ change     ,'MSG(,' MSG(,/             nw " ||, 03913099
+            "        /$ change     ,"'"'"MSG(,"'"'" MSG(,/     nw " ||, 03914099
+            "        /$ change     , MSG(,RC=MSG(,/            nw " ||, 03920053
+            "        /$ not locate w1 ,++INC,/                 nw " ||, 03930053
+            "        /$ chop 72/                               nw " ||, 03940053
+            "        /$ rexx *:/                               nw " ||, 03950051
+            "        /$ *.output:/                             nw " ||, 03960051
+            "| pipcmd                                             " ||, 03970051
+            "| dyn:fanout                                         " ||, 03980051
+            "| hole                                               " ||, 03990052
+            "? "                                                    ||, 04000051
+            "fan:"                                                  ||, 04010051
+            "  faninany                                           " ||, 04020052
+            "| proc:fanout                                        " ||, 04030051
+            "| hole                                               " ||, 04040052
+            "? "                                                    ||, 04050051
+            "ndyn:"                                                 ||, 04060051
+            "| fan:                                               " ||, 04070052
+            "? "                                                    ||, 04080051
+            "dyn:"                                                  ||, 04090051
+            "| prt:fanout                                         " ||, 04100052
+            "| specs w1 1  /'/ 16  w1 17  /'/ 25                  " ||, 04110054
+            "| fan:                                               " ||, 04120052
+            "? "                                                    ||, 04130052
+            "prt:"                                                  ||, 04140052
+            "| spec /:: = Var &/ 1 w2 n /substituted by/ nw w1 nw " ||, 04150054
+            "| terminal                                           " ||, 04160052
+            "? "                                                    ||, 04170052
+            "proc:"                                                 ||, 04180052
+            "| specs /callpipe (stagesep $ endchar @)/ 1          " ||, 04190051
+             /*  If member is found in REXXLIB read it and  :       */, 04200040
+             /*  - issue messsage about REXXLIB stream              */, 04210040
+             /*  - close GATE GRC to prevent streaming from COPYLIB */, 04220040
+             /*  - close GATE GRS (via rs:) to prevent streaming    */, 04230040
+             /*    from SUMRXLIB                                    */, 04240040
+             "        /  listpds "rexxlib"/                    nw " ||, 04250040
+             "        /$ chop 8          /                     nw " ||, 04260040
+             "        /$ pick w1 ==/  nw /,/ nw w1 n /,/ n        " ||, 04270040
+             "        /$ members "rexxlib"/                    nw " ||, 04280040
+             "        /$ chop 72/                              nw " ||, 04290040
+             "        /$ drop last 1/                          nw " ||, 04300040
+             "        /$ r:fanout/                             nw " ||, 04310040
+             "        /$ count lines/                          nw " ||, 04320040
+             "        /$ pick f1 \== ,0,/                      nw " ||, 04330040
+             "        /$ specs/ nw /,/ nw /:: Member/ n 16-25 nw  " ||, 04340054
+             "          /loaded from "rexxlib"/ nw /,/ n /1/ nw   " ||, 04350040
+             "        /$ change ,',,/                          nw " ||, 04360045
+             "        /$ terminal/                             nw " ||, 04370040
+             "        /$ rs:fanout/                            nw " ||, 04380040
+             "        /$ GRC:gate /                            nw " ||, 04390040
+             /*  read member from COPYLIB                           */, 04400040
+             "        /@ /                                     nw " ||, 04410040
+             "        /  listpds "copylib"/                    nw " ||, 04420040
+             "        /$ chop 8          /                     nw " ||, 04430040
+             "        /$ pick w1 ==/  nw /,/ nw w1 n /,/ n        " ||, 04440040
+             "        /$ members "COPYLIB"/                    nw " ||, 04450040
+             "        /$ chop 72/                              nw " ||, 04460040
+             "        /$ drop last 1/                          nw " ||, 04470040
+             "        /$ c:fanout/                             nw " ||, 04480040
+             "        /$ hole  /                               nw " ||, 04490040
+             /*  read member from SUMRXLIB                          */, 04500040
+             "        /@ /                                     nw " ||, 04510040
+             "        /  listpds "sumrxlib"/                   nw " ||, 04520040
+             "        /$ chop 8          /                     nw " ||, 04530040
+             "        /$ pick w1 ==/  nw /,/ nw w1 n /,/ n        " ||, 04540040
+             "        /$ members "sumrxlib"/                   nw " ||, 04550040
+             "        /$ chop 72/                              nw " ||, 04560040
+             "        /$ drop last 1/                          nw " ||, 04570040
+             "        /$ s:fanout/                             nw " ||, 04580040
+             "        /$ hole  /                               nw " ||, 04590040
+             /*  collect read member content and yield it           */, 04600040
+             "        /@ /                                     nw " ||, 04610040
+             "        /  o:fanin 1 2 3/                        nw " ||, 04620040
+             "        /$ *.output:/                            nw " ||, 04630040
+             /*  try streaming COPYLIB through GATE GRC             */, 04640040
+             "        /@ /                                     nw " ||, 04650040
+             "        /c:/                                     nw " ||, 04660040
+             "        /$ c1:fanout/                            nw " ||, 04670040
+             "        /$ GRC:/                                 nw " ||, 04680040
+             "        /$ c2:fanout/                            nw " ||, 04690040
+             "        /$ o:/                                   nw " ||, 04700040
+             /*  routing REXXLIB stream to out                      */, 04710040
+             "        /@ /                                     nw " ||, 04720040
+             "        /r:/                                     nw " ||, 04730040
+             "        /$ r1:fanout/                            nw " ||, 04740040
+             "        /$ buffer/                               nw " ||, 04750040
+             "        /$ o:/                                   nw " ||, 04760040
+             /*  evaluate total size of all streams                 */, 04770040
+             "        /@ /                                     nw " ||, 04780040
+             "        /  count:faninany/                       nw " ||, 04790040
+             "        /$ count lines /                         nw " ||, 04800040
+             "        /$ h:pick f1 == ,0,/                     nw " ||, 04810040
+             "        /$ specs/ nw /,/ nw /** Error: Member/ n    " ||, 04820040
+             "           16-25 nw /not found/ nw /,/ n /1/ nw     " ||, 04830054
+             "        /$ change ,',,/                          nw " ||, 04840040
+             "        /$ terminal/                             nw " ||, 04850040
+             "        /@ /                                     nw " ||, 04860040
+             "        /h:/                                     nw " ||, 04870040
+             "        /$ hole/                                 nw " ||, 04880040
+             /*  routing COPYLIB stream to size evaluation          */, 04890040
+             "        /@ /                                     nw " ||, 04900040
+             "        /c1:/                                    nw " ||, 04910040
+             "        /$ count:/                               nw " ||, 04920040
+             /*  COPYLIB stream passed through GATE GRC of REXXLIB  */, 04930040
+             /*  If this stream is not empty :                      */, 04940040
+             /*      - issue messsage about COPYLIB stream          */, 04950040
+             /*      - close GATE GCS to prevent SUMRXLIB stream    */, 04960041
+             "        /@ /                                     nw " ||, 04970040
+             "        /c2:/                                    nw " ||, 04980040
+             "        /$ count lines /                         nw " ||, 04990040
+             "        /$ pick f1 \== ,0,/                      nw " ||, 05000040
+             "        /$ specs/ nw /,/ nw /:: Member/ n 16-25 nw  " ||, 05010054
+             "          /loaded from "copylib"/ nw /,/ n /1/ nw   " ||, 05020040
+             "        /$ change ,',,/                          nw " ||, 05030040
+             "        /$ terminal/                             nw " ||, 05040040
+             "        /$ GCS:gate/                             nw " ||, 05050040
+             /*  routing REXXLIB stream to size evaluation          */, 05060040
+             "        /@ /                                     nw " ||, 05070040
+             "        /r1:/                                    nw " ||, 05080040
+             "        /$ count:/                               nw " ||, 05090040
+             /*  Not empty REXXLIB stream closes GATE GRS here to   */, 05100040
+             /*  prevent SUMRXLIB streaming                         */, 05110040
+             "        /@ /                                     nw " ||, 05120040
+             "        /rs:/                                    nw " ||, 05130040
+             "        /$ GRS:gate/                             nw " ||, 05140040
+             /*  routing SUMRXLIB stream to out only if member      */, 05150040
+             /*  was not found in either REXXLIB or COPYLIB         */, 05160040
+             /*  Notice that SUMRXLIB stream is locked by 2 gates:  */, 05170040
+             /*  - GRS , by REXXLIB                                 */, 05180040
+             /*  - GCS , by COPYLIB                                 */, 05190040
+             "        /@ /                                     nw " ||, 05200040
+             "        /s:/                                     nw " ||, 05210040
+             "        /$ s1:fanout/                            nw " ||, 05220040
+             "        /$ GRS:/                                 nw " ||, 05230040
+             "        /$ GCS:/                                 nw " ||, 05240040
+             "        /$ s2:fanout/                            nw " ||, 05250040
+             "        /$ o:/                                   nw " ||, 05260040
+             /*  routing SUMRXLIB stream to size evaluation         */, 05270040
+             "        /@ /                                     nw " ||, 05280040
+             "        /s1:/                                    nw " ||, 05290040
+             "        /$ count:/                               nw " ||, 05300040
+             /*  if SUMRXLIB strem is not empty, issue message      */, 05310040
+             "        /@ /                                     nw " ||, 05320040
+             "        /s2:/                                    nw " ||, 05330040
+             "        /$ count lines /                         nw " ||, 05340040
+             "        /$ pick f1 \== ,0,/                      nw " ||, 05350040
+             "        /$ specs/ nw /,/ nw /:: Member/ n 16-25 nw  " ||, 05360054
+             "         /loaded from "sumrxlib"/ nw /,/ n /1/ nw   " ||, 05370040
+             "        /$ change ,',,/                          nw " ||, 05380040
+             "        /$ terminal/                             nw " ||, 05390040
+            "| pipcmd                                             " ||, 05400040
+            "| m:                                                 " ||, 05410040
+            "? "                                                    ||, 05420040
+            "b:"                                                    ||, 05430040
+            "| var  inccount                                      "     05440040
+                                                                        05450000
+    if inccount=0                                                       05460000
+      then                                                              05470000
+        leave                                                           05480000
+    /* work with copy of stem between iterations  */                    05490000
+     LPIPE() " (endchar ?)                       " || ,                 05500002
+             "  stem content.                    " || ,                 05510002
+             "| stem content_copy.               "                      05520002
+                                                                        05530000
+    source_eyecatcher = source_cont                                     05540000
+    end  /*  loop until all ++INC are resolved */                       05550000
+   end   /* pipemode on */                                              05560000
+ else                                                                   05570000
+   do  /* pipemode off */                                               05580000
+    /* check existence of main program */                               05590000
+    dsname = rexxlib"("rexxname")"                                      05600000
+    rc=SYSDSN(dsname); if rc='OK' then rc=0;                            05610000
+    if rc <> 0                                                          05620000
+     then                                                               05630000
+       return 8                                                         05640000
+                                                                        05650078
+    /* here we set CONTENT. = <REXX>  with  appended   */               05660099
+    /* to it cards of :                                */               05670082
+    /* "++INC REXXNAME"                                */               05680082
+                                                                        05690078
+    content.1 = "/* REXX */"                                            05700000
+    /* when calling recursive injector ++INC card should be last */     05710099
+    /* and index of CONTENT array should point to -1 place of it */     05720099
+    content.2  = "++INC" rexxname                                       05730099
+    content.0  = 2                                                      05740099
+    if INJ_RECURSIVE_INC(1) <> 0                                        05750099
+      then                                                              05760099
+        return 8                                                        05770099
+                                                                        06060078
+    /* Insert SUMRX Anchor                             */               06070099
+    /* "++INC FW_ANCHOR"                               */               06080099
+    /* when calling recursive injector ++INC card should be last */     06090078
+    /* and index of CONTENT array should point to -1 place of it */     06100078
+    content.0 = content.0 + 1                                           06110078
+    ix_fwan = content.0                                                 06120078
+    interpret "content."ix_fwan " = '++INC "fw_anchor"'"                06130078
+    if INJ_RECURSIVE_INC(content.0 - 1) <> 0                            06140078
+      then                                                              06150000
+        return 8                                                        06160000
+                                                                        06170078
+   end /* pipemode off */                                               06180000
+                                                                        06190000
+                                                                        06200000
+return 0                                                                06210000
+                                                                        06220000
+/***********************************************************/           06230000
+/*                                                         */           06240000
+/*  Inject code dynamically                                */           06250000
+/*                                                         */           06260000
+/***********************************************************/           06270000
+INJ_INS_CODE: procedure expose insert_trc_pl exec_parm content. dsn   , 06280000
+                               injector rexxlib prolog_source.        , 06290041
+                               copylib sumrxlib                       , 06300041
+                               msg_level mode pipemode INJ@327X       , 06310041
+                               CMDPIPE_CONSTANT HEAP_IMAGE HEAP_SHR     06320093
+ /* here we append the injector code after all changes done. */         06330000
+ /* this gurantees the injector code will not be changed.    */         06340000
+                                                                        06350000
+if pipemode = 1                                                         06360000
+ then                                                                   06370000
+   do /* pipemode on */                                                 06380000
+   LPIPE() "(endchar ?)                                      " ||,      06390015
+           /*  the script code with expanded ++INCs            */,      06400015
+           "  stem content.                                  " ||,      06410015
+           "| change 1.4 /MSG(/ MSG(/                        " ||,      06411099
+           "| change     /;MSG(/; MSG(/                      " ||,      06412099
+           "| change     /.MSG(/. MSG(/                      " ||,      06413099
+           "| change     /'MSG(/' MSG(/                      " ||,      06414099
+           "| change     /"'"'"MSG(/"'"'" MSG(/              " ||,      06414199
+           "| change     / MSG(/RC=MSG(/                     " ||,      06415099
+           "| change /MSG_MESSAGES_TRACE_LEVEL=INJDATA"        ||,      06440015
+                    "/MSG_MESSAGES_TRACE_LEVEL="msg_level"/"   ||,      06450015
+           "| change /MSG_MESSAGES_TRACE_MODE=INJMODE"         ||,      06460015
+                    "/MSG_MESSAGES_TRACE_MODE="mode"/"         ||,      06470015
+           "| change /PIPEMODE_PIPE_INJECTED=INJDATA"          ||,      06480015
+                    "/PIPEMODE_PIPE_INJECTED="pipemode"/"      ||,      06490015
+            insert_trc_pl                                      ||,      06500015
+           "| f:fanin                                        " ||,      06510015
+           "| pad  100                                       " ||,      06520015
+           "| chop 100                                       " ||,      06530015
+           "| stem content_copy.                             " ||,      06540015
+           /*  creating GETPROLOG routine and appending it     */,      06550015
+           "? "                                                ||,      06560015
+           "  stem prolog_source.                            " ||,      06570015
+           "| chop 72                                        " ||,      06580015
+           "| literal GETPROLOG : PROCEDURE expose prolog.   " ||,      06590015
+           "| append literal return                          " ||,      06600015
+           "| f:                                             " ||,      06610015
+           /*  appending INJECTOR routine with right LIB name  */,      06620015
+           "? "                                                ||,      06630015
+           "  members" sumrxlib injector                       ||,      06640041
+           "| drop last 1                                    " ||,      06650015
+           "| chop 72                                        " ||,      06660015
+           "| literal "injector" : PROCEDURE EXPOSE how_parm " ||,      06670015
+           "| change /SOURCE_LIB_DYN="||"INJDATA"              ||,      06680021
+                    "/SOURCE_LIB_DYN='"rexxlib"'/"             ||,      06690015
+           "| change /CMDPIPE_VAR="||"INJDATA"                 ||,      06700021
+                    "/CMDPIPE_VAR="CMDPIPE_CONSTANT"/"         ||,      06710019
+           "| change /HEAP_IMAGE_FILE="||"INJDATA"             ||,      06720061
+                    "/HEAP_IMAGE_FILE='"HEAP_IMAGE"'/"         ||,      06730061
+           "| change /HEAP_SHARE="||"INJDATA"                  ||,      06740093
+                    "/HEAP_SHARE='"HEAP_SHR"'/"                ||,      06750099
+           "| f:                                             "          06760015
+                                                                        06770000
+    LPIPE() " (endchar ?)                       " || ,                  06780002
+            "  stem content_copy.               " || ,                  06790002
+            "| stem content.                    "                       06800002
+   end /* pipemode on */                                                06810000
+ else                                                                   06820000
+  do  /* pipemode off */                                                06830000
+   /* make changes in the main stream */                                06840000
+   do i = 1 to content.0                                                06850000
+   content.i = INJ_STR_REPL(content.i,"MSG("," MSG(")                   06860099
+   content.i = INJ_STR_REPL(content.i," MSG(","RC=MSG(")                06870000
+   content.i =                                                         ,06880000
+            INJ_STR_REPL(content.i,"MSG_MESSAGES_TRACE_LEVEL=INJDATA", ,06890000
+                               "MSG_MESSAGES_TRACE_LEVEL="msg_level)    06900000
+   content.i =                                                         ,06910000
+            INJ_STR_REPL(content.i,"MSG_MESSAGES_TRACE_MODE=INJMODE",  ,06920000
+                               "MSG_MESSAGES_TRACE_MODE="mode)          06930000
+   content.i =                                                         ,06940000
+            INJ_STR_REPL(content.i,"PIPEMODE_PIPE_INJECTED=INJDATA",   ,06950000
+                               "PIPEMODE_PIPE_INJECTED="pipemode)       06960000
+   if insert_trc_pl <> ""                                               06970000
+    then                                                                06980000
+     content.i =                                                       ,06990000
+            INJ_STR_REPL(content.i,"MSG_MESSAGES_TRACE_SESSION=''",    ,07000000
+                               "MSG_MESSAGES_TRACE_SESSION=."INJ@327X)  07010000
+   end                                                                  07020000
+                                                                        07030000
+   /* append GETPROLOG procedure */                                     07040000
+   k = content.0 + 1                                                    07050000
+   content.k = "GETPROLOG : PROCEDURE expose prolog."                   07060000
+   do i = 1 to prolog_source.0                                          07070000
+   k = content.0 + 1 + i                                                07080000
+   content.k = prolog_source.i                                          07090000
+   end                                                                  07100000
+   k = content.0 + 1 + prolog_source.0 + 1                              07110000
+   content.k = "RETURN"                                                 07120000
+                                                                        07130000
+   /* append INJECTOR code itself */                                    07140000
+   k = k + 1                                                            07150000
+   content.k = injector" : PROCEDURE EXPOSE how_parm"                   07160015
+   dsname = sumrxlib"("injector")"                                      07170041
+   k = k + 1                                                            07180000
+   content.0 = k                                                        07190004
+   call INJ_INSERT_MEMBER dsname , k                                    07200000
+   do i = k to content.0                                                07210000
+   content.i = substr(content.i,1,72)                                   07220000
+   content.i = INJ_STR_REPL(content.i,"SOURCE_LIB_DYN="||"INJDATA",   , 07230021
+                                      "SOURCE_LIB_DYN='"rexxlib"'")     07240021
+   content.i = INJ_STR_REPL(content.i,"CMDPIPE_VAR="||"INJDATA",      , 07250021
+                                      "CMDPIPE_VAR="CMDPIPE_CONSTANT)   07260021
+   content.i = INJ_STR_REPL(content.i,"HEAP_IMAGE_FILE="||"INJDATA",   ,07270081
+                                      "HEAP_IMAGE_FILE='"HEAP_IMAGE"'") 07280061
+   content.i = INJ_STR_REPL(content.i,"HEAP_SHARE="||"INJDATA",   ,     07290093
+                                      "HEAP_SHARE='"HEAP_SHR"'")        07300099
+   end                                                                  07310000
+  end /* pipemode off */                                                07320000
+                                                                        07330000
+ return 0                                                               07340000
+                                                                        07350000
+/***********************************************************/           07360000
+/*                                                         */           07370000
+/*  Prepare 3270 session                                   */           07380000
+/*                                                         */           07390000
+/***********************************************************/           07400000
+INJ_PREPARE_3270 : procedure expose insert_trc_pl INJ@327X pipemode     07410000
+ /* support a number of logical ISPF sessions */                        07420000
+ varlist = "INJ@327X"                                                   07430000
+ "ISPEXEC VGET (&varlist) PROFILE"                                      07440000
+ /* INJ@327X kept across TSO sessions due to PROFILE spool */           07450000
+ /* So, for the 1st time in new TSO session it may happen  */           07460000
+ /* that INJ@327X is numeric but TRM3270 is not allocated  */           07470000
+ RET = LISTDSI('TRM3270' ' FILE')                                       07480000
+ if SYSREASON <> 3      /* RET is always 16 due to SYSOUT */            07490000
+    then   /* not allocated to sysout */                                07500000
+      do                                                                07510000
+      INJ@327X = "NO"   /* any no NUM type value */                     07520000
+      end                                                               07530000
+                                                                        07540000
+ if datatype(INJ@327X) <> "NUM"                                         07550000
+   then                                                                 07560000
+     do   /* first 3270 consumer */                                     07570000
+      X = OUTTRAP(STM.)                                                 07580000
+      /* force delete DD TRM3270 */                                     07590000
+      "FREE DD(TRM3270) DELETE"                                         07600000
+      /* allocate new spool file TRM3270 under TSO */                   07610000
+      "ALLOCATE DD(TRM3270) SYSOUT"                                     07620000
+      X = OUTTRAP("OFF")                                                07630000
+      INJ@327X = 1                                                      07640000
+     end  /* first 3270 cinsumer */                                     07650000
+   else                                                                 07660000
+     do   /* not first 3270 consumer */                                 07670000
+      INJ@327X = INJ@327X + 1                                           07680000
+     end  /* not first 3270 consumer */                                 07690000
+ /* update ISPF sessions number */                                      07700000
+ "ISPEXEC VPUT (&varlist) PROFILE"                                      07710000
+ if pipemode = 1                                                        07720000
+   then                                                                 07730000
+     insert_trc_pl ="| change /MSG_MESSAGES_TRACE_SESSION=''" ||,       07740000
+                    "/MSG_MESSAGES_TRACE_SESSION=."INJ@327X"/"          07750000
+   else                                                                 07760000
+     do                                                                 07770000
+     insert_trc_pl =""                                                  07780000
+     end                                                                07790000
+ return 0                                                               07800000
+                                                                        07810000
+                                                                        07820000
+/***********************************************************/           07830000
+/*                                                         */           07840000
+/*  Destroy 3270 session                                   */           07850000
+/*                                                         */           07860000
+/***********************************************************/           07870000
+INJ_DESTROY_3270 : procedure expose INJ@327X                            07880000
+ /* support a number of logical ISPF sessions */                        07890000
+ varlist = "INJ@327X"                                                   07900000
+ if datatype(INJ@327X) <> "NUM"                                         07910000
+   then                                                                 07920000
+     do   /* internal error */                                          07930000
+     say injector": TRM3270 logical error encountered"                  07940000
+     end                                                                07950000
+   else                                                                 07960000
+    do   /* TRM3270 active  */                                          07970000
+    "ISPEXEC VGET (&varlist) PROFILE"                                   07980000
+    INJ@327X = INJ@327X - 1                                             07990000
+    if INJ@327X = 0                                                     08000000
+      then                                                              08010000
+        do                                                              08020000
+         /* erase ISPF sessions number */                               08030000
+         "ISPEXEC VERASE (&varlist) PROFILE"                            08040000
+         /* reset vars        */                                        08050000
+         drop (varlist)                                                 08060000
+         drop (INJ@327X)                                                08070000
+        end                                                             08080000
+      else                                                              08090000
+       do                                                               08100000
+       /* update ISPF sessions number */                                08110000
+       "ISPEXEC VPUT (&varlist) PROFILE"                                08120000
+       end                                                              08130000
+    end  /* TRM3270 active */                                           08140000
+return 0                                                                08150000
+                                                                        08160000
+/********************************************************************/  08170000
+/* This routine returns value of desired VAR which is set in member */  08180011
+/* <mem> of preprocessor directive "++INC <mem>,ENV"                */  08190000
+/* Before executing it converts member <mem> to a REXX roitine in   */  08200000
+/* SAFE mode : MSG and ++INC directives are ignored                 */  08210000
+/********************************************************************/  08220000
+INJ_GET_VAR_FROM_SETBASE: procedure expose prolog. pipemode injector ,  08230025
+                                    exec_file_mode setbase              08240099
+ varname  = arg(1)                                                      08250099
+ rexxlib  = arg(2)                                                      08260099
+ rexxname = arg(3)                                                      08270099
+ uservar  = ''                                                          08280099
+                                                                        08290000
+ setbase = INJ_FIND_SETBASE(rexxlib,rexxname)                           08291099
+ if setbase = ''                                                        08292099
+   then                                                                 08293099
+     return ''                                                          08294099
+                                                                        08295099
+                                                                        08540000
+mem = strip(setbase)                                                    08560051
+if pipemode = 1                                                         08570000
+ then                                                                   08580000
+   do  /* pipemode on */                                                08590000
+   LPIPE() "(endchar ?)                         " ||,                   08600099
+           "  members "rexxlib mem                ||,                   08610099
+           "| drop last 1                       " ||,                   08620099
+           "| f:fanin 1 0                       " ||,                   08630099
+           "| append literal 'output'" varname    ||,                   08640099
+           "| append literal EXIT               " ||,                   08650099
+           "| append literal MSG: PROCEDURE     " ||,                   08660099
+           "| append literal RETURN 0           " ||,                   08670099
+           "| change 1.4 /MSG(/ MSG(/           " ||,                   08680099
+           "| change     /;MSG(/; MSG(/         " ||,                   08681099
+           "| change     /.MSG(/. MSG(/         " ||,                   08682099
+           "| change     /'MSG(/' MSG(/         " ||,                   08683099
+           "| change     /"'"'"MSG(/"'"'" MSG(/ " ||,                   08684099
+           "| change     / MSG(/RC=MSG(/        " ||,                   08690099
+           "| not locate w1 /++INC/             " ||,                   08700099
+           "| chop 72                           " ||,                   08710099
+           "| rexx *:                           " ||,                   08720099
+           "| var uservar                       " ||,                   08730099
+           "?"                                    ||,                   08740099
+           "  stem prolog.                      " ||,                   08750099
+           "| literal /* REXX */                " ||,                   08760099
+           "| f:                                "                       08770099
+   end /* pipemode on */                                                08780000
+ else                                                                   08790000
+   do  /* pipemode off */                                               08800000
+   /* insert PROLOG. */                                                 08810000
+   content.1 = "/* REXX */"                                             08820000
+   content.0 = 1                                                        08830000
+   if prolog.0 > 0                                                      08840000
+    then                                                                08850000
+      do                                                                08860000
+       do i = 1 to prolog.0                                             08870000
+       k = i + 1                                                        08880000
+       content.k =  prolog.i                                            08890000
+       end                                                              08900000
+       content.0 = prolog.0 + 1                                         08910000
+     end                                                                08920000
+    /* insert <mem> */                                                  08930000
+    dsname = rexxlib"("mem")"                                           08940000
+    content.0 = content.0  + 1                                          08950000
+    rc=SYSDSN(dsname); if rc='OK' then rc=0;                            08960000
+    if rc = 0                                                           08970000
+      then                                                              08980000
+       call INJ_INSERT_MEMBER dsname , content.0                        08990000
+    /* convert to valid REXX program code */                            09000000
+    k = content.0                                                       09010000
+    k=k+1; content.k = "INJUVAR ="varname;                              09020005
+    k=k+1; content.k = 'varlist = "INJUVAR"'                            09030005
+    k=k+1; content.k = '"ISPEXEC VPUT (&varlist) PROFILE"'              09040000
+    k=k+1; content.k = "RETURN 0"        ;                              09050000
+    k=k+1; content.k = "MSG : PROCEDURE" ;                              09060000
+    k=k+1; content.k = "RETURN 0"        ;                              09070000
+    content.0 = k                                                       09080000
+    /* suppress ++INC and make MSG dummy  */                            09090000
+    do i = 1 to content.0                                               09100000
+    content.i = substr(content.i,1,72)                                  09110000
+    if substr(content.i,1,5) = "++INC"                                  09120000
+      then                                                              09130000
+        content.i = " "                                                 09140000
+    content.i = INJ_STR_REPL(content.i,"MSG(","RC=MSG(")                09150000
+    end                                                                 09160000
+    rc=INJ_EXEC_REXX_FROM_STEM()                                        09170000
+    varlist = "INJUVAR"                                                 09180006
+    "ISPEXEC VGET (&varlist) PROFILE"                                   09190000
+    uservar = INJUVAR                                                   09200006
+       "ISPEXEC VERASE (&varlist) PROFILE"                              09210000
+   end /* pipemode off */                                               09220000
+ return uservar                                                         09230005
+                                                                        09240000
+/********************************************************************/  09241099
+/* This routine returns base configuration element                  */  09242099
+/********************************************************************/  09244099
+INJ_FIND_SETBASE : procedure                                            09245099
+ rexxlib  = arg(1)                                                      09245199
+ rexxname = arg(2)                                                      09245299
+ /* find "++INC <setbase>,ENV" and extract <setbase> */                 09246099
+ setbase = ''                                                           09247099
+ dsname = rexxlib"("rexxname")"                                         09248099
+ content.0 = 1                                                          09249099
+ content.1 = " "                                                        09249199
+ rc=SYSDSN(dsname); if rc='OK' then rc=0;                               09249299
+ if rc = 0                                                              09249399
+   then                                                                 09249499
+    call INJ_INSERT_MEMBER dsname , content.0                           09249599
+ do i = 1 to content.0                                                  09249699
+ if substr(content.i,1,5) = "++INC"                                     09249799
+   then                                                                 09249899
+     do                                                                 09249999
+     parse var content.i "++INC" setbase "," type .                     09250099
+     if translate(type) = "ENV"                                         09250199
+       then                                                             09250299
+          leave                                                         09250399
+       else                                                             09250499
+          setbase = ''                                                  09250599
+     end                                                                09250699
+ end                                                                    09250799
+ drop content.                                                          09250899
+ return setbase                                                         09250999
+                                                                        09251099
+/********************************************************************/  09252007
+/* This routine saves REXX in a file                                */  09260007
+/* PARM   : dataset name                                            */  09270008
+/* RETURN : return code of the execution                            */  09280007
+/********************************************************************/  09290007
+INJ_SAVE_REXX_IN_FILE : procedure expose content. rexxname              09300009
+ dataset   = arg(1)                                                     09310008
+ "ALLOCATE  DA('"dataset"')"                                            09320008
+ filename = INJ_GET_FILENAME_ALLOC_DSN(dataset)                         09330008
+ "EXECIO * DISKW" filename "(STEM content. OPEN FINIS"                  09340007
+ retcode = rc                                                           09350009
+ "FREE FI("filename")"                                                  09360008
+ if retcode = 0                                                         09370009
+   then                                                                 09380009
+    say "INJ: save READY" rexxname "successful in file" dataset         09390009
+   else                                                                 09400009
+    say "INJ: save READY" rexxname "in  file" dataset "failed"          09410009
+ return retcode                                                         09420009
+                                                                        09430007
+/********************************************************************/  09440000
+/* This routine executes REXX from stem CONTENT.                    */  09450000
+/* PARM   : exec paramteter                                         */  09460000
+/* RETURN : return code of the execution                            */  09470000
+/********************************************************************/  09480000
+INJ_EXEC_REXX_FROM_STEM : procedure expose content. injector ,          09490024
+                                    exec_file_mode rexxname             09500025
+ exec_parm = arg(1)                                                     09510000
+                                                                        09520000
+ if exec_file_mode = "TEMP"                                             09530070
+   then                                                                 09540070
+     do                                                                 09550070
+     dsn_yc = injector                                                  09560070
+     cmd_sfx = "DELETE"                                                 09570070
+     end                                                                09580070
+   else                                                                 09590070
+     do                                                                 09600070
+     dsn_yc = rexxname                                                  09610070
+     cmd_sfx = ""                                                       09620070
+     end                                                                09630070
+                                                                        09640070
+ /* calculate space */                                                  09650070
+ wtrk = (content.0 * 100 / 55996 + 1) * 1.15                            09660072
+ parse var wtrk TRKS "." .                                              09670071
+ TRKS = TRKS + 1                                                        09680072
+ wtrk =  TRKS/16                                                        09690072
+ parse var wtrk TRKS_SEC "." .                                          09700072
+ TRKS_SEC = TRKS_SEC + 1                                                09710072
+                                                                        09720070
+ dsn =  INJ_GENERATE_TEMP_DSNAME(dsn_yc)                                09730070
+ /* allocate new file and store CONTENT in it */                        09740070
+ "ALLOCATE NEW UNIT(SYSDA) RECFM(F B) LRECL(100) DA('"dsn"')"    ,      09750070
+           "BLKSIZE(5000) SPACE("TRKS","TRKS_SEC") TRACKS" cmd_sfx      09760070
+ filename = INJ_GET_FILENAME_ALLOC_DSN(dsn)                             09770070
+ "EXECIO * DISKW" filename "(STEM content. OPEN FINIS"                  09780070
+                                                                        09790024
+ /* execute created REXX program from the file    */                    09800000
+ exec "'"dsn"'"   "'"exec_parm"'"                                       09810000
+ retcode = rc                                                           09820099
+ "FREE DATASET('"dsn"')"                                                09830000
+ return retcode                                                         09840099
+                                                                        09850099
+/*********************************************************************/ 09860000
+/* This routine creates PROLOG_SOURCE stem filled with REXX code and */ 09870000
+/* ready to be used as a routine GETPROLOG()                         */ 09880000
+/*********************************************************************/ 09890000
+INJ_FILL_PROLOG_SOURCE : procedure expose prolog. prolog_source.        09900000
+ /* This is the REXX code to KEEP stem PROLOG. values */                09910000
+ prolog_source.0 = prolog.0 + 1                                         09920000
+  do i = 1 to prolog.0                                                  09930000
+  if pos("'",prolog.i) > 0                                              09940033
+     then                                                               09950033
+       do                                                               09960037
+       prolog_source.i = "prolog."i "="  """"strip(prolog.i)""""        09970037
+       end                                                              09980037
+     else                                                               09990033
+       do                                                               10000037
+       prolog_source.i = 'prolog.'i '=' ''''strip(prolog.i)''''         10010037
+       end                                                              10020037
+  end                                                                   10030000
+ i = prolog.0 + 1                                                       10040000
+ prolog_source.i = 'prolog.0=' ||  prolog.0                             10050000
+                                                                        10060037
+ return                                                                 10070000
+                                                                        10080000
+/**********************************************************************/10090000
+/*     TSO EXEC of requested REXX with parameters                     */10100000
+/*     SOURCLE_LIB_DYN is for INJREXX injection                       */10110000
+/*                                                                    */10120093
+/*  PARMS : heap_share_mode                                           */10130091
+/*        : program_name appl_parm                                    */10140091
+/*                                                                    */10150093
+/*  How it works .                                                    */10160092
+/*       CALLER                      |         CALLEE                 */10170092
+/* APPL:INJ_CALLEXEC HEAP_SHR,PARM   |                                */10180092
+/* INJ_CALLEXEC :                    |                                */10190092
+/* -SERIALIZE_HEAP_TO_FILE(HEAP_SHR) |                                */10200092
+/* -Set 2nd word of 2nd parm to      |                                */10210092
+/*     HEAP_SHARE||"_"||HEAP_IMAGE   |                                */10220092
+/* -CALL INJREXX P1,P2               |                                */10230092
+/*                                   | INJECTOR :                     */10240092
+/*                                   | -Extracts from 2nd PARM        */10250092
+/*                                   |     HEAP_SHARE & HEAP_IMAGE    */10260092
+/*                                   |     and injects to INJSTUB     */10270092
+/*                                   | -DESERIALIZE_HEAP_FROM_FILE(   */10280092
+/*                                   |                 HEAP_IMAGE)    */10290092
+/*                                   | -CALL SUMRX_MAIN(P1)           */10300092
+/*                                   | -SERIALIZE_HEAP_TO_FILE(       */10310092
+/*                                   |                 HEAP_SHARE)    */10320092
+/*                                   |        and returns HEAP_IMAGE  */10330092
+/* -DESERIALIZE_HEAP_FROM_FILE(      |                                */10340092
+/*               HEAP_IMAGE)         |                                */10350092
+/* -Returns to APPL                  |                                */10360092
+/**********************************************************************/10370000
+INJ_CALLEXEC : procedure expose rexxlib msg_level HEAP.                 10380093
+SOURCE_LIB_DYN=INJDATA                                                  10390094
+                                                                        10400091
+HEAP_SHR =  translate(arg(1))                                           10410091
+PARM2 = arg(2)                                                          10420099
+parse var PARM2 PROGRAM PARAMETER                                       10430099
+                                                                        10440091
+parse value SERIALIZE_HEAP_TO_FILE(HEAP_SHR) with rcode HEAP_IMAGE .    10450093
+if rcode <> 0                                                           10460091
+  then                                                                  10470091
+    do                                                                  10480091
+    say "SUMRX : Error detected during HEAP serialization"              10490091
+    return 16                                                           10500091
+    end                                                                 10510091
+                                                                        10520091
+/* 2nd parm is a clue to injector it's called on 2nd+ level in BG */    10530000
+if sysvar('SYSENV')  = "BACK"                                           10540000
+  then  /* BG */                                                        10550044
+   INJECT_DYN_CMD="*" SET_HEAP_MODE_FILE(HEAP_SHR,HEAP_IMAGE)           10560099
+  else  /* FG */                                                        10570044
+   do                                                                   10580044
+   varlist = "INJ@327X"                                                 10590044
+   "ISPEXEC VGET (&varlist) PROFILE"                                    10600044
+   if datatype(INJ@327X) = "NUM"                                        10610044
+    then                                                                10620044
+      INJECT_DYN_CMD="ONLINE" SET_HEAP_MODE_FILE(HEAP_SHR,HEAP_IMAGE)   10630099
+    else                                                                10640044
+      INJECT_DYN_CMD="*" SET_HEAP_MODE_FILE(HEAP_SHR,HEAP_IMAGE)        10650099
+   end                                                                  10660044
+                                                                        10670044
+/* "exec '"SOURCE_LIB_DYN"("PROGRAM")' '"PARAMETER"'" */                10680094
+/* address TSO */                                                       10690000
+p1 = PROGRAM SOURCE_LIB_DYN msg_level PARAMETER                         10700094
+p2 = INJECT_DYN_CMD                                                     10710000
+rc = INJREXX(p1,p2)                                                     10720099
+                                                                        10730099
+varlist = "INJACTRC"                                                    10740099
+"ISPEXEC VGET (&varlist) PROFILE"                                       10750099
+                                                                        10770099
+parse var INJACTRC appl_code rcode HEAP_IMAGE .                         10780099
+                                                                        10780199
+"ISPEXEC VERASE (&varlist) PROFILE"                                     10781099
+                                                                        10790099
+if rcode <> 0 | strip(HEAP_IMAGE) = ''                                  10800094
+  then                                                                  10810094
+    return appl_code                                                    10820099
+                                                                        10830094
+rc = DESERIALIZE_HEAP_FROM_FILE(HEAP_IMAGE)                             10840094
+                                                                        10850094
+return appl_code                                                        10860099
+                                                                        10870094
+/***********************************************************/           10871099
+/* SUMRX will CHECK return code of the application whether */           10872099
+/* APPL forgot to set it. For example : RETURN ''          */           10873099
+/***********************************************************/           10875099
+INJ_CHKCODE : procedure                                                 10876099
+  if datatype(arg(1)) <> "NUM"                                          10878099
+    then                                                                10879099
+      do                                                                10879199
+      say "SUMRX ERROR: Unexpected APPLICATION CODE returned"           10879299
+      RC=MSG('F',67,arg(1),arg(2)) /*Unexpected return code from appl*/ 10879399
+      return 8                                                          10879499
+      end                                                               10879599
+  return arg(1)                                                         10879699
+                                                                        10879799
+/***********************************************************/           10880091
+/* Serialize heap to file                                  */           10890091
+/* PARMS : heap share mode                                 */           10900091
+/*   RET : 0 serialized_filename OR 8                      */           10910094
+/***********************************************************/           10920091
+SERIALIZE_HEAP_TO_FILE : procedure expose HEAP.                         10930091
+HEAP_SHR = arg(1)                                                       10940091
+                                                                        10950091
+if HEAP_SHR <> "SHR" & HEAP_SHR <> "SEP" & HEAP_SHR <> "CPY"  &  ,      10960098
+   HEAP_SHR <> "DRP"                                                    10970098
+  then                                                                  10980091
+    do                                                                  10990091
+    say "SUMRX : Error in HEAP serialization request. Terminating"      11000091
+    return 8                                                            11010094
+    end                                                                 11020091
+                                                                        11030091
+if HEAP.0 = 0  | symbol('HEAP.0') = "LIT"                               11040099
+ then                                                                   11050099
+   HEAP_SHR = "SEP"                                                     11060099
+                                                                        11070099
+if HEAP_SHR = "SEP"                                                     11080091
+  then                                                                  11090091
+    return 0                                                            11100091
+                                                                        11110091
+return DO_HEAP_SERIALIZATION(HEAP_SHR)                                  11120093
+                                                                        11130091
+/*********************************************************************/ 11140093
+/* Deserialize HEAP from file                                        */ 11150093
+/* PARM : file name                                                  */ 11160093
+/*  RET : 0                                                          */ 11170093
+/*********************************************************************/ 11180093
+DESERIALIZE_HEAP_FROM_FILE : procedure expose HEAP.                     11190093
+HEAP_IMAGE_FILE=arg(1)                                                  11200093
+                                                                        11210093
+SAY "SUMRX: HEAP deserialization started from filename" HEAP_IMAGE_FILE 11220093
+ num_read = 0                                                           11230093
+ do while (1=1)                                                         11240093
+  "EXECIO 1 DISKR" HEAP_IMAGE_FILE "(STEM heap_item."                   11250093
+  if rc <> 0                                                            11260093
+    then                                                                11270093
+      do                                                                11280093
+      "EXECIO 0 DISKR" HEAP_IMAGE_FILE "(FINIS"                         11290093
+      "FREE FI("HEAP_IMAGE_FILE")"                                      11300099
+      leave                                                             11310093
+      end                                                               11320093
+  num_read = num_read + 1                                               11330093
+  interpret heap_item.1                                                 11340093
+ end                                                                    11350093
+ SAY "SUMRX: HEAP has been deserialized from" num_read "records"        11360093
+ return 0                                                               11370093
+                                                                        11380093
+/***********************************************************/           11390093
+/* HEAP serialization                                      */           11400093
+/* PARMS : heap share mode                                 */           11410099
+/*   RET : 0 serialized_filename OR 8                      */           11420094
+/***********************************************************/           11430093
+DO_HEAP_SERIALIZATION : procedure expose HEAP.                          11440093
+HEAP_SHR = arg(1)                                                       11450099
+                                                                        11460093
+parse value GET_AND_PRINT_HEAP_STATISTICS(HEAP_SHR) with TRKS TRKS_SEC .11470099
+                                                                        11480093
+if HEAP_SHR <> "DRP"                                                    11490098
+ then                                                                   11500098
+  do                                                                    11510098
+  dsn_heap_image =  INJ_GENERATE_TEMP_DSNAME("HEAP")                    11520098
+  "ALLOCATE NEW UNIT(SYSDA) RECFM(V B) DA('"dsn_heap_image"')"  ,       11530098
+            "BLKSIZE(5000) SPACE("TRKS","TRKS_SEC") TRACKS DELETE"      11540098
+                                                                        11550098
+  /* find filename in LISTALC output */                                 11560098
+  HEAP_IMAGE = INJ_GET_FILENAME_ALLOC_DSN(dsn_heap_image)               11570098
+  say "SUMRX: HEAP serialization in" HEAP_SHR "mode started"            11580098
+  end                                                                   11590098
+ else                                                                   11600098
+  do                                                                    11610098
+  HEAP_IMAGE = ''                                                       11620098
+  end                                                                   11630098
+                                                                        11640093
+/* serialize HEAP */                                                    11650093
+if HEAP_SERIALIZE_EXT(HEAP_SHR,HEAP_IMAGE) = 0                          11660093
+  then                                                                  11670093
+    do                                                                  11680093
+    if HEAP_IMAGE <> ''                                                 11690098
+     then                                                               11700098
+       do                                                               11710098
+       "EXECIO 0 DISKW" HEAP_IMAGE "(FINIS"                             11720098
+        say "SUMRX: HEAP has been serialized," SRLZ_REC "records added",11730098
+             "to file" HEAP_IMAGE                                       11740098
+       end                                                              11750098
+     else                                                               11760098
+        say "SUMRX: HEAP has been dropped"                              11770098
+    return 0 HEAP_IMAGE                                                 11780093
+    end                                                                 11790093
+  else                                                                  11800093
+    do                                                                  11810098
+    say "SUMRX: HEAP serialization failed"                              11820098
+    return 8                                                            11830093
+    end                                                                 11840098
+                                                                        11850093
+/***********************************************************/           11860093
+/* Get and print HEAP statistics                           */           11870093
+/* PARM : HEAP SHARE mode                                  */           11880099
+/*  RET : tracks tracks_secondary for SRLZ file alloc      */           11890099
+/***********************************************************/           11900093
+GET_AND_PRINT_HEAP_STATISTICS : procedure expose HEAP.                  11910093
+HEAP_SHR = arg(1)                                                       11920099
+rc =  GET_HEAP_STATISTICS_EXT()                                         11930093
+if HEAP_SHR = "SHR" | HEAP_SHR = "CPY"                                  11940099
+ then                                                                   11950099
+  do                                                                    11960099
+  st.l = right(st.l,4)        || ' '                                    11970099
+  st.m = right(st.m,4)        || ' '                                    11980099
+  st.o = right(st.o,4)        || '     '                                11990099
+  st.e = right(st.e,4)                                                  12000099
+  st.v = right(st.v,4)                                                  12010099
+  st.t = right(st.t,5)                                                  12020099
+  st.i = left(st.i,5)                                                   12030099
+  st.d = right(st.d,7)        || '  '                                   12040099
+  st.s = right(st.s,4)        || ' '                                    12050099
+  say "SumRx HEAP Statistics"                                           12060099
+  say "+==============================================================="12070099
+  say "|                                   Meta/Appl            SRLZ  |"12080099
+  say "| Lists  Maps  Objs  Elements Vars    lines    Data(b)   trks  |"12090099
+  say "| .....  .... ...... ........ .... ........... .......   ....  |"12100099
+  say "| " st.l  st.m  st.o    st.e   st.v  st.t"/"st.i st.d    st.s "|"12110099
+  say "|                                                              |"12120099
+  say "+==============================================================="12130099
+  end                                                                   12140099
+/* calculate space */                                                   12150093
+TRKS = st.s                                                             12160093
+wtrk = TRKS/16                                                          12170093
+parse var wtrk TRKS_SEC "." .                                           12180093
+TRKS_SEC = TRKS_SEC + 1                                                 12190093
+return TRKS TRKS_SEC                                                    12200093
+                                                                        12210093
+/***********************************************************/           12220093
+/* Routines used in no-pipe mode                           */           12230093
+/***********************************************************/           12240000
+                                                                        12250000
+/***********************************************************/           12260000
+/*                                                         */           12270000
+/*  Resolve ++INC recursively                              */           12280000
+/*  PARMS  : start position to look over content           */           12290000
+/*                                                         */           12300000
+/***********************************************************/           12310000
+INJ_RECURSIVE_INC : procedure expose content. line copylib sumrxlib   , 12320099
+                            exec_file_mode injector rexxlib rexxname  , 12330099
+                            setbase prolog.                             12331099
+ start_pos  = arg(1)                                                    12340000
+ inc_loop_bndry  = content.0                                            12350000
+ do line = start_pos to inc_loop_bndry /* loop over content */          12360000
+ content.line = substr(content.line,1,72)                               12370000
+ /* insert PROLOG. before base configuration element */                 12371099
+ j = line + 1                                                           12371199
+ if pos(setbase",ENV",translate(content.j)) > 0                         12372099
+   then                                                                 12373099
+     do   /* BCE found */                                               12374099
+      if prolog.0 > 0                                                   12375099
+       then                                                             12376099
+         do  /* prolog exists */                                        12377099
+          l = j                      /* last  to move */                12378099
+          k = content.0              /* first to move */                12379099
+          content.0 = content.0 + prolog.0                              12379199
+          /* widening array to insert prolog */                         12379299
+          n = 0                                                         12379399
+          do i = k to l by -1                                           12379499
+          n = n + 1                                                     12379599
+          m = content.0 + 1 - n      /* dest pos */                     12379699
+          content.m = content.i                                         12379799
+          end                                                           12379899
+          /* insert prolog */                                           12379999
+          do i = 1 to prolog.0                                          12380099
+          k = j - 1 + i                                                 12380199
+          content.k = prolog.i                                          12380299
+          end                                                           12380399
+         end /* prolog exists */                                        12380499
+     inc_loop_bndry  = content.0                                        12380599
+     line = line + prolog.0                                             12380699
+     end  /* BCE found */                                               12380999
+                                                                        12381099
+ if substr(content.line,1,5) = "++INC"                                  12382000
+   then                                                                 12390000
+     do   /* care ++INC */                                              12400041
+     content.line = INJ_STR_REPL(content.line,",ENV","")                12412000
+     mem_name = word(content.line,2)                                    12420000
+     if substr(mem_name,1,1) = '&'                                      12430055
+       then                                                             12440055
+         do                                                             12450055
+         new_name = INJ_GET_VAR_FROM_SETBASE(,                          12460056
+                   'injstm.'substr(mem_name,2),rexxlib,rexxname)        12470056
+         say "++ = Var" mem_name "substituted by" new_name              12480089
+         mem_name = new_name                                            12490056
+         end                                                            12500055
+     dsname = rexxlib"("mem_name")"                                     12510000
+     rc=SYSDSN(dsname); if rc='OK' then rc=0;                           12520000
+     if rc = 0                                                          12530000
+       then                                                             12540000
+         do   /* member found in rexxlib */                             12550000
+         num_before_member = content.0                                  12560082
+         call INJ_INSERT_MEMBER dsname , line                           12570000
+         num_after_member = content.0                                   12580082
+         /* deprecate INJSTUB procedure in REXXNAME */                  12590082
+         if mem_name = rexxname                                         12600082
+           then                                                         12610082
+             do                                                         12620082
+              do mm = num_before_member to num_after_member             12630082
+              content.mm = INJ_STR_REPL(content.mm,"INJ"||"STUB",  ,    12640085
+                                                   "INJ"||"STUB_NA")    12650085
+              end                                                       12660082
+             end                                                        12670082
+         say  "++ Member" left(mem_name,8,' ') "found in" rexxlib       12680000
+         if INJ_RECURSIVE_INC(line) <> 0                                12690000
+           then                                                         12700000
+             return 8                                                   12710000
+         end  /* member found in rexxlib */                             12720000
+       else                                                             12730000
+         do   /* not rexxlib */                                         12740041
+         dsname = copylib"("mem_name")"                                 12750041
+         rc=SYSDSN(dsname); if rc='OK' then rc=0;                       12760000
+         if rc = 0                                                      12770041
+          then                                                          12780000
+           do   /* member found in copylib */                           12790041
+           call INJ_INSERT_MEMBER dsname , line                         12800000
+           say  "++ Member" left(mem_name,8,' ') "found in" copylib     12810041
+           if INJ_RECURSIVE_INC(line) <> 0                              12820000
+             then                                                       12830000
+               return 8                                                 12840000
+           end  /* member found in copylib */                           12850041
+          else                                                          12860000
+           do /* not rexxlib & not copylib */                           12870041
+           dsname = sumrxlib"("mem_name")"                              12880041
+           rc=SYSDSN(dsname); if rc='OK' then rc=0;                     12890041
+           if rc = 0                                                    12900041
+            then                                                        12910041
+             do   /* member found in sumrxlib */                        12920041
+             call INJ_INSERT_MEMBER dsname , line                       12930041
+             say  "++ Member" left(mem_name,8,' ') "found in" sumrxlib  12940046
+             if INJ_RECURSIVE_INC(line) <> 0                            12950041
+              then                                                      12960041
+                return 8                                                12970041
+             end  /* member found in sumrxlib */                        12980041
+            else                                                        12990041
+             do                                                         13000041
+             say  "++ Member" left(mem_name,8,' ') "not found"          13010041
+             end  /* member not found */                                13020041
+           end /* not rexxlib & not copylib */                          13030041
+         end /* not rexxlib */                                          13040041
+    end /* care ++INC */                                                13050041
+ end                         /* loop over content */                    13060000
+ return 0                                                               13070000
+/***********************************************************/           13080000
+/*                                                         */           13090000
+/*  Insert ++INC member into stem  at "i" position         */           13100000
+/*                                                         */           13110000
+/***********************************************************/           13120000
+INJ_INSERT_MEMBER : procedure expose content. inc_loop_bndry            13130000
+ dsn  = arg(1)                                                          13140000
+ ipos = arg(2)                                                          13150000
+ if INJ_GET_FILE_CONTENT("file",dsn,' ',"S") <> 0                       13160000
+   then                                                                 13170000
+     return 8                                                           13180000
+                                                                        13190000
+ /* array of elements from ipos+1 to the end */                         13200000
+ k = 0                                                                  13210000
+ do i = ipos  to content.0                                              13220000
+ if i = ipos /* to avoid endless loop at the last element */            13230000
+   then                                                                 13240000
+    iterate                                                             13250000
+ k = k + 1                                                              13260000
+ interpret "cont."k "= content."i                                       13270000
+ end                                                                    13280000
+ cont.0 = k                                                             13290000
+                                                                        13300000
+ do i = ipos to content.0+mem_content.0-1                               13310000
+ if i >= ipos  &  i < ipos + mem_content.0                              13320000
+   then                                                                 13330000
+     do                                                                 13340000
+     k = i - ipos + 1                                                   13350000
+     content.i = mem_content.k                                          13360000
+     end                                                                13370000
+ if i >= ipos + mem_content.0 & cont.0 > 0                              13380000
+   then                                                                 13390000
+     do                                                                 13400000
+     k = i - (ipos + mem_content.0) + 1                                 13410000
+     content.i = cont.k                                                 13420000
+     end                                                                13430000
+ end                                                                    13440000
+                                                                        13450000
+ content.0      = content.0 + mem_content.0  - 1                        13460000
+ inc_loop_bndry = content.0                                             13470000
+ return                                                                 13480000
+                                                                        13490000
+/********************************************************************/  13500000
+/* This routine returns content of sequential file or lib member    */  13510000
+/* PARM                                                             */  13520000
+/*     type     : FILE or LIB                                       */  13530000
+/*     dsn      : FILE/LIB name                                     */  13540000
+/*     member   : member name if type=LIB                           */  13550000
+/*     stemname : put stem name , default is CONTENT.               */  13560000
+/*              : whatever character means MEM_CONTENT.             */  13570000
+/* routine returns data in stem CONTENT. or MEM_CONTENT.            */  13580000
+/********************************************************************/  13590000
+INJ_GET_FILE_CONTENT: procedure expose content. mem_content.            13600000
+ type   = translate(arg(1))                                             13610000
+ dsn    = translate(arg(2))                                             13620000
+ member = translate(arg(3))                                             13630000
+ if arg(4) = ''                                                         13640000
+   then                                                                 13650000
+     stmname = CONTENT                                                  13660000
+   else                                                                 13670000
+     stmname = MEM_CONTENT                                              13680000
+                                                                        13690000
+ if type = "FILE"                                                       13700000
+   then                                                                 13710000
+     file = dsn                                                         13720000
+ if type = "LIB"                                                        13730000
+   then                                                                 13740000
+     file = dsn"("member")"                                             13750000
+                                                                        13760000
+ "ALLOCATE DA('"file"') SHR"                                            13770000
+ /* find filename in LISTALC output */                                  13780000
+ filename = INJ_GET_FILENAME_ALLOC_DSN(file)                            13790000
+ if filename = ''                                                       13800000
+   then                                                                 13810000
+     return 8                                                           13820000
+                                                                        13830000
+ interpret "'EXECIO * DISKR" filename "(STEM" stmname". FINIS'"         13840000
+ "FREE DA('"file"')"                                                    13850000
+                                                                        13860000
+ return 0                                                               13870000
+                                                                        13880000
+/*********************************************************************/ 13890000
+/* Routine returns filename of TSO allocated dataset                 */ 13900000
+/*********************************************************************/ 13910000
+INJ_GET_FILENAME_ALLOC_DSN : procedure                                  13920000
+file = arg(1)                                                           13930000
+ x = outtrap(out.)                                                      13940000
+ "listalc status sysnames"                                              13950000
+ x = outtrap("off")                                                     13960000
+                                                                        13970000
+ do i = 1 to out.0                                                      13980000
+ if pos(file,out.i) > 0                                                 13990000
+   then                                                                 14000000
+     do                                                                 14010000
+     i = i + 1                                                          14020000
+     return word(out.i,1)                                               14030000
+     end                                                                14040000
+ end                                                                    14050000
+ return ''                                                              14060000
+                                                                        14070000
+/*********************************************************************/ 14080000
+/* Returns temporary dataset name based on current timestamp         */ 14090000
+/*********************************************************************/ 14100000
+INJ_GENERATE_TEMP_DSNAME : procedure                                    14110000
+ name = arg(1)                                                          14120000
+ MS = TIME("L")                                                         14130000
+ MS = substr(MS,length(MS)-1,2)                                         14140000
+ return  userid()                               || ,                    14150000
+         ".INJREXX"                             || ,                    14160029
+         "."name                                || ,                    14170029
+         ".D"||strip(substr(DATE('B'),1,7))     || ,                    14180000
+         ".T"||strip(substr(TIME('S')||MS,1,7))                         14190000
+                                                                        14200000
+/*********************************************************************/ 14210000
+/* Find a source substring in string and replace it by target string */ 14220000
+/*********************************************************************/ 14230000
+/* PARMS : string                                                    */ 14240000
+/*         source substring                                          */ 14250047
+/*         target string                                             */ 14260047
+/*         source location (optional)                                */ 14270000
+/* Tests :                                                           */ 14280000
+/* say INJ_STR_REPL("1 msg(aaa) /* sss */","msg(","-msg(",3)         */ 14290000
+/* say INJ_STR_REPL("msg(aaa) /* sss */","msg("," msg(",1)           */ 14300000
+/* say INJ_STR_REPL(" msg(aaa) /* sss */","msg(","+msg(",2)          */ 14310000
+/* say INJ_STR_REPL(" msg(aaa) /* sss */"," msg("," x=msg(")         */ 14320000
+/* say INJ_STR_REPL("applmsg(aaa) /* sss */"," msg("," x=msg(")      */ 14330047
+/* say INJ_STR_REPL("applmsg(aaa) /* sss */","msg("," x=msg(")       */ 14340047
+/* say INJ_STR_REPL("mem,ENV      /* sss */",",ENV",'')              */ 14350050
+                                                                        14360050
+INJ_STR_REPL : procedure                                                14370050
+str    = arg(1)                                                         14380050
+src    = arg(2)                                                         14390050
+trg    = arg(3)                                                         14400050
+loc    = arg(4)                                                         14410050
+                                                                        14420050
+idx = pos(src,str)                                                      14430050
+if idx = 0                                                              14440050
+   then                                                                 14450050
+     return str                                                         14460050
+   else                                                                 14470050
+   do   /* source found in string */                                    14480050
+   /* if char preceding source in string is not one from exception    */14490050
+   /* array and the 1st char of source string is also such , then     */14500050
+   /* do nothing                                                      */14510050
+   if idx > 1                                                           14520050
+     then                                                               14530050
+      if IS_SIGN_EXCEPTION(substr(str,idx-1,1)) = 0 & ,                 14540050
+         IS_SIGN_EXCEPTION(substr(str,idx,1)) = 0                       14550050
+       then                                                             14560050
+        return str                                                      14570050
+   if loc <> ''                                                         14580050
+    then                                                                14590050
+     do                                                                 14600050
+     interpret "parse var str . " loc  "(src)  sfx"                     14610050
+     parse var str pfx (src) (sfx)                                      14620050
+     return pfx || trg || sfx                                           14630050
+     end                                                                14640050
+    else                                                                14650050
+     do                                                                 14660050
+     parse var str pfx (src)  sfx                                       14670050
+     return pfx || trg || sfx                                           14680050
+     end                                                                14690050
+   end  /* source found in string */                                    14700050
+                                                                        14710050
+/*********************************************************************/ 14720050
+/* This checks arg(1) with elements in SE array                      */ 14730050
+/* RET : 1 - compared with either, 0 - not compared with any         */ 14740050
+/*********************************************************************/ 14750050
+IS_SIGN_EXCEPTION: procedure                                            14760050
+ se.0 = 6                                                               14770099
+ se.1 = ';'                                                             14780050
+ se.2 = '.'                                                             14790050
+ se.3 = ','                                                             14800050
+ se.4 = ' '                                                             14810050
+ se.5 = '"'                                                             14811099
+ se.6 = "'"                                                             14812099
+ do i = 1 to se.0                                                       14820050
+ if arg(1) = se.i                                                       14830050
+   then                                                                 14840050
+     return 1                                                           14850050
+ end                                                                    14860050
+ return 0                                                               14870050
+                                                                        14880049
+/*********************************************************************/ 14890001
+/* This sets the pipe routine name to use inside INJECTOR            */ 14900012
+/*********************************************************************/ 14910001
+LPIPE : procedure                                                       14920001
+ return "PIPE"                                                          14930001
+/*********************************************************************/ 14940012
+/* This sets the pipe routine name to use in application             */ 14950012
+/*********************************************************************/ 14960012
+PIPEC : procedure                                                       14970013
+CMDPIPE_VAR=INJDATA                                                     14980019
+ return CMDPIPE_VAR                                                     14990019
+/*********************************************************************/ 15000078
+/* This returns framework anchor helper name                         */ 15010078
+/*********************************************************************/ 15020078
+GET_SMRX_ANCHOR_HELPER_NAME : procedure                                 15030078
+ return "FWHELPER"                                                      15040078
+/*********************************************************************/ 15050059
+/* return heap image file name from 2nd word of argument             */ 15060099
+/* PARM : second argument of 2nd+ level call                         */ 15070059
+/* EXAMPLE : * CPY_FILE0123                                          */ 15080099
+/*********************************************************************/ 15090059
+GET_HEAP_IMAGE_FILE : procedure                                         15100059
+tok = word(arg(1),2)                                                    15110099
+parse var tok  . '_' image_file .                                       15120099
+return strip(image_file)                                                15130099
+/*********************************************************************/ 15140091
+/* return heap sharing mode from second word of argument             */ 15150099
+/* PARM : second argument of 2nd+ level call                         */ 15160091
+/* EXAMPLE : * CPY_FILE0123                                          */ 15170099
+/*********************************************************************/ 15180091
+GET_HEAP_SHARE_MODE : procedure                                         15190091
+tok = word(arg(1),2)                                                    15200099
+parse var tok share_mode '_' .                                          15210099
+return strip(share_mode)                                                15220099
+/*********************************************************************/ 15230093
+/* set heap mode and heap file to word                               */ 15240093
+/* PARM : heap mode                                                  */ 15250093
+/*      : heap file                                                  */ 15260093
+/* RET  : word containing both they                                  */ 15270093
+/*********************************************************************/ 15280093
+SET_HEAP_MODE_FILE : procedure                                          15290093
+if strip(arg(2)) = ''                                                   15300094
+  then                                                                  15310094
+    return ''                                                           15320094
+  else                                                                  15330094
+    return arg(1)||"_"||arg(2)                                          15340094
+/*********************************************************************/ 15350082
+/* This routine will replace INJSTUB routine in user application     */ 15360082
+/* PARM : exec parameter of application                              */ 15370093
+/*  RET : appl_RC and ISPF VAR INJACTRC : appl_RC srlz_RC HEAP_IMAGE */ 15380099
+/*********************************************************************/ 15390082
+INJSTUB : procedure expose HEAP.                                        15400082
+HEAP_IMAGE_FILE=INJDATA                                                 15410093
+HEAP_SHARE=INJDATA                                                      15420093
+                                                                        15430099
+signal on syntax  name INJ_EXP_SYNTAX                                   15440099
+signal on failure name INJ_EXP_FAILURE                                  15450099
+/* signal on error   name INJ_EXP_ERROR */                              15460099
+                                                                        15470099
+/* there are 2 different situations here :                            */15480082
+/* 1. INJSTUB called in 1st lvl                                       */15490082
+/*    At this point HEAP does not exist yet, so it's filtered         */15500094
+/* 2. INJSTUB called in 2nd lvl                                       */15510082
+/*    At this point HEAP already exists and call will deserialize it  */15520082
+/*                                                                    */15530082
+                                                                        15540099
+/* In 1st level INJECTOR will set NO_HEAP_IMAGE to HEAP_IMAGE_FILE */   15550094
+/* In SEP mode HEAP_IMAGE_FILE is NULL                             */   15560099
+if HEAP_IMAGE_FILE <> "NO_HEAP_IMAGE" & strip(HEAP_IMAGE_FILE) <> ''    15570099
+  then                                                                  15580094
+    rcode = DESERIALIZE_HEAP_FROM_FILE(HEAP_IMAGE_FILE)                 15590094
+                                                                        15600082
+rcode = PARM_VALIDATION(arg(1))                                         15610090
+if word(rcode,1) <> 0                                                   15620090
+  then                                                                  15630090
+    return 8                                                            15640090
+  else                                                                  15650090
+    do                                                                  15660090
+    msg_level = word(rcode,2)                                           15670090
+    end                                                                 15680090
+                                                                        15690090
+/* call main routine */                                                 15700099
+appl_ret = SUMRX_MAIN(arg(1))                                           15710094
+appl_ret = INJ_CHKCODE(appl_ret,"SUMRX_MAIN")                           15711099
+rcode = POST_MAIN(appl_ret)                                             15720099
+return appl_ret                                                         15730099
+                                                                        15740099
+/*********************************************************************/ 15750099
+/* This routine work after SUMRX_MAIN completion or exception        */ 15760099
+/* PARM : SUMRX_MAIN return code OR 16 if exception                  */ 15770099
+/*  RET : appl_RC and ISPF VAR INJACTRC : appl_RC srlz_RC HEAP_IMAGE */ 15780099
+/*********************************************************************/ 15790099
+POST_MAIN : procedure expose HEAP.                                      15800099
+HEAP_IMAGE_FILE=INJDATA                                                 15810099
+HEAP_SHARE=INJDATA                                                      15820099
+appl_ret = arg(1)                                                       15830099
+                                                                        15840099
+/* for HEAP_SHARE=CPY drop HEAP before return to caller */              15850098
+if HEAP_SHARE = "CPY" | HEAP_SHARE = "SEP"                              15860099
+  then                                                                  15870098
+   HEAP_SHARE = "DRP"                                                   15880098
+                                                                        15890099
+INJACTRC = 0                                                            15900099
+if HEAP_SHARE = "SHR"  | HEAP_SHARE = "DRP"                             15910098
+  then                                                                  15920095
+    INJACTRC = appl_ret SERIALIZE_HEAP_TO_FILE(HEAP_SHARE)              15930099
+  else                                                                  15940095
+    INJACTRC = appl_ret                                                 15950099
+                                                                        15960099
+/* do not use ISPF var in first level */                                15970099
+if HEAP_IMAGE_FILE = "NO_HEAP_IMAGE"                                    15980099
+  then                                                                  15990099
+   return appl_ret                                                      16000099
+                                                                        16010099
+/* return completion code via ISPF var */                               16020099
+varlist = "INJACTRC"                                                    16030099
+"ISPEXEC VPUT (&varlist) PROFILE"                                       16040099
+return appl_ret                                                         16050099
+                                                                        16060099
+/*********************************************************************/ 16070099
+/* This routine/labels is called upon exception                      */ 16080099
+/* PARM :                                                            */ 16090099
+/*  RET : 16                                                         */ 16100099
+/*********************************************************************/ 16110099
+INJ_HANDLE_LABELS : procedure                                           16120030
+INJ_EXP_SYNTAX:                                                         16130040
+ return INJ_ERROR_HANDLE("SYNTAX",SIGL)                                 16140041
+INJ_EXP_ERROR:                                                          16150044
+ return INJ_ERROR_HANDLE("ERROR",SIGL)                                  16160045
+INJ_EXP_FAILURE:                                                        16170046
+ return INJ_ERROR_HANDLE("FAILURE",SIGL)                                16180047
+                                                                        16190050
+/*********************************************************************/ 16200099
+/* This handles exception and calls POST_MAIN to survive HEAP !!!    */ 16210099
+/* PARM :                                                            */ 16220099
+/*  RET : 16                                                         */ 16230099
+/*********************************************************************/ 16240099
+INJ_ERROR_HANDLE : procedure expose HEAP.                               16250000
+reason = arg(1)                                                         16260000
+signum = arg(2)                                                         16270010
+                                                                        16280099
+/* Unrecoverable error detected */                                      16290099
+call CMSG 66                                                            16300099
+                                                                        16310099
+say "REASON of failure:" reason                                         16320010
+                                                                        16330000
+from_int  = 25                                                          16340099
+total_num = 50                                                          16350099
+                                                                        16360099
+ say "SUMRX : failure" reason "detected in line" signum                 16370000
+if datatype(signum) = "NUM"                                             16380000
+ then                                                                   16390000
+  do                                                                    16400000
+  parse source . . . file_name dsn .                                    16410000
+  skip_num = signum - from_int                                          16420000
+  if skip_num < 1                                                       16430000
+   then                                                                 16440000
+     skip_num = 0                                                       16450000
+  "EXECIO" skip_num  "DISKR" file_name "(OPEN SKIP )"                   16460000
+  "EXECIO" total_num "DISKR" file_name "(STEM fail. FINIS)"             16470000
+  if datatype(fail.0) = "NUM"                                           16480000
+   then                                                                 16490000
+     do i = 1 to fail.0                                                 16500000
+     if strip(substr(fail.i,1,72)) = ''                                 16510000
+       then                                                             16520000
+         iterate                                                        16530000
+     if skip_num + i = signum                                           16540000
+      then                                                              16550000
+         say '==>' substr(strip(fail.i),1,70)                           16560000
+      else                                                              16570000
+         say ':::' substr(strip(fail.i),1,70)                           16580000
+     end                                                                16590000
+  end                                                                   16600000
+/* do HEAP serialization */                                             16610099
+rcode = POST_MAIN(16)                                                   16620099
+exit 16                                                                 16630000
