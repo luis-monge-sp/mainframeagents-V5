@@ -1,0 +1,646 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Get RSS parameters (ACF2)                *
+ *                                                             *
+ * File Name        : ctsbgpr.c                                *
+ *                                                             *
+ * Author           : Yishay Yovel                             *
+ *                                                             *
+ * Creation Date    : 20/05/97                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------- -------------------------------- *
+ * WS2337   Guy      07/10/98 Added Multi Valued Fields support*
+ * PS0321   Guy      25/10/98 Changed structure of ACFFDR field*
+ * PS0405   Yonatan  05/06/00 Obtain ACF2 version Id.          *
+ * BS2439   Yoni     21/11/00 RESWORD parameter does not exist *
+ * WS2456   Yoni     21/01/02 SUPPORT_VERIFY_PWD flag is Y     *
+ * BS2563   AvnerL   05/11/02 empty ACFFDRx when it's full...  *
+ * bs2607   AvnerL 29/05/2003 support date user defined fields *
+ * IS0353   AvnerL 28/06/2006 set debug_level before cts2ver   *
+ * WS2565   EliMY  13/11/2006 Turn on keyword of GSO record    *
+ *                        OPTS, PSWD, RULEOPTS, EXITS, RESWORD *
+ * WS10007  AvnerL 03/09/2007 pswdfrc -> pswd_reset_chg_pswd.  *
+ * IS10119  AvnerL 17/03/2014 Support ACCREL# in ACCVT.        *
+ * SAS2IBMT SeligT 01/11/2016 SAS/C to IBM C Conversion Project*
+ * IS10182  AvnerL   17/07/19  S0C4/S0C1 due to DIAG vsprintf  *
+ * WS10082  MauriC   07/11/22 Recompile for new ADDINFO macros *
+ **************************************************************/
+ #include <globs.h>
+
+/*
+ *    Standard include files
+ */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+
+/*
+ *    ESA include files
+ */
+
+ #include   ESA_API
+ #include   API_ADDINFO
+ #include   ESA_DIAG
+ #include   ESA_CTSAMSG
+ #include   ESA_API_CODES
+
+ #include MVS_OS_CLI
+ #include MVS_COMP
+
+/*
+ *    ACF2 include files
+ */
+
+#include ACF2_CODES
+
+/*
+ *    This varaible instrcuts ACF2 include files to generate
+ *    RSS Parameters oriented definitions (Get/Update)
+ */
+#define ACF2_GLOBAL_PARAMETERS_DEFINITIONS
+
+#include ACF2
+
+/*
+ *    Local Function Definitions
+ */
+static ESA_RC Set_Structure_Fields(RSS_PARAMS_rec_typ * rss_params,
+                                   ADDINFO_rec_ptr addinfo,
+                                   CTSAMSG_DEST_TABLE_rec_typ * dest,
+                                   CTSAMSG_HANDLE_rec_typ     * msgs);
+
+static ESA_RC Set_Special_Fields(ADDINFO_rec_ptr addinfo,
+                                 CTSAMSG_DEST_TABLE_rec_typ * dest,
+                                 CTSAMSG_HANDLE_rec_typ     * msgs,
+   /* bs2607 */               ADMIN_PARAMS_rec_typ  * admin_params);
+
+static void Process_Exceptional_GSO_Fields(ADDINFO_rec_ptr laddinfo);
+
+static void Complete_ADDINFO_Fields(ADDINFO_rec_ptr addinfo,
+                                    char            *prefix,
+                                    ADDINFO_KDTE_rec_typ    *kdt);
+
+/* SAS2IBMT prototype changed for IBM C
+extern ESA_RC cts2ver(int         *debug_level,
+                      char        *acf2_real_nm_version);            */
+extern ESA_RC cts2ver();                                  /* SAS2IBMT */
+
+static char component[] = "CTSBGPR";
+
+/******************************************************************
+ * Procedure Name : CTSGetRSSParameters
+ ******************************************************************
+ * Description    : Get ACF2 RSS parameters
+ * Input          : addinfo, admin, err
+ * Output         : rss_params
+ * Input/Output   :
+ * Return Value   : ESA_RC
+ * Side Effects   :
+ *                :
+ * Comments       : We hold several ACF2 GSO records in the rss
+ *                : parametrs entity. Each RSS field is prefixed
+ *                : with the record name it belongs to.
+ *                :
+ *                : Processing is done looping thru all supported
+ *                : GSO records and extracting its fields.
+ ******************************************************************/
+
+ ESA_RC CTSGetRSSParams (RSS_PARAMS_rec_typ   * rss_params,
+                         ADDINFO_rec_typ      * addinfo,
+                         ADMIN_PARAMS_rec_typ * admin_params,
+                         ERR_STRUCT_rec_typ   * err)
+ {
+
+  /*
+   *   Variables
+   */
+
+   static char func[]="CTSGetRSSParams";
+   ONE_FIELD_rec_ptr            pair;
+   ONE_FIELD_rec_ptr            pair1;            /* WS10007 */
+   char                         acf_version[50];  /* ACF2 version */
+   int                          rc_asm=0;
+   int                          debug_level;
+   CTSAMSG_HANDLE_rec_typ     * msgs;
+   CTSAMSG_DEST_TABLE_rec_typ * dest;
+   char                         msg[256]="";
+   ESA_RC                       rc = ESA_OK;
+   ACF2_API_Return_Codes        ACF2_rc ;
+   ADDINFO_rec_typ              *laddinfo = NULL;
+   int                          i;
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GTRSPRM, DEBUG_SHOW_IMPORTANT, func );
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   /* PS0405. Get ACF2 version  */
+
+   debug_level=(int)ESA_DIAG_get_debug_level(ESA_COMP_USAAPI);/*IS0353*/
+   /* SAS2IBMT
+   rc_asm=cts2ver(&debug_level, acf_version);                        */
+   rc_asm=(*(ASM_RTN_TYP *)&cts2ver)                      /* SAS2IBMT */
+                 (&debug_level, acf_version);
+   /* IS10119 if ( rc_asm EQ 0 ) BEGIN */
+   acf_version[4]=NULL_CHAR;  /* ACF2 version ID */
+   pair = ADDINFO_search("ACF2_VERSION_ID",
+                                    ACF_ADDINFO_KWD_LEN,
+                                    addinfo->pair,
+                                    addinfo->num_pairs);
+   if (pair NE NULL)
+      ADDINFO_updval(acf_version,
+                     ACF_ADDINFO_VAL_LEN, pair );
+   /* IS10119 END */
+   if ( rc_asm NE 0 ) {
+   /* IS10119 else {                              * IS0353 */
+      /* IS10119 rc = ESA_FATAL;                 /* IS0353 */
+      rc = ESA_OK;                               /* IS10119 */
+      /* CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+        "ACF2 not active/Version not supported", 16,__LINE__);*IS10119*/
+      /*IS10182 admin_params->cs_func.DIAG_printf_ptr(        *is10119*/
+      ESA_DIAG_printf(                          /*IS10182     *is10119*/
+        ESA_COMP_APIINIT,0,
+        "Version %s identified for rss_type %s. Operation continues.",
+        acf_version, admin_params->rss_type);
+      /* SAS2IBMT
+      admin_params->cs_func.MSG_printf_ptr(               //IS10119//
+        ACF2_NEW_VER,acf_version);                                   */
+      CTSAMSG_print(ACF2_NEW_VER, msgs, NULL, dest,      /* SAS2IBMT */
+                    acf_version);                        /* SAS2IBMT */
+      /* IS10119 goto exit;                                * IS0353 */
+   }                                                      /* IS0353 */
+
+  /* ws2456 start
+   *
+   *  Indicate verify password feature exists
+   */
+
+  pair = ADDINFO_search("SUPPORT_VERIFY_PWD",
+                                 ACF_ADDINFO_KWD_LEN,
+                                 addinfo->pair,
+                                 addinfo->num_pairs);
+  if (pair NE NULL)
+    {
+
+      ESA_DIAG_printf(ESA_COMP_GTRSPRM, DEBUG_SHOW_IMPORTANT,
+                      "Turning on SUPPORT_VERIFY_PWD");
+      ADDINFO_updval(KWD_FLAG_ON,
+                     ACF_ADDINFO_VAL_LEN, pair );
+    }
+  /* ws2456 end */
+
+  /*
+   *  Allocate laddinfo
+   */
+   if (ADDINFO_alloc(func,ACF2_ADDINFO,&laddinfo,dest,msgs) NE ESA_OK)
+    {
+      CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+               "laddinfo alloc failed", 16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+    };
+
+  /*
+   *  Set rss_params structure fields
+   */
+   rc = Set_Structure_Fields(rss_params, laddinfo, dest, msgs);
+   if (rc NE ESA_OK)
+    {
+      CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+               "Set Structure failed", rc,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+     };
+
+  /*
+   *  Set speical ACFFDR and UID Structure fields
+   */
+
+   ADDINFO_empty(laddinfo);
+   Set_Special_Fields(laddinfo, dest, msgs,
+                      admin_params); /* bs2607*/
+   ADDINFO_masupd(addinfo,laddinfo,ADDINFO_masupd_NoMerge,dest,msgs);
+
+  /*
+   *  Get Fields for Single GSO record at a time
+   */
+   for(i=0; gso_kdts[i].gso_name[0] NE NULL_CHAR; i++)
+    {
+     /* BS2439 - check if resword  */
+
+     pair = ADDINFO_search(gso_kdts[i].gso_name, ACF_ADDINFO_KWD_LEN,
+                                                addinfo->pair,
+                                                addinfo->num_pairs);
+     if (pair EQ NULL)
+             continue;
+
+     /* BS2439 end   */
+
+     /* WS2565 start here:
+     Turn on GSO record keywords in ESS console by default. */
+
+     ADDINFO_updval(KWD_FLAG_ON,
+                    ACF_ADDINFO_VAL_LEN,
+                    pair);
+
+     /* WS2565 end here */
+
+     ADDINFO_empty(laddinfo);
+
+     /*
+      *  Read Current GSO record of name "gso_name"
+      *  (see ACF2_Get_GSO for definition of Current GSO Record)
+      */
+     strcpy(msg,"");
+     ACF2_rc = ACF2_Get_GSO(gso_kdts[i].gso_name,
+                            laddinfo,
+                            msg);
+
+     if (ACF2_rc NE ACF2_OK)
+      {
+       sprintf(msg,"Get GSO record %s failed rc=%d \n",
+               gso_kdts[i].gso_name,ACF2_rc);
+       CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+               msg, 16,__LINE__);
+       rc = ESA_FATAL;
+       goto exit;
+      };
+
+     /*
+      *  Convert list fields to ESS list field format
+      */
+     Process_Exceptional_GSO_Fields(laddinfo);
+
+     /*
+      *  Set non-returned zero bit values to KWD_FLAG_OFF
+      */
+     Complete_ADDINFO_Fields(addinfo,
+                             gso_kdts[i].gso_name,
+                             gso_kdts[i].gso_kdt);
+
+     /*
+      *  Update Input ADDINFO structure with values retrieved from ACF2
+      */
+     ADDINFO_masupd(addinfo,laddinfo,ADDINFO_masupd_NoMerge,dest,msgs);
+
+     /******************** WS10007 starts ***********************/
+     pair = ADDINFO_search("PSWD.PSWDFRC", ACF_ADDINFO_KWD_LEN,
+                         addinfo->pair,
+                         addinfo->num_pairs);
+     if ( pair NE NULL )
+      {
+       ESA_DIAG_printf(ESA_COMP_GTRSPRM, 3,
+         "GSO(PSWD) PSWDFRC=<%s>", pair->value);
+       pair1 = ADDINFO_search("PSWD.PSWDFRC1", ACF_ADDINFO_KWD_LEN,
+                         addinfo->pair,
+                         addinfo->num_pairs);
+       if ( pair1 NE NULL )
+        {
+         ESA_DIAG_printf(ESA_COMP_GTRSPRM, 3,
+         "PSWD.PSWDFRC1 found");
+         ADDINFO_updval(pair->value,
+                    ACF_ADDINFO_VAL_LEN,
+                    pair1);
+        }
+      }
+     else
+      {
+       ESA_DIAG_printf(ESA_COMP_GTRSPRM, 3,
+         "PSWDFRC of GSO not found.");
+       goto exit;
+      };
+     /*********************** WS10007 ends *************************/
+    };
+
+  exit :;
+
+   /*
+    *  Free local addinfo
+    */
+   if (laddinfo NE NULL)
+    ADDINFO_free(&laddinfo);
+
+   ESA_DIAG_exit(ESA_COMP_GTRSPRM, DEBUG_SHOW_IMPORTANT, func, rc );
+
+   return rc;
+
+}
+
+/******************************************************************
+ * Procedure Name: Set_Structure_Fields
+ ******************************************************************
+ * Description   : Set RSS structure fields from ACF2 GSO records
+ *
+ * Input         : laddinfo     - ADDINFO workarea
+ *                 CTSAMSG stuff
+ *
+ * Output        : rss_params   - Structure to update
+ *
+ * Input/Output  : addinfo      - Caller ADDINFO to set with ACF2
+ *                                values
+ * Return Value  : ESA_RC
+ ******************************************************************/
+static ESA_RC Set_Structure_Fields(RSS_PARAMS_rec_typ      * rss_params,
+                                   ADDINFO_rec_ptr           laddinfo,
+                                   CTSAMSG_DEST_TABLE_rec_typ * dest,
+                                   CTSAMSG_HANDLE_rec_typ     * msgs)
+{
+
+   int                          rc = ESA_OK;
+   ACF2_API_Return_Codes        ACF2_rc ;
+   ONE_FIELD_rec_ptr            pair;
+   char                         msg[256] = "";
+   char                         errmsg[256] = "";
+
+   static  char    func[]="Set_Structure_Fields";
+
+   ESA_DIAG_enter(ESA_COMP_GTRSPRM, DEBUG_SHOW_IMPORTANT, func );
+
+   /*
+    *  Get PSWD record (for password oriented RSS fields)
+    */
+   ACF2_rc = ACF2_Get_GSO("PSWD",
+                          laddinfo,
+                          msg);
+   if (ACF2_rc NE ACF2_OK)
+    {
+     sprintf(errmsg,"Get PSWD Failed, rc=%d msg=%s \n",rc,msg);
+     CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+             errmsg, 16,__LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+    };
+
+   /*
+    *  Max Expire Not supported
+    */
+   rss_params->max_expire = EMPTY_NUMBER;
+
+   /*
+    *  Set Minimum password length fields
+    */
+   pair = ADDINFO_search("PSWD.MINPSWD", ACF_ADDINFO_KWD_LEN,
+                         laddinfo->pair,
+                         laddinfo->num_pairs);
+
+   if ( pair NE NULL )
+    {
+     rss_params->min_pass_len = atoi(pair->value);
+    }
+   else
+    {
+     CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+             "MINPSWD not retrieved", 16,__LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+    };
+
+   /*
+    *  Set Maximum Login attempts
+    */
+   pair = ADDINFO_search("PSWD.PASSLMT", ACF_ADDINFO_KWD_LEN,
+                         laddinfo->pair,
+                         laddinfo->num_pairs);
+
+   if ( pair NE NULL )
+    {
+     rss_params->max_logins = atoi(pair->value);
+    }
+   else
+    {
+     CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+             "PASSLMT not retrieved", 16,__LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+    };
+
+  exit :;
+
+  ESA_DIAG_exit(ESA_COMP_GTRSPRM, DEBUG_SHOW_IMPORTANT, func, rc);
+  return rc;
+ }
+
+/******************************************************************
+ * Procedure Name: Set_Special_Fields
+ ******************************************************************
+ * Description   : Set RSS descriptive fields
+ *
+ * Input         : laddinfo     - ADDINFO workarea
+ *                 CTSAMSG stuff
+ *
+ * Input/Output  : laddinfo     - Caller ADDINFO to set with user
+ *                                defined fields
+ * Return Value  : ESA_RC
+ ******************************************************************/
+static ESA_RC Set_Special_Fields(ADDINFO_rec_ptr           addinfo,
+                                 CTSAMSG_DEST_TABLE_rec_typ * dest,
+                                 CTSAMSG_HANDLE_rec_typ     * msgs,
+   /* bs2607 */               ADMIN_PARAMS_rec_typ  * admin_params)
+{
+
+   int                          rc = ESA_OK;
+   int                          i,j;                      /* PS0321 */
+   char                         field_out[32000]="";
+  /* PS0321 - Deleted
+   char                         field2_out[32000]=""; */  /* WS2337 */
+
+   char                         curr_split[3]="";         /* PS0321 */
+   char                         keyword_name[10]="";      /* PS0321 */
+   char                       * field_ptr = NULL;         /* PS0321 */
+
+  static  char    func[]="Set_Special_Fields";
+
+  ESA_DIAG_enter(ESA_COMP_GTRSPRM, DEBUG_SHOW_IMPORTANT, func );
+
+  rc = ESA_OK;
+
+  Get_ACFFDR_In_ESS_Format(field_out,                     /* PS0321 */
+                           admin_params);                 /* bs2607 */
+
+  /* PS0321 - Now supports dynamic splits (no limit) */
+  /*  WS2337 - Support VERY LONG ACFFDR DATA
+   *  Do we need to split the ACFFDR field ?
+   */
+
+  field_ptr = field_out;                                  /* PS0321 */
+
+  /* PS0321 - split logic */
+  j = 1;
+
+  while (1)
+  {
+    /* Build name of current ADDINFO keyword (ACFFDRxx) */
+
+    strcpy (keyword_name, "ACFFDR");
+    sprintf (curr_split, "%d", j);
+    strcat (keyword_name, curr_split);
+
+    ESA_DIAG_printf(ESA_COMP_GTRSPRM, DEBUG_SHOW_IMPORTANT,
+                    "current ACFFDR split keyword=%s", keyword_name);
+
+    if (strlen (field_ptr) LE ACF_ADDINFO_VAL_LEN)
+    {
+      ESA_DIAG_printf(ESA_COMP_GTRSPRM, DEBUG_SHOW_IMPORTANT,
+                      "performing last ADDINFO insert");
+
+      ADDINFO_insert(TYPE_1B, keyword_name,
+                     field_ptr,
+                     addinfo,
+                     ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                     UNIQUE);
+
+      break;
+    };
+
+    /* Search for last entry that we can fit into current field */
+  /*for (i=ACF_ADDINFO_VAL_LEN; i GT 0; i--) taken out bs2563 */
+    for (i=ACF_ADDINFO_VAL_LEN - 1; i GT 0; i--) /* bs2563 */
+    {
+      if (field_ptr[i] EQ ADDINFO_LIST_ENTRY)
+        break;
+    };
+
+    field_ptr[i] = NULL_CHAR;
+
+    ADDINFO_insert(TYPE_1B, keyword_name,
+                   field_ptr,
+                   addinfo,
+                   ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                   UNIQUE);
+
+    field_ptr = field_ptr + i + 1;
+
+    j++;
+  };
+  /* End of PS0321 */
+
+  Get_UID_In_ESS_Format(field_out);
+
+  ADDINFO_insert(TYPE_1B, "UIDSTRUC",
+                 field_out,
+                 addinfo,
+                 ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                 UNIQUE);
+
+  ESA_DIAG_exit(ESA_COMP_GTRSPRM, DEBUG_SHOW_IMPORTANT, func, rc);
+  return rc;
+ }
+
+/******************************************************************
+ * Procedure Name: Process_Exceptional_GSO_Fields
+ ******************************************************************
+ * Description   : Convert ACF2 List fields to ESS list fields
+ *
+ * Input/Output  : addinfo      - ADDINFO to convert
+ * Return Value  : None
+ ******************************************************************/
+static void Process_Exceptional_GSO_Fields(ADDINFO_rec_ptr laddinfo)
+ {
+  typedef char EXC_FLD[16];
+
+  static EXC_FLD Exc_Fld_Vec[] = {
+   "OPTS.MODE",
+   ""
+   };
+
+   int i;
+   ONE_FIELD_rec_ptr pair;
+
+   for (i=0;*(Exc_Fld_Vec[i]) NE NULL_CHAR;i++)
+    {
+     pair = ADDINFO_search(Exc_Fld_Vec[i],
+                           ACF_ADDINFO_KWD_LEN,
+                           laddinfo->pair,
+                           laddinfo->num_pairs);
+     if (pair NE NULL)
+        ADDINFO_convert_list_sep(pair->value,
+                           ADDINFO_LIST_ENTRY, ADDINFO_LIST_SUBFIELD,
+                                 ',', ',' );
+    };
+}
+
+/******************************************************************
+ * Procedure Name: Complete_ADDINFO_Fields
+ ******************************************************************
+ * Description   : Scan ADDINFO for NULL Bit Fields and set them
+ *                 to zero-bit value (KWD_FLAG_OFF). If SYSID field is
+ *                 NULL set it to constant (NOSYSID).
+ *
+ * Input         : prefix       - GSO record name which prefixes fields
+ *                 kdt          - field name definitions table
+ *
+ * Input/Output  : addinfo      - ADDINFO to process
+ * Return Value  : None
+ ******************************************************************/
+static void Complete_ADDINFO_Fields(ADDINFO_rec_ptr         addinfo,
+                                    char                    *prefix,
+                                    ADDINFO_KDTE_rec_typ    *kdt)
+{
+  static  char    func[]="Complete_ADDINFO_Fields";
+
+  ONE_FIELD_rec_ptr pair = NULL;
+  int  i;
+  char field_name[24]="";
+
+  ESA_DIAG_enter(PLT_COMP_API_ACF2,DEBUG_SHOW_REGULAR,func);
+
+ /******************************************************************
+ * Handle SYSIDs
+ ******************************************************************/
+  strcpy(field_name,prefix);
+  strcat(field_name,".SYSID");
+  pair = ADDINFO_search(field_name, ACF_ADDINFO_KWD_LEN,
+                        addinfo->pair,
+                        addinfo->num_pairs);
+
+  if (pair NE NULL)
+    if (pair->value[0] EQ NULL_CHAR)
+      ADDINFO_updval("NOSYSID",
+                     ACF_ADDINFO_VAL_LEN,
+                     pair);
+
+ /******************************************************************
+ * Handle Bit fields
+ ******************************************************************/
+  for(i=0;kdt[i].kwd[0] NE NULL_CHAR;i++)
+   {
+    if (kdt[i].type NE KDT_FLG)
+     continue;
+
+    strcpy(field_name,prefix);
+    strcat(field_name,".")   ;
+    strcat(field_name,kdt[i].kwd);
+
+    pair = ADDINFO_search(field_name, ACF_ADDINFO_KWD_LEN,
+                         addinfo->pair,
+                         addinfo->num_pairs);
+
+    if (pair EQ NULL)
+     continue;
+
+    if (pair->value[0] EQ NULL_CHAR)
+     ADDINFO_updval(KWD_FLAG_OFF,
+                    ACF_ADDINFO_VAL_LEN,
+                    pair);
+
+   };
+
+  exit:;
+
+  ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func, ESA_OK);
+}
+

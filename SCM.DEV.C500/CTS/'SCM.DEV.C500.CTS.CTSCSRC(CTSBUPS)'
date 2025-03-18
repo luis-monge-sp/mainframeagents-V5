@@ -1,0 +1,824 @@
+/**************************************************************
+*                                                             *
+* Title            : Update user password (ACF2)              *
+*                                                             *
+* File Name        : ctsbups.c                                *
+*                                                             *
+* Author           : Yishay Yovel                             *
+*                                                             *
+* Creation Date    : 20/07/97                                 *
+*                                                             *
+* Description      :                                          *
+*                                                             *
+* Assumptions and                                             *
+*   Considerations :                                          *
+*                                                             *
+**************************************************************/
+
+/**************************************************************
+* Mod.Id   Who      When     Description                      *
+* -------- -------- -------- -------------------------------- *
+* BS2310   Guy      02/11/97 Modified keyword type to KEYG    *
+* WS2459   Yonatan  03/03/02 PSWD-EXP should not be always    *
+*                            issued                           *
+* WS2456   Yonatan  13/02/02 Support VERIFY_PWD keyword       *
+* WS2538   AvnerL   24/07/02 4 acf2 suspend user,no vrfy pswd *
+* BS2540   AvnerL   30/07/02 enable nopswd-exp when ess asks  *
+* BS2562   AmirH    20/10/02 Verify password check            *
+*                            (no handling of revoked/expired) *
+* BS2569   AvnerL   10/12/02 set new ws2459 (bs2540 is bad)   *
+* IS10002  AvnerL   31/01/07 VERIFY_PASSWORD_BY_LOGIN use val.*
+* WS10007  AvnerL   22/08/07 InsertUser calls CTSUpdPassword. *
+* IS10066  NuritY   14/02/12 Verify password succeeds even    *
+*                            when the user is revoked /       *
+*                            expired.                         *
+* BS10028  NuritY   23/02/12 Create Account fails after       *
+*                            upgrade to 3.2.02.               *
+* BS10029  Nurity   12/03/12 Apply BS10028.                   *
+* SAS2IBMT SeligT   12/07/16 SAS/C to IBM C Conversion Project*
+* SAS2IBMN NuritY   09/08/16 SAS/C to IBM C Conversion:       *
+*                            replace loadm, buildm, unloadm,  *
+*                            OS_DYNAM_Load and OS_DYNAM_Delete*
+*                            with calls to ctsaldm and ctsadlm*
+* IS10147A SeligT   18/06/17 Add support for password phrase  *
+* IS10147C Kailas   06/07/17 Ignore field if '3' or '/'       *
+* IS10174  NuritY   25/12/17 Take VERIFY_PASSWORD_BY_LOGIN    *
+*                            from common_params.              *
+* IS10184  NuritY   02/09/21 Improve scripts performance      *
+* BS10120  AvnerL   30/01/23 PWPHRASE per CA LU06571 PTF      *
+* WS10082  MauriC   07/11/22 Recompile for new ADDINFO macros *
+* BS10125  Vaibhav  16/06/23 Mask ClearText pswd in error msg *
+**************************************************************/
+
+#include   <globs.h>
+
+/*
+ *   Standard include files
+ */
+
+#include   STDLIB
+#include   STDIO
+#include   STRING
+
+/*
+ *   Dynamic load files (bs2569)
+ */
+/* #include <dynam.h>                                        SAS2IBMT */
+#include MVS_CODES
+/*
+ *   CONTROL-SA include files
+ */
+
+#include ESA_DIAG
+#include ESA_API
+#include ESA_CTSAMSG
+#include ESA_API_CODES
+#include API_ADDINFO
+
+#include MVS_OS_CLI
+
+#include ACF2_CODES
+#include ACF2
+
+ /*
+  *     MKT for Change Password
+  *         (Mandatory Keywords Table)
+  */
+
+ static ADDINFO_MKTE_rec_typ mkt[] = {
+    "" };      /* a null string indicate end-of-mkt */
+
+ /*
+  *     RKT for Change Password
+  *         (Reserved Keywords Table)
+  */
+
+ static ADDINFO_RKTE_rec_typ rkt[] = {
+    "" };      /* a null string indicate end-of-rkt */
+
+ /*
+  *     KDT for Change Password COMMAND
+  *         (Keyword Decscription Table)
+  */
+
+ static ADDINFO_KDTE_rec_typ kdt[] =     {
+
+  /*                                                            */
+  /* keyword             type   negative       value delimiters */
+  /*                             value                          */
+  /* =================== ====== ============== ================ */
+
+    {"PASSWORD"     , KDT_KEYG, ""           ,"("   ,")"},
+    {"PWPHRASE"     , KDT_KEYG, ""           ,"("   ,")"},/*IS10147A*/
+    {"PSWD-EXP"     , KDT_FLG , "NOPSWD-EXP" ,""    ,"" },
+    {"PWP-EXP"      , KDT_FLG , "NOPWP-EXP"  ,""    ,"" },/*IS10147A*/
+    {""             , KDT_FLG , ""           ,""    ,"" }
+    };                                                    /* BS2310 */
+ void cts2ntr();                                           /*BS10120*/
+ /*** new internal routine                                   BS10120*/
+static long int  local_acf2cmd(int               set_user_profile,
+                          char                  *cmd,
+                          ADDINFO_rec_typ       *laddinfo,
+                          ADDINFO_MKTE_rec_ptr   mkt,
+                          ADDINFO_KDTE_rec_ptr   kdt,
+                          USER_PARAMS_rec_typ   *user_params,
+                          ADMIN_PARAMS_rec_typ  *admin_params);
+ /* BS10028
+ static ADDINFO_KDTE_rec_typ kdt_no_PSWD_EXP[] =     {
+
+   *                                                            *
+   * keyword             type   negative       value delimiters *
+   *                             value                          *
+   * =================== ====== ============== ================ *
+
+    {"PASSWORD"        , KDT_KEYG, ""           ,"("   ,")"   },
+    {""                , KDT_FLG , ""           ,""    ,""    }
+    };                                                     * BS2310 *
+                                                                   */
+
+ /* ws2456 */
+ #include MVS_OS_DYNAM
+ /* IS10174
+ #define VERIFY_PASSWORD_BY_LOGIN "VERIFY_PASSWORD_BY_LOGIN"
+ */
+ #define RACF_FUNCTION_OK_RC      0
+ /* IS10066 #define RACF_FUNCTION_FAILED_RC  8     */
+ /* IS10066 #define RACF_PASSWORD_EXPIRED_RC 12    */
+ /* IS10066 #define RACF_USER_REVOKED_RC     28    */
+ /* ws2456 */
+
+ static char component[]="UpdPass";                    /*IS10184*/
+
+/***************************************************************
+* Procedure Name : updpass                                     *
+* Description    : Update password and its parameters          *
+* Input          : user, password, addinfo, admin              *
+* Output         : err                                         *
+* Input/Output   :                                             *
+* Return Value   : ESA_RC                                      *
+* Side Effects   :                                             *
+* Comments       :                                             *
+***************************************************************/
+
+ESA_RC CTSUpdPassword (USER_PARAMS_rec_typ  * user_params,
+                       ADDINFO_rec_typ      * addinfo,
+                       ADMIN_PARAMS_rec_typ * admin_params,
+                       ERR_STRUCT_rec_typ   * err)
+{
+
+  static char       func[]="CTSUpdPassword";
+
+  /*
+   *   Variables
+   */
+
+  ESA_RC                     rc = ESA_OK;
+  ADDINFO_rec_ptr            laddinfo = NULL;
+  char                       cmd[MAX_API_ST];
+  CTSAMSG_HANDLE_rec_ptr     msgs;
+  CTSAMSG_DEST_TABLE_rec_ptr dest;
+  int                        password_provided = 0; /* BS10028 */
+  int                        Expire_Password = 0;   /* ws2459 */
+  int                        NoExpire_Password = 0; /* ws2459 */
+  ONE_FIELD_rec_ptr          cpair;                 /* ws2459 */
+
+  /*ws2456 def starts */
+  int         create_racf_rc, create_racf_out, create_racf_reason;
+  int         delete_racf_rc, delete_racf_out, delete_racf_reason;
+  /*IS10002 int         prm_rc ;  drop it as it is not used */
+  int         verify_password_rc,dbg_lvl;
+  /* IS10184 char      * how_to_verify = " ";  */
+  char        how_to_verify = ' ';                        /* IS10184 */
+  /*ws2456 def ends*/
+  /*ws2569 def starts */
+  int        cts2gso_rc = 8;
+  /* SAS2IBMN - start */
+  /*
+  int (*fp)(void);  *func. ptr of dyn. loaded module cts2gso  *
+   __local __ref int (*asmfp)(); * local fp   *
+  extern void unloadm(void *);  * prototype of unloadm !
+  */
+  /* IS10147A ASM_RTN_TYP * asmfp;                                   */
+  extern ESA_RC cts2gso();                               /* IS10147A */
+  int           load_rc;
+  /* SAS2IBMN - end */
+
+  int                        pswd_ne_default= 0;
+  /*ws2569 def ends */
+  /* IS10184 ACF2_PARAMS_rec_typ * params_ptr = NULL;     * IS10002 * */
+  COMMON_PARAMS_rec_typ    * cmnp_ptr = NULL;              /* IS10184 */
+  char        how_to_return = ' ';                         /* BS10028 */
+  char        errmsg[170] = "";                           /* IS10184 */
+  int         check_pwphrase = FALSE;                     /*BS10120*/
+  int         set_user_profile = FALSE;                   /*BS10120*/
+  ACF2_INF_record Temp_Record;                            /*BS10120*/
+  char       last_lid[ACF2_LID_SIZE];                     /*BS10120*/
+  char  buffer[ACF2_ARE_BUFFER_LENGTH+1];                 /*BS10120*/
+  int   buffer_length = ACF2_ARE_BUFFER_LENGTH;           /*BS10120*/
+  ESA_RC rc1 = ESA_OK;                                    /*BS10120*/
+  char  last_tod[9];                                      /*BS10120*/
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_UPDPASS, DEBUG_SHOW_IMPORTANT, func);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  if ( ESA_DIAG_get_debug_level(ESA_COMP_UPDPASS) GE 1 ) /* ws2459 */
+    ADDINFO_dump(addinfo,1);                             /* ws2459 */
+
+  /* ws2456 start
+   *
+   *  Check if VERIFY_PWD was requested
+   *  If it was, call the verify password routine and exit,
+   * Otherwise continue as normal.
+   *
+   */
+
+  cpair = ADDINFO_search("VERIFY_PWD",
+                         ACF_ADDINFO_KWD_LEN,
+                         addinfo->pair,
+                         addinfo->num_pairs);
+
+  if (cpair NE NULL)
+    {
+     ESA_DIAG_printf(ESA_COMP_UPDPASS, 2,
+                     "VERIFY_PWD = %s", cpair->value);
+     if (strcmp(cpair->value,KWD_FLAG_ON) EQ 0)
+      {
+       /* IS10184 - replace with a call to GET_P_CMNPRMS
+       params_ptr = admin_params->apiinit_handle;            /@IS10002@/
+       /@ IS10174- start @/
+       /@ *how_to_verify =
+         params_ptr->rssparm_VERIFY_PASS_LOGIN[0];        *IS10002*   @/
+       *how_to_verify =
+         params_ptr->common_params->rssparm_VERIFY_PASS_LOGIN[0];
+          end of replaced code  */
+       GET_P_CMNPRMS(admin_params, cmnp_ptr, rc, errmsg)  /* IS10184 */
+       if (rc NE ESA_OK)       /* no common_params - err     IS10184 */
+       {                                                  /* IS10184 */
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,   /* IS10184 */
+                       component, func, errmsg,           /* IS10184 */
+                       16, __LINE__);                     /* IS10184 */
+         goto exit;                                       /* IS10184 */
+       };                                                 /* IS10184 */
+
+       how_to_verify =                                    /* IS10184 */
+                 cmnp_ptr->rssparm_VERIFY_PASS_LOGIN[0];  /* IS10184 */
+       /* IS10174 - end  */
+       ESA_DIAG_printf(ESA_COMP_UPDPASS, 3,
+          "VERIFY_PASSWORD_BY_LOGIN = %c", how_to_verify); /* IS10184 */
+       /* IS10184   "VERIFY_PASSWORD_BY_LOGIN = %c", *how_to_verify);*/
+       /*IS10002 prm_rc = admin_params->cs_func.rssprm_get_opt_ptr
+                       (admin_params->rss_name,
+                       VERIFY_PASSWORD_BY_LOGIN,
+                       sizeof(how_to_verify),
+                       how_to_verify,
+                       OPT_TRUE,
+                       OPT_FALSE);
+       if (prm_rc NE ESA_OK)
+         how_to_verify = KWD_FLAG_ON; /* verify using login by
+                                                default */
+       rc=ESA_FATAL;
+       dbg_lvl =
+          (int)ESA_DIAG_get_debug_level(ESA_COMP_UPDPASS);
+       if ( dbg_lvl GT 0 )
+          dbg_lvl = 1;
+
+       /* SAS2IBMT
+       verify_password_rc =  OS_DYNAM_call("CTSAVPS ",1,             */
+       verify_password_rc = (*(ASM_RTN_TYP *)&OS_DYNAM_call)
+                                    ("CTSAVPS ",1,        /* SAS2IBMT */
+                                    user_params->user,
+                                    user_params->passwd,
+                      /* IS10184    how_to_verify,                 */
+                                    &how_to_verify,       /* Is10184 */
+                                    admin_params->rss_type,
+                                    &dbg_lvl,
+                                    &create_racf_out,
+                                    &create_racf_rc,
+                                    &create_racf_reason,
+                                    &delete_racf_out,
+                                    &delete_racf_rc,
+                                    &delete_racf_reason);
+
+       /* WS10007 ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT,2,   */
+       ESA_DIAG_printf (ESA_COMP_UPDPASS,2,          /*WS10007 */
+                    "CTSAVPS create: FRC=%d, RC=%d  rc=%d, rs=%d",
+                    verify_password_rc,create_racf_out,
+                    create_racf_rc,create_racf_reason);
+
+     if (verify_password_rc EQ RACF_FUNCTION_OK_RC)      /* BS2562 */
+               rc = ESA_OK;
+
+       CTSAMSG_print(ACF2_VERIFY_PWD, msgs, NULL, dest,
+                  user_params->user,rc);
+       goto exit_verify_password;
+      }
+     }
+  /* ws2456 end */
+
+  /* BS10028 - code moved. Buffer will be obtained only if needed.
+   *
+  *   Obtain a local addinfo buffer
+  *
+
+  rc = ADDINFO_alloc(func,5,&laddinfo,dest,msgs);
+
+  if (rc NE ESA_OK)
+   {
+     rc = ESA_FATAL;
+     goto exit;
+   };
+                                                                 */
+
+  /******************* BS2540 starts ********** avner drop bs2540
+  if (user_params->passwd_life EQ PASS_LIFE_PERMANENT)
+       NoExpire_Password = 1;
+  else Expire_Password = 1;
+  ******************* BS2540 ends ****bs2540 is dropped ********/
+  /*** CTSUpdPassword may be called without a password but only with
+   *** PSWD_EXP or NOPSWD_EXP keywords.                  WS10007 ***/
+  if ((strcmp(user_params->passwd, BACKSLASH_STR) NE 0 ) /* WS10007 */
+  AND (strcmp(user_params->passwd, BACKSLASH_ALT) NE 0 )) /*IS10147C*/
+   { /*WS10007 */
+    /*   BS10028 - removed becasue results are not handled
+    cpair = ADDINFO_search ( "PASSWORD", ACF_ADDINFO_KWD_LEN, *WS10007*
+                             addinfo->pair,
+                             addinfo->num_pairs );
+                                                                      */
+
+    /*   BS10028 - code moved after obtaining local addinfo.
+    ADDINFO_insert(TYPE_1A, "PASSWORD", user_params->passwd, laddinfo,
+                  ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                  UNIQUE);
+                                                                      */
+    password_provided = 1;                                  /*BS10028*/
+
+    ESA_DIAG_printf(ESA_COMP_UPDPASS, 1, /* WS10007 */
+      "PASSWORD or PWPHRASE is set");
+   } /* WS10007 */
+
+  /*ws2459
+   * Check if PSWD-EXP or NOPWSD-EXP flags may be used
+   */
+
+  cpair = ADDINFO_search ( "EXPIRED", ACF_ADDINFO_KWD_LEN,
+                         addinfo->pair,
+                         addinfo->num_pairs );
+  if ( (cpair NE NULL) AND
+       ( strcmp(cpair->value,KWD_FLAG_ON) EQ 0 ))
+  /*  bs2569  {  no need  * BS2540 */
+      Expire_Password = 1;
+  /*  bs2569 NoExpire_Password = 0; no need  * BS2540 */
+  /*  bs2569 }  * BS2540 */
+
+  cpair = ADDINFO_search ( "NOEXPIRED", ACF_ADDINFO_KWD_LEN,
+                         addinfo->pair,
+                         addinfo->num_pairs );
+  if ( (cpair NE NULL) AND
+       ( strcmp(cpair->value,KWD_FLAG_ON) EQ 0 ) )
+     NoExpire_Password = 1;
+
+  ESA_DIAG_printf(ESA_COMP_UPDPASS, 1,
+   "Expire_Password = %d NoExpirePassword = %d",
+   Expire_Password,NoExpire_Password);
+
+  /* end ws2459 */
+
+  /* BS10028 - start                                          */
+  /* Process only if at least one parameter exists            */
+  if (Expire_Password OR NoExpire_Password OR password_provided)
+   {
+    /*
+     *   Obtain a local addinfo buffer
+     */
+
+    rc = ADDINFO_alloc(func,5,&laddinfo,dest,msgs);
+
+    if (rc NE ESA_OK)
+     {
+       rc = ESA_FATAL;
+       goto exit;
+     };
+
+    if (password_provided) {
+      if (strlen(user_params->passwd) LT
+                              MIN_RSS_PSWDPHRS_LEN)      /* IS10147A */
+      ADDINFO_insert(TYPE_1A, "PASSWORD", user_params->passwd, laddinfo,
+                     ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                     UNIQUE);
+  /* BS10125 - start   If PWPHRASE length is more than 100, ERROR */
+      else if(strlen(user_params->passwd) GT 100)
+        {
+         CTSAMSG_print(ERR_CS_MSG_CHKSIZE, msgs, NULL, dest,
+         func,"PWPHRASE",strlen(user_params->passwd),100);
+
+         rc = ESA_FATAL;
+         goto exit;
+         }
+  /* BS10125 - end */
+      else                                               /* IS10147A */
+      ADDINFO_insert(TYPE_1A, "PWPHRASE", user_params->passwd, laddinfo,
+                     ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                     UNIQUE);                            /* IS10147A */
+    }
+    /* BS10028 - end                                             */
+
+    /* bs2569 part 1 starts        Avner */
+    if (Expire_Password == 0 AND NoExpire_Password == 0) {
+    /* When none of the above 2 flags were set,
+       check ACF2 default in GSO PSWDFRC/NOPSWDFRC */
+
+       /* Load a load module named "cts2gso" and call it. */
+       /* SAS2IBMN loadm("CTS2GSO",&fp);     */
+       /* SAS2IBMN if (fp == NULL)                      */
+       /* SAS2IBMT
+       load_rc = ctsaldm("CTS2GSO ", "       ", &asmfp); // SAS2IBMN */
+       /* IS10147A - remove all of this dynamic load code because
+                     we will call cts2gso directly.
+       load_rc = (*(ASM_RTN_TYP *)&ctsaldm)("CTS2GSO ",  // SAS2IBMT //
+                                     "       ", &asmfp); // SAS2IBMN //
+       if (load_rc NE 0)                                 // SAS2IBMN //
+          {
+            CTSAMSG_print(DYNAMIC_LOAD_FAILED, msgs, NULL, dest,
+                          "CTS2GSO");
+            rc = ESA_FATAL;
+            goto exit;
+          }                                                          */
+       /* SAS2IBMN - start */
+       /*
+         asmfp=(__local __ref int (*)()) fp;  *remote->local*
+         cts2gso_rc = (*fp)();  * check ACF2 pswdfrc/nopswdfrc gso opt*
+         unloadm(fp);
+       */
+       /* IS10147A
+       cts2gso_rc = (*asmfp)(); // check ACF2 pswdfrc/nopswdfrc gso opt */
+       cts2gso_rc = (*(ASM_RTN_TYP *)&cts2gso)("PFRC");  /* IS10147A */
+
+       /* SAS2IBMT
+       load_rc = ctsadlm("CTS2GSO ");    // delete the module */
+       /* IS10147A - remove all of this dynamic delete code because
+                     we called cts2gso directly.
+       load_rc = (*(ASM_RTN_TYP *)&ctsadlm)("CTS2GSO "); // SAS2IBMT //
+       if (rc NE 0)
+         CTSAMSG_print(DYNAMIC_DEL_LOAD_FAILED, msgs, NULL, dest,
+                      "CTS2GSO");  // issue warning if delete failed //
+       // SAS2IBMN - end                                             */
+
+      if (cts2gso_rc == 0) /* pswdfrc */
+        ESA_DIAG_printf(ESA_COMP_UPDPASS, 1,
+                        "GSO default is password expired");
+      else                 /* nopswdfrc */
+        ESA_DIAG_printf(ESA_COMP_UPDPASS, 1,
+                        "GSO default is password NO expired");
+    }
+  /* bs2569 part 1 ends          Avner */
+   /*
+    * Set New Password (temporary = + PSWD-EXP , Perm = + NOPSWD-EXP
+    */
+
+    if (Expire_Password OR NoExpire_Password) {     /* ws2459 */
+  /* bs2569 part 2 starts */
+      if (Expire_Password) {     /* bs2569 */
+            ESA_DIAG_printf(ESA_COMP_UPDPASS, 1,
+         "PSWD-EXP/PWP-EXP:Expired was requested by ESS_admin.");
+         if (strlen(user_params->passwd) LT
+                              MIN_RSS_PSWDPHRS_LEN)      /* IS10147A */
+            ADDINFO_insert(TYPE_1A, "PSWD-EXP", KWD_FLAG_ON, laddinfo,
+                           ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                           UNIQUE);
+         else                                            /* IS10147A */
+            ADDINFO_insert(TYPE_1A, "PWP-EXP", KWD_FLAG_ON, laddinfo,
+                           ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                           UNIQUE);                      /* IS10147A */
+        }
+      else { /* NoExpire_Password         bs2569 */
+            ESA_DIAG_printf(ESA_COMP_UPDPASS, 1,
+         "NOPSWD-EXP/NOPWP-EXP:NoExpired was requested by ESS_admin.");
+         if (strlen(user_params->passwd) LT
+                              MIN_RSS_PSWDPHRS_LEN)      /* IS10147A */
+            ADDINFO_insert(TYPE_1A, "PSWD-EXP", KWD_FLAG_OFF, laddinfo,
+                           ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                           UNIQUE);
+         else                                            /* IS10147A */
+            ADDINFO_insert(TYPE_1A, "PWP-EXP", KWD_FLAG_OFF, laddinfo,
+                           ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                           UNIQUE);                      /* IS10147A */
+        }
+      }  /* bs2569 part 2 ends */
+
+   else /* bs2569 part 3 starts Expire_Password=NoExpirePassword=0 */
+   switch(user_params->passwd_life)
+    {
+    case PASS_LIFE_RESET:
+       if (cts2gso_rc == 4) { /* acf2 default is noexpired bs2569 */
+          ESA_DIAG_printf(ESA_COMP_UPDPASS, 1,
+       "PSWD-EXP/PWP-EXP:ACF2 default is noexpired and PASS_LIFE_RESET");
+       pswd_ne_default = 1 ;
+          if (strlen(user_params->passwd) LT
+                              MIN_RSS_PSWDPHRS_LEN)      /* IS10147A */
+          ADDINFO_insert(TYPE_1A, "PSWD-EXP", KWD_FLAG_ON, laddinfo,
+                         ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                         UNIQUE);
+          else                                           /* IS10147A */
+          ADDINFO_insert(TYPE_1A, "PWP-EXP", KWD_FLAG_ON, laddinfo,
+                         ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                         UNIQUE);                        /* IS10147A */
+          }
+       break;
+    case PASS_LIFE_PERMANENT:
+       if (cts2gso_rc == 0) { /* acf2 default is expired bs2569 */
+          ESA_DIAG_printf(ESA_COMP_UPDPASS, 1,
+       "NOPSWD-EXP/NOPWP-EXP:ACF2 default is expired and PASS_LIFE_PERMANENT");
+       pswd_ne_default = 1 ;
+          if (strlen(user_params->passwd) LT
+                              MIN_RSS_PSWDPHRS_LEN)      /* IS10147A */
+          ADDINFO_insert(TYPE_1A, "PSWD-EXP", KWD_FLAG_OFF, laddinfo,
+                         ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                         UNIQUE);
+          else                                           /* IS10147A */
+          ADDINFO_insert(TYPE_1A, "PWP-EXP", KWD_FLAG_OFF, laddinfo,
+                         ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                         UNIQUE);                        /* IS10147A */
+     /* bs2569 part 3 ends */
+          }
+       break;
+    default:;
+    }
+     /* ws2459 */
+
+    /************************* BS10028 start *********************
+     *** If any keyword was created for password processing    ***
+     *** handle them according to "CTSBUPS_RETURN_KEYWORDS"    ***
+     *** value:                                                ***
+     *** "A" - append to the caller keywords.                  ***
+     *** "R" - replace the caller keywords with the password   ***
+     ***       keywords.                                       ***
+     *** " " - issue a change command with these keywords.     ***/
+
+     cpair = ADDINFO_search("CTSBUPS_RETURN_KEYWORDS",
+                            ACF_ADDINFO_KWD_LEN,
+                            addinfo->pair,
+                            addinfo->num_pairs);
+
+     if (cpair NE NULL)
+       {
+        ESA_DIAG_printf(ESA_COMP_UPDPASS, 2,
+                        "CTSBUPS_RETURN_KEYWORDS = %s", cpair->value);
+        if (strcmp(cpair->value,"A") EQ 0 OR
+            strcmp(cpair->value,"R") EQ 0 OR
+            strcmp(cpair->value," ") EQ 0)
+               how_to_return = cpair->value[0];
+         else
+           {
+            ESA_DIAG_printf(ESA_COMP_UPDPASS, 0,
+                           "CTSBUPS_RETURN_KEYWORDS = %s is incorrect",
+                           cpair->value);
+            how_to_return = ' ';
+           }
+       }
+    /************************* BS10028 end  **********************/
+
+  /*
+   *   Build and issue ACF2 Change command
+   */
+
+    /*   BS10028 - Remove support for INSERT command
+
+    ************************* WS10007 start *********************
+    *** Issue INSERT when called by InsertUser.               ***
+    params_ptr = admin_params->apiinit_handle;
+    admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_UPDPASS,3,
+      "Insert_Calls_CTSUpdPassword=<%s>",
+      params_ptr->Insert_Calls_CTSUpdPassword[0]);
+    if(params_ptr->Insert_Calls_CTSUpdPassword[0] EQ 'I')
+     {                                                     *WS10007 *
+      params_ptr->Insert_Calls_CTSUpdPassword[0] = ' ';    *WS10007 *
+      sprintf(cmd,"ACF2 LID INSERT %s ",user_params->user);
+     }                                                     *WS10007 *
+    else
+    ************************* WS10007 end *************************
+                                                                    */
+     /* BS10028 - start                                              */
+     /* Print the local addinfo                                      */
+     ESA_DIAG_printf(ESA_COMP_UPDPASS, DEBUG_SHOW_REGULAR,
+                    "local addinfo");
+     if (ESA_DIAG_get_debug_level(ESA_COMP_UPDPASS) GE 6) /*BS10120*/
+         ADDINFO_dump(laddinfo,1);                        /*BS10120*/
+         /*BS10120                    DEBUG_SHOW_REGULAR)          */
+         /*BS10120 ADDINFO_dump(addinfo,1);                        */
+     /*************** BS10120 start ***********************************
+      * If we are called by CTSUpdUser or CC directly and phrase is to*
+      * be updated, per LU06571, if PWPHRASE is not set yet for the   *
+      * user, we should issue these 2 commands to insert the new      *
+      * phrase to the user-profile record:                            *
+      * SET P(USER) DIV(PWPHRASE)                                     *
+      * INS <userid> PWPHRASE(xxxxxxxxxxxxxxxxxxx)                    *
+      *****************************************************************/
+     cpair = ADDINFO_search("PWPHRASE", /*are we updating the phrase? */
+                            ACF_ADDINFO_KWD_LEN,
+                            laddinfo->pair,
+                            laddinfo->num_pairs);
+     if (cpair NE NULL) { /*check who is the caller of CTSUpdPassword*/
+      cpair = ADDINFO_search("CTSBUPS_CALLER",
+                            ACF_ADDINFO_KWD_LEN,
+                            addinfo->pair,
+                            addinfo->num_pairs);
+      if (cpair NE NULL) /*CC does not add this temp attribute*/
+       {
+        ESA_DIAG_printf(ESA_COMP_UPDPASS, 6,
+          "CTSBUPS_CALLER = <%s>", cpair->value);
+        if (strcmp(cpair->value,"InsertUser") EQ 0)
+          check_pwphrase = FALSE; /*no need to check PWPHRASE*/
+         else /* CTSUpdUser */
+          check_pwphrase = TRUE; /*CTSUpdUser - should check phrase*/
+       }
+      else /* direct call by CC */
+       check_pwphrase = TRUE; /*CC - should check phrase */
+      if (check_pwphrase) { /* check whether PWPHRASE is set already */
+       /* output of this part is set_user_profile = TRUE or FALSE */
+       /**************************************************************/
+       /* prepare parameters for cts2ntr                             */
+       /**************************************************************/
+       memset(buffer,0X00,4);
+       memset(last_lid,0X00,sizeof(last_lid));
+       Temp_Record.INF_sysid_masked = 'N';
+       Temp_Record.INF_recid_masked = 'N';
+       Temp_Record.INF_class = 'P';
+       strcpy(Temp_Record.INF_type,"USR");
+       strcpy(Temp_Record.INF_key,"PWPHRASE");
+       Temp_Record.INF_sysid_length = strlen("PWPHRASE");
+       strcpy(Temp_Record.INF_key+8,user_params->user);
+       Temp_Record.INF_recid_length = strlen(user_params->user);
+       ESA_DIAG_printf(ESA_COMP_UPDPASS , 6,
+         "userid=<%s> <%s> userid length=<%d>",
+         Temp_Record.INF_key+8,user_params->user,
+         Temp_Record.INF_recid_length);
+       if (ESA_DIAG_get_debug_level(ESA_COMP_UPDPASS) GE 6)
+        {
+         SNAP_AREA( "Before 2ntr CTSBUPS", &Temp_Record, 64)
+        };
+       /**************************************************************
+        * Call cts2ntr to check whether the user has already a phrase*
+        * If yes, rc=0 no need to issue the below 2 commands         *
+        * If no,  rc=4 the below 2 commands should be issued         *
+        *              SET P(USER) DIV(PWPHRASE)                     *
+        *              INS <userid> PWPHRASE(xxxxxxxxxxxxxxxxxxx)    *
+        **************************************************************/
+       (*(ASM_RTN_TYP *)&cts2ntr)(&Temp_Record,
+           "",
+           last_lid,
+           last_tod,
+           &buffer_length,
+           buffer,
+           &rc1,
+           errmsg);
+       ESA_DIAG_printf(ESA_COMP_UPDPASS , 6,
+           "after cts2ntr rc1=<%d> errmsg=<%s>",rc1,errmsg);
+       if (rc1 EQ 4) { /* no PWPHRASE yet */
+       /**************************************************************
+        * cts2ntr rc is 4 when PWPHRASE user profile does not exist. *
+        * In this case we need to issue the 2 commands:              *
+        * SET P(USER) DIV(PWPHRASE) & INS <userid> PWPHRASE(xxxxxxx) *
+        * The ACF2 GEN-P(USER) text below, will be replaced by       *
+        * CTSBCMD clist with 2 ACF2 commands mentioned above.        *
+        * set a flag to be used by the local_acf2cmd.                *
+        **************************************************************/
+        set_user_profile = TRUE;
+       } /* end of (rc1 EQ 4)                         */
+      } /* end of if (check_pwphrase)                */
+     } /* end of PWPHRASE NE NULL */
+    /********************* BS10120 end ******************************/
+
+     /*   Add support for returning the password handling keywords
+          to the caller.                                             */
+     ESA_DIAG_printf(ESA_COMP_UPDPASS , 6,                   /*BS10120*/
+       "how_to_return=<%c>",how_to_return);
+     switch (how_to_return)
+     {
+       case 'A':
+         ADDINFO_delete(addinfo, "PASSWORD");  /* remove any...       */
+         ADDINFO_delete(addinfo, "PSWD-EXP");  /* ... password...     */
+         ADDINFO_delete(addinfo, "PSWD_EXP");  /*   ... related entry */
+         ADDINFO_delete(addinfo, "PWPHRASE");  /*            IS10147A */
+         ADDINFO_delete(addinfo, "PWP-EXP");   /*            IS10147A */
+         ADDINFO_delete(addinfo, "PWP_EXP");   /*            IS10147A */
+         /************************* BS10120 start *********************/
+         if (set_user_profile) {
+         /*************************************************************
+          * call new internal acf2 routine with laddinfo and          *
+          * set_user_profile to decide which ACF2 command to issue.   *
+          ************************* BS10120 start *********************/
+          rc = local_acf2cmd(set_user_profile,
+                             cmd,
+                             laddinfo,
+                             mkt,
+                             kdt,
+                             user_params,
+                             admin_params);
+          break;
+         }
+         else                                                /*BS10120*/
+        /************************* BS10120 end ***********************/
+           ADDINFO_masupd(addinfo, laddinfo, ADDINFO_masupd_Merge,
+                          dest, msgs);           /*  add ours */
+         rc = ESA_OK;
+         break;
+       case 'R':
+        /************************* BS10120 start**********************/
+         if (set_user_profile) {
+         /*************************************************************
+          * call new internal acf2 routine with laddinfo and          *
+          * set_user_profile to decide which ACF2 command to issue.   *
+          ************************* BS10120 start *********************/
+          rc = local_acf2cmd(set_user_profile,
+                             cmd,
+                             laddinfo,
+                             mkt,
+                             kdt,
+                             user_params,
+                             admin_params);
+           /* WS10082N rc = ADDINFO_empty(addinfo);  */
+           ADDINFO_empty(addinfo);                        /* WS10082N */
+         }
+         else
+        /************************* BS10120 end ***********************/
+           rc = ADDINFO_copy(addinfo, laddinfo);
+         break;
+       default:
+        /************************* BS10028 end ***********************/
+        /************************* BS10120 start *********************/
+        /* call new internal acf2 routine with laddinfo and          *
+         * set_user_profile to decide which ACF2 command to issue.   *
+         ************************* BS10120 start *********************/
+          rc = local_acf2cmd(set_user_profile,
+                             cmd,
+                             laddinfo,
+                             mkt,
+                             kdt,
+                             user_params,
+                             admin_params);
+        /************************* BS10120 end ***********************/
+         break;
+     }
+     /* BS10028 - Print the returned addinfo                          */
+     /*BS10120 ESA_DIAG_printf(ESA_COMP_UPDPASS, DEBUG_SHOW_REGULAR,  */
+     ESA_DIAG_printf(ESA_COMP_UPDPASS, 6,                    /*BS10120*/
+                    "returned addinfo, if requested");
+     /*BS10120 if (ESA_DIAG_get_debug_level(ESA_COMP_UPDPASS) GE */
+     /*BS10120                                     DEBUG_SHOW_REGULAR)*/
+     if (ESA_DIAG_get_debug_level(ESA_COMP_UPDPASS) GE 6)    /*BS10120*/
+        ADDINFO_dump(addinfo,1);
+     /* BS10028 - end                                                 */
+    }
+ /*
+  *   Finish
+  */
+ exit:;
+  if (laddinfo NE NULL)                                     /*BS10028*/
+   ADDINFO_free(&laddinfo);
+  exit_verify_password:
+  ESA_DIAG_exit(ESA_COMP_UPDPASS, DEBUG_SHOW_IMPORTANT, func, rc );
+  return rc;
+}
+ /************************* BS10120 ****************************
+ *                                                             *
+ * PROCEDURE NAME : local_acf2cmd                              *
+ * DESCRIPTION    : issue ACF2 command per set_user_profile    *
+ * INPUT          : set_user_profile                           *
+ * OUTPUT         : rc                                         *
+ * RETURN VALUE   : None                                       *
+ **************************************************************/
+static long int local_acf2cmd(int                set_user_profile,
+                          char                  *cmd,
+                          ADDINFO_rec_typ       *laddinfo,
+                          ADDINFO_MKTE_rec_ptr   mkt,
+                          ADDINFO_KDTE_rec_ptr   kdt,
+                          USER_PARAMS_rec_typ   *user_params,
+                          ADMIN_PARAMS_rec_typ  *admin_params)
+{
+ static char                func[]="local_acf2cmd";
+ ONE_FIELD_rec_ptr          pair = NULL;
+ ESA_RC                     rc;
+ ESA_DIAG_enter(ESA_COMP_UPDPASS, 1 , func);
+ if (laddinfo->num_pairs NE 0) {
+  if (set_user_profile) { /* issue the SET P(USER) & INS PWPHRASE*/
+  /* The ACF2 GEN-P(USER) text below, will be replaced by
+     CTSBCMD clist with 2 ACF2 commands mentioned above    */
+   sprintf(cmd,"ACF2 GEN-P(USER)-SYSID(PWPHRASE) INS %s ",
+     user_params->user);
+ }
+ else /* issue the regular LID CHANGE command */
+  sprintf(cmd,"ACF2 LID CHANGE %s ",user_params->user);
+
+  ESA_DIAG_printf(ESA_COMP_UPDPASS, 6,
+    "Command header prepared (%s)", cmd);
+  rc = ACF2cmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+               cmd, MAX_OK_RC_0, 1, &laddinfo, mkt, kdt,
+               admin_params, CMDOUT_YES, ACF2_YES);
+ }
+ ESA_DIAG_exit(ESA_COMP_UPDPASS, 1, func, rc);
+}

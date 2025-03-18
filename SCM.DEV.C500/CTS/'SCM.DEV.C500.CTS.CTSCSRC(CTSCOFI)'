@@ -1,0 +1,995 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Offline interceptor                      *
+ *                                                             *
+ * File Name        : ctscofi.c                                *
+ *                                                             *
+ * Author           : Alexander Shvartsman                     *
+ *                                                             *
+ * Creation Date    : 10/08/94                                 *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------- -------------------------------- *
+ *                                                             *
+ * PS0095   AS       03/06/97 Change assembler prog name       *
+ *                            from ctsfcvd to ctsacvd          *
+ * ps0177   Alex     10/08/97 Fix bug                          *
+ * ps0219   Alex     26/10/97 Support for RSS type in EVT      *
+ * ps0254   Guy      21/04/98 Added argc,argv to call          *
+ * ps0295   Guy      13/08/98 Changes for common code 3.0.0 GA *
+ * ps0296   Guy      18/08/98 Increase WORK_INTERCEPT_AREA_LEN *
+ *                            for CTSFU83 from 1K to 2K        *
+ * ps0452   Yonatan  02/01/01 Add encrhndl to interceptorinit  *
+ * bs2515   Yonatan  18/08/98 Increase WORK_INTERCEPT_AREA_LEN *
+ *                            for CTSFU83 from 2K to 4K        *
+ * ws2505   BellaP   23/03/03 Filter out certain events from   *
+ *                            Online Interceptor. This doesn't *
+ *                            effect on Offline Interceptor.   *
+ *                            For Offline Interceptor only     *
+ *                            default parameters is assigned.  *
+ * BS2624   AvnerL   14/10/03 Enlarge SMF rec 2 32k. Recompile.*
+ * BS2626   AvnerL   25/11/03 When EOF,write loop by rssparm.  *
+ * BS2627   AvnerL   11/12/03 rc=0,though provlem occured.     *
+ *                            0c4 occurs after bs2626.         *
+ * IS0272   Michael  10/06/04 Update RACF 3.2.0 with old fixes *
+ * ws2529   AvnerL   12/10/04 Load SAS/C modules.              *
+ * bs2700   Eli M.Y  10/11/05 ESS originated events, not sent. *
+ * is0324   Eli M.Y  14/11/05 Ofli rescans SMF recs of prev run*
+ * IS10024  AvnerL   03/09/08 S0C4 in OFLI-workarea too small. *
+ * IS10100  NuritY   29/07/13 Support REVOKE REASON.           *
+ * SAS2IBMT SeligT   03/07/16 SAS/C to IBM C Conversion Project*
+ * SAS2IBMN NuritY   09/08/16 SAS/C to IBM C Conversion:       *
+ *                            replace loadm, buildm, unloadm,  *
+ *                            OS_DYNAM_Load and OS_DYNAM_Delete*
+ *                            with calls to ctsaldm and ctsadlm*
+ *     "      "      17/01/17 Replace sleep with ctsaslp       *
+ * WS10064  MeirS    07/02/18 Support Phrase (only to define   *
+ *                   passflag and phrsflag as external to      *
+ *                   CTSCINT)                                  *
+ * WS10067  SeligT   05/02/18 Update GDB dynamically when      *
+ *                            access or resource rules are     *
+ *                            added/modified                   *
+ * IS10184  NuritY   31/08/21 Improve scripts performance      *
+ * WS10085  PatilV   09/10/23 Enable RU_LOCKED for IDN with    *
+ *                            RACF                             *
+ **************************************************************/
+/****************************************************
+ * Procedure Name: ctscofi
+ * Description   : Offline interceptor
+ *                 main routine.
+ *
+ * Input         : argv[1] -
+ *               : argv[2] -
+ *               : argv[3] -
+ *
+ *
+ *
+ * Return Value  : ESA_OK, ESA_FATAL
+ *
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+
+#define THIS_IS_MAIN
+#include <globs.h>
+
+/*
+ *   Standard header files
+ */
+
+ #include STRING
+ #include STDIO
+ #include STDLIB
+/* SAS2IBMT #include LCIO                                            */
+ #include ERRNO                                           /* SAS2IBMT */
+
+/*
+ *   ESA code header files
+ */
+
+ #include ESA_API
+ #include ESA_INIT
+ #include ESA_CS_OS
+ #include ESA_DIAG
+ #include ESA_API_CODES
+
+ #include MVS_INTERCEPTOR
+
+ #include MVS_OS_MVS
+ #include MVS_OS_DYNAM
+ #include MVS_CODES
+
+ /* SAS2IBMN  #include UNISTD                 * for sleep bs2626*/
+ #include MATH                               /* for MAX   bs2627*/
+ /*
+  *   Dynamic load files (ws2529)
+  */
+ /* SAS2IBMT #include <dynam.h>                                      */
+
+ /*
+       #include RACF
+       #include RACF_CODES
+ */
+
+ #define  DD_SMF_DUMP_FILE         "DD:SMFDUMP" /* added DD: SAS2IBMT */
+ #define  INTERCEPT_WAIT_TIME      3
+ #define  RES_NAME                 "SMF"
+ #define  RES_TYP                  LOCK_RES_FILE
+ #define  WORK_INTERCEPT_AREA_LEN  4096
+ #define  BLANK8                   "        "
+ #define  BLANK6                   "      "
+ #define  ONLI_ACS_JBN_PARAM "ONLI_ACSJBN"   /* BS2700 */
+
+ #define CONSOLE_ON(msgs)              \
+      if (msgs.ctsamsg_dest NE NULL)   \
+        msgs.ctsamsg_dest->dests[CTSAMSG_DEST_CNSL].active = FLAG_YES;
+
+ #define CONSOLE_OFF(msgs)              \
+      if (msgs.ctsamsg_dest NE NULL)    \
+        msgs.ctsamsg_dest->dests[CTSAMSG_DEST_CNSL].active = FLAG_NO;
+ #define MAX_Q_TRY "MAX_Q_TRY"                         /*bs2626*/
+ #define WAIT_WHEN_Q_EOF "WAIT_WHEN_Q_EOF"             /*bs2626*/
+ #define DEFAULT_MAX_Q_TRY 999999/*default=forever/till no EOF bs2626*/
+ #define DEFAULT_WAIT_WHEN_Q_EOF 120 /*default=120 seconds  bs2626*/
+
+/*
+ *   Conversion routines
+ */
+
+ /***** convert date and time from binary to character ******/
+
+ /* SAS2IBMT parameters not needed
+ extern ESA_RC ctsacvd(int             *debug_level,
+                       int             *last_date,
+                       int             *last_time,
+                       char            *last_date_char,
+                       char            *last_time_char);             */
+ extern ESA_RC ctsacvd();
+ extern ESA_RC ctsaslp();                                /* SAS2IBMN */
+
+ /***** convert date and time from character to binary ******/
+
+ static ESA_RC cnv_times_criteria(char         *date_char,
+                                  char         *time_char,
+                                  int          *date_bin,
+                                  int          *time_bin) ;
+
+ char      pwdflag  = FLAG_PWD_ONLY_OFF;       /*WS2505 */
+ char      usrflag  = FLAG_USERID_ON;          /*WS2505 */
+ char      grpflag  = FLAG_GROUP_ON;           /*WS2505 */
+ char      oeflag   = FLAG_OE_ON;              /*WS2505 */
+ /* WS10064 - The following two variables are external to CTSCINT  */
+ char      passflag = FLAG_PASSWORD_OFF;       /*WS10064           */
+ char      phrsflag = FLAG_PHRASE_OFF;         /*WS10064           */
+ char      provflag = IDNT_PLTFORM_IIQ_FLAG ;  /*WS10085 */
+ /**************************************************************
+ *                                                             *
+ *   Main program                                              *
+ *                                                             *
+ **************************************************************/
+
+ /* SAS2IBMT ESA_RC main(int argc, char **argv)                      */
+    int    main(int argc, char **argv)                    /* SAS2IBMT */
+
+
+ {
+
+ static char func[] = "ctscofi";
+ static detail_msgs = 1 ;
+ static char internal2_msg_buf[200];
+
+ /**************************************************************
+ *     Variables                                               *
+ **************************************************************/
+
+  ESA_RC               rc = ESA_OK ;
+  ESA_RC               rc1 = ESA_OK ;       /* temp rc BS2627   */
+  int                  debug_level=0;       /* Debug level      */
+  char                 ofli_flg[] ="@BTC";  /* Ofline flag      */
+  int                  event_count=0;       /* Event total cntr */
+  int                  records_count=0;     /* Records counter  */
+  int                  rss_init_flag=0;
+  char                 parm_get[81] = "";                 /* WS10067 */
+  ESA_RC               rc2 = ESA_OK ;                     /* WS10067 */
+  int                  ACF2_init_done = FALSE;            /* WS10067 */
+
+  /* SAS2IBMN FP                 fp_ptr;                      */
+  /* SAS2IBMN FP_U83             u83_ptr;                     */
+  FP_U83             * u83_ptr;                            /* SAS2IBMN */
+  char                 u83_module[10] = "";
+  int                  load_rc;                            /* SAS2IBMN */
+  /* SAS2IBMN
+  int (*fp)(void);  *func. ptr of SAS/C loaded modules ws2529 *
+  */
+
+  TIME_RANGE_rec_typ   time_range;
+
+  /********************** IS10024 *******************************
+   Length of work_area should be coordinated with workarea in
+   CTS2U83 and CTSFU83 .                                       */
+  struct  {
+      char work_area_prefix[4];
+      char work_area_data[WORK_INTERCEPT_AREA_LEN];
+      char work_area_data1[WORK_INTERCEPT_AREA_LEN];    /*IS10024*/
+          }  work_area={"WORK"};
+
+  /******** smf processing variables ********/
+
+  FILE               * smf_file_in = NULL; /* BS2627-0C4 without it */
+  INTERCEPT_SMF_RECORD_rec_typ   smfrec80;
+
+  int   date_from, time_from    ;
+  int   last_date=0, last_time=0;
+  char  last_date_char[9];
+  char  last_time_char[7];
+
+  /******** event processing variables ******/
+
+  INTERCEPT_EVENT_rec_typ      evt;
+  INTERCEPT_RSS_PARAMS_rec_typ rss_parm ;
+
+ /*
+  *  CTSAMSG varaibles
+  */
+
+  CTSAMSG_PARAMS_rec_typ       msgs_params;               /* ps0295 */
+
+  CTSAMSG_HANDLE_rec_ptr     msgs;                        /* ps0295 */
+  CTSAMSG_DEST_TABLE_rec_ptr dest;                        /* ps0295 */
+
+  ADMIN_PARAMS_rec_typ         admin_params;              /* ps0295 */
+  long int              crnt_q_try;                  /* bs2626 */
+  char                  max_q_try_char[8];           /* bs2626 */
+  long int              max_q_try;                   /* bs2626 */
+  char                  wait_when_q_eof_char[5];/*in seconds bs2626*/
+  long int              wait_when_q_eof;             /* bs2626 */
+  char                  acsjbn_parm[9];              /* bs2700 */
+  char                  ctsaslp_time_type = 'S'; /* S(conds) SAS2IBMN */
+
+  /**************************************************************
+  *     Initialize                                              *
+  **************************************************************/
+
+  /* Removed by PS0089
+   *    RACF_version_get(rss_parm.type);
+   */
+
+  strcpy(rss_parm.type, NULL_STRING);   /* ps0177 */
+
+  if (argc GT 1)
+     strcpy(rss_parm.name,argv[1]);
+
+  /* Removed by PS0089
+   * else strcpy(rss_parm.name, NULL_STRING);
+   */
+
+  rss_parm.handle = NULL;
+
+  rc = CTSInterceptorInit( rss_parm.type, rss_parm.name,
+                           &rss_parm.handle, NULL,        /* ps0452 */
+                           INTERCEPT_OFFLINE,
+                           &time_range, &admin_params,    /* ps0295 */
+                           argc, argv);
+                                               /* PS0254 */
+
+  msgs = admin_params.ctsamsg_handle;
+  dest = admin_params.ctsamsg_dest;
+
+  msgs_params.ctsamsg_handle = msgs;                      /* ps0295 */
+  msgs_params.ctsamsg_dest = dest;                        /* ps0295 */
+
+  rss_parm.msg_params = &msgs_params;                     /* ps0295 */
+
+  ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, 1, func);
+
+  ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,1,
+                  "rsinit rc=%d rss_type=%s rss_name=%s",
+                  rc, rss_parm.type, rss_parm.name);
+
+  if ( rc NE ESA_OK ) {
+     ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,1,
+                     "RSS Init failed rc=%d", rc);
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+  rss_parm.rss_num = 0;                 /* ps0219 */
+
+  /*                                                                */
+  /* CONSOLE_ON(msgs)                                               */
+  /* CTSAMSG_print(MSG_OFLI_STARTED,msgs.ctsamsg_handle, NULL,      */
+  /*               msgs.ctsamsg_dest);                              */
+  /* CONSOLE_OFF(msgs)                                              */
+  /*                                                                */
+
+  rss_init_flag=1;
+
+   /* SAS2IBMN -
+    * The code below is removed becaus it is not relevant for IBM C
+    ********************* ws2529 starts *********************
+    * Without this pre-load of SAS/C modules, these modules *
+    * are loaded many times and great i/o activity is done  *
+    * by the agent. (this is monitored by PDSMAN-BLDL.      *
+    *********************************************************
+   ESA_DIAG_printf( ESA_COMP_RSS_INTERCEPT,6,
+         "Going to load SAS/C modules.");
+   loadm("LSCALMT",&fp);
+   if (fp NE NULL)
+       ESA_DIAG_printf( ESA_COMP_RSS_INTERCEPT,6,
+         "SAS/C LSCALMT load module was loaded successfully.");
+   loadm("LSCIDDN",&fp);
+   if (fp NE NULL)
+       ESA_DIAG_printf( ESA_COMP_RSS_INTERCEPT,6,
+         "SAS/C LSCIDDN load module was loaded successfully.");
+   loadm("LSCRSTD",&fp);
+   if (fp NE NULL)
+       ESA_DIAG_printf( ESA_COMP_RSS_INTERCEPT,6,
+         "SAS/C LSCRSTD load module was loaded successfully.");
+   loadm("LSCIDSN",&fp);
+   if (fp NE NULL)
+       ESA_DIAG_printf( ESA_COMP_RSS_INTERCEPT,6,
+         "SAS/C LSCIDSN load module was loaded successfully.");
+   loadm("LSCOKVS",&fp);
+   if (fp NE NULL)
+       ESA_DIAG_printf( ESA_COMP_RSS_INTERCEPT,6,
+         "SAS/C LSCOKVS load module was loaded successfully.");
+   loadm("LSCKIO",&fp);
+   if (fp NE NULL)
+       ESA_DIAG_printf( ESA_COMP_RSS_INTERCEPT,6,
+         "SAS/C LSCKIO load module was loaded successfully.");
+    ********************** ws2529 ends **********************
+    */
+
+ /*
+  *  Initialize according to rss type
+  */
+  if ( memcmp(rss_parm.type, "RACF", 4 ) EQ 0 )
+  {                                                        /* IS10100 */
+     rc = CTSCINT_RACF_Init(ESA_COMP_RSS_INTERCEPT,        /* IS10100 */
+                            &admin_params);                /* IS10100 */
+     if (rc NE ESA_OK)                                     /* IS10100 */
+     {                                                     /* IS10100 */
+        rc = ESA_FATAL;                                    /* IS10100 */
+        goto exit;                                         /* IS10100 */
+     }                                                     /* IS10100 */
+
+     strcpy(u83_module, RACF_U83_MODULE);
+  }
+  else
+    if ( memcmp(rss_parm.type, "ACF2", 4 ) EQ 0 ) {
+       strcpy(u83_module, ACF2_U83_MODULE);
+       /*                                                    WS10067
+        *  Check whether the user wants us to process        WS10067
+        *  'groups'. If yes, continue.  If not, skip the     WS10067
+        *  call to CTSCINT_ACF2_Init.                        WS10067
+        */                                                /* WS10067 */
+       rc2 = rssprm_get_opt (rss_parm.name, "UDB_ACTIVE", /* WS10067 */
+                                      sizeof(parm_get),   /* WS10067 */
+                                      parm_get,           /* WS10067 */
+                                      OPT_TRUE,           /* WS10067 */
+                                      OPT_TRUE);          /* WS10067 */
+       if ( (rc2 EQ ESA_OK) AND                           /* WS10067 */
+            (strcmp (parm_get, "N") EQ 0) ) goto skpinit; /* WS10067 */
+                                                          /* WS10067 */
+       rc = CTSCINT_ACF2_Init(ESA_COMP_RSS_INTERCEPT,     /* WS10067 */
+                              &admin_params);             /* WS10067 */
+       if (rc EQ ESA_OK)                                  /* WS10067 */
+          ACF2_init_done = TRUE;                          /* WS10067 */
+       else {                                             /* WS10067 */
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,        /* WS10067 */
+                  dest, "CTSCOFI", func,                  /* WS10067 */
+                  "ACF2_Init Failed", 16, __LINE__);      /* WS10067 */
+          rc = ESA_FATAL;                                 /* WS10067 */
+          goto exit;                                      /* WS10067 */
+       }                                                  /* WS10067 */
+    }                                                     /* WS10067 */
+    else
+    {
+      sprintf(internal2_msg_buf ,
+             "Unknown rss_type=%s (rss_name=%s)",
+             rss_parm.type, rss_parm.name);
+      CTSAMSG_print(ERR_INTERNAL2,
+                    msgs, NULL, dest,                       /* ps0295 */
+                    "CTSCOFI",func, internal2_msg_buf,
+                    16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+    }
+    skpinit: ;                                            /* WS10067 */
+
+    /* IS10184 - start                           */
+    /*           Create the common_params if not already created.  */
+    rc = OS_CS_init_cmnprms(COMMON_PARAMS_OWNER_ONLINE,
+                            &admin_params);
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 1,
+              "OS_CS_init_cmnprms: rc = %d  blk = %p->%p->%p",
+              rc, &admin_params, admin_params.apiinit_handle,
+              ((DUMMY_PARAMS_rec_typ  *)admin_params.apiinit_handle)->
+                                                         common_params);
+    if ( rc NE ESA_OK )
+    {
+       rc = ESA_FATAL;
+       goto exit;
+    };
+    /* IS10184 - end  */
+ /*
+  *  Load U83 module
+  */
+
+  /* SAS2IBMN fp_ptr = OS_DYNAM_load(u83_module, NULL );            */
+  /* SAS2IBMN u83_ptr = (FP_U83)fp_ptr;                             */
+
+  /* SAS2IBMN if ( u83_ptr EQ NULL) {                               */
+    /* SAS2IBMT
+    load_rc = ctsaldm(u83_module, "       ", &u83_ptr); // SAS2IBMN */
+    load_rc = (*(ASM_RTN_TYP *)&ctsaldm)                  /* SAS2IBMT */
+                     (u83_module, "       ", &u83_ptr); /* SAS2IBMN */
+    if (load_rc NE 0)                                   /* SAS2IBMN */
+    {
+    sprintf(internal2_msg_buf ,
+           "Load module %s failed", u83_module);
+    CTSAMSG_print(ERR_INTERNAL2,
+                  msgs, NULL, dest,                       /* ps0295 */
+                  "CTSCOFI",func, internal2_msg_buf,
+                  16,__LINE__);
+    rc = ESA_FATAL ;
+    goto exit;
+  /* SAS2IBMN END                                                    */
+    }                                                    /* SAS2IBMN */
+
+  /*
+   *  BS2700: Get ACS Jobname details
+   */
+   rc = rssprm_get (rss_parm.name, ONLI_ACS_JBN_PARAM,
+                  sizeof(acsjbn_parm), acsjbn_parm);
+   if (rc NE ESA_OK) {
+      ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 2,
+                      "parameter get error keyword=%s rc=%d",
+                      ONLI_ACS_JBN_PARAM, rc );
+      rc = ESA_FATAL;
+      goto exit;
+   }
+   ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 2,
+                      "acs jobaname=%s", acsjbn_parm );
+   /* END OF BS2700 */
+
+  debug_level = ESA_DIAG_get_debug_level(ESA_COMP_RSS_INTERCEPT);
+
+  strcpy(evt.prefix, "EVT ");
+
+ /*
+  *   Convert dates, times  to binary format that use in SMF records
+  */
+
+  time_range.from_date[8] = NULL_CHAR;
+  time_range.from_time[6] = NULL_CHAR;
+
+  strcpy(time_range.end_date, time_range.from_date);  /* Default */
+  strcpy(time_range.end_time, time_range.from_time);  /* Default */
+
+ /*
+  *    Convert date,time to binary form
+  */
+
+  rc = cnv_times_criteria(time_range.from_date, time_range.from_time,
+                          &date_from, &time_from );
+
+  if ( rc NE ESA_OK ) {
+     CTSAMSG_print(ERR_OFLI_TIMES_CRITERIA,
+                   msgs, NULL, dest,                      /* ps0295 */
+                   time_range.from_date,
+                   time_range.from_time);
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+  CTSAMSG_print(MSG_OFLI_START_DATE, msgs, NULL, dest,    /* ps0295 */
+                rss_parm.name,
+                time_range.from_date, time_range.from_time);
+
+ /*
+  *      Open audit file
+  */
+
+/* SAS2IBMT smf_file_in = afopen(DD_SMF_DUMP_FILE, FILE_OPEN_READ_BINARY,
+                       NULL_STRING, NULL_STRING);                    */
+  smf_file_in = fopen(DD_SMF_DUMP_FILE, FILE_OPEN_READ_BINARY_REC);
+                                                          /* SAS2IBMT */
+  if ( smf_file_in EQ NULL) {
+     CTSAMSG_print(ERR_FILE, msgs, NULL, dest,            /* ps0295 */
+                   "open","SMF dump",DD_SMF_DUMP_FILE,
+                   strerror(errno));
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+  /**************************************************************
+  *   Loop - Read input file                                    *
+  **************************************************************/
+
+/* SAS2IBMT
+  afread(smfrec80.record.data,1, sizeof(smfrec80), smf_file_in) ;    */
+  fread(smfrec80.record.data, 1, sizeof(smfrec80), smf_file_in);
+                                                          /* SAS2IBMT */
+
+  while ( (feof(smf_file_in) EQ ZERO) ) {                 /* SAS2IBMT */
+
+     ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,4,
+     "rec typ=%x date=%x time=%x event code=%x event code qualifier=%x",
+                      smfrec80.record.header.smf80rty,
+                      *( (int *)&smfrec80.record.header.smf80dte ),
+                      *( (int *)&smfrec80.record.header.smf80tme ),
+                      smfrec80.record.header.smf80evt,
+                      smfrec80.record.header.smf80evq);
+    /*
+     *   Handle errors
+     */
+
+     if (ferror(smf_file_in)) {
+        CTSAMSG_print(ERR_FILE, msgs, NULL, dest,         /* ps0295 */
+                      "get","SMF dump", DD_SMF_DUMP_FILE,
+                      strerror(errno) );
+        rc = ESA_FATAL;
+        break;
+     }
+
+    /*
+     *    Select SMF records
+     *    evt.flag=1 means : record was selected - evt structure filled
+     */
+
+     records_count++;    /* Records counter */
+     evt.flag=0;
+     (*u83_ptr)(ofli_flg,(char *)&smfrec80,&evt,(char *)&work_area);
+
+    /*
+     *      SMF record accepted
+     */
+
+     if ( evt.flag EQ 1 ) {
+
+        ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,4,
+               "EVT: evt.date=%x date from=%x evt.time=%x time from=%x",
+                evt.date, date_from, evt.time, time_from);
+
+        /*
+         *     Check according times criterias
+         */
+
+         if ( ( (evt.date EQ date_from) AND (evt.time GT time_from)) OR
+                (evt.date GT date_from) )  {
+
+             rc = evnt2rs(&evt, &rss_parm, detail_msgs,
+                          acsjbn_parm,         /* bs2700 */
+                          NULL,
+                          PASSWORD_FLAG_LOWER,
+                          PASSWORD_FILTER_OFF, /* WS2348 */
+                          &admin_params);      /* PS0295 */
+
+             /**************** bs2626 starts ********************/
+             /* when EOF,loop based on rssparm called MAX_Q_TRY */
+             /* when no MAX_Q_TRY or when MAX_Q_TRY EQ 0, loops */
+             /* loops forever or till EOF situation stops.      */
+             if (rc EQ ESA_EOF)
+               {
+                rc = rssprm_get_opt (rss_parm.name,
+                                  MAX_Q_TRY,
+                                  sizeof(max_q_try_char),
+                                  max_q_try_char,
+                                  OPT_TRUE,
+                                  OPT_FALSE);
+
+                if (rc EQ ESA_OK)
+                  {
+                   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,4,
+                       "MAX_Q_TRY set in RSSPARM = %s",max_q_try_char);
+                   max_q_try = atoi(max_q_try_char);
+                  }
+                else max_q_try = DEFAULT_MAX_Q_TRY;
+                crnt_q_try = max_q_try;
+
+                rc = rssprm_get_opt (rss_parm.name,
+                                  WAIT_WHEN_Q_EOF,
+                                  sizeof(wait_when_q_eof_char),
+                                  wait_when_q_eof_char,
+                                  OPT_TRUE,
+                                  OPT_FALSE);
+
+                if (rc EQ ESA_OK)
+                  {
+                   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,4,
+                     "WAIT_WHEN_Q_EOF set in RSSPARM = %s",
+                     wait_when_q_eof_char);
+                   wait_when_q_eof = atoi(wait_when_q_eof_char);
+                  }
+                else wait_when_q_eof = DEFAULT_WAIT_WHEN_Q_EOF;
+             rc = ESA_EOF;   /* restore rc */
+
+             while (rc EQ ESA_EOF AND
+                    crnt_q_try GT 0)
+                {
+                 CTSAMSG_print(WRN_ONLI_QUEUE_FULL,
+                   msgs, NULL, dest );
+                 /* SAS2IBMN sleep(wait_when_q_eof);                  */
+                 (*(ASM_RTN_TYP *)&ctsaslp)               /* SAS2IBMN */
+                   (&wait_when_q_eof, &ctsaslp_time_type, /* SAS2IBMN */
+                    &debug_level);                        /* SAS2IBMN */
+                 rc = evnt2rs(&evt, &rss_parm, detail_msgs,
+                          acsjbn_parm,          /* bs2700 */
+                          NULL,
+                          PASSWORD_FLAG_LOWER,
+                          PASSWORD_FILTER_OFF,
+                          &admin_params);
+                 crnt_q_try--;
+                } /* while ends */
+               } /* if (rc EQ ESA_EOF) ends */
+             /**************** bs2626 ends ********************/
+
+             if ( ( rc NE ESA_OK ) AND (rc NE ESA_SKIP) )
+               break;
+             else {
+                if (rc EQ ESA_OK)
+                   event_count++;      /* total event counter    */
+                last_date = evt.date ; /* last date record proces*/
+                last_time = evt.time ; /* last time record proces*/
+             }    /* Successful event processing        */
+         }        /* Successful time criterias checking */
+     }            /* SMF record accepted                */
+
+    /*
+     *     SMF record not accepted. Get only date, time
+     */
+
+     else {
+
+        last_date = *( (int *)&smfrec80.record.header.smf80dte ) ;
+        last_time = *( (int *)&smfrec80.record.header.smf80tme ) ;
+
+     }
+
+/* SAS2IBMT
+     afread(smfrec80.record.data, 1, sizeof(smfrec80), smf_file_in); */
+     fread(smfrec80.record.data, 1, sizeof(smfrec80), smf_file_in);
+                                                          /* SAS2IBMT */
+
+   }
+
+  /**************************************************************
+  *   Finish                                                    *
+  **************************************************************/
+
+   exit: ;
+
+  /*
+   *      set last date time
+   */
+
+   if ( records_count NE 0 )  {          /* Terminate processing */
+
+      /* SAS2IBMT
+      ctsacvd(&debug_level, &last_date, &last_time, last_date_char,  */
+      (*(ASM_RTN_TYP *)&ctsacvd)(&debug_level, &last_date, &last_time,
+              last_date_char, last_time_char);           /* SAS2IBMT */
+
+      last_date_char[8]=NULL_CHAR;
+      last_time_char[6]=NULL_CHAR;
+
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,2,
+                      "last date %#x(%s) last time %#x(%s)",
+                     last_date,last_date_char,last_time,last_time_char);
+
+     /*
+      *      set dates for RS terminate
+      */
+
+      strcpy(time_range.end_date,last_date_char);
+      strcpy(time_range.end_time,last_time_char);
+
+      CTSAMSG_print(MSG_OFLI_END_DATE, msgs, NULL, dest,  /* ps0295 */
+                    rss_parm.name,
+                    time_range.end_date, time_range.end_time);
+
+      if ( rc EQ ESA_OK )
+          CTSAMSG_print(MSG_OFLI_STATS, msgs, NULL, dest, /* ps0295 */
+                        event_count,records_count);
+      else
+          CTSAMSG_print(MSG_OFLI_PART_STATS,
+                        msgs, NULL, dest,                 /* ps0295 */
+                        records_count, event_count);
+
+   }
+
+  /*
+   *      No records was processed
+   */
+
+   else if ( rss_init_flag EQ 1 )
+      CTSAMSG_print(MSG_OFLI_NO_RECORDS,
+                    msgs, NULL, dest);                    /* ps0295 */
+
+
+  /*
+   *      RS terminate
+   */
+
+   if ( rss_init_flag EQ 1 ) {
+
+  /*                                                                */
+  /* CONSOLE_ON(msgs)                                               */
+  /* if ( rc EQ ESA_OK )                                            */
+  /*    CTSAMSG_print(MSG_OFLI_END_OK  ,msgs.ctsamsg_handle,        */
+  /*                  NULL, msgs.ctsamsg_dest);                     */
+  /* else CTSAMSG_print(MSG_OFLI_END_ERR ,msgs.ctsamsg_handle,      */
+  /*                  NULL, msgs.ctsamsg_dest);                     */
+  /* CONSOLE_OFF(msgs)                                              */
+  /*                                                                */
+
+     rc1= rc;                           /* keep current rc BS2627 */
+
+ /****m*********************** is0324 ******************************
+  * When last SMF record, handled by Ofli, had rc=ESA_SKIP, RSSOFLI
+  * was not updated. As a result, next Ofli run handled all SMF
+  * records which were handled already by Ofli previous run.        */
+     if (rc == ESA_SKIP)     /* Last SMF rec is skipped?     is0324 */
+         rc = ESA_OK;        /* Cause RSSOFLI to be updated  is0324 */
+                             /* by CTSInterceptorTerm.       is0324 */
+ /********************** end of IS0324 ******************************/
+
+     /* IS10184 - start */
+
+     /*   Free the common_params and dummy_params, if needed */
+
+     ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 1,
+               "Go free common_params and dummy_params: %p->%p->%p",
+                &admin_params, admin_params.apiinit_handle,
+              ((DUMMY_PARAMS_rec_typ  *)admin_params.apiinit_handle)->
+                                                       common_params);
+     rc = OS_CS_term_cmnprms(COMMON_PARAMS_OWNER_ONLINE,
+                             &admin_params);
+     ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 1,
+                     "OS_CS_term_cmnprms: rc = %d", rc);
+     /* IS10184 - end  */
+
+     /*                                                   * IS10100 *
+      *  perform termination for RACF environment.        * IS10100 *
+      */                                                 /* IS10100 */
+     if ( memcmp( "RACF", rss_parm.type , 4) EQ 0)       /* IS10100 */
+     {                                                   /* IS10100 */
+       rc = CTSCINT_RACF_Term(ESA_COMP_RSS_INTERCEPT,    /* IS10100 */
+                              &admin_params);            /* IS10100 */
+     }                                                   /* IS10100 */
+     /*                                                    * WS10067 *
+      *  perform termination for ACF2 environment.         * WS10067 *
+      */                                                  /* WS10067 */
+     if (memcmp("ACF2", rss_parm.type, 4) EQ 0) {         /* WS10067 */
+        if (ACF2_init_done)                               /* WS10067 */
+          rc = CTSCINT_ACF2_Term(ESA_COMP_RSS_INTERCEPT,  /* WS10067 */
+                                 &admin_params);          /* WS10067 */
+     }                                                    /* WS10067 */
+
+     rc = CTSInterceptorTerm( &rss_parm.handle, INTERCEPT_OFFLINE, rc,
+                              &time_range, &admin_params);
+                                           /* ps0295 */
+     rc = MAX(rc,rc1);                  /* set highest rc  BS2627 */
+
+   }
+
+  /*
+   *      Close SMF file
+   */
+
+   if ( smf_file_in NE NULL )
+      fclose(smf_file_in);
+
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, 1, func, rc);
+
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : cnv_times_criteria                        *
+ *                                                             *
+ * DESCRIPTION     : Convert date,time from char frorm         *
+ *                   to binary form                            *
+ *                                                             *
+ * INPUT           : date_char   -  date in char from          *
+ *                                  YYYYMMDD                   *
+ *                   time_char   -  time in char from          *
+ *                                  HHMMSS                     *
+ *                                                             *
+ * OUTPUT          : date_bin    -  ptr to date in bin from    *
+ *                                  0cyydddf                   *
+ *                 : time_bin    -  ptr to time in bin from    *
+ *                                  time equivalent to 0.01 sec*
+ *                                                             *
+ * CALLED BY       : main                                      *
+ *                                                             *
+ * CALLS TO        : ESA_DIAG_enter                            *
+ *                   ESA_DIAG_exit                             *
+ *                                                             *
+ * RETURN VALUE    : ESA_OK, ESA_ERR                           *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC cnv_times_criteria(char         *date_char,
+                                  char         *time_char,
+                                  int          *date_bin,
+                                  int          *time_bin)
+
+  {
+
+   static char func[] = "cnv_times_criteria";
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC rc=ESA_OK;
+   int  centure;          /* Centure binary  form   */
+   char cent_c[5];        /* Centure char    form   */
+   int  date,time;
+   char yy_c[5];          /* Year char form         */
+   int  yy_i;             /* Year bin  form         */
+   char mm_c[5];          /* Mounth char form       */
+   int  mm_i;             /* Mounth binary form     */
+   char dd_c[5];          /* Day char form          */
+   int  dd_i;             /* Day binary form        */
+   div_t  d;
+   short  *p_days;
+
+   static short days_leap_year[]={
+                        0,31,60,91,121,152,182,213,244,274,305,335,366};
+   static short days_no_leap_year[]={
+                        0,31,59,90,120,151,181,212,243,273,304,334,365};
+   int days;
+   char hh_c[5];
+   int  hh_i;
+   char ss_c[5];
+   int  ss_i;
+
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, 1, func);
+
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,2,
+                   "Entering date=%s time=%s",
+                    date_char,time_char);
+
+  /*
+   *   If date was not obtained.
+   *   processing all SMF records ( date_from = 00000 )
+   */
+
+   if ( memcmp(date_char,BLANK8,8) EQ 0 )
+        *date_bin =  0xF ;
+
+ /*
+  *      Check and convert date to binary form
+  */
+
+   else {
+
+      date=atoi(date_char);    /* convert date to integer form */
+      if ( date EQ 0 ) {
+        rc=ESA_ERR ;
+        goto exit ;
+      }
+
+      time=atoi(time_char);    /* convert time to integer form */
+      if ( time EQ 0 ) {
+        rc=ESA_ERR ;
+        goto exit ;
+      }
+      memcpy(yy_c,date_char,2);  /* processing centure value   */
+      yy_c[2]=NULL_CHAR;
+      yy_i=atoi(yy_c);
+      if ( yy_i EQ 0 ) {
+        rc=ESA_ERR ;
+        goto exit ;
+      }
+                                 /* for year 19..  -> centure 0*/
+                                 /* for year 20..  -> centure 1*/
+                                 /* for year 21..  -> centure 2*/
+                                 /* and so on                  */
+      else centure=yy_i - 19 ;
+      sprintf(cent_c,"%01d",centure);
+
+      /*  Definition leap year or no      */
+
+      memcpy(yy_c,date_char+2,2);      /* get year   */
+      yy_c[2]=NULL_CHAR;
+      yy_i=atoi(yy_c);
+
+      d=div(yy_i,4);
+      if ( d.rem EQ 0 )               /* Leap year */
+        p_days = days_leap_year;
+      else
+        p_days = days_no_leap_year;
+
+      memcpy(mm_c,date_char+4,2) ;    /* get mounth */
+      mm_c[2]=NULL_CHAR;
+      mm_i=atoi(mm_c) - 1;
+      if ( ( mm_i LT 0 ) OR ( mm_i GT 11 ) ) {
+        rc=ESA_ERR ;
+        goto exit ;
+      }
+
+      days=*(p_days + mm_i );
+
+      memcpy(dd_c,date_char+6,2) ;    /* get day    */
+      dd_c[2]=NULL_CHAR;
+      dd_i=atoi(dd_c);
+
+      if ( dd_i EQ 0 ) {
+        rc=ESA_ERR ;
+        goto exit ;
+      }
+
+      days += dd_i;
+      sprintf(dd_c,"%03d",days);
+
+      *date_bin = ( (cent_c[0] - '0' )  << 24 ) |
+                  ( (yy_c[0]   - '0' )  << 20 ) |
+                  ( (yy_c[1]   - '0' )  << 16 ) |
+                  ( (dd_c[0]   - '0' )  << 12 ) |
+                  ( (dd_c[1]   - '0' )  <<  8 ) |
+                  ( (dd_c[2]   - '0' )  <<  4 ) |  0xF ;
+
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,2,
+                      "centure=%s year=%s days=%s date_bin=%#x",
+                      cent_c,yy_c,dd_c,*date_bin);
+
+   }
+
+  /*
+   *   If time was not obtained.
+   *   processing SMF records ( time_from = 000000 )
+   */
+
+   if ( memcmp(time_char,BLANK6,6) EQ 0 )
+        *time_bin = 0;
+
+   else {
+
+      memcpy(hh_c,time_char,2) ;    /* get hours  */
+      hh_c[2]=NULL_CHAR;
+      hh_i=atoi(hh_c);
+      if ( mm_i GT 24 ) {
+        rc=ESA_ERR ;
+        goto exit ;
+      }
+
+      memcpy(mm_c,time_char+2,2) ;  /* get min    */
+      mm_c[2]=NULL_CHAR;
+      mm_i=atoi(mm_c);
+      if ( mm_i GT 60 ) {
+        rc=ESA_ERR ;
+        goto exit ;
+      }
+
+      memcpy(ss_c,time_char+4,2) ;  /* get sec    */
+      ss_c[2]=NULL_CHAR;
+      ss_i=atoi(ss_c);
+      if ( ss_i GT 60 ) {
+        rc=ESA_ERR ;
+        goto exit ;
+      }
+
+      *time_bin = ( ( hh_i * 3600 ) + ( mm_i * 60 ) + ss_i ) * 100 ;
+
+   }
+
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,2,
+                   "hours=%d min=%d sec=%d time_bin=%#x",
+                   hh_i,mm_i,ss_i,*time_bin);
+
+   exit :;
+
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, 1, func, rc);
+
+   return rc;
+
+  }

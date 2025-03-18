@@ -1,0 +1,711 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Issue a ACF2 command                     *
+ *                                                             *
+ * File Name        : ACF2cmd                                  *
+ *                                                             *
+ * Author           : Yishay Yovel                             *
+ *                                                             *
+ * Creation Date    : 25/05/97                                 *
+ *                                                             *
+ * Description      : ACF2 command issue                       *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ * BS2639   AvnerL 01/02/2004 Password is not cleared in msg.  *
+ * BS2665   AvnerL 09/03/2004 S0c4 in Federal Reserve.         *
+ * BS2666   AvnerL 17/03/2004 Password still not clear...      *
+ * WS2565   Eli MY 19/10/2006 Support keyword PSWXHSTN,        *
+ *                            PSWDPLST, PSWDPAIR.              *
+ *                            PSWXHSTN is known as PSWXHST#.   *
+ * WS10006  AvnerL 06/08/2007 Support keyword PSWXHST@.        *
+ * BS10019  AvnerL 03DEC2009  Add user fails when no password. *
+ * BS10029  Nurity 12/03/2012 Copy from 3.2.02 in order to     *
+ *                            apply BS10019.                   *
+ * SAS2IBMA AvnerL 17/07/2016 SAS/C to IBM/C & chg to {}       *
+ * SAS2IBMT SeligT 30/06/2016 SAS/C to IBM C Conversion Project*
+ * IS10147A SeligT 18/06/2017 Add support for password phrase  *
+ * IS10174  NuritY   15/01/18 Dynamic EXECOUT support.         *
+ * IS10183  ThomaS   05/05/21 Don't print pswd in clear        *
+ * WS10082  MauriC   07/11/22 Recompile & other changes        *
+ * BS10125  Vaibhav  16/06/23 Mask ClearText pswd in error msg *
+ **************************************************************/
+
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDIO
+ #include   STDLIB
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ /* IS10174 #include ESA_CTSAMSG     */
+ #include ESA_API_CODES
+ #include API_ADDINFO
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_OS_CLI
+ #include MVS_COMP
+
+ /*
+  *   ESA include files
+  */
+
+ #include ACF2
+ #include ACF2_CODES
+
+ /* WS2565 - Start here:
+  *  Keyword Description Entry definition for keywords with
+  *  possible empty parenthesis
+  */
+
+ typedef struct {
+    char                   kwd[MAX_RSS_ADDINFO_KWD_LEN+1];
+    char                   null_char;
+  } ADDINFO_KDTE_ACF2_LIST_typ, *ADDINFO_KDTE_ACF2_LIST_ptr;
+
+  static ADDINFO_KDTE_ACF2_LIST_typ empty_list_keywords[] = {
+  /*  Keywrod      If not empty then null char is */
+  /*  ------------ ------------------------------ */
+      "PSWDPLST"  , ' '  ,
+      "SPECLIST"  , ' '  ,                               /* IS10147A */
+      "PSWDPAIR"  , 'N'  ,
+      "REPCHAR"   , 'N'  ,                               /* IS10147A */
+      "VMIDLEOP"  , 'N'  ,
+      ""          , ' '
+  };
+  /* WS2565 - End here */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : ACF2cmd                                    *
+ *                                                             *
+ * DESCRIPTION    : Issue a ACF2 command                       *
+ *                                                             *
+ * INPUT          :                                            *
+ *                                                             *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ *                                                             *
+ * ddn parameter:                                 * IS10174 *  *
+ * ==============                                              *
+ * When gout_flag is not CMDOUT_YES, ddn should be a variable  *
+ * containing the ddname, and not a literal. When ACF2cmd      *
+ * does not handle the output (according to gout_flag and      *
+ * command execution results), it will return the ddname to    *
+ * the caller. The ddname will be in the same format (with     *
+ * or without DD:) as the input ddname.                        *
+ *                                                             *
+ *                                                             *
+ **************************************************************/
+ ESA_RC ACF2cmd (char                      *func,
+                 char                      *ddn,
+                 USER_typ                   admin_uname,
+                 char                      *cmd,
+   /* ps0320 */  CMD_RC_typ                 max_ok_rc,
+                 short                      numaddi,
+                 ADDINFO_rec_ptr           *addinfo,
+                 ADDINFO_MKTE_rec_ptr       mkt,
+                 ADDINFO_KDTE_rec_ptr       kdt,
+  /* IS10174 */  ADMIN_PARAMS_rec_typ     * admin_params,
+   /* ps0320 */  CMDOUT_typ                 gout_flag,
+ /* WSAR1003 */  ACF2_FLAG_typ              ignore_no_addinfo)
+  /* IS10174     CTSAMSG_DEST_TABLE_rec_ptr dest,              */
+  /* IS10174     CTSAMSG_HANDLE_rec_ptr     msgs,              */
+ {
+
+    /*
+     *    Local Variables
+     */
+
+     static char fn[]="ACF2cmd";
+
+     ESA_RC rc = ESA_OK, output_rc, build_rc, check_rc;
+     ESA_RC rem_rc;
+
+     short  output_len;
+     char   output_buffer[8192];
+     char   exec_cmd[8192];
+     char   exec_cmd_ps[8192] = NULL_STRING;              /* IS10183 */
+     char   * ps = NULL;                                  /* IS10183 */
+     char   * pse= NULL;                                  /* IS10183 */
+     int    initial_cmd_len ;
+     int    coff, clen, i;
+     int    cpy_ch = 0;         /* BS10125 # of chars copied */
+     int    tso_rc;
+     char   *pass_str;
+     char   *work;
+     /* IS10174 char   *ddnx;                                       */
+     char    ddnx[9];                                     /* IS10174 */
+     char   l1e_l2s[37]="";/*end of line[i]&start of line[i+1] BS2639*/
+     int    pwd_is_fnd = 0;    /*password was found indication BS2639*/
+     int    pwd_pos    = 0;    /*temp password position        BS2639*/
+     int    cts2gso_rc = 0;    /* return code of cts2gso    IS10147A */
+     extern ESA_RC cts2gso();                            /* IS10147A */
+     char  *pwd_ptr    = NULL; /*temp password ptr             BS2639*/
+     /***** IS10147A start *******************************************/
+     char   p1e_p2s[250]="";  /* end of line[i] & start of line[i+1] */
+     char  *pwp_ptr    = NULL;                  /* temp pwphrase ptr */
+     int    pwp_pos    = 0;                /* temp pwphrase position */
+     int    pwp_is_fnd = 0;         /* pwphrase was found indication */
+     /***** IS10147A end *********************************************/
+     char   *pStr;                                          /* WS2565 */
+     int    psworpwp   = FALSE ;                          /* IS10183  */
+
+     ONE_FIELD_rec_ptr  pair;                               /* WS2565 */
+
+     char  temp_kwd[MAX_RSS_ADDINFO_KWD_LEN +
+                 MAX_RSS_ADDINFO_VAL_LEN + 1];              /* WS2565 */
+     int    j;                                              /* WS2565 */
+     int    temp_kwd_len;                                   /* WS2565 */
+
+     CTSAMSG_HANDLE_rec_typ     * msgs;                   /* IS10174  */
+     CTSAMSG_DEST_TABLE_rec_typ * dest;                   /* IS10174  */
+
+    /*
+     *   Initialize
+     */
+
+     ESA_DIAG_enter(PLT_COMP_API_ACF2,1,fn);
+
+     msgs = admin_params->ctsamsg_handle;                 /* IS10174  */
+     dest = admin_params->ctsamsg_dest;                   /* IS10174  */
+    /*
+     *    Convert ESS-style field names to ACF2 field names
+     */
+     Convert_Keyword_Chars(*addinfo,'_','-');
+
+    /*
+     *    Check that mandatory keywords were specified
+     */
+
+     check_rc = ADDINFO_mkt_check(func,numaddi,addinfo,mkt,kdt,
+                                  dest, msgs);
+
+     if (check_rc NE ESA_OK) {
+        rc = ESA_FATAL;
+        goto exit;
+     }
+
+    /*
+     *    Build remaining Command
+     */
+
+     initial_cmd_len = strlen(cmd);
+
+     ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+                     "cmd: %s,numaddi:%d ",cmd,numaddi); /*bs10019*/
+
+     build_rc = ADDINFO_concat(func, cmd, numaddi, addinfo, kdt,
+                               dest, msgs);
+
+     if (   (strstr(cmd, "PASSWORD(" ) EQ 0)  OR         /* IS10183  */
+            (strstr(cmd, "PWPHRASE(" ) EQ 0)  )          /* IS10183  */
+        psworpwp = TRUE ;                                /* IS10183  */
+
+     if (NOT psworpwp)                                   /* IS10183  */
+     ESA_DIAG_printf(PLT_COMP_API_ACF2,11,             /*bs10019*/
+       "After ADDINFO_concat: cmd: %s,numaddi:%d ",cmd,numaddi);
+
+     if (build_rc NE ESA_OK) {
+        rc = ESA_FATAL;
+        goto exit;
+     }
+
+     /* If we were called by CTSAddUser and the command     IS10147A
+        contains "ACF2 LID INSERT" but no "PASSWORD("       IS10147A
+        operand, then call cts2gso to see whether PSWDREQ   IS10147A
+        is set in the PSWD GSO record. If it is, then       IS10147A
+        display an error message and leave immediately.     IS10147A */
+     if ((strcmp(func,"CTSAddUser")       EQ 0)  AND     /* IS10147A */
+         (strstr(cmd, "ACF2 LID INSERT ") NE 0)  AND     /* IS10147A */
+         (strstr(cmd, "PASSWORD(" )       EQ 0)) {       /* IS10147A */
+       cts2gso_rc = (*(ASM_RTN_TYP *)&cts2gso)("PSRQ");  /* IS10147A */
+       if (cts2gso_rc == 0) /* pswdreq */ {              /* IS10147A */
+         ESA_DIAG_printf(PLT_COMP_API_ACF2, 11,          /* IS10147A */
+             "PSWDREQ set - PASSWORD must be specified on INSERT");
+         CTSAMSG_print(ACF2_PSWD_REQUIRED, msgs, NULL, dest); /*IS10147A*/
+         rc = ESA_FATAL;                                 /* IS10147A */
+         goto exit;                                      /* IS10147A */
+       }
+       else                 /* nopswdreq */              /* IS10147A */
+         ESA_DIAG_printf(PLT_COMP_API_ACF2, 11,          /* IS10147A */
+                  "NOPSWDREQ set - PASSWORD can be omitted on INSERT");
+     }
+
+    /*
+     *    Convert back to ESS style field names
+     */
+     Convert_Keyword_Chars(*addinfo,'-','_');
+
+     /* WS2565 start here */
+     /* Special case of PSWXHST# keyword, # can not be in
+        keyword name */
+     for (i = 0;i < numaddi;i++) {
+
+      /*ws10006 pair = ADDINFO_search("PSWXHSTN", ACF_ADDINFO_KWD_LEN,*/
+        pair = ADDINFO_search("PSWXHST@", ACF_ADDINFO_KWD_LEN,
+                               addinfo[i]->pair,
+                               addinfo[i]->num_pairs);
+        if ( pair NE 0 ) {
+           pStr = strstr(cmd,"PSWXHST@");
+           if ( pStr NE 0 ) {
+              *(pStr+7) = '#'; /* change PSWXHSTN to PSWXHST# */
+           }
+        break;
+        }
+     }
+
+     /* This section scan empty_list_keywords array, and
+        concatenate keyword with empty parenthesis to command line */
+ /*SAS2IBMA for(j=0; empty_list_keywords[j].kwd[0] != (char) NULL;j++){*/
+  for (j=0;empty_list_keywords[j].kwd[0] != (char) NULL;j++){/*SAS2IBMA*/
+        for (i = 0;i < numaddi;i++) {
+           pair = ADDINFO_search(empty_list_keywords[j].kwd,
+                                 ACF_ADDINFO_KWD_LEN,
+                                 addinfo[i]->pair,
+                                 addinfo[i]->num_pairs);
+           if ( pair NE 0 ) {
+              if ( strlen(pair->value) EQ 0 ) { /* keyword empty? */
+                strcat(cmd,empty_list_keywords[j].kwd);/* yes, empty */
+                strcat(cmd,"()"); /* final result: keyword() */
+              }
+              else {
+                 strcpy(temp_kwd,empty_list_keywords[j].kwd);
+                 strcat(temp_kwd,"(");
+                 temp_kwd_len = strlen(temp_kwd);
+                 temp_kwd[temp_kwd_len] =
+                    empty_list_keywords[j].null_char;
+                 /*temp_kwd[temp_kwd_len+1] = NULL; SAS2IBMA*/
+                 temp_kwd[temp_kwd_len+1] = (char) NULL; /*SAS2IBMA*/
+                 strcat(temp_kwd,")");
+                 pStr = strstr(cmd,temp_kwd);
+                 if ( pStr NE 0 ) {
+                    pStr = strchr(pStr,
+                                  empty_list_keywords[j].null_char);
+                    if ( pStr == NULL ) {
+                       rc = ESA_FATAL;
+                       goto exit;
+                    }
+                    *pStr = ')';        /* change keyword(N) to */
+                    *(pStr + 1) = ' ';  /* keyword() */
+                 }
+              }
+              break;
+           }
+        }
+     }
+     /* WS2565 end here */
+
+    /*
+     *    Do not issue the command if no additional info specified
+     */
+     ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+       "check if addinfo specified: initial_cmd_len:%d",
+       initial_cmd_len);                                   /*bs10019*/
+
+     ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+      "numaddi:%d, ignore_no_addinfo:%d, strlen(cmd):%d",
+      numaddi,ignore_no_addinfo,strlen(cmd));               /*bs10019*/
+
+     if (  (numaddi NE 0) AND
+           (initial_cmd_len EQ strlen(cmd) )  AND
+           (ignore_no_addinfo EQ ACF2_YES)      )  /* WSAR1003 */
+       { /* if ACF2 command is not issued ==> rc = ESA_FATAL BS10019 */
+         /* only when called by AddUser with INSERT command.         */
+        if ((strcmp(func,"CTSAddUser") EQ 0)  AND          /*BS10019*/
+            (strstr( cmd, "INSERT" ) NE 0))                /*BS10019*/
+          {                                                /*BS10019*/
+           ESA_DIAG_printf(PLT_COMP_API_ACF2,11,           /*BS10019*/
+             "CTSAddUser calls with INSERT ==> rc=fatal"); /*BS10019*/
+           CTSAMSG_print(ACF2_ADDU_NOPSWD,msgs,NULL,dest); /*WS10082A*/
+           rc = ESA_FATAL;                                 /*BS10019*/
+          }                                                /*BS10019*/
+        goto exit;
+       }                                                   /*BS10019*/
+    /*
+     *    Activate Shell
+     */
+
+   /* IS10174 - start  */
+   /*
+     ddnx = ddn;
+     work = strstr( ddn, "DD:" );   * used to be DDN:        SAS2IBMT *
+     if ( work NE NULL )
+       ddnx = work + 3;             * used to be 4           SAS2IBMT *
+   */
+   if (strncmp(ddn, "DD:", 3) NE 0)
+     strcpy(ddnx, ddn);
+   else
+     strcpy(ddnx, ddn+3);
+   /* IS10174 - end    */
+
+     sprintf(exec_cmd, "%%CTSBCMD %s %s %s", ddnx, admin_uname, cmd);
+     /* IS10183 - start */
+     if (psworpwp)
+     {
+      strcpy(exec_cmd_ps,exec_cmd);
+      ps = strstr(exec_cmd_ps,"PASSWORD(");
+      if (ps EQ NULL)
+        ps = strstr(exec_cmd_ps,"PWPHRASE(");
+      if (ps NE NULL)
+      {
+        pse =  strstr(ps+9,")");
+        if (pse NE NULL)
+        {
+         for (ps=ps+9; ps LT pse; ps++)
+             *ps = '*';
+         ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+                     "ACF2 cmd to be executed: %s",exec_cmd_ps);
+        }
+      }
+     }
+     else
+     /* IS10183 - end   */
+     ESA_DIAG_printf(PLT_COMP_API_ACF2,11,         /* BS2639 */
+                     "ACF2 cmd to be executed: %s",exec_cmd);
+     /* IS10174 - start */
+     /*
+     rc = ESA_CLI_exec_wait(ddn, exec_cmd, &tso_rc, dest, msgs);
+     ESA_DIAG_printf(PLT_COMP_API_ACF2,1,
+                     "Executor rc=%d tso_rc=%d max_ok_rc=%d",
+                      rc, tso_rc, max_ok_rc);
+     */
+     rc = ESA_CLI_exec_wait(ddnx, exec_cmd, &tso_rc, admin_params);
+     ESA_DIAG_printf(PLT_COMP_API_ACF2,1,
+                     "Executor rc=%d ddn=%s tso_rc=%d max_ok_rc=%d",
+                      rc, ddnx, tso_rc, max_ok_rc);
+     /* IS10174 - end    */
+     if (rc EQ ESA_OK) {
+        if ( tso_rc LE max_ok_rc )      /* if (tso_rc LT 8)  */
+           rc = ESA_OK;                 /* if (tso_rc LT 4)  */
+
+       /*
+        * else if (tso_rc LT 8)
+        *    rc = ESA_ERR;
+        */
+
+        else rc = ESA_FATAL;
+     }
+     else rc = ESA_FATAL;
+
+    /*
+     *    Obtain output
+     */
+
+     if ( ( gout_flag EQ CMDOUT_YES) OR
+          ( ( rc NE ESA_OK ) AND ( gout_flag EQ CMDOUT_ERR ) )  ) {
+
+        output_len =  sizeof(output_buffer);
+        /*  IS10174
+        output_rc = ESA_CLI_get_output(ddn, output_buffer, &output_len,
+                                       dest, msgs );
+
+        ESA_DIAG_printf(PLT_COMP_API_ACF2,5,
+                        "Shell Output rc=%d",output_rc);
+        */
+        output_rc = ESA_CLI_get_output(ddnx,             /* IS10174 */
+                                       output_buffer,    /* IS10174 */
+                                       &output_len,      /* IS10174 */
+                                       admin_params);    /* IS10174 */
+                                                         /* IS10174 */
+        ESA_DIAG_printf(PLT_COMP_API_ACF2,5,             /* IS10174 */
+                        "Shell Output rc=%d  ddn=%s",    /* IS10174 */
+                        output_rc, ddnx);                /* IS10174 */
+
+     if (NOT psworpwp)                                   /* IS10183  */
+        ESA_DIAG_printf(PLT_COMP_API_ACF2,11,            /* BS2639 */
+                        "output_buffer=%s, output_len=%d",
+                        output_buffer,output_len);
+
+       /*
+        *    Issue output messages
+        */
+
+        if (output_rc EQ ESA_OK)
+        {
+           for (coff = 0; coff LT output_len; coff += clen ) {
+                 clen = strlen(&output_buffer[coff])+1;
+ /*************************** BS2639 *******************************
+  * When password is split between 2 lines we do a special search  *
+  * for it. This is done in order to clear the password text which *
+  * is sent in a message. Start of next line is appended to the end*
+  * of current line to search the split password( text. When found *
+  * password text is cleared in output_buffer accordingly.         *
+  * When password( is found in current line but password text is   *
+  * split between lines, we recognize it as well.                  *
+  *************************** BS2639 *******************************/
+
+                 /* IS10183 - start */
+                 if (psworpwp)
+                 {
+                 ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+                 "In for loop.coff=%d clen=%d pwd_is_fnd=%d",
+                   coff,clen,pwd_is_fnd);
+                 ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+                 "            pwp_is_fnd=%d",
+                              pwp_is_fnd);
+                 }
+                 else
+                 {
+                 /* IS10183 - end   */
+                 ESA_DIAG_printf(PLT_COMP_API_ACF2,11,  /* BS2639 */
+ /* BS2665 */    "In for loop.coff=%d clen=%d pwd_is_fnd=%d l1e_l2s=%s",
+                   coff,clen,pwd_is_fnd,l1e_l2s);
+                 ESA_DIAG_printf(PLT_COMP_API_ACF2,11,  /* IS10147A */
+                 "            pwp_is_fnd=%d p1e_p2s=%s",/* IS10147A */
+                              pwp_is_fnd,p1e_p2s);      /* IS10147A */
+                 }                                      /* IS10183  */
+                 /* concat start of next line when relevant */
+                 if ((strcmp(l1e_l2s,"") NE 0) AND/* not 1st line AND */
+                     (pwd_is_fnd NE 1))   /* pwd not fully clr BS2639 */
+                  {                       /* or not found yet         */
+                 /* concat first 18 chars from next line    */
+                   strncat(l1e_l2s,&output_buffer[coff],18);
+                 /* IS10183 - start */
+                 if (psworpwp)
+                   ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+                    "Check for PASSWORD( in concatenated lines");
+                   /*
+                   ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+                    "Check for PASSWORD( in (%s)",l1e_l2s); */
+                 /* IS10183 - end   */
+                   pwd_ptr = strstr(l1e_l2s,"PASSWORD(");
+                   if (pwd_ptr NE NULL) /* password is splited */
+                    {
+                     /* pwd_pos is position of password itself within
+                        2nd line of splited password              */
+                     if (pwd_is_fnd EQ 2) /* when password text is */
+                       pwd_pos = 0; /* split, we start at pos=0 of */
+                                    /* next line.                  */
+                     else /* calc position within output_buffer */
+                       pwd_pos = pwd_ptr - l1e_l2s - 18 + 9 + 2;
+                     ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+                       "password is split between lines. pwd_pos=%d",
+                       pwd_pos);
+                     for(i=pwd_pos;(output_buffer[coff + i] NE ')')AND
+                            (output_buffer[coff + i] NE NULL_CHAR); i++)
+                       {
+                        /* IS10183
+                        ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+                          "Current char to be set as * =%c",
+                          output_buffer[coff + i]);                 */
+                        output_buffer[coff + i] = '*';
+                       }
+                 /*BS10125  start */
+                 /*  pwd_is_fnd = 1;    password fnd & cleared */
+                     memset(l1e_l2s,NULL_CHAR,37) ; /*clear temp bfr*/
+                     pwd_is_fnd = 0;
+                 /*BS10125  end   */
+                    } /* end of "password is split" */
+                  } /* end of "password not found yet" */
+
+                 /***** IS10147A start ********************************/
+                 /* Whatever we did above for PASSWORD, we will now   */
+                 /* do for PWPHRASE...                                */
+                 /*****************************************************/
+                 /* concat start of next line when relevant */
+                 if ((strcmp(p1e_p2s,"") NE 0) AND/* not 1st line AND */
+                     (pwp_is_fnd NE 1))           /* pwp not fully clr*/
+                  {                               /* or not found yet */
+                 /* concat first 110 chars from next line   */
+                   strncat(p1e_p2s,&output_buffer[coff],110);
+                 /* IS10183 - start */
+                 if (psworpwp)
+                   ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+                         "Check for PWPHRASE( in concatenated lines");
+                   /*
+                   ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+                                 "Check for PWPHRASE( in (%s)",p1e_p2s);
+                   */
+                 /* IS10183 - end   */
+                   pwp_ptr = strstr(p1e_p2s,"PWPHRASE(");
+                   if (pwp_ptr NE NULL)          /* pwphrase is split */
+                    {
+                     /* pwp_pos is position of pwphrase itself within
+                        2nd line of split pwphrase                    */
+                     if (pwp_is_fnd EQ 2)    /* when pwphrase text is */
+                       pwp_pos = 0;          /* split, we start at    */
+                                             /* pos=0 of next line    */
+                     else       /* calc position within output_buffer */
+     /* BS10125        pwp_pos = pwp_ptr - p1e_p2s - 110 + 101 + 2;   */
+     /* BS10125 */     pwp_pos = pwp_ptr - p1e_p2s - cpy_ch + 9 + 2;
+                     ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+                          "pwphrase is split between lines. pwp_pos=%d",
+                          pwp_pos);
+                     for(i=pwp_pos;(output_buffer[coff + i] NE ')')AND
+                            (output_buffer[coff + i] NE NULL_CHAR); i++)
+                       {
+                        /* IS10183
+                        ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+                                      "Current char to be set as * =%c",
+                                      output_buffer[coff + i]);     */
+                        output_buffer[coff + i] = '*';
+                       }
+                     /*BS10125   start */
+                     /*  pwp_is_fnd = 1;  pwphrase found & cleared */
+                     memset(p1e_p2s,NULL_CHAR,250); /* clear temp buf*/
+                     pwp_is_fnd = 0;
+                     /*BS10125   end   */
+                    }                   /* end of "pwphrase is split" */
+                  }                /* end of "pwphrase not found yet" */
+                 /***** IS10147A end **********************************/
+
+                 /* suppress newline markers */
+                 if ( (clen GT 2) AND
+                      (output_buffer[coff+clen-2] EQ '\n'))
+                    output_buffer[coff+clen-2] = NULL_CHAR;
+
+                 /* suppress password text */
+                 if (pwd_is_fnd EQ 0) /* password not found yet */
+                 {
+                   pass_str = strstr(&output_buffer[coff],"PASSWORD(");
+                   if (pass_str NE NULL)
+                   {
+                    ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+                        "PASSWORD( found. coff=%d clen=%d",coff,clen);
+                    for ( i=9; (pass_str[i] NE ')'); i++)
+                       if (pass_str[i] NE NULL_CHAR)
+                       {
+                         /* BS10125 pwd_is_fnd = 1;  */
+                         pwd_is_fnd = 0;                  /* BS10125 */
+                         pass_str[i] = '*';
+                       }
+                       else /* password text is split */
+                       {
+                        ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+                         "Line ends in the middle of password.");
+                         pwd_is_fnd = 2;  /* pswd text is split ind. */
+                         pwd_pos = 0; /* set pwd_pos=0 as password*/
+                         break;       /* text continues in next line */
+                       }
+                   }
+                 }
+                 /***** IS10147A start ********************************/
+                 /* Whatever we did above for PASSWORD, we will now   */
+                 /* do for PWPHRASE...                                */
+                 /*****************************************************/
+                 /* suppress pwphrase text */
+                 if (pwp_is_fnd EQ 0)       /* pwphrase not found yet */
+                 {
+                   pass_str = strstr(&output_buffer[coff],"PWPHRASE(");
+                   if (pass_str NE NULL)
+                   {
+                    ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+                          "PWPHRASE( found. coff=%d clen=%d",coff,clen);
+                    for ( i=9; (pass_str[i] NE ')'); i++)
+                       if (pass_str[i] NE NULL_CHAR)
+                       {
+                         /* BS10125 pwp_is_fnd = 1;   */
+                         pwp_is_fnd = 0;         /* BS10125 */
+                         pass_str[i] = '*';
+                       }
+                       else                 /* pwphrase text is split */
+                       {
+                        ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+                         "Line ends in the middle of pwphrase.");
+                         pwp_is_fnd = 2; /* pwphrase text is split ind*/
+                         pwp_pos = 0;    /* set pwp_pos=0 as pwphrase */
+                         break;          /*text continues in next line*/
+                       }
+                   }
+                 }
+                 /***** IS10147A end **********************************/
+
+                 /* set last 18 chars of current line, to be checked
+                    for password( when not fnd & fully clr yet */
+                 if (pwd_is_fnd NE 1)
+                 {
+  /*bs2666         strcpy(l1e_l2s,&output_buffer[clen-18]); */
+  /*bs2666*/       strcpy(l1e_l2s,&output_buffer[coff + clen-18]);
+                 if (NOT psworpwp)                        /* IS10183 */
+                   ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+                        "end of current line=%s",l1e_l2s);
+                   /************ end of BS2639 **************/
+                 }
+
+                 /***** IS10147A start ********************************/
+                 /* set last 110 chars of current line, to be checked
+                    for PWPHRASE( when not fnd & fully cleared yet    */
+                 if (pwp_is_fnd NE 1)
+                 {
+                   /* IS10183
+                   ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+                     "coff=%d clen=%d output_buffer[coff+clen-110]=%s",
+                     coff, clen, &output_buffer[coff + clen - 110]);*/
+                   /* BS10125    start */
+                   /* strcpy(p1e_p2s,&output_buffer[coff + clen-110]);*/
+                   if(clen LT 110)
+                     cpy_ch  = clen ;   /* length of prev line */
+                   else
+                     cpy_ch  = 110 ;
+                   strcpy(p1e_p2s,&output_buffer[coff + clen-cpy_ch]);
+                   /* BS10125    end   */
+                   /* IS10183
+                   ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+                                      "end of current line=%s",p1e_p2s);
+                   */
+                 }
+                 /***** IS10147A end **********************************/
+
+                 ESA_DIAG_printf(PLT_COMP_API_ACF2,11,
+                   "Info msg sent=(%s) , coff=(%d), clen=(%d)",
+                   &output_buffer[coff],coff,clen); /*bs2666*/
+                 CTSAMSG_print(ACF2_OUTPUT_LINE,   msgs, NULL, dest,
+                               &output_buffer[coff] );
+           } /* for */
+        }
+        else {
+           CTSAMSG_print(ACF2_OUTPUT_ERR,   msgs, NULL, dest);
+           rc = ESA_ERR;
+        }
+
+       /*
+        *    Remove output file
+        */
+
+        /* IS10174 rem_rc = ESA_CLI_delete_output( ddn, dest, msgs );*/
+        rem_rc = ESA_CLI_delete_output( ddnx,            /* IS10174 */
+                                        admin_params );  /* IS10174 */
+        if ( rem_rc NE ESA_OK )
+           rc = ESA_ERR;
+
+    } /* get output */
+    /* IS10174 - start */
+    else   /*  output not processed - return the ddname */
+    {
+      if (strncmp(ddn, "DD:", 3) EQ 0)
+        i = 3;
+      else
+        i = 0;
+
+      if (strcmp(ddn+i, ddnx) NE 0)   /* if ddname was changed...  */
+         strcpy(ddn+i, ddnx);          /* return the new ddname     */
+    }
+    /* IS10174 - end   */
+
+    /*
+     *    Finish
+     */
+
+   exit:;
+
+     ESA_DIAG_exit(PLT_COMP_API_ACF2,1, fn, rc );
+
+     return rc;
+
+}

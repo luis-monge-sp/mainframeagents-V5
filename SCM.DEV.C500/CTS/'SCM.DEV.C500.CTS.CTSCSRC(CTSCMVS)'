@@ -1,0 +1,799 @@
+/**************************************************************
+*                                                             *
+*  <!><!> ATTENTION <!><!>                                    *
+*  =-=-=-=-=-=-=-=-=-=-=-=                                    *
+*                                                             *
+*  When updating this member, do not forget to update         *
+*  CTSOMVS in ALL.CSRC as well.                               *
+*                                                             *
+*                                                             *
+**************************************************************/
+/**************************************************************
+*                                                             *
+* Title            : OS MVS functions                         *
+*                                                             *
+* File Name        : ctscmvs.c                                *
+*                                                             *
+* Author           : Alexander Shvartsman                     *
+*                    Doron Cohen                              *
+*                                                             *
+* Creation Date    : 20/07/94                                 *
+*                                                             *
+* Description      :                                          *
+*                                                             *
+* Assumptions and                                             *
+*   Considerations :                                          *
+*                                                             *
+**************************************************************/
+
+/**************************************************************
+* Mod.Id   Who      When     Description                      *
+* -------- -------- -------  -------------------------------- *
+* IS0216   AvnerL   16/01/04 Add OS_LocalTime empty function. *
+* IS0225   AvnerL   21/01/04 Implement OS_LocalTime.          *
+* SAS2IBMT SeligT   12/07/16 SAS/C to IBM C Conversion Project*
+* SAS2IBMN NuritY 09/10/16  SAS/C to IBM C Conversion Project:*
+*                           Replace osddinfo with ctsaddi     *
+* BS10059  NuritY 09/08/17  1. os_mvs_ddinfo returns          *
+*          + Meir              incorrect rc when ddname not   *
+*                              found.                         *
+*                           2. dsname is nullified.           *
+* IS10174  NuritY 31/12/17  Dynamic EXECOUT support.          *
+**************************************************************/
+
+#include   <globs.h>
+
+#include   CTYPE
+#include   STDIO
+#include   STDLIB
+#include   STRING
+#include   STDARG                                        /* IS10174 */
+ /* #include   LCLIB                                         SAS2IBMT */
+
+ /* #include   OS                                            SAS2IBMT */
+
+#include   ESA_DIAG
+#include   ESA_API
+#include   ESA_API_CODES
+
+#include   MVS_CODES
+#include   MVS_OS_MVS
+#include   MVS_COMP
+
+static char comp[]="OSMVS";
+
+ typedef struct proc_struct {
+   char             jobname[10];
+   char             jobid[10];
+   char             userid[10];
+   char             sysid[9];
+   void           * acee;
+ } OS_PROC_rec_typ;
+
+/*
+ *     Assembler routine to obtain address space info
+ */
+
+/* SAS2IBMT prototype changed for IBM C
+extern int ctsawho(char *jobname, char *jobid,
+                   char *userid, char *sysid, void *acee);           */
+extern int ctsawho();                                     /* SAS2IBMT */
+
+extern int ctsaapf(void);
+
+/* SAS2IBMT prototype changed for IBM C
+extern int ctsaolt(unsigned short *,unsigned short *,
+                   unsigned short *,unsigned short *,
+                   unsigned short *,unsigned short *,
+                   unsigned short *);                     // IS0225 */
+extern int ctsaolt();                                     /* SAS2IBMT */
+
+ /* SAS2IBMN - start */
+extern  int ctsaddi();
+ /* SAS2IBMN - end */
+
+/****************************************************
+* Procedure Name: OS_MVS_checksum
+* Description   : Calculate control symbol according
+*                 current  header ptr in char form
+* Input         : 1.ptr to header ptr
+* Output        : 1.control symbol
+*
+* called by     : OS_CS_script
+*                 CTSAVAR
+*
+* Return Value  : ESA_OK, ESA_ERR
+* Side Effects  :
+* Scope         :
+***************************************************/
+
+ESA_RC OS_MVS_checksum(char *header_ptr,int *c_symb )
+{
+
+  /*
+   *    Variables
+   */
+
+   int   sum;
+   short l;
+   char  *c;
+   char  sum_char[10];
+   ESA_RC rc=ESA_OK ;
+
+  /*
+   *    Initilize
+   */
+
+   sum=0;
+
+  /*
+   *    Loop on area
+   */
+
+   for ( c=header_ptr ; *c NE NULL_CHAR ; c++ )
+
+       if ( toupper(*c) NE BLANK ) {
+          if ( isxdigit(*c) NE 0 ) {                   /* hexadecimal */
+             if ( isdigit(*c) NE 0 )                /* digits      */
+                sum += toupper(*c) - '0';
+             else sum += toupper(*c) - ( 'A' - 1 ) ;  /* hex letters */
+          }
+          else {
+             rc = ESA_ERR ;
+             goto exit ;
+          }
+       }
+
+  /*
+   *    Convert summ to char form
+   */
+
+   sprintf(sum_char,"%08d",sum);
+
+
+  /*
+   *    Definition control symbol
+   */
+
+   l=strlen(sum_char);
+   if ( l LE 0 )
+     *c_symb='0' ;
+   else *c_symb=sum_char[l-1];
+
+   exit : ;
+
+   return rc;
+
+}
+/* IS10174- start */
+/****************************************************
+ * Procedure Name: OS_PROC_ddinfo
+ * Description   : Retrieve dsname and member name
+ *                 of a re-allocated DD.
+ * Input         : OS-MVS-ddinfo parameters
+ * Output        :
+ * Input/Output  :
+ * Return Value  : Save as OS_MVS_ddinfo_do
+ * Side Effects  :
+ * Comments      :
+ ***************************************************/
+
+ESA_RC OS_MVS_ddinfo ( char                         * ddn,
+                        char                        * file_name,
+                        int                           issue_err_msg,
+                        CTSAMSG_DEST_TABLE_rec_typ  * dest,
+                        CTSAMSG_HANDLE_rec_typ      * msgs,
+        /* IS10174 */   int                           parm_num,
+        /* IS10174 */   ... )
+{
+
+  ESA_RC             rc;
+  va_list            arg_list;
+
+  va_start (arg_list, parm_num);
+
+  rc = OS_MVS_ddinfo_do (ddn, file_name, issue_err_msg,
+                      dest, msgs, parm_num,
+                      arg_list);
+
+  va_end (arg_list);
+
+  return rc;
+}
+/* IS10174- end   */
+
+/**************************************************************
+*                                                             *
+* Subroutine name : OS_MVS_ddinfo_do                          *
+*                                                             *
+* DESCRIPTION     : Obtain data set name corresp ddname       *
+*                                                             *
+* INPUT           : ddn           - ddname                    *
+*                   issue_err_msg - 1 - YES, 0 - NO           *
+*                   parm_num      - Number of requested       *IS10174
+*                                   attributes.               *IS10174
+*                   arg_list        Attributes list. For each *IS10174
+*                                   Attribute 3 prameters     *IS10174
+*                                   are needed:               *IS10174
+*                          (I)      - parm name, padded with  *IS10174
+*                                     blanks (char[8])        *
+*                          (O)      - area for value (char *) *IS10174
+*                          (O)      - parm rc (int *)         *IS10174
+*                                                             *
+* OUTPUT          : file_name     - dsname[(member)]          *
+*                   arg_list      - values and rc for  or     *IS10174
+*                                   parameters pointed by     *IS10174
+*                                   arg_list.                 *
+*                                                             *
+* RETURN VALUE    : ESA_OK - OK.                              *
+*                 : ESA_NOT_SUPP - no ddname.                 *
+*                 : ESA_FATAL - error.                        *
+*                                                             *
+**************************************************************/
+ESA_RC OS_MVS_ddinfo_do ( char                        * ddn,
+                          char                        * file_name,
+                          int                           issue_err_msg,
+                          CTSAMSG_DEST_TABLE_rec_typ  * dest,
+                          CTSAMSG_HANDLE_rec_typ      * msgs,
+        /* IS10174 */     int                           parm_num,
+        /* IS10174 */     va_list                       arg_list)
+{
+
+ typedef struct _ATTR_ARRAY_PARM {                       /* IS10174 */
+    char   * name;                                       /* IS10174 */
+    void   * value;                                      /* IS10174 */
+    int    * rc;                                         /* IS10174 */
+ } ATTR_ARRAY_PARM_typ,  * ATTR_ARRAY_PARM_ptr;          /* IS10174 */
+
+  /*
+   *   Variables
+   */
+
+   static char        func[]="OS_MVS_ddinfo";
+   ESA_RC             rc = ESA_OK;
+   int                int_rc;
+   char               err_msg[80];
+   char               dsnm[45]  = "";     /* Data set name */
+   char               member[9] = "";     /* Member        */
+   /* IS10174 int                dsnm_len  = 0;         * SAS2IBMN * */
+   /* IS10174 int                member_len = 0;        * SAS2IBMN * */
+   int                dsnm_rc;                           /* IS10174 */
+   int                mem_rc;                            /* IS10174 */
+   fldata_t           fileinfo;                           /* SAS2IBMT */
+   int                debug_level=0;                      /* SAS2IBMN */
+   int                i;                                  /* IS10174 */
+
+   ATTR_ARRAY_PARM_typ  * attr_array = NULL;              /* IS10174 */
+   ATTR_ARRAY_PARM_typ  * curr_parm = NULL;               /* IS10174 */
+   int                    num_to_get = 0;                 /* IS10174 */
+   int                    array_size = 0;                 /* IS10174 */
+   int                    get_dsn;   /* TRUE / FALSE */   /* IS10174 */
+   char                 * str_end;                        /* IS10174 */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter (PLT_COMP_OS_MVS, 1, func );
+
+   /* IS10174 *file_name = NULL_CHAR;                      */
+
+   /* IS10174 - start */
+   /* Do not ignore EXECOUT
+   if( strcmp(ddn, EXECOUT_DDNAME) EQ 0 )    * Work file *
+      goto exit;
+   */
+   /* If the number of parameters is not a multiple of the
+    * number of fields in structure, error
+    */
+   ESA_DIAG_printf(PLT_COMP_OS_MVS, 6,
+                   "ddn = %s   parm_num = %d  file_name ptr = %8X",
+                   ddn, parm_num, file_name);
+
+   /*
+    *  Allocate the parms array to be passed to CTSADDI
+    */
+   num_to_get = parm_num;
+   if (file_name NE NULL)
+   {
+     /* IS10174 num_to_get = parm_num + 2;  */
+     num_to_get += 2;
+     *file_name = NULL_CHAR;
+     get_dsn = TRUE;
+   }
+   else
+     get_dsn = FALSE;
+
+   ESA_DIAG_printf(PLT_COMP_OS_MVS, 6,
+                   "num_to_get = %d", num_to_get);
+
+   if (num_to_get GT 0)
+   {
+     array_size = sizeof(ATTR_ARRAY_PARM_typ) * num_to_get ;
+     ESA_DIAG_printf(PLT_COMP_OS_MVS, 6,
+                   "array size = %d", array_size);
+
+     attr_array = (ATTR_ARRAY_PARM_typ *)malloc(array_size);
+     if (attr_array EQ NULL) /* if not allocated - error */
+     {
+       if ( issue_err_msg )
+       {
+         CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                      "OS_MVS_ddinfo parms array",
+                      array_size);
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                      comp, func, "MALLOC OUTPUT",
+                      16, __LINE__);
+       }
+       else
+         ESA_DIAG_printf(PLT_COMP_OS_MVS, 0,
+                   "Allocation of parm array failed. size = %d ",
+                   array_size);
+
+       rc = ESA_FATAL;
+       goto exit ;
+     }
+
+     ESA_DIAG_printf(PLT_COMP_OS_MVS, 6,
+                   "array = %8X", attr_array);
+
+     curr_parm = attr_array;
+
+     /*
+      *  If filename is requested, put dsn and member in parm array.
+      */
+     if (get_dsn)
+     {
+       curr_parm->name = (char *)"DSNAME  ";
+       curr_parm->value = (char *)dsnm;
+       curr_parm->rc = &dsnm_rc;
+       ESA_DIAG_printf(PLT_COMP_OS_MVS, 6,
+                       "curr_parm = %8X (%s) / %8X / %8X",
+                       curr_parm->name, curr_parm->name,
+                       curr_parm->value, curr_parm->rc);
+       curr_parm++;
+
+       curr_parm->name = (char *)"MEMBER  ";
+       curr_parm->value = (char *)member;
+       curr_parm->rc = &mem_rc;
+       ESA_DIAG_printf(PLT_COMP_OS_MVS, 6,
+                       "curr_parm = %8X (%s) / %8X / %8X",
+                       curr_parm->name, curr_parm->name,
+                       curr_parm->value, curr_parm->rc);
+       curr_parm++;
+     }
+
+     /*
+      *  Retrieve the variable arguments list and create the list
+      *  of pointers to CTSADDI.
+      */
+     for (i = 0;
+          i LT parm_num;
+          i++, curr_parm++)
+     {
+       curr_parm->name = va_arg(arg_list, char*);
+       curr_parm->value = va_arg(arg_list, char*);
+       curr_parm->rc = va_arg(arg_list, int*);
+       ESA_DIAG_printf(PLT_COMP_OS_MVS, 6,
+                       "curr_parm = %8X (%s) / %8X / %8X",
+                       curr_parm->name, curr_parm->name,
+                       curr_parm->value, curr_parm->rc);
+     }
+
+   }
+
+   /* IS10174 - end   */
+
+  /*
+   *   Obtain ddcard information
+   */
+   /* SAS2IBMN
+   int_rc=osddinfo(ddn, dsnm, member, NULL , NULL, NULL );    */
+   debug_level = ESA_DIAG_get_debug_level(PLT_COMP_OS_MVS); /*SAS2IBMN*/
+
+   /* IS10174 - start */
+   /*  Replace the call to CTSADDI with a new call with the new
+    *  parameters.
+    *
+    * SAS2IBMT int_rc = ctsaddi(ddn, dsnm, &dsnm_len,        *SAS2IBMN*
+   int_rc = (*(ASM_RTN_TYP *)&ctsaddi)(ddn, (char *)dsnm,  *SAS2IBMT*
+                     &dsnm_len, (char *)member,            * SAS2IBMN *
+                     &member_len, &debug_level);           * SAS2IBMN *
+   dsnm[dsnm_len] = NULL_CHAR;                             * SAS2IBMN *
+   /* BS10059 dsnm[dsnm_len] = NULL_CHAR;                  * SAS2IBMN *
+   member[member_len] = NULL_CHAR;               * SAS2IBMN + BS10059 *
+   ESA_DIAG_printf(PLT_COMP_OS_MVS,1,
+                   "obtained file name=%s", dsnm);
+    * BS10059 if ( int_rc LT 0 ) {   *
+   if ( int_rc NE 0 )                            * BS10059  *
+   */
+   int_rc = (*(ASM_RTN_TYP *)&ctsaddi)(ddn, &num_to_get,
+                     (void *)attr_array, &debug_level);
+   ESA_DIAG_printf(PLT_COMP_OS_MVS, 6,
+                  "CTSADDI for ddn %s:  rc = %d",
+                   ddn, int_rc);
+   if ( int_rc GT 4 )   /* If an error occured, set error rc.        */
+   /* IS10174 - end  */
+   {
+     if (int_rc EQ 8)
+       rc = ESA_NOT_SUPP;
+     else
+     {
+       if ( issue_err_msg ) {
+       /* SAS2IBMNsprintf( err_msg, "osddinfo() failed. ddn=%s", ddn);*/
+         sprintf(err_msg, "ctsaddi() failed. ddn=%s",    /* SAS2IBMN */
+                 ddn);                                   /* SAS2IBMN */
+
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, comp, func,
+                       err_msg , int_rc,  __LINE__ );
+       }
+       rc = ESA_FATAL ;
+     }
+     goto exit;
+   }
+   else   /* ctsaddi rc is 0 / 4 / 8   */
+   {
+     /* IS10174 - start  */
+     if (debug_level GE 6)       /* print the output  */
+     {
+       for (i = 0, curr_parm = attr_array;
+            i LT num_to_get;
+            i++, curr_parm++)
+       {
+         ESA_DIAG_printf(PLT_COMP_OS_MVS, 0,
+                      "curr_parm = %8X (%s) / %8X (%1X) / %8X (%d)",
+                         curr_parm->name, curr_parm->name,
+                         curr_parm->value, *(int *)curr_parm->value,
+                         curr_parm->rc, *(int *)curr_parm->rc);
+       }
+     }
+
+
+     if (get_dsn)     /* return dsname, if required  */
+     {
+       dsnm[sizeof(dsnm)-1] = NULL_CHAR;
+       str_end = strchr(dsnm, ' ');     /* Look for end of dsname */
+       if (str_end NE NULL)
+         str_end[0] = NULL_CHAR;        /* put 'end-of-string'    */
+
+       member[sizeof(member)-1] = NULL_CHAR;
+       str_end = strchr(member, ' ');   /* Look for end of member */
+       if (str_end NE NULL)
+         str_end[0] = NULL_CHAR;        /* put 'end-of-string'    */
+     /* IS10174 - end    */
+
+       if ( strlen(member) EQ 0 )
+         sprintf(file_name, "%s", dsnm);
+       else
+         sprintf(file_name, "%s(%s)", dsnm, member );
+
+       ESA_DIAG_printf(PLT_COMP_OS_MVS, 6,               /* IS10174 */
+                      "CTSADDI for ddn %s:  rc = %d",    /* IS10174 */
+                       ddn, int_rc);                     /* IS10174 */
+     }  /* return dsname, if required  */
+
+     /* IS10174 - start  */
+     if (int_rc EQ 0)
+       rc = ESA_OK;
+     else     /* int_rc = 4 */
+       rc = ESA_SKIP;
+     /* IS10174 - end    */
+   }   /* ctsaddi rc is 0 / 4   */
+
+  /*
+   *   Finish
+   */
+
+  exit :;
+
+   if (attr_array NE NULL)                               /* IS10174 */
+     free (attr_array);                                  /* IS10174 */
+
+   ESA_DIAG_exit(PLT_COMP_OS_MVS, 1 , func , rc );
+
+   return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : OS_MVS_whoami                             *
+*                                                             *
+* DESCRIPTION     : Obtain address space information          *
+*                                                             *
+* INPUT           : none                                      *
+*                                                             *
+* OUTPUT          : jobname                                   *
+*                   jobid                                     *
+*                   userid                                    *
+*                                                             *
+* RETURN VALUE    : None                                      *
+*                                                             *
+**************************************************************/
+
+void  OS_MVS_whoami (char * jobname, char * jobid, char * userid,
+                     char * sysid, void **acee)
+{
+
+  /*
+   *   Variables
+   */
+
+   static char func[]="OS_MVS_whoami";
+   char * end_of_str;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter (PLT_COMP_OS_MVS, 1, func );
+
+  /*
+   *   Call assembler routine
+   */
+
+   /* SAS2IBMT
+   ctsawho(jobname, jobid, userid, sysid, acee);                     */
+   (*(ASM_RTN_TYP *)&ctsawho)                             /* SAS2IBMT */
+          (jobname, jobid, userid, sysid, acee);
+
+  /*
+   *   Convert field to string
+   */
+
+   end_of_str = memchr(jobname, BLANK, 8 );
+   if (end_of_str NE NULL)
+      *end_of_str = NULL_CHAR;
+   else jobname[8] = NULL_CHAR;
+
+   end_of_str = memchr(jobid, BLANK, 8 );
+   if (end_of_str NE NULL)
+      *end_of_str = NULL_CHAR;
+   else jobid[8] = NULL_CHAR;
+
+   end_of_str = memchr(userid, BLANK, 8 );
+   if (end_of_str NE NULL)
+      *end_of_str = NULL_CHAR;
+   else userid[8] = NULL_CHAR;
+
+   end_of_str = memchr(sysid, BLANK, 4 );
+   if (end_of_str NE NULL)
+      *end_of_str = NULL_CHAR;
+   else sysid[4] = NULL_CHAR;
+
+  /*
+   *   Finish
+   */
+
+   exit :;
+
+   ESA_DIAG_exit(PLT_COMP_OS_MVS, 1 , func , ESA_RC_VOID );
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : OS_MVS_check_apf                          *
+*                                                             *
+* DESCRIPTION     : Check if address space is apf authorized  *
+*                                                             *
+* INPUT           : message parameters                        *
+*                                                             *
+* OUTPUT          : None                                      *
+*                                                             *
+* RETURN VALUE    : ESA_OK - authorized                       *
+*                   ESA_ERR- not authorized                   *
+*                                                             *
+**************************************************************/
+
+ESA_RC OS_MVS_check_apf ( CTSAMSG_HANDLE_rec_typ      * msgs,
+                          CTSAMSG_DEST_TABLE_rec_typ  * dest)
+{
+
+  /*
+   *   Variables
+   */
+
+   static char func[]="OS_MVS_check_apf";
+   ESA_RC rc = ESA_OK;
+   int    r15 ;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter (PLT_COMP_OS_MVS, 1, func );
+
+  /*
+   *   Call assmebler routine
+   */
+
+   /* SAS2IBMT r15 = ctsaapf();                                      */
+   r15 = (*(ASM_RTN_TYP *)&ctsaapf)();                    /* SAS2IBMT */
+   if (r15 NE 0) {
+      CTSAMSG_print(ERR_NO_APFAUTH ,msgs, NULL, dest );
+      rc = ESA_ERR;
+   }
+
+  /*
+   *   Finish
+   */
+
+   exit :;
+
+   ESA_DIAG_exit(PLT_COMP_OS_MVS, 1 , func , rc );
+   return rc;
+
+}
+
+/****************************************************
+ * Procedure Name: OS_MVS_init
+ * Description   : Perform OS-related initialization steps
+ *                 upon process initialization.
+ * Input         : Main_type - the main process type.
+ * Output        :
+ * Input/Output  : handle.
+ * Return Value  : ESA_FATAL if failed.
+ * Side Effects  :
+ * Comments      :
+ ***************************************************/
+
+ESA_RC OS_MVS_init ( void              ** handle)
+{
+
+  ESA_RC             rc = ESA_OK;
+  OS_PROC_rec_typ   *proc_rec;
+
+  proc_rec = (OS_PROC_rec_typ *)malloc(sizeof(OS_PROC_rec_typ));
+  if (proc_rec EQ NULL) {
+    fprintf(stderr, "OS_PROC_init: malloc of %d bytes failed\n",
+            sizeof(OS_PROC_rec_typ));
+    rc = ESA_FATAL;
+    goto exit;
+  }
+
+  proc_rec->jobname[0]   = NULL_CHAR;
+  proc_rec->jobid[0]     = NULL_CHAR;
+  proc_rec->userid[0]    = NULL_CHAR;
+  proc_rec->sysid[0]     = NULL_CHAR;
+  proc_rec->acee         = NULL;
+
+  OS_MVS_whoami( proc_rec->jobname, proc_rec->jobid,
+                 proc_rec->userid,  proc_rec->sysid,
+                 &(proc_rec->acee) );
+
+  exit :;
+
+  *handle = proc_rec;
+
+  return rc;
+}
+
+/****************************************************
+ * Procedure Name: OS_MVS_chkid
+ * Description   : Perform OS-related check steps
+ *                 due to running process
+ * Input         : handle
+ * Output        :
+ * Input/Output  : none
+ * Return Value  : ESA_OK    - started task process
+ *                 ESA_ERR   - other process
+ *                 ESA_FATAL - any other cases
+ * Side Effects  :
+ * Comments      :
+ ***************************************************/
+
+ESA_RC OS_MVS_chkid(void    * os_proc_handle)
+{
+
+  ESA_RC                       rc = ESA_OK;
+  OS_PROC_rec_typ              current;
+  OS_PROC_rec_typ            * proc_rec;
+
+ /*
+  *   Initialize
+  */
+
+  proc_rec = (OS_PROC_rec_typ *)os_proc_handle;
+  if (proc_rec EQ NULL)
+    goto exit;
+
+  OS_MVS_whoami( current.jobname, current.jobid,
+                 current.userid,  current.sysid,
+                 &current.acee );
+
+  if ( proc_rec->acee EQ current.acee )
+    rc = ESA_OK;
+  else
+    rc = ESA_ERR;
+
+  exit :;
+
+  return rc;
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : OS_MVS_trace_out                           *
+ *                                                             *
+ * DESCRIPTION    : Print back trace                           *
+ *                  Invoke by btrace func SAS/C                *
+ * INPUT          : line  - trace line                         *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+static void OS_MVS_trace_out(const char *line)
+{
+
+   ESA_DIAG_printf(PLT_COMP_OS_MVS, 0, "%s", line);
+
+}
+
+
+/****************************************************
+ * Procedure Name: OS_MVS_btrace
+ * Description   : Perform OS-related back trace printing
+ *                 due to running process
+ * Input         : handle
+ * Output        :
+ * Input/Output  : none
+ * Return Value  : ESA_OK    - started task process
+ *                 ESA_ERR   - other process
+ *                 ESA_FATAL - any other cases
+ * Side Effects  :
+ * Comments      :
+ ***************************************************/
+
+void OS_MVS_btrace( void )
+{
+
+ /* btrace( &OS_MVS_trace_out );                             SAS2IBMT */
+
+    int rc;                                               /* SAS2IBMT */
+
+    rc = ctrace("CTS ctrace (backtrace) output");         /* SAS2IBMT */
+}
+
+/********************************************* IS0216 & IS0225 ***
+ * Procedure Name: OS_LocalTime
+ * Description   : Provide local time including milliseconds
+ *                 Implemented with IS0225.
+ * Input         :
+ * Output        :
+ *
+ * Return Value  : ESA_NOT_SUPP
+ * Notes         : DIAGs not allowed !!
+ ******************************************************************/
+ESA_RC OS_LocalTime  (unsigned short * Year,
+                      unsigned short * Month,
+                      unsigned short * Day,
+                      unsigned short * Hour,
+                      unsigned short * Minute,
+                      unsigned short * Second,
+                      unsigned short * Milliseconds)
+{
+ ESA_RC           rc = ESA_OK;
+ /* static char      func[]="OS_LocalTime"; no DIAGS */
+
+ /* ESA_DIAG_enter (PLT_COMP_OS_MVS, 1, func ); not allowed */
+ /* SAS2IBMT
+ rc = ctsaolt(Year,Month,Day,Hour,Minute,Second,Milliseconds);       */
+ rc = (*(ASM_RTN_TYP *)&ctsaolt)(Year,Month,Day,Hour,Minute,Second,
+                                Milliseconds);            /* SAS2IBMT */
+ rc = ESA_OK;             /* ctsaolt's rc is always 0 */
+ /* ESA_DIAG_printf(PLT_COMP_OS_MVS, 3,
+ "Year=%d Month=%d Day=%d Hour=%d Minute=%d Second=%d Milliseconds=%d",
+ Year,Month,Day,Hour,Minute,Second,Milliseconds); not allowed */
+ /* to be used for debug when needed, as diags are not allowed
+ printf(
+ "Year=%d Month=%d Day=%d Hour=%d Minute=%d Second=%d Milliseconds=%d",
+ *Year,*Month,*Day,*Hour,*Minute,*Second,*Milliseconds); */
+ /* temp message for debug only - avner */
+cleanup:
+  /* ESA_DIAG_exit(PLT_COMP_OS_MVS, 1 , func , rc ); not allowed */
+  return (rc);
+ }
+/********* end of IS0216 & IS0225 ************************/

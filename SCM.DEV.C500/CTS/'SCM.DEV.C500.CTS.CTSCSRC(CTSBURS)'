@@ -1,0 +1,466 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Update a resource (ACF2)                 *
+ *                                                             *
+ * File Name        : ctsburs.c                                *
+ *                                                             *
+ * Author           : Guy Shavitt                              *
+ *                                                             *
+ * Creation Date    : 27/01/1998                               *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who    When       Description                      *
+ * -------- ------ ---------- -------------------------------- *
+ * PS0252   Guy    13/04/1998 Common code changes              *
+ * PS0278   Guy    15/06/1998 Added rule backup                *
+ * WS2333   Guy    02/08/1998 No more Get_Dsn_Resource         *
+ * PS0347   Guy    03/12/1998 Changed parms of Compile_Ruleset *
+ * WS2358   Guy    14/10/1999 Support for the virtual resource *
+ * IS10122  NuritY 16/06/2014 Ignore ROLESET rules.            *
+ * WS10082  MauriC   07/11/22 Recompile for new ADDINFO macros *
+ **************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include   ESA_DIAG
+ #include   ESA_API
+ #include   ESA_CTSAMSG
+ #include   ESA_API_CODES
+
+ #include   MVS_OS_CLI
+ #include   MVS_OS_MVS
+ #include   MVS_COMP
+
+ #include   API_ADDINFO
+ #include   API_AUTH
+
+ #include   ACF2_CODES
+ #include   ACF2
+
+ static  char   component[] = "UPDRES";
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : updres                                     *
+ *                                                             *
+ * DESCRIPTION    : Update a resource                          *
+ *                                                             *
+ * INPUT          : resource, addinfo, admin                   *
+ *                                                             *
+ * OUTPUT         : err                                        *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC CTSUpdRes (RES_PARAMS_rec_typ   * res_params,
+          /*       ADDINFO_rec_typ      * addinfo_res,    PS0252 */
+                   ADDINFO_rec_typ      * addinfo,
+                   ADMIN_PARAMS_rec_typ * admin_params,
+                   ERR_STRUCT_rec_typ   * err)
+ {
+
+  /*
+   *    Variables
+   */
+
+   ESA_RC                     rc = ESA_OK;
+   static char                func[]="CTSUpdRes";
+   CTSAMSG_HANDLE_rec_ptr     msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr dest;
+
+   ACE_rec_typ                 ace;
+   ADDINFO_rec_ptr             laddinfo = NULL, ace_addinfo = NULL;
+   ONE_FIELD_rec_ptr           pair = NULL, lpair = NULL;
+   ACF2_Get_ResACL_Handle     *h = NULL;
+
+   RESOURCE_typ                current_key = "";
+   FILE                       *rule_file = NULL;
+   char                       *obj_buffer = NULL;
+   char                        msg[256]="";
+   char                        errmsg[256]="";
+   int                         i, iterate, num_rules;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_UPDRES, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   /* WS2358 */
+   /*****************************************************************
+   * Did the request specify the virtual resource ?                 *
+   ******************************************************************/
+   if (ACF2_Is_Virtual_Resource (res_params->resource) )
+     goto exit;
+   /* End of WS2358 */
+
+   /*************************************************************
+   * Allocate handle for Get_ACE operation and initialize it    *
+   **************************************************************/
+   rc = Init_ACE_Handle (&h,
+                         msgs,
+                         dest);
+
+   if (rc NE ESA_OK)
+     goto exit;
+
+   /*************************************************************
+   * Allocate a local addinfo for current resource fields       *
+   **************************************************************/
+   if (ADDINFO_alloc(func, ACF2_ADDINFO, &laddinfo, NULL, NULL)
+    NE ESA_OK)
+   {
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+   ADDINFO_empty(laddinfo);
+
+   /*************************************************************
+   * Allocate addinfo for the resource ACE's                    *
+   **************************************************************/
+   if (ADDINFO_alloc(func, ACF2_ADDINFO, &ace_addinfo, NULL, NULL)
+    NE ESA_OK)
+   {
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+   ADDINFO_empty(ace_addinfo);
+
+   /*************************************************************
+   * Fill local addinfo with all the resource keywords          *
+   **************************************************************/
+   Fill_Res_Keywords(laddinfo);
+
+   /*************************************************************
+   * Fill ACE addinfo with all the ACE keywords                 *
+   **************************************************************/
+   Fill_ACE_Keywords (ace_addinfo);
+
+   /*************************************************************
+   * Get current fields of resource                             *
+   **************************************************************/
+   rc = ACF2_Get_Resource(res_params->resource,
+                          ACF2_Object_is_Not_Masked,
+                          res_params->restype,
+                          ACF2_Return_Ruleset,
+                          NULL,
+                          NULL,                           /* WS2333 */
+                          current_key,
+                          NULL,
+                          laddinfo,
+                          errmsg,
+                          admin_params);
+
+   /*************************************************************
+   * Check result of GET operation                              *
+   **************************************************************/
+   switch(rc)
+   {
+      case ACF2_OK:
+        break;
+
+      case ACF2_Not_Found:
+        /* IS10122 - start */
+        if ( strcmp(errmsg, ACF2_ROLESET_IGNORED_MSG) EQ 0 )
+          CTSAMSG_print(ACF2_RES_ROLESET_IGNORED, msgs, NULL, dest,
+                        res_params->resource, res_params->restype);
+        else
+        /* IS10122 - end */
+          CTSAMSG_print(ERR_RES_NOT_EXIST, msgs, NULL, dest,
+                        res_params->resource);
+        rc = ESA_FATAL;
+        goto exit;
+
+      default:
+        sprintf(msg,"Get Res fail res=%s rc=%d msg=%s",
+                  res_params->resource, rc, errmsg);
+        CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,
+               func, msg, 16,__LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+   }
+
+   /*************************************************************
+   * Print current fields                                       *
+   **************************************************************/
+   for (i=0; i LT laddinfo->num_pairs; i++)
+   {
+     lpair = ADDINFO_get_next(laddinfo, lpair);
+
+     if (lpair EQ NULL)
+       break;
+
+     if (lpair->value[0] NE NULL_CHAR)
+       ESA_DIAG_printf(PLT_COMP_API_ACF2, DEBUG_SHOW_IMPORTANT,
+                       "LADDINFO keyword=(%s) val=(%s)",
+                       lpair->keyword, lpair->value);
+   };
+
+   pair = NULL;
+   lpair = NULL;
+
+   /*************************************************************
+   * Merge updated fields with current fields                   *
+   **************************************************************/
+   for (i=0; i LT addinfo->num_pairs; i++)
+   {
+     pair = ADDINFO_get_next(addinfo, pair);
+
+     if (pair EQ NULL)
+       break;
+
+     ESA_DIAG_printf(PLT_COMP_API_ACF2, DEBUG_SHOW_IMPORTANT,
+                     "ADDINFO keyword=(%s) val=(%s)",
+                     pair->keyword, pair->value);
+
+     lpair = ADDINFO_search (pair->keyword,
+                             ACF_ADDINFO_KWD_LEN,
+                             laddinfo->pair,
+                             laddinfo->num_pairs);
+
+     if (lpair EQ NULL)
+     {
+       sprintf(msg,"Unknown keyword received. keyword=%s",
+                 pair->keyword);
+       CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,
+                     func, msg, 16,__LINE__);
+     };
+
+     ADDINFO_updval(pair->value, ACF_ADDINFO_VAL_LEN, lpair);
+   };
+
+   pair = NULL;
+   lpair = NULL;
+
+   ESA_DIAG_printf(PLT_COMP_API_ACF2, DEBUG_SHOW_IMPORTANT,
+                   "*** Contents of merged ADDINFO: ***");
+
+   /*************************************************************
+   * Print total fields                                         *
+   **************************************************************/
+   for (i=0; i LT laddinfo->num_pairs; i++)
+   {
+     lpair = ADDINFO_get_next(laddinfo, lpair);
+
+     if (lpair EQ NULL)
+       break;
+
+     ESA_DIAG_printf(PLT_COMP_API_ACF2, DEBUG_SHOW_IMPORTANT,
+                     "LADDINFO keyword=(%s) val=(%s)",
+                     lpair->keyword, lpair->value);
+   };
+
+   /*****************************************************************
+   * Prepare ACF2IN file for output                                 *
+   ******************************************************************/
+   rc = Prepare_ACF2IN_File (&rule_file,
+                             msgs,
+                             dest);
+   if (rc NE ESA_OK)
+     goto exit;
+
+   /*************************************************************
+   * Write ruleset header data to file                          *
+   **************************************************************/
+   rc = Build_Ruleset (res_params->resource,              /* WS2358 */
+                       res_params->restype,               /* WS2358 */
+                       laddinfo,
+                       rule_file,
+                       msgs,
+                       dest);
+
+   if (rc NE ESA_OK)
+   {
+     sprintf(msg,"Upd Res fail res=%s msg=Build ruleset header failed",
+               res_params->resource);
+     CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,
+            func, msg, 16,__LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+   /*************************************************************
+   * Obtain storage for rule object buffer                      *
+   **************************************************************/
+   obj_buffer = (char *) malloc (ACF2_RULE_BUFFER_LENGTH);
+
+   if (obj_buffer EQ NULL)
+   {
+     CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                  "RULE OBJECT BUFFER",
+                  ACF2_RULE_BUFFER_LENGTH);
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+   /*************************************************************
+   * Get all ACEs of the resource and write them to ACF2IN      *
+   **************************************************************/
+   iterate = TRUE;
+
+   num_rules = 0;
+
+   while (iterate)
+   {
+     ADDINFO_clear(ace_addinfo);
+
+     rc = ACF2_Get_Resource(res_params->resource,
+                            ACF2_Object_is_Not_Masked,
+                            res_params->restype,
+                            ACF2_Return_Rule_Entries,
+                            h,
+                            NULL,                         /* WS2333 */
+                            current_key,
+                            &ace,
+                            ace_addinfo,
+                            errmsg,
+                            admin_params);
+
+     switch(rc)
+     {
+        case ACF2_OK:
+          break;
+
+        case ACF2_Not_Found:
+          /* IS10122 - start */
+          if ( strcmp(errmsg, ACF2_ROLESET_IGNORED_MSG) EQ 0 )
+            CTSAMSG_print(ACF2_RES_ROLESET_IGNORED, msgs, NULL, dest,
+                          res_params->resource, res_params->restype);
+          else
+          /* IS10122 - end */
+            CTSAMSG_print(ERR_RES_NOT_EXIST, msgs, NULL, dest,
+                          res_params->resource);
+          rc = ESA_FATAL;
+          goto exit;
+
+        default:
+          sprintf(msg,"Get ResACL fail res=%s rc=%d msg=%s",
+                    res_params->resource, rc, errmsg);
+          CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,
+                 func, msg, 16,__LINE__);
+          rc = ESA_FATAL;
+          goto exit;
+     }
+
+     if (strcmp (errmsg, "NO MORE ACES") EQ 0)
+       iterate = FALSE;
+     else
+     {
+       rc = Build_Rule_Entry (&ace,
+                              ace_addinfo,
+                              res_params->restype,
+                              rule_file,
+                              msgs,
+                              dest);
+       if (rc NE ESA_OK)
+       {
+         rc = ESA_FATAL;
+         goto exit;
+       };
+     };
+     num_rules++;
+   };
+
+   fclose (rule_file);
+   rule_file = NULL;
+
+   /*************************************************************
+   * Back up the rule before updating it                        *
+   **************************************************************/
+   rc = Rule_Backup ("UPDRES",
+                     res_params -> resource,
+                     res_params -> restype,
+                     admin_params);
+
+   if (rc NE ESA_OK)
+     goto exit;
+
+   /*************************************************************
+   * Compile the ruleset and store it                           *
+   **************************************************************/
+   num_rules = num_rules + 50;
+
+   rc = Compile_Ruleset (res_params->resource,
+                         res_params->restype,
+                         ACF2_Replace_Rule,
+                         num_rules,
+                         obj_buffer,
+                         errmsg,
+                         admin_params);                   /* PS0347 */
+
+   if (rc NE ESA_OK)
+   {
+     if (rc EQ ESA_ERR)
+     {
+       CTSAMSG_print(ERR_RES_NOT_EXIST, msgs, NULL, dest,
+                     res_params->resource);
+     }
+     else
+     {
+       if (strcmp (errmsg, "ACF2 Compiler Error") NE 0)
+       {
+         sprintf(msg,"Upd Res fail res=%s msg=%s",
+                 res_params->resource, errmsg);
+         CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,
+                func, msg, 16,__LINE__);
+       };
+     };
+
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+  /*
+   *   Finish
+   */
+
+   exit:;
+
+   if (rule_file NE NULL)
+     fclose (rule_file);
+
+   if (obj_buffer NE NULL)
+     free (obj_buffer);
+
+   if (h NE NULL)
+   {
+     if (h->Rule_Buffer NE NULL)
+       free(h->Rule_Buffer);
+
+     free(h);
+   };
+
+   if (laddinfo NE NULL)
+    ADDINFO_free(&laddinfo);
+
+   if (ace_addinfo NE NULL)
+    ADDINFO_free(&ace_addinfo);
+
+   ESA_DIAG_exit(ESA_COMP_UPDRES, 1, func, rc );
+
+   return rc;
+
+ }

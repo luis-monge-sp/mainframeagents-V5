@@ -1,0 +1,1121 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Add an ACE to a resource ACL (ACF2)      *
+ *                                                             *
+ * File Name        : ctsbiac.c                                *
+ *                                                             *
+ * Author           : Guy Shavitt                              *
+ *                                                             *
+ * Creation Date    : 03/02/1998                               *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who    When       Description                      *
+ * -------- ------ ---------- -------------------------------- *
+ * PS0252   Guy    13/04/1998 Common code changes              *
+ * PS0278   Guy    15/06/1998 Added rule backup                *
+ * WS2333   Guy    02/08/1998 No more Get_Dsn_Resource         *
+ * PS0347   Guy    03/12/1998 Changed parms of Compile_Ruleset *
+ * WS2358   Guy    19/10/1999 Support for the virtual resource *
+ * PS0398   Guy    02/12/1999 ARI fails for qualified resrules *
+ * BS2411   Guy    14/12/1999 PREFIX field not handled correct *
+ * IS10122  NuritY 16/06/2014 Ignore ROLESET rules.            *
+ * BS10097  SeligT 19/11/2018 ACF2 Group Aggregation Endless   *
+ *                            Loop.                            *
+ * IS10178  SeligT 18/12/2018 Supporting LID Anywhere in UID   *
+ * IS10178B SeligT 12/03/2019 Permission Which Ends With a     *
+ *                            LID Which Ends With a Blank Will *
+ *                            Be Replaced With This Character: *
+ *                            rssparm_REPL_END_BLNK            *
+ **************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_CTSAMSG
+ #include ESA_API
+ #include ESA_API_CODES
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_OS_CLI
+ #include MVS_COMP
+
+ /*
+  *   ACF2 include files
+  */
+
+ #include API_ADDINFO
+ #include API_AUTH
+
+ #include ACF2_CODES
+ #include ACF2
+
+ static char component[]="ADDACE"  ;
+ /**************************************************************
+ *                                                             *
+ * Procedure Name : CTSAddACE                                  *
+ * Description    : Connect user/ug to a resource              *
+ * Input          : ACE type, user, group, resource, addinfo,  *
+ *                  admin                                      *
+ * Output         : err                                        *
+ * Input/Output   :                                            *
+ * Return Value   : ESA_RC                                     *
+ * Side Effects   :                                            *
+ * Comments       : 1. addinfo contains the requested          *
+ *                     permissions.                            *
+ *                  2. Either 'user_params' or 'ug_params'     *
+ *                     is used,                                *
+ *                     as per 'ace_type' value.                *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC CTSAddACE (RES_PARAMS_rec_typ   * res_params,
+            /*     ADDINFO_rec_typ      * res_addinfo,    PS0252 */
+                   ACE_rec_typ          * new_ace,
+                   ADDINFO_rec_typ      * new_addinfo,
+                   ACE_POS_typ            ace_place,
+                   ACE_rec_typ          * rel_ace,
+                   ADDINFO_rec_typ      * rel_addinfo,
+                   ADMIN_PARAMS_rec_typ * admin_params,
+                   ERR_STRUCT_rec_typ   * err)
+
+ {
+
+   static char                func[]="CTSAddACE";
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                     rc = ESA_OK;
+   CTSAMSG_HANDLE_rec_ptr     msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr dest;
+
+   ACF2_Get_ResACL_Handle     *h = NULL;
+   ACF2_Key_Cell_Ptr           KEYs_list = NULL;          /* WS2358 */
+   ONE_FIELD_rec_ptr           pair = NULL;
+   ONE_FIELD_rec_ptr           pair2 = NULL;              /* BS2411 */
+   ADDINFO_rec_ptr             ace_addinfo = NULL, laddinfo = NULL;
+   ADDINFO_rec_ptr             filtered_addinfo = NULL;
+   ADDINFO_rec_ptr             ARI_addinfo = NULL;        /* WS2358 */
+   RESOURCE_typ                target_rule = "";          /* WS2358 */
+   RESOURCE_typ                current_key = "";
+   ACE_rec_typ                 curr_ace;
+   FILE                       *rule_file = NULL;
+   char                       *obj_buffer = NULL;
+   char                       *nextkeys_list = NULL;      /* WS2358 */
+   char                        msg[256]="";
+   char                        errmsg[256]="";
+   char                        parm_get[81]="";           /* WS2358 */
+   char                        real_resource[ACF_RESOURCE_NAME_LEN+1];
+                                                          /* WS2358 */
+   char                        temp_resource[ACF_RESOURCE_NAME_LEN+1];
+                                                          /* WS2358 */
+   char                        res_to_match[ACF_RESOURCE_NAME_LEN+1];
+                                                          /* WS2358 */
+   char                        qual_sep[2];               /* WS2358 */
+   int                         iterate, rule_sorted;
+   int                         insert_after, ace_added, num_rules;
+   int                         automate = FALSE, i;       /* WS2358 */
+   int                         simulate = FALSE;          /* WS2358 */
+   int                         no_resmask;                /* WS2358 */
+   int                         res_is_qualified;          /* WS2358 */
+   int                         long_resname;              /* WS2358 */
+   int                         match_found;               /* WS2358 */
+   int                         num_of_keys_in_list;       /* WS2358 */
+   int                         base_ruleset_given;        /* BS2411 */
+   int                         LID_In_UID, LID_Offset;    /* BS10097 */
+   int                         LID_Length;                /* IS10178 */
+   ACF2_PARAMS_rec_typ       * params_ptr = NULL;         /* BS10097 */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_ADDACE, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   qual_sep[0] = '.';                                     /* WS2358 */
+   qual_sep[1] = NULL_CHAR;                               /* WS2358 */
+
+   res_to_match[0] = NULL_CHAR;                           /* WS2358 */
+
+   /* IS10178 adding ug_name to this diagnostic message             */
+   ESA_DIAG_printf(ESA_COMP_ADDACE, DEBUG_SHOW_IMPORTANT,
+            "ACE type(%d) user_name(%s) ug_name(%s)",
+            new_ace->ace_type, new_ace->user_name), new_ace->ug_name;
+
+   /* The following few lines of code were not tested.       BS10097 */
+
+   if (new_ace->ace_type EQ ACE_TYPE_GROUP)               /* IS10178 */
+     {
+        /* IS10178 change this because when ACE_TYPE_GROUP, the
+                   ug_name field will have the name of the group
+        RESTORE_ENDING_BLANK(new_ace->user_name,                     */
+        RESTORE_ENDING_BLANK(new_ace->ug_name,            /* IS10178 */
+                             ESA_COMP_ADDACE);            /* BS10097 */
+     }
+
+   pair = ADDINFO_search ("UID",                          /* BS10097 */
+                          ACF_ADDINFO_KWD_LEN,            /* BS10097 */
+                          new_addinfo->pair,              /* BS10097 */
+                          new_addinfo->num_pairs);        /* BS10097 */
+
+   if (pair EQ NULL)             goto skip_UID;           /* BS10097 */
+   if (pair->value EQ NULL_CHAR) goto skip_UID;           /* BS10097 */
+
+   RESTORE_ENDING_BLANK(pair->value,
+                        ESA_COMP_ADDACE);                 /* BS10097 */
+   RESTORE_PRMSN_LID_EB(pair->value,                      /* IS10178B*/
+                        ESA_COMP_ADDACE);                 /* IS10178B*/
+
+   ESA_DIAG_printf(ESA_COMP_ADDACE, DEBUG_SHOW_IMPORTANT, /* BS10097 */
+                   "ACE UIDMASK: (%s)", pair->value);     /* BS10097 */
+
+   skip_UID:                                              /* BS10097 */
+
+   /*************************************************************
+   * Does the ACE have UNTIL value which is already expired ?   *
+   **************************************************************/
+   rc = Check_ACE_UNTIL (new_addinfo);
+
+   if (rc NE ESA_OK)
+   {
+     CTSAMSG_print( ACF2_UNTIL_DATE_PASSED, msgs, NULL, dest);
+     goto exit;
+   };
+
+ strcpy (real_resource, res_params->resource);            /* WS2358 */
+
+ /* WS2358 */
+ /******************************************************************/
+ /* Was AUTOMATE requested in this transaction ?                   */
+ /******************************************************************/
+ if (ACF2_Is_Virtual_Resource (res_params->resource) )
+ {
+   /*************************************************************
+   * Allocate addinfo for ARI process                           *
+   **************************************************************/
+   if (ADDINFO_alloc(func, ACF2_ADDINFO, &ARI_addinfo, NULL, NULL)
+    NE ESA_OK)
+   {
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+   ADDINFO_empty(ARI_addinfo);
+   ADDINFO_copy(ARI_addinfo, new_addinfo);
+
+   /*************************************************************
+   * Allocate buffer for NEXTKEYs list                          *
+   **************************************************************/
+   nextkeys_list = (char *) malloc (ACF2_NEXTKEY_LIST_EXTENT);
+
+   if (nextkeys_list EQ NULL)
+   {
+     CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                  "NEXTKEYS LIST BUFFER EXTENT",
+                  ACF2_NEXTKEY_LIST_EXTENT);
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+   *nextkeys_list = NULL_CHAR;
+
+   /****************************************************************/
+   /* Extract resource mask so we know what KEY to search for      */
+   /****************************************************************/
+   pair = ADDINFO_search ("RESMASK",
+                          ACF_ADDINFO_KWD_LEN,
+                          ARI_addinfo->pair,
+                          ARI_addinfo->num_pairs);
+
+   /****************************************************************/
+   /* Resource mask is mandatory in automated process              */
+   /* *BS2411* - not mandatory if BASEKEY is specified             */
+   /****************************************************************/
+   no_resmask = FALSE;
+
+   if (pair EQ NULL)
+     no_resmask = TRUE;
+   else
+   {
+     if (pair->value[0] EQ NULL_CHAR)
+       no_resmask = TRUE;
+     else
+     {
+       /************************************************************/
+       /* Handle special case: '.' resource name received          */
+       /************************************************************/
+       if (strcmp (pair->value, qual_sep) EQ 0)
+       {                                                  /* BS2411 */
+         CTSAMSG_print(ACF2_RESMASK_REQUIRED, msgs,       /* BS2411 */
+                       NULL, dest);                       /* BS2411 */
+         rc = ESA_FATAL;                                  /* BS2411 */
+         goto exit;                                       /* BS2411 */
+       };                                                 /* BS2411 */
+     };
+   };
+
+   real_resource[0] = NULL_CHAR;
+
+   /****************************************************************/
+   /* Different logic in ACCESS RULES and RESOURCE RULES           */
+   /* ==================================================           */
+   /* ACCESS RULES - base ruleset is derived directly from         */
+   /*                first qualifier sent in RESMASK by ESS        */
+   /* RESOURCE RULES - base ruleset has to be searched among       */
+   /*                  all rulesets based on a 'most-specific'     */
+   /*                  search logic                                */
+   /****************************************************************/
+   if (strcmp (res_params->restype, "DSN") EQ 0)
+   {
+     /* BS2411 - moved forward specifically for access rules */
+     if (no_resmask)
+     {
+        CTSAMSG_print(ACF2_RESMASK_REQUIRED, msgs, NULL, dest);
+        rc = ESA_FATAL;
+        goto exit;
+     };
+
+     /**************************************************************/
+     /* Extract real resource name from resource mask (up to '.')  */
+     /**************************************************************/
+     Get_First_Qualifier (real_resource, pair->value,     /* PS0398 */
+                          sizeof(QUALIFIER));             /* PS0398 */
+
+     /**************************************************************/
+     /* Update RESMASK in NEW ACE to contain REAL RESOURCE MASK    */
+     /* (without the first qualifier which is the $KEY value)      */
+     /*                                                            */
+     /* BS2411 fix:                                                */
+     /* We do not update RESMASK of new ACE !!!                    */
+     /*                                                            */
+     /* When there is no $PREFIX (usually only in base ruleset)    */
+     /* we strip 1st qualifier from RESMASK and use it in match    */
+     /* test, and when we add the rule entry. An exception is      */
+     /* a quoted rule entry. In this case we strip 1st qualifier   */
+     /* for match test, but add the rule AS IS (!!!) with quotes.  */
+     /* (stripping logic is in Calc_Real_Rule_Entry)               */
+     /*                                                            */
+     /* If there is a $PREFIX, we calculate the RESMASK from the   */
+     /* original one (by stripping qualifiers from it). Here also  */
+     /* we have the exception of quoted rules.                     */
+     /*                                                            */
+     /**************************************************************/
+  /* Removed by BS2411
+     if (pair->value[0] EQ QUOTE_CHAR)
+     {
+       Strip_First_Qualifier (temp_resource+1, pair->value);
+       temp_resource[0] = QUOTE_CHAR;
+
+       if (strlen(temp_resource) LE 1)
+         no_resmask = TRUE;
+     }
+     else
+     {
+       Strip_First_Qualifier (temp_resource, pair->value);
+
+       if (temp_resource[0] EQ NULL_CHAR)
+         no_resmask = TRUE;
+     };
+
+     if (no_resmask)
+     {
+       CTSAMSG_print(ACF2_RESMASK_REQUIRED, msgs, NULL, dest);
+       rc = ESA_FATAL;
+       goto exit;
+     };
+
+     ADDINFO_updval (temp_resource,
+                     ACF_ADDINFO_VAL_LEN,
+                     pair);
+  */
+
+     /**************************************************************/
+     /* Strip leading and trailing quotes (if any) from rule name  */
+     /**************************************************************/
+     if (real_resource[strlen(real_resource)-1] EQ QUOTE_CHAR)
+       real_resource[strlen(real_resource)-1] = NULL_CHAR;
+
+     if (real_resource[0] EQ QUOTE_CHAR)
+     {
+       for (i=0; i LT strlen(real_resource); i++)
+         real_resource[i] = real_resource[i+1];
+     };
+   }
+   else
+   {
+     /**************************************************************/
+     /* RESOURCE RULES LOGIC                                       */
+     /* ====================                                       */
+     /**************************************************************/
+     /* Allocate storage for resource rules KEYs list              */
+     /* (list contains only rules of specific resource type)       */
+     /**************************************************************/
+     KEYs_list = (ACF2_Key_Cell_Typ *) malloc
+       ( sizeof(ACF2_Key_Cell_Typ)*ACF2_MAX_NUM_OF_RULES );
+
+     if (KEYs_list EQ NULL)
+     {
+       CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                    "RESOURCE RULES KEYS LIST",
+                    sizeof(ACF2_Key_Cell_Typ)*ACF2_MAX_NUM_OF_RULES);
+       rc = ESA_FATAL;
+       goto exit;
+     };
+
+     temp_resource[0] = NULL_CHAR;                        /* BS2411 */
+
+     /* BS2411 */
+     /**************************************************************/
+     /* Was BASE RULESET given to us in new ACE ?                  */
+     /**************************************************************/
+     base_ruleset_given = FALSE;                          /* BS2411 */
+
+     pair2 = ADDINFO_search ("BASEKEY",                   /* BS2411 */
+                             ACF_ADDINFO_KWD_LEN,         /* BS2411 */
+                             ARI_addinfo->pair,           /* BS2411 */
+                             ARI_addinfo->num_pairs);     /* BS2411 */
+
+     if (pair2 NE NULL)                                   /* BS2411 */
+       if (pair2->value[0] NE NULL_CHAR)                  /* BS2411 */
+         base_ruleset_given = TRUE;                       /* BS2411 */
+
+     if (NOT base_ruleset_given)                          /* BS2411 */
+     {                                                    /* BS2411 */
+       ESA_DIAG_printf(ESA_COMP_ADDACE,                   /* BS2411 */
+                       DEBUG_SHOW_IMPORTANT,              /* BS2411 */
+                      "BASEKEY not provided");            /* BS2411 */
+
+       if (no_resmask)                                    /* BS2411 */
+       {                                                  /* BS2411 */
+          CTSAMSG_print(ACF2_RESMASK_REQUIRED, msgs,      /* BS2411 */
+                        NULL, dest);                      /* BS2411 */
+          rc = ESA_FATAL;                                 /* BS2411 */
+          goto exit;                                      /* BS2411 */
+       };                                                 /* BS2411 */
+     }                                                    /* BS2411 */
+     else                                                 /* BS2411 */
+     {                                                    /* BS2411 */
+       ESA_DIAG_printf(ESA_COMP_ADDACE,                   /* BS2411 */
+                       DEBUG_SHOW_IMPORTANT,              /* BS2411 */
+                      "BASEKEY provided");                /* BS2411 */
+
+       strcpy (res_to_match, pair2->value);               /* BS2411 */
+
+       if (strchr (pair->value, QUOTE_CHAR) EQ NULL)      /* BS2411 */
+       {
+         strcpy (temp_resource, pair2->value);            /* BS2411 */
+         if (NOT no_resmask)                              /* BS2411 */
+         {                                                /* BS2411 */
+           strcat (temp_resource, qual_sep);              /* BS2411 */
+           strcat (temp_resource, pair->value);           /* BS2411 */
+         };                                               /* BS2411 */
+       }                                                  /* BS2411 */
+       else                                               /* BS2411 */
+         strcpy (temp_resource, pair->value);             /* BS2411 */
+     };                                                   /* BS2411 */
+
+     if (NOT no_resmask)                                  /* BS2411 */
+       ESA_DIAG_printf(ESA_COMP_ADDACE, DEBUG_SHOW_IMPORTANT,
+                     "RESMASK=(%s) len(%d)",
+                     pair->value, strlen(pair->value));
+
+     /**************************************************************/
+     /* Prepare resource rules KEYs list                           */
+     /* (to be used during transaction execution)                  */
+     /**************************************************************/
+     rc = Prepare_KEYs_List (res_params->restype,
+                             KEYs_list,
+                             &num_of_keys_in_list,
+                             admin_params);
+
+     if (rc NE ESA_OK)
+     {
+       rc = ESA_FATAL;
+       goto exit;
+     };
+
+     if (NOT base_ruleset_given)                          /* BS2411 */
+     {                                                    /* BS2411 */
+       /************************************************************/
+       /* Determine what match test we need to do...               */
+       /* Is resource name qualified ? (extended resource name)    */
+       /************************************************************/
+       res_is_qualified = FALSE;
+       long_resname = FALSE;
+
+       if (strchr (pair->value, '.') EQ NULL)
+       {
+         /* Resource is not qualified. Full resname match */
+         strcpy (res_to_match, pair->value);
+       /* Replaced by BS2411
+         temp_resource[0] = NULL_CHAR;
+       */
+         strcpy(temp_resource, pair->value);              /* BS2411 */
+       }
+       else
+       {
+         /**********************************************************/
+         /* Resource name is qualified. Does it exceed 40 chars ?  */
+         /*                                                        */
+         /* If more than 40 chars:                                 */
+         /*     perform match with 1st qualifier only              */
+         /*                                                        */
+         /* If less or equal to 40 chars:                          */
+         /*     perform match with full resource name              */
+         /*     if no match                                        */
+         /*        perform match with 1st qualifier only           */
+         /**********************************************************/
+         res_is_qualified = TRUE;
+
+         if (strlen (pair->value) GE ACF2_RESRULE_KEY_SIZE)
+         {
+           long_resname = TRUE;
+           Get_First_Qualifier (res_to_match, pair->value,  /* PS0398 */
+                                ACF2_RESRULE_KEY_SIZE);     /* PS0398 */
+
+         /* Replaced by BS2411
+           Strip_First_Qualifier (temp_resource, pair->value);
+         */
+           strcpy (temp_resource, pair->value);           /* BS2411 */
+         }
+         else
+         {
+           strcpy (res_to_match, pair->value);
+         /* Replaced by BS2411
+           temp_resource[0] = NULL_CHAR;
+         */
+           strcpy (temp_resource, pair->value);           /* BS2411 */
+         };
+       };
+     };                                                   /* BS2411 */
+
+     ESA_DIAG_printf(ESA_COMP_ADDACE, DEBUG_SHOW_IMPORTANT,
+                   "Performing match test with resname(%s) len(%d)",
+                   res_to_match, strlen(res_to_match));
+
+     /**************************************************************/
+     /* Activate logic to find most specific match ruleset $KEY    */
+     /**************************************************************/
+     match_found = Most_Specific_Match
+                              (real_resource,        /* base ruleset */
+                               res_to_match,         /* given resmsk */
+                               KEYs_list,
+                               num_of_keys_in_list,
+                               admin_params);
+
+     /**************************************************************/
+     /* If no match found and we have qualified resname <= 40      */
+     /* we try another match, this time with 1st qualifier only    */
+     /**************************************************************/
+     if ( (NOT match_found) AND (res_is_qualified) AND
+          (NOT long_resname) )
+     {
+       Get_First_Qualifier (res_to_match, pair->value,    /* PS0398 */
+                            ACF2_RESRULE_KEY_SIZE);       /* PS0398 */
+
+     /* Removed by BS2411
+       Strip_First_Qualifier (temp_resource, pair->value);
+     */
+
+       ESA_DIAG_printf(ESA_COMP_ADDACE, DEBUG_SHOW_IMPORTANT,
+                     "Retrying match test with resname(%s) len(%d)",
+                     res_to_match, strlen(res_to_match));
+
+       match_found = Most_Specific_Match
+                                (real_resource,
+                                 res_to_match,
+                                 KEYs_list,
+                                 num_of_keys_in_list,
+                                 admin_params);
+     };
+
+     if (NOT match_found)
+     {
+       CTSAMSG_print(ACF2_NO_MATCHING_KEY, msgs, NULL, dest);
+       rc = ESA_FATAL;
+       goto exit;
+     };
+
+     ESA_DIAG_printf(ESA_COMP_ADDACE, DEBUG_SHOW_IMPORTANT,
+                   "Found match $KEY=(%s) full_rule_entry(%s)(%d)",
+                   real_resource, temp_resource,
+                   strlen(temp_resource));
+
+     ADDINFO_updval (temp_resource,
+                     ACF_ADDINFO_VAL_LEN,
+                     pair);
+   };
+
+   ESA_DIAG_printf(ESA_COMP_ADDACE, DEBUG_SHOW_IMPORTANT,
+                   "AUTOMATE(%s) starting from ruleset(%s)",
+                   res_params->restype,
+                   real_resource);
+
+   CTSAMSG_print(ACF2_ARI_STARTING, msgs, NULL, dest, real_resource);
+
+   automate = TRUE;
+
+   /****************************************************************/
+   /* Was SIMULATE mode requested ?                                */
+   /****************************************************************/
+   rc = admin_params ->
+    cs_func.rssprm_get_opt_ptr(admin_params -> rss_name,
+                               "SIMULATE_ARI",
+                               sizeof(parm_get),
+                               parm_get,
+                               OPT_TRUE,
+                               OPT_TRUE);
+
+   if (rc EQ ESA_OK)
+   {
+     if (strcmp (parm_get, "Y") EQ 0)
+       simulate = TRUE;
+   };
+
+   rc = ESA_OK;
+ };
+ /* End of WS2358 */
+
+   /*************************************************************
+   * Allocate handle for Get_ACE operation and initialize it    *
+   **************************************************************/
+   rc = Init_ACE_Handle (&h,
+                         msgs,
+                         dest);
+
+   if (rc NE ESA_OK)
+     goto exit;
+
+   /*************************************************************
+   * Allocate a local addinfo for resource fields               *
+   **************************************************************/
+   if (ADDINFO_alloc(func, ACF2_ADDINFO, &laddinfo, NULL, NULL)
+    NE ESA_OK)
+   {
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+   /* WS2358 - moved this code forward */
+   /*************************************************************
+   * Allocate addinfo for the ACE fields                        *
+   **************************************************************/
+   if (ADDINFO_alloc(func, ACF2_ADDINFO, &ace_addinfo, NULL, NULL)
+    NE ESA_OK)
+   {
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+   ADDINFO_empty(ace_addinfo);
+
+   /* WS2358 - moved this code forward */
+   /*************************************************************
+   * Obtain storage for rule object buffer                      *
+   **************************************************************/
+   obj_buffer = (char *) malloc (ACF2_RULE_BUFFER_LENGTH);
+
+   if (obj_buffer EQ NULL)
+   {
+     CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                  "RULE OBJECT BUFFER",
+                  ACF2_RULE_BUFFER_LENGTH);
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+   /* WS2358 - moved this code forward */
+   /*****************************************************************
+   * Prepare ACF2IN file for output                                 *
+   ******************************************************************/
+   rc = Prepare_ACF2IN_File (&rule_file,
+                             msgs,
+                             dest);
+   if (rc NE ESA_OK)
+     goto exit;
+
+   /*************************************************************
+   * WS2358 - if AUTOMATE request call automate function        *
+   **************************************************************/
+   if (automate)
+   {
+     num_rules = 0;
+
+     rc = ACF2_Automate (real_resource,       /* Base ruleset name */
+                         res_params->restype, /* Base ruleset type */
+                         new_ace,             /* New ACE struct    */
+                         ARI_addinfo,         /* New ACE ADDINFO   */
+                         h,                   /* ACEs handle       */
+                         laddinfo,            /* res. work addinfo */
+                         ace_addinfo,         /* ACE work addinfo  */
+                         rule_file,           /* File already open */
+                        &num_rules,           /* # of rules (out)  */
+                         target_rule,         /* End ruleset name  */
+                         KEYs_list,           /* KEYs list         */
+                         num_of_keys_in_list, /* num of KEYs       */
+                         nextkeys_list,       /* buffer            */
+                         errmsg,
+                         admin_params);
+
+     if (rc NE ESA_OK)
+     {
+       rc = ESA_FATAL;
+       goto exit;
+     };
+
+     if (simulate)
+     {
+       ESA_DIAG_printf(ESA_COMP_ADDACE, DEBUG_SHOW_IMPORTANT,
+                       "SIMULATE mode. Abort rule update.");
+       goto exit;
+     };
+
+     strcpy (real_resource, target_rule);
+
+     goto backup_rule;
+   };
+   /* End of WS2358 */
+
+   ADDINFO_empty(laddinfo);
+
+   /*************************************************************
+   * Fill local addinfo with all the resource keywords          *
+   * (used to emulate a Get_Resource request with all keywords) *
+   **************************************************************/
+   Fill_Res_Keywords(laddinfo);
+
+   ESA_DIAG_printf(ESA_COMP_ADDACE, DEBUG_SHOW_IMPORTANT,
+                 "Get resource fields res=(%s)",
+                 real_resource);                          /* WS2358 */
+
+   /*************************************************************
+   * Get current fields of resource                             *
+   **************************************************************/
+   rc = ACF2_Get_Resource(real_resource,                  /* WS2358 */
+                          ACF2_Object_is_Not_Masked,
+                          res_params->restype,
+                          ACF2_Return_Ruleset,
+                          NULL,
+                          NULL,                           /* WS2333 */
+                          current_key,
+                          NULL,
+                          laddinfo,
+                          errmsg,
+                          admin_params);
+
+   /*************************************************************
+   * Check result of GET operation                              *
+   **************************************************************/
+   switch(rc)
+   {
+      case ACF2_OK:
+        break;
+
+      case ACF2_Not_Found:
+        /* IS10122 - start */
+        if ( strcmp(errmsg, ACF2_ROLESET_IGNORED_MSG) EQ 0 )
+          CTSAMSG_print(ACF2_RES_ROLESET_IGNORED, msgs, NULL, dest,
+                        real_resource, res_params->restype);
+        else
+        /* IS10122 - end */
+          CTSAMSG_print(ERR_RES_NOT_EXIST, msgs, NULL, dest,
+                        real_resource);                  /* WS2358 */
+        rc = ESA_FATAL;
+        goto exit;
+
+      default:
+        sprintf(msg,"Get Res fail res=%s rc=%d msg=%s",
+                  real_resource, rc, errmsg);             /* WS2358 */
+        CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,
+               func, msg, 16,__LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+   }
+
+   /*************************************************************
+   * Is the resource in NOSORT mode ?                           *
+   **************************************************************/
+   pair = ADDINFO_search ("NOSORT",
+                          ACF_ADDINFO_KWD_LEN,
+                          laddinfo->pair,
+                          laddinfo->num_pairs);
+
+   if (pair EQ NULL)
+   {
+     CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component, func,
+           "Mandatory keyword NOSORT missing in resource ADDINFO",
+           16,__LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+   if (pair->value[0] EQ 'Y')
+     rule_sorted = FALSE;
+   else
+     rule_sorted = TRUE;
+
+   if (rule_sorted)
+     ESA_DIAG_printf(ESA_COMP_ADDACE, DEBUG_SHOW_IMPORTANT,
+                   "** Rule is SORTED **");
+   else
+   {
+     ESA_DIAG_printf(ESA_COMP_ADDACE, DEBUG_SHOW_IMPORTANT,
+                   "** Rule is not SORTED **");
+
+     ESA_DIAG_printf(ESA_COMP_ADDACE, DEBUG_SHOW_IMPORTANT,
+                   "ACE place(%d) rel_ace_name(%s) type(%d)",
+                   ace_place, rel_ace->user_name,
+                   rel_ace->ace_type);
+     /*
+     ADDINFO_dump(rel_addinfo, 1);
+     */
+   };
+
+   /*************************************************************
+   * Allocate addinfo for filter process                        *
+   **************************************************************/
+   if (ADDINFO_alloc(func, ACF2_ADDINFO, &filtered_addinfo, NULL, NULL)
+    NE ESA_OK)
+   {
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+   ADDINFO_empty(filtered_addinfo);
+   ADDINFO_copy(filtered_addinfo, rel_addinfo);
+
+   ACF2_Filter_ADDINFO (res_params->restype,
+                        filtered_addinfo);
+
+   /*************************************************************
+   * Fill ACE addinfo with all the ACE keywords                 *
+   **************************************************************/
+   Fill_ACE_Keywords (ace_addinfo);
+
+   /*************************************************************
+   * Write ruleset header data to file                          *
+   **************************************************************/
+   rc = Build_Ruleset (real_resource,                     /* WS2358 */
+                       res_params->restype,               /* WS2358 */
+                       laddinfo,
+                       rule_file,
+                       msgs,
+                       dest);
+
+   if (rc NE ESA_OK)
+   {
+     sprintf(msg,"Add ACE fail res=%s msg=Build ruleset header failed",
+               real_resource);                            /* WS2358 */
+     CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,
+            func, msg, 16,__LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+   /*************************************************************
+   * Get all ACEs of the resource.                              *
+   * If the resource is in NOSORT mode:                         *
+   * ----------------------------------                         *
+   * Compare current ACE's position to our given relative       *
+   * ACE position. If it matches, handle the insert processing. *
+   * If we didn't find the relative position, we exit with err. *
+   *                                                            *
+   * If the resource is SORTED:                                 *
+   * --------------------------                                 *
+   * Add the new ACE as the last entry, after all existing ACEs *
+   **************************************************************/
+   iterate = TRUE;
+
+   num_rules = 0;
+
+   ace_added = FALSE;
+
+   while (iterate)
+   {
+     insert_after = FALSE;
+
+     /***********************************************************
+     * 1st case: NOSORT, new ACE was requested to be first      *
+     ************************************************************/
+     if ((h->Current_ACE_Pos EQ 0) AND
+         (NOT rule_sorted) AND
+         (NOT ace_added) AND
+         (ace_place EQ ACE_POS_FIRST))
+     {
+       rc = Build_Rule_Entry (new_ace,
+                              new_addinfo,
+                              res_params->restype,
+                              rule_file,
+                              msgs,
+                              dest);
+       if (rc NE ESA_OK)
+         goto build_failed;
+
+       ace_added = TRUE;
+     };
+
+     ADDINFO_clear(ace_addinfo);
+
+     rc = ACF2_Get_Resource(real_resource,                /* WS2358 */
+                            ACF2_Object_is_Not_Masked,
+                            res_params->restype,
+                            ACF2_Return_Rule_Entries,
+                            h,
+                            NULL,                         /* WS2333 */
+                            current_key,
+                            &curr_ace,
+                            ace_addinfo,
+                            errmsg,
+                            admin_params);
+
+     switch(rc)
+     {
+        case ACF2_OK:
+          break;
+
+        case ACF2_Not_Found:
+          /* IS10122 - start */
+          if ( strcmp(errmsg, ACF2_ROLESET_IGNORED_MSG) EQ 0 )
+            CTSAMSG_print(ACF2_RES_ROLESET_IGNORED, msgs, NULL, dest,
+                          real_resource, res_params->restype);
+          else
+          /* IS10122 - end */
+            CTSAMSG_print(ERR_RES_NOT_EXIST, msgs, NULL, dest,
+                          real_resource);                  /* WS2358 */
+          rc = ESA_FATAL;
+          goto exit;
+
+        default:
+          sprintf(msg,"Get ResACL fail res=%s rc=%d msg=%s",
+                    real_resource, rc, errmsg);           /* WS2358 */
+          CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,
+                 func, msg, 16,__LINE__);
+          rc = ESA_FATAL;
+          goto exit;
+     }
+
+     if (strcmp (errmsg, "NO MORE ACES") EQ 0)
+       iterate = FALSE;
+     else
+     {
+       /*********************************************************
+       * 2nd case: NOSORT, new ACE should be in the middle      *
+       **********************************************************/
+       if ((NOT rule_sorted) AND (ace_place NE ACE_POS_FIRST) AND
+           (ace_place NE ACE_POS_LAST) AND (NOT ace_added))
+       {
+         /*******************************************************
+         * Is current ACE the one specified as RELATIVE ?       *
+         ********************************************************/
+         if (ACES_Match (&curr_ace,
+                         ace_addinfo,
+                         rel_ace,
+                         filtered_addinfo))
+         {
+           if (ace_place EQ ACE_POS_BEFORE)
+           {
+             rc = Build_Rule_Entry (new_ace,
+                                    new_addinfo,
+                                    res_params->restype,
+                                    rule_file,
+                                    msgs,
+                                    dest);
+             if (rc NE ESA_OK)
+               goto build_failed;
+
+             ace_added = TRUE;
+           }
+           else
+             insert_after = TRUE;
+         };
+       };
+
+       rc = Build_Rule_Entry (&curr_ace,
+                              ace_addinfo,
+                              res_params->restype,
+                              rule_file,
+                              msgs,
+                              dest);
+       if (rc NE ESA_OK)
+         goto build_failed;
+
+       if (insert_after)
+       {
+         rc = Build_Rule_Entry (new_ace,
+                                new_addinfo,
+                                res_params->restype,
+                                rule_file,
+                                msgs,
+                                dest);
+         if (rc NE ESA_OK)
+           goto build_failed;
+
+         insert_after = FALSE;
+         ace_added = TRUE;
+       };
+     };
+     num_rules++;
+   }; /* main while loop */
+
+   /*************************************************************
+   * 3rd case:                                                  *
+   * If the resource is sorted, or the relative place is LAST   *
+   * we add the new ACE in the end                              *
+   **************************************************************/
+   if ((rule_sorted) OR
+       (NOT rule_sorted AND ace_place EQ ACE_POS_LAST))
+   {
+     rc = Build_Rule_Entry (new_ace,
+                            new_addinfo,
+                            res_params->restype,
+                            rule_file,
+                            msgs,
+                            dest);
+     if (rc NE ESA_OK)
+       goto build_failed;
+
+     ace_added = TRUE;
+   };
+
+   if ((NOT rule_sorted) AND (NOT ace_added))
+   {
+     CTSAMSG_print(ERR_ACE_REL_NOT_FOUND, msgs, NULL, dest,
+                   real_resource);                        /* WS2358 */
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+ backup_rule:;                                            /* WS2358 */
+
+   fclose (rule_file);
+   rule_file = NULL;
+
+   /*************************************************************
+   * Back up the rule before updating it                        *
+   **************************************************************/
+   rc = Rule_Backup ("ADDACE",
+                     real_resource,                       /* WS2358 */
+                     res_params -> restype,
+                     admin_params);
+
+   if (rc NE ESA_OK)
+     goto exit;
+
+   /*************************************************************
+   * Compile the ruleset and store it                           *
+   **************************************************************/
+   num_rules = num_rules + 50;
+
+   rc = Compile_Ruleset (real_resource,                   /* WS2358 */
+                         res_params->restype,
+                         ACF2_Replace_Rule,
+                         num_rules,
+                         obj_buffer,
+                         errmsg,
+                         admin_params);                   /* PS0347 */
+
+   if (rc NE ESA_OK)
+   {
+     if (rc EQ ESA_ERR)
+     {
+       CTSAMSG_print(ERR_RES_NOT_EXIST, msgs, NULL, dest,
+                     real_resource);                      /* WS2358 */
+     }
+     else
+     {
+       if (strcmp (errmsg, "ACF2 Compiler Error") NE 0)
+       {
+         sprintf(msg,"Add ACE fail res=%s msg=%s",
+                   real_resource, errmsg);                /* WS2358 */
+         CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,
+                func, msg, 16,__LINE__);
+       };
+     };
+
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+  goto exit;
+
+  /*
+   *   Finish
+   */
+
+  build_failed:;
+   rc = ESA_FATAL;
+
+   exit:;
+
+   /* WS2358 */
+   if (automate)
+     if (rc EQ ESA_OK)
+       CTSAMSG_print(ACF2_ARI_ENDED, msgs, NULL, dest);
+     else
+       CTSAMSG_print(ACF2_ARI_FAILED, msgs, NULL, dest);
+
+   if (rule_file NE NULL)
+     fclose (rule_file);
+
+   /* WS2358 */
+   if (KEYs_list NE NULL)
+     free (KEYs_list);
+
+   /* WS2358 */
+   if (nextkeys_list NE NULL)
+     free (nextkeys_list);
+
+   if (obj_buffer NE NULL)
+     free (obj_buffer);
+
+   if (h NE NULL)
+   {
+     if (h->Rule_Buffer NE NULL)
+       free(h->Rule_Buffer);
+
+     free(h);
+   };
+
+   if (ace_addinfo NE NULL)
+    ADDINFO_free(&ace_addinfo);
+
+   if (filtered_addinfo NE NULL)
+    ADDINFO_free(&filtered_addinfo);
+
+   /* WS2358 */
+   if (ARI_addinfo NE NULL)
+    ADDINFO_free(&ARI_addinfo);
+
+   if (laddinfo NE NULL)
+    ADDINFO_free(&laddinfo);
+
+   ESA_DIAG_exit(ESA_COMP_ADDACE, 1, func, rc);
+
+   return rc;
+
+ }

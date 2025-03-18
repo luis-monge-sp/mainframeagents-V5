@@ -1,0 +1,1443 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : get user to group connections (ACF2)     *
+ *                                                             *
+ * File Name        : ctsbgcn.c                                *
+ *                                                             *
+ * Author           : Yishay Yovel                             *
+ *                                                             *
+ * Creation Date    : 20/07/97                                 *
+ *                                                             *
+ * Description      : Get User to Group Connections            *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ * - ACF2 has no builtin group entity. A group is a logical    *
+ *   entitiy encapsulating a set of uidmasks. A user is        *
+ *   connected to a group if its UID string matches ANY of the *
+ *   uidmasks associated with a group.                         *
+ *                                                             *
+ * - All the different User-Group Connections are derived from *
+ *   a basic loop on ACF2 User's DB (unless GET_MANY_CONNS)    *
+ *                                                             *
+ * - In order to boost GET_GROUP_CONNS and GET_ALL_CONNS, all  *
+ *   groups relevant to processing are being loaded into       *
+ *   in-core storage table (UT).                               *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------- -------------------------------- *
+ * BS2306   Guy      27/10/97 Added new constant for group_uid *
+ *                            and dest+msgs prms to some funcs *
+ * PS0339   Guy      26/11/98 Return connections of all user   *
+ *                            UIDs if MULTI VALUED             *
+ * ws2431   Michael  22/11/01 Send connection updates for ACF2 *
+ * BS2556   AvnerL   14/10/02 send acf2 original error msg     *
+ * SAS2IBMA AvnerL   17/07/16 SAS/C to IBM/C                   *
+ * BS10061  SeligT   24/08/17 Resolving full aggregation       *
+ *                            performance problem after CIQ#6  *
+ *                            (in CTSBGUS)                     *
+ * BS10097  SeligT   19/11/18 ACF2 Group Aggregation Endless   *
+ *                            Loop.  The problem was solved by *
+ *                            Nurit.  We now allow group names *
+ *                            to end with a trailing blank.    *
+ * IS10177A SeligT   12/12/18 Enhance ACF2 Account Aggregation *
+ *                            Performance (by modifying the    *
+ *                            GET_USERS_CONNS_FAST call to     *
+ *                            get connections from an in-core  *
+ *                            table instead of reading the GDB *
+ *                            file and . . .                   *
+ * IS10177B SeligT   12/12/18              by modifying the    *
+ *                            GET_USERS_CONNS_FAST call to     *
+ *                            get the UID and UIDX field from  *
+ *                            a passed addinfo table instead   *
+ *                            of calling ACF2 and reading the  *
+ *                            UDB file)                        *
+ * IS10178  SeligT   18/12/18 Supporting LID Anywhere in UID   *
+ * WS10076S SeligT   02/01/20 Manage Permissions as Account    *
+ *                            and Group Attributes - Phase 2   *
+ * WS10076A AvnerL   19/01/20 Add admin_params 2 ACF2_Get_Group*
+ * WS10082  MauriC   07/11/22 Recompile for new ADDINFO macros *
+ **************************************************************/
+
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDIO
+ #include   STDLIB
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include   ESA_API
+ #include   ESA_DIAG
+ #include   ESA_CTSAMSG
+ #include   ESA_API_CODES
+
+ #include   API_ADDINFO
+ #include   API_AUTH
+
+ /*
+  *   MVS include files
+  */
+
+ #include   MVS_COMP
+
+ /*
+  *   ACF2 include files
+  */
+
+ #include   ACF2_CODES
+ #include   ACF2
+
+ static char component[]="GTUG2UC" ;
+
+ /*
+  *    Debug level for assembler programs
+  */
+
+ static int debug = 0;
+
+ /*
+  *  Entry Definition of GROUP-UIDMASK table
+  */
+
+ typedef struct {
+   UIDMASK UT_uidmask;
+   UG_typ  UT_ug_name;
+ } UT_entry;
+
+ /*
+  *  Entry Definition of Get Connections Handle
+  */
+ typedef struct {
+   UG_typ                       Current_Group;
+   USER_typ                     Current_User;
+   USER_typ                     Previous_User;            /* BS10061 */
+   UT_entry                     *UT;
+   char                         UID[ACF2_UID_SIZE];
+   char                        *UIDs_List;                /* PS0339 */
+   int                          Current_UG;
+   int                          Current_US;
+   int                          Current_UT;
+   char                        *Current_UID_Pos;          /* PS0339 */
+   int                          Multi_UIDs;               /* PS0339 */
+   ADDINFO_rec_ptr              laddinfo;
+   } ACF2_Get_Conns_Handle;
+
+ /*
+  *  Local Function Definitions
+  */
+
+ static void Build_U2UG(USER_typ ,
+                        UG_typ   ,
+                        U2UG_PARAMS_rec_typ *U2UG);
+
+ /*ws2431 routine ACF2_Get_User_Groups moved to ctsbapi.
+    it is no longer internal*/
+
+ /* PS0339 - New function */
+ static ACF2_API_Return_Codes ACF2_Compare_User_And_Group
+              (char            *UID,
+               UG_typ           Group,
+               char            *UIDs_list,
+               ADDINFO_rec_ptr  laddinfo,
+               ADMIN_PARAMS_rec_typ * admin_params);   /*WS10076A*
+               CTSAMSG_DEST_TABLE_rec_typ *dest,
+               CTSAMSG_HANDLE_rec_typ     *msgs);                */
+
+ static ACF2_API_Return_Codes  Build_UT(short ug_num,
+                                  UG_typ ug[1],
+                                  int      *UT_Entries,
+                                  UT_entry **UT,
+                                  ADDINFO_rec_ptr laddinfo,
+  /*WS10076A*/                    ADMIN_PARAMS_rec_typ * admin_params);
+  /*WS10076A                      CTSAMSG_DEST_TABLE_rec_typ  * dest,
+                                  CTSAMSG_HANDLE_rec_typ      * msgs);
+                           * BS2306 - added dest+msgs parms         */
+
+ static ACF2_API_Return_Codes  Get_UT(char     *uid,
+                                     UT_entry *UT,
+                                     int     *Current_UT,
+                                     UG_typ  Current_UG_Name);
+
+ static void Cleanup(ACF2_Get_Conns_Handle *h,
+                     void **handle,
+                     ADMIN_PARAMS_rec_typ * admin_params,
+                     ERR_STRUCT_rec_typ   * err);
+
+ /*
+  *  Static Variables
+  */
+
+ static int conn_count = 0;
+ static int GDB_Opened = FALSE;
+ static int UDB_Opened = FALSE;
+
+ /****************************************************
+ * Procedure Name: CTSGetConns
+ * Description   : Get user-group to user connections
+ * Input         : mode         - ALL_UGS    - get connections of all
+ *                                             ugs (all users of all
+ *                                             groups)
+ *                                ALL_USERS  - get connections of all
+ *                                             users (same as ALL_UGS
+ *                                             from different angle)
+ *                                MANY_UGS   - get connections of
+ *                                             supplied ugs
+ *                                MANY_USERS - NOT IMPLEMENTED yet
+ *                                MANY_PAIRS - get connections for
+ *                                             supplied pairs.
+ *                 max_conns    - # of elements in ugs,
+ *                                users, objs_exist & addinfo
+ *                                arrays
+ *                 admin_params -
+ *                 num_ugs_in   - # of input ugs
+ *                 num_users_in - # of input users
+ *                 ugs_in - array of num_ugs_in.
+ *                                Caller fills with ugs requested
+ *                                (if not GET_ALL);
+ *                 users_params_in - array of num_users_in.
+ *                                Caller fills with users requested.
+ * Output        : actual_num   - # of connections returned (always 1)
+ *                 have_more    - HAVE_MORE if more conns, else NO_MORE
+ *                 objs_exist   - array of max_conns:
+ *                                OBJ_EXIST if connection exists, else
+ *                                OBJ_NOT_EXIST.
+ *                 addinfo      - array of max_conns:
+ *                                add.info per connection
+ *                 err          - error indication, message, etc.
+ * Input/Output  : handle       - NULL on first call, filled by callee,
+ *                                used by callee to keep track.
+ *                                Freed by caller.
+ * Return Value  : ESA_RC
+ * Side Effects  : Function may allocate memory, return pointer in
+ *                 *handle; Caller MUST free when done.
+ * Comments      : 1. Data is returned as quartets-ug, user, obj_exist,
+ *                    add.info.
+ *
+ ****************************************************/
+
+ ESA_RC CTSGetConns (GET_CONN_MODE          mode,
+                     short                  max_conns,
+                     short                * actual_num,
+                     HAVE_MORE_typ        * have_more,
+                     void                ** handle,
+                     short                  num_ugs_in,
+                     short                  num_users_in,
+                     UG_typ                 ugs_in[1],
+                     USER_typ               users_in[1],
+                     U2UG_PARAMS_rec_typ    u2ug_params[1],
+                     ADDINFO_rec_ptr        addinfo[1],
+                     OBJ_EXISTS_typ         objs_exist[1],
+                     ADMIN_PARAMS_rec_typ * admin_params,
+                     ERR_STRUCT_rec_typ   * err)
+
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                     rc = ESA_OK;
+   ACF2_API_Return_Codes      ACF2_rc = ACF2_OK;
+   CTSAMSG_HANDLE_rec_ptr     msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr dest;
+   USER_typ                   User;
+   UIDMASK                    uidmask_filter = "";
+   char                       multi_field_name[20]="";    /* PS0339 */
+   char                      *entry_pos;                  /* PS0339 */
+   int                        multi_field_offset = 0;     /* PS0339 */
+   int                        UT_Entries = 0;
+   int                        LID_In_UID, LID_Offset;     /* BS10097 */
+   int                        LID_Length;                 /* IS10178 */
+   ACF2_PARAMS_rec_typ      * params_ptr = NULL;          /* BS10097 */
+
+   int i , Iterate = FALSE, Process_New_User = FALSE;
+   int                        Get_UID_UIDX_call2 = FALSE; /* IS10177B*/
+   ONE_FIELD_rec_ptr          pair = NULL;                /* IS10177B*/
+
+   static char                func[]="CTSGetConns";
+
+   ACF2_Get_Conns_Handle *h;
+
+  /*
+   *     Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GTUG2UC, DEBUG_SHOW_IMPORTANT, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   ESA_DIAG_printf(ESA_COMP_GTUG2UC, DEBUG_SHOW_IMPORTANT,
+    "Mode = %d, Num Users = %d, Num UGs = %d, User=%s, Group=%s",
+     mode, num_users_in, num_ugs_in, users_in[0], ugs_in[0]);
+
+  /*
+   *     Allocate Handle, if first call
+   */
+
+   if ( (*handle EQ NULL) AND (mode NE GET_FREE_HANDLE_CONNS) )
+    {
+     ESA_DIAG_printf(ESA_COMP_GTUG2UC, 2,                 /* BS10061 */
+         "Init processing: user(%s) group(%s)",           /* BS10061 */
+         users_in[0], ugs_in[0]);                         /* BS10061 */
+     conn_count = 0;
+     Process_New_User = TRUE;
+     *handle = (void *) calloc (sizeof(ACF2_Get_Conns_Handle), 1);
+     h = (ACF2_Get_Conns_Handle *) *handle;
+
+     h->UIDs_List = (char *) calloc (9600, 1);
+
+     if (h->UIDs_List EQ NULL)
+     {
+      CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+               "UIDs vector alloc failed", 16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+     };
+
+     if (ADDINFO_alloc(func, ACF2_ADDINFO, &(h->laddinfo), dest, msgs)
+                      NE ESA_OK)
+      {
+      CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+               "laddinfo alloc failed", 16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+      };
+
+     /* PS0339 */
+     if (UID_Contains_MULTI(multi_field_name,
+                            &multi_field_offset))
+       h->Multi_UIDs = TRUE;
+     else
+       h->Multi_UIDs = FALSE;
+
+     strcpy(h->Previous_User, users_in[0]);               /* BS10061 */
+
+     if (GDB_Set_Mode(GDB_ReadOnly,admin_params,err) NE GDB_OK)
+      {
+       CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+                "Open GDB for READ failed", 16,__LINE__);
+       rc = ESA_FATAL;
+       goto exit;
+      };
+     GDB_Opened = TRUE;
+
+     if (Global_UDB_Active() EQ TRUE)
+      if (UDB_Set_Mode(UDB_ReadOnly,admin_params,err) NE UDB_OK)
+       {
+        CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+                 "Open UDB for READ failed", 16,__LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+       };
+     UDB_Opened = TRUE;
+    }
+
+   /* * * * BS10061 start * * */
+   /* This is a FastPath-type of initialization. We will not allocate
+      storage and open any files.  We will just clear the storage and
+      leave the files open.  This will improve the performance when
+      we are doing full aggregation with get_connection = 'Y'. (Only
+      after all users are processed, will we free all calloc'ed storage
+      and close all open files by calling this routine with calling
+      mode GET_FREE_HANDLE_CONNS from CTSGetUsers.)                  */
+   else if ((*handle NE NULL) AND (mode EQ GET_USERS_CONNS_FAST)) {
+      h = (ACF2_Get_Conns_Handle *) *handle;
+      ESA_DIAG_printf(ESA_COMP_GTUG2UC, 2,
+          "FastPath Init check: Previous(%s) Current(%s)",
+                          h->Previous_User,users_in[0]);
+      if (strcmp(h->Previous_User, users_in[0]) NE 0)   {
+         strcpy(h->Previous_User, users_in[0]);
+         ESA_DIAG_printf(ESA_COMP_GTUG2UC, 2,
+             "FastPath Init done for User(%s)",users_in[0]);
+         conn_count = 0;
+         Process_New_User = TRUE;
+         h->Current_Group[0] = NULL_CHAR;
+         h->Current_User[0]  = NULL_CHAR;
+         h->UID[0]           = NULL_CHAR;
+         h->UIDs_List[0]     = NULL_CHAR;
+         h->Current_UG       = 0;
+         h->Current_US       = 0;
+         h->Current_UT       = 0;
+         h->Current_UID_Pos  = NULL_CHAR;
+         if (UID_Contains_MULTI(multi_field_name, &multi_field_offset))
+            h->Multi_UIDs = TRUE;
+         else
+            h->Multi_UIDs = FALSE;
+         ADDINFO_empty(h->laddinfo);
+      }
+      else                                                /* IS10177B*/
+         Get_UID_UIDX_call2 = TRUE;                       /* IS10177B*/
+   };
+   /* * * * BS10061 end * * */
+
+   h = (ACF2_Get_Conns_Handle *) *handle;
+
+  /*
+   *     Assume 1 Connection will be returned, more to come
+   */
+
+   *actual_num = 1;
+   *have_more = HAVE_MORE;
+   objs_exist[0] = OBJ_EXIST;
+
+  /*--------------------------------------------------------------
+   * Main Loop: Perform Loop thru entire ACF2 Logon DB
+   *            (for GET_MANY_CONNS this loop has no meaning)
+   ---------------------------------------------------------------*/
+   do
+    {
+    Iterate = FALSE;
+
+    /*--------------------------------------------------------------
+     * Next User: When all connections of the current user where
+     *            returned, read next one (until ACF2 EOF)
+     ---------------------------------------------------------------*/
+    if (Process_New_User EQ TRUE)
+     {
+      /*--------------------------------------------------------------
+       * Setup LID mask for ACF2 DB read
+       * -------------------------------
+       *  "********" - For ALL Users read
+       *  Speicifc User for other calls.
+       ---------------------------------------------------------------*/
+       switch(mode)
+        {
+         case GET_USERS_CONNS:
+         case GET_USERS_CONNS_FAST:                       /* BS10061 */
+           strcpy(User,users_in[h->Current_US]);
+           break;
+         case GET_ALL_CONNS:
+/*SAS2IBMA if ( (h->Current_User[0] EQ NULL) AND (num_users_in EQ 1))*/
+           if ((h->Current_User[0] EQ (char)NULL)AND(num_users_in EQ 1))
+             strcpy(h->Current_User,users_in[0]);
+         default:
+           strcpy(User,"********");
+         };
+
+      /*--------------------------------------------------------------
+       * Get ACF2 User UID field
+       ---------------------------------------------------------------*/
+       h->Current_Group[0] = NULL_CHAR;
+       ADDINFO_empty(h->laddinfo);
+
+       h->Current_UID_Pos = h->UIDs_List;                 /* PS0339 */
+
+       /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * **/
+       /* IS10177B start                                             */
+       /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * **/
+       /* Instead of calling the ACF2_Get_User_UID routine when we
+          are processing the GET_USERS_CONNS_FAST request (in order
+          to get the UID and the UIDs_List (AKA UIDX) fields), we
+          have already saved these fields in addinfo in CTSBGUS
+          before calling this routine.  This will save UDB I/O and
+          a call to ACF2.                                            */
+       if (mode EQ GET_USERS_CONNS_FAST)
+         {
+          h->UIDs_List[0] = NULL_CHAR;
+          /* A user may or may not have a UIDX assigned to it so it  */
+          /* isn't an error if this search returns with pair EQ NULL */
+          pair = ADDINFO_search("UIDX", ACF_ADDINFO_KWD_LEN,
+                                addinfo[0]->pair,
+                                addinfo[0]->num_pairs);
+          if (pair NE NULL)
+            strcpy (h->UIDs_List,pair->value);
+          h->UID[0]       = NULL_CHAR;
+          /* A user must have a UID assigned to it so it is an error */
+          /* if this search returns with pair EQ NULL                */
+          pair = ADDINFO_search("UID", ACF_ADDINFO_KWD_LEN,
+                                addinfo[0]->pair,
+                                addinfo[0]->num_pairs);
+          if (pair NE NULL)
+            strcpy (h->UID,pair->value);
+          else
+            {
+             CTSAMSG_print(ERR_INTERNAL2,msgs,NULL,dest,component,func,
+                      "CTSGetUsers did not pass UID", 16,__LINE__);
+             rc = ESA_FATAL;
+             goto exit;
+            };
+          if (Get_UID_UIDX_call2 EQ FALSE)
+             ACF2_rc = ACF2_OK;
+          else
+             ACF2_rc = ACF2_Not_Found;
+         }
+       else
+       /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * **/
+       /* IS10177B end                                               */
+       /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * **/
+       ACF2_rc = ACF2_Get_User_UID(User,
+                                   h->UID,
+                                   h->Current_User,
+                                   uidmask_filter,
+                                   h->UIDs_List,          /* PS0339 */
+                                   h->laddinfo,
+                                   admin_params);         /*bs2556*/
+
+       switch(ACF2_rc)
+        {
+         case ACF2_OK:
+          ESA_DIAG_printf(ESA_COMP_GTUG2UC, DEBUG_SHOW_IMPORTANT,
+                          "User(%s) UID(%s) UIDs_List(%s)",
+                          h->Current_User,
+                          h->UID,
+                          h->UIDs_List);                  /* PS0339 */
+
+          break;
+
+         /*------------------------------------------------------
+          * ACF2 EOF Condition
+          -------------------------------------------------------*/
+         case ACF2_Not_Found:
+          ESA_DIAG_printf(ESA_COMP_GTUG2UC, DEBUG_SHOW_IMPORTANT,
+                          "ACF2_Not_Found = ACF2 EOF condition");
+          goto No_More_Conns;
+
+         /*------------------------------------------------------
+          * ACF2 DB Read ERROR
+          -------------------------------------------------------*/
+         default:
+        CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+                 "Get User UID failed", 16,__LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+        };
+     };
+
+    /* PS0339 */
+    if ( (h->Multi_UIDs) AND (h->UIDs_List[0] NE NULL_CHAR) )
+    {
+      ESA_DIAG_printf(ESA_COMP_GTUG2UC, DEBUG_SHOW_IMPORTANT,
+                      "Copy current UID from UIDs_List");
+
+      entry_pos = strchr(h->Current_UID_Pos, ADDINFO_LIST_ENTRY);
+
+      if (entry_pos NE NULL)
+        *entry_pos = NULL_CHAR;
+
+      strcpy (h->UID, h->Current_UID_Pos);
+      Trim (h->UID);
+
+      ESA_DIAG_printf(ESA_COMP_GTUG2UC, DEBUG_SHOW_IMPORTANT,
+                      "Current UID is (%s)",
+                      h->UID);
+
+      if (entry_pos NE NULL)
+        *entry_pos = ADDINFO_LIST_ENTRY;
+    };
+
+    switch(mode)
+     {
+/*-------------------------------------------------------------------*/
+/* Get ALL   Conns                                                   */
+/*-------------------------------------------------------------------*/
+     case GET_ALL_CONNS   :
+
+     /*----------------------------------------------------------*/
+     /* Build Group DB in-core table                             */
+     /* ----------------------------                             */
+     /* - Build incore table of GROUP-UIDMASKS pairs             */
+     /* - (-1) in Build_UT means "Read All Groups into storage"  */
+     /*----------------------------------------------------------*/
+       if (h->UT EQ NULL)
+        {
+         h->Current_UT = 0;
+         ADDINFO_empty(h->laddinfo);
+         Build_UT(-1,ugs_in,&UT_Entries,&(h->UT),h->laddinfo,
+      /*WS10076A  dest,msgs);                              * BS2306 */
+                  admin_params);                          /*WS10076A*/
+         if (UT_Entries EQ 0)
+          goto No_More_Conns;
+        };
+
+     /*----------------------------------------------------------*/
+     /* Get Next Matching Group for Current User                 */
+     /* ----------------------------------------                 */
+     /* - Get for incore UIDMASK table, matching UIDMASK         */
+     /*   the Current_UT field in the handle preserves current   */
+     /*   position in UT.                                        */
+     /* - If No UIDMASK is matching, process next UID of user    */
+     /*   and if all UIDs were checked, process next user        */
+     /*----------------------------------------------------------*/
+
+       ACF2_rc = Get_UT(h->UID,
+                        h->UT,
+                        &(h->Current_UT),
+                        h->Current_Group);
+
+       switch(ACF2_rc)
+        {
+         case ACF2_OK:
+          break;
+       /*----------------------------------------------------------*/
+       /* Process Next User UID, or if no more - Next User         */
+       /*----------------------------------------------------------*/
+         case ACF2_Not_Found:
+           h->Current_UT = 0;
+
+           /* PS0339 */
+           if ( (h->Multi_UIDs) AND (h->UIDs_List[0] NE NULL_CHAR) )
+           {
+             entry_pos=strchr(h->Current_UID_Pos, ADDINFO_LIST_ENTRY);
+
+             /* No more UIDs for user? process next user */
+             if (entry_pos EQ NULL)
+               Process_New_User = TRUE;
+             else
+             {
+               h->Current_UID_Pos = entry_pos + 1;
+               Process_New_User = FALSE;
+             };
+           }
+           else
+             Process_New_User = TRUE;
+
+           /* End of PS0339 */
+
+           Iterate = TRUE;
+           goto iterate;
+
+       /*----------------------------------------------------------*/
+       /* UT Processing Error                                      */
+       /*----------------------------------------------------------*/
+         default:
+           rc = ESA_FATAL;
+           goto exit;
+        };
+
+       /*----------------------------------------------------------*/
+       /* Build Connection Object                                  */
+       /*----------------------------------------------------------*/
+        Build_U2UG(h->Current_User, h->Current_Group,
+                   &(u2ug_params[0]));
+
+        REPLACE_ENDING_BLANK(u2ug_params[0].group,
+                             ESA_COMP_GTUG2UC);           /* BS10097 */
+
+      break;
+
+/*-------------------------------------------------------------------*/
+/* Get Group Conns                                                   */
+/*-------------------------------------------------------------------*/
+
+    case GET_GROUPS_CONNS:
+     /*----------------------------------------------------------*/
+     /* Build Group DB in-core table                             */
+     /* ----------------------------                             */
+     /* - Build incore table of GROUP-UIDMASKS pairs             */
+     /* - Build only groups sepcified in calls                   */
+     /* - A performance shortcut: if only one group is requested */
+     /*     and this group has one uidmask, use this uid mask    */
+     /*     to filter user records retrieved from ACF2, thus     */
+     /*     speeding ACF2 Logonid DB read process.               */
+     /*----------------------------------------------------------*/
+       if (h->UT EQ NULL)
+        {
+         h->Current_UT = 0;
+         ADDINFO_empty(h->laddinfo);
+
+         RESTORE_ENDING_BLANK(ugs_in[0],
+                              ESA_COMP_GTUG2UC);          /* BS10097 */
+
+         Build_UT(num_ugs_in,ugs_in,&UT_Entries,&(h->UT),h->laddinfo,
+       /*WS10076A dest,msgs);                              * BS2306 */
+                  admin_params);                          /*WS10076A*/
+         if (UT_Entries EQ 0)
+          goto No_More_Conns;
+
+         /* PS0339 - Fixed */
+         if ( (h->UT)[1].UT_uidmask[0] EQ NULL_CHAR )
+         {
+          strcpy(uidmask_filter,(h->UT)[0].UT_uidmask);
+          ESA_DIAG_printf(ESA_COMP_GTUG2UC, DEBUG_SHOW_IMPORTANT,
+                          "Use Hotpath uidmask filter=(%s)",
+                          uidmask_filter);
+         };
+        };
+
+       ESA_DIAG_printf(ESA_COMP_GTUG2UC, DEBUG_SHOW_IMPORTANT,
+                       "Match UTs for UID (%s)",
+                       h->UID);
+
+       ACF2_rc = Get_UT(h->UID,
+                        h->UT,
+                        &(h->Current_UT),
+                        h->Current_Group);
+
+       switch(ACF2_rc)
+        {
+         case ACF2_OK:
+          ESA_DIAG_printf(ESA_COMP_GTUG2UC, DEBUG_SHOW_IMPORTANT,
+                          "Found connection with user (%s) group (%s)",
+                          h->Current_User, h->Current_Group);
+          break;
+       /*----------------------------------------------------------*/
+       /* Process Next User UID or Next User                       */
+       /*----------------------------------------------------------*/
+         case ACF2_Not_Found:
+           h->Current_UT = 0;
+
+           /* PS0339 */
+           if ( (h->Multi_UIDs) AND (h->UIDs_List[0] NE NULL_CHAR) )
+           {
+             entry_pos=strchr(h->Current_UID_Pos, ADDINFO_LIST_ENTRY);
+
+             /* No more UIDs for user? process next user */
+             if (entry_pos EQ NULL)
+             {
+               ESA_DIAG_printf(ESA_COMP_GTUG2UC, DEBUG_SHOW_IMPORTANT,
+                               "No more UIDs for current user");
+               Process_New_User = TRUE;
+             }
+             else
+             {
+               h->Current_UID_Pos = entry_pos + 1;
+               Process_New_User = FALSE;
+             };
+           }
+           else
+           {
+             ESA_DIAG_printf(ESA_COMP_GTUG2UC, DEBUG_SHOW_IMPORTANT,
+                             "User UID checked. Process next user");
+             Process_New_User = TRUE;
+           };
+
+           /* End of PS0339 */
+
+           Iterate = TRUE;
+           goto iterate;
+
+         default:
+           rc = ESA_FATAL;
+           goto exit;
+        };
+
+       /*----------------------------------------------------------*/
+       /* Build Connection Object                                  */
+       /*----------------------------------------------------------*/
+        Build_U2UG(h->Current_User, h->Current_Group,
+                   &(u2ug_params[0]));
+
+        REPLACE_ENDING_BLANK(u2ug_params[0].group,
+                             ESA_COMP_GTUG2UC);           /* BS10097 */
+
+      break;
+
+/*-------------------------------------------------------------------*/
+/* Get Users Conns                                                   */
+/*-------------------------------------------------------------------*/
+    case GET_USERS_CONNS:
+    case GET_USERS_CONNS_FAST:                            /* BS10061 */
+
+    if (mode EQ GET_USERS_CONNS)                          /* IS10177A*/
+      {                                                   /* IS10177A*/
+      /*----------------------------------------------------------*/
+      /* Get User Groups by reading groups database               */
+      /*----------------------------------------------------------*/
+      ADDINFO_empty(h->laddinfo);
+      rc = ACF2_Get_User_Groups(GDB_Generic_Locate,
+                                h->UID,
+                                h->Current_Group,
+                                h->laddinfo,
+                                admin_params);            /*WS10076A*
+                                dest,                      * BS2306 *
+                                msgs);                     * BS2306 */
+      }                                                   /* IS10177A*/
+    else   /* if (mode EQ GET_USERS_CONNS_FAST)              IS10177A*/
+      /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+      /* IS10177A start                                              */
+      /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+      /* When mode EQ GET_USERS_CONNS_FAST, we (build and) call the
+         UT table in order to get connection info from the (in-core)
+         table instead of reading the GDB file                       */
+      {
+       if (h->UT EQ NULL)
+          {
+           h->Current_UT = 0;
+           ADDINFO_empty(h->laddinfo);
+           Build_UT(-1,ugs_in,&UT_Entries,&(h->UT),h->laddinfo,
+          /*WS10076A dest,msgs); */
+                    admin_params);                      /*WS10076A*/
+           if (UT_Entries EQ 0)
+            goto No_More_Conns;
+          };
+
+       /*----------------------------------------------------------*/
+       /* Get Next Matching Group for Current User                 */
+       /* ----------------------------------------                 */
+       /* - Get matching UIDMASK from incore UIDMASK table.        */
+       /* - The Current_UT field in the handle preserves current   */
+       /*   position in UT.                                        */
+       /* - If No UIDMASK is matching, process next UID of user    */
+       /*   and if all UIDs were checked, process next user        */
+       /*----------------------------------------------------------*/
+
+       rc = Get_UT(h->UID,
+                   h->UT,
+                   &(h->Current_UT),
+                   h->Current_Group);
+      }
+      /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+      /* IS10177A end                                                */
+      /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+      switch(rc)
+       {
+        case ACF2_OK:
+         break;
+
+      /*----------------------------------------------------------*/
+      /* Not found, Process next User UID or next User in         */
+      /* input list                                               */
+      /*----------------------------------------------------------*/
+        case ACF2_Not_Found:
+
+         /* PS0339 */
+         if ( (h->Multi_UIDs) AND (h->UIDs_List[0] NE NULL_CHAR) )
+         {
+           entry_pos=strchr(h->Current_UID_Pos, ADDINFO_LIST_ENTRY);
+
+           /* No more UIDs for user? process next user */
+           if (entry_pos EQ NULL)
+           {
+             ESA_DIAG_printf(ESA_COMP_GTUG2UC, DEBUG_SHOW_IMPORTANT,
+                             "Checked all UIDs. Process next user");
+             Process_New_User = TRUE;
+             (h->Current_US)++;
+             if (h->Current_US > num_users_in)
+               goto No_More_Conns;
+             h->Current_User[0] = NULL_CHAR;
+           }
+           else
+           {
+             h->Current_UID_Pos = entry_pos + 1;
+             Process_New_User = FALSE;
+             /* We reached the end of the groups block but   IS10177A
+                there are additional UIDs to process for     IS10177A
+                the user so. . .                             IS10177A*/
+             if (mode EQ GET_USERS_CONNS_FAST)            /* IS10177A*/
+                h->Current_UT = 0;                        /* IS10177A*/
+           };
+         }
+         else
+         {
+           ESA_DIAG_printf(ESA_COMP_GTUG2UC, DEBUG_SHOW_IMPORTANT,
+                           "Checked User UID. Process next user");
+           Process_New_User = TRUE;
+           (h->Current_US)++;
+           if (h->Current_US > num_users_in)
+             goto No_More_Conns;
+           h->Current_User[0] = NULL_CHAR;
+         };
+
+         /* End of PS0339 */
+
+         Iterate = TRUE;
+         h->Current_Group[0] = NULL_CHAR;
+         goto iterate;
+
+      /*----------------------------------------------------------*/
+      /* GDB Error                                                */
+      /*----------------------------------------------------------*/
+        default:
+         CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+                  "Get User CONNS failed", 16,__LINE__);
+         rc = ESA_FATAL;
+         goto exit;
+       };
+
+      /*----------------------------------------------------------*/
+      /* Build Object                                             */
+      /*----------------------------------------------------------*/
+       Build_U2UG(users_in[h->Current_US], h->Current_Group,
+                  &(u2ug_params[0]));
+
+       REPLACE_ENDING_BLANK(u2ug_params[0].group,
+                            ESA_COMP_GTUG2UC);            /* BS10097 */
+
+      break;
+
+/*-------------------------------------------------------------------*/
+/* Get Many  Conns                                                   */
+/*-------------------------------------------------------------------*/
+    case GET_MANY_CONNS  :
+
+    /*----------------------------------------------------------*/
+    /* Analyze Specific Connection Requested                    */
+    /*----------------------------------------------------------*/
+     for (i=0; i<num_users_in; i++)
+      {
+       /*----------------------------------------------------------*/
+       /* Assume Connection not exist                              */
+       /*----------------------------------------------------------*/
+       RESTORE_ENDING_BLANK(ugs_in[i],
+                            ESA_COMP_GTUG2UC);            /* BS10097 */
+
+       Build_U2UG(users_in[i],ugs_in[i],&(u2ug_params[i]));
+       objs_exist[i] = OBJ_NOT_EXIST;
+
+       /*----------------------------------------------------------*/
+       /* Get User UID                                             */
+       /*----------------------------------------------------------*/
+       ADDINFO_empty(h->laddinfo);
+       h->Current_User[0] = NULL_CHAR;
+       ACF2_rc = ACF2_Get_User_UID(users_in[i],
+                         h->UID,
+                         h->Current_User,
+                         "",
+                         h->UIDs_List,                    /* PS0339 */
+                         h->laddinfo,
+                         admin_params);                   /*bs2556*/
+
+       /*----------------------------------------------------------*/
+       /* If no User exist, process next connection                */
+       /*----------------------------------------------------------*/
+       switch(ACF2_rc)
+        {
+         case ACF2_OK:        break;
+         case ACF2_Not_Found: continue;
+         default:
+          CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+                       "Get User UID failed", 16,__LINE__);
+          rc = ESA_FATAL;
+          goto exit;
+        };
+
+       /*----------------------------------------------------------*/
+       /* Check if connection exists                               */
+       /*----------------------------------------------------------*/
+       ADDINFO_empty(h->laddinfo);
+       ACF2_rc = ACF2_Compare_User_And_Group(h->UID,
+                                             ugs_in[i],
+                                             h->UIDs_List,
+                                             h->laddinfo,
+                                             admin_params);/*WS10076A*
+                                             dest,
+                                             msgs);        * PS0339 */
+
+       /*----------------------------------------------------------*/
+       /* If no connection exist, process next connection          */
+       /*----------------------------------------------------------*/
+       if (ACF2_rc EQ ACF2_OK)
+        objs_exist[i] = OBJ_EXIST;
+
+       REPLACE_ENDING_BLANK(ugs_in[i],
+                            ESA_COMP_GTUG2UC);            /* BS10097 */
+       REPLACE_ENDING_BLANK(u2ug_params[0].group,
+                            ESA_COMP_GTUG2UC);            /* BS10097 */
+      };
+
+      *actual_num = num_users_in;
+      *have_more  = NO_MORE;
+      break;
+
+/*-------------------------------------------------------------------*/
+/* Free Handle                                                       */
+/*-------------------------------------------------------------------*/
+    case GET_FREE_HANDLE_CONNS :
+      ESA_DIAG_printf(ESA_COMP_GTUG2UC, DEBUG_SHOW_IMPORTANT,
+          "GET_FREE_HANDLE_CONNS - calling Cleanup routine");
+      Cleanup(h,handle,admin_params,err);
+      rc = ESA_OK;
+      goto exit;
+
+    default:;
+    }
+
+   iterate:;
+
+ /*-------------------------------------------------------------------*/
+ /* Continue Iterating until loop is broken                           */
+ /*-------------------------------------------------------------------*/
+   } while(Iterate EQ TRUE);
+
+ /*-------------------------------------------------------------------*/
+ /* Connection Returned OK                                            */
+ /*-------------------------------------------------------------------*/
+   conn_count++;
+   ESA_DIAG_printf(ESA_COMP_GTUG2UC, DEBUG_SHOW_IMPORTANT,
+                 "Conn returned: %s<->%s, exist=%d (# %d)",
+                 u2ug_params[0].user, u2ug_params[0].group,
+                 objs_exist[0],conn_count);
+
+   rc = ESA_OK;
+   goto exit;
+
+ /*-------------------------------------------------------------------*/
+ /* No More Connections : Process Completed OK                        */
+ /*-------------------------------------------------------------------*/
+   No_More_Conns:
+
+   ESA_DIAG_printf(ESA_COMP_GTUG2UC, DEBUG_SHOW_IMPORTANT,
+          "No more connections - leaving CTSGetConns routine now");
+   conn_count = 0;
+   *actual_num = 0;
+   *have_more = NO_MORE;
+   rc = ESA_OK;
+
+ /*-------------------------------------------------------------------*/
+ /* Exit Point: Good or Bad                                           */
+ /*-------------------------------------------------------------------*/
+   exit:
+
+   if ( (rc NE ESA_OK) OR (*have_more EQ NO_MORE) )
+      if (mode NE GET_USERS_CONNS_FAST)                   /* BS10061 */
+         Cleanup(h,handle,admin_params,err);
+
+   ESA_DIAG_exit(ESA_COMP_GTUG2UC, DEBUG_SHOW_IMPORTANT, func, rc );
+
+   return rc ;
+ }
+
+/* PS0339 - New function */
+/******************************************************************
+ * Procedure Name: ACF2_Compare_User_And_Group
+ ******************************************************************
+ * Description   : Check if specific user and group are connected
+ *
+ * Input         : UID          - User UID to match group uidmasks
+ *                 group        - group to compare
+ *                 UIDs_list    - if MULTI-VALUE UIDs - list of UIDs
+ *                 laddinfo     - pre-allocated laddinfo
+ *                 ctsamsg stuff
+ *
+ * Return Value  : ACF2_OK        - Connection exists
+ *               : ACF2_Not_Found - Connection does not exist
+ *               : otherwise      - ACF2 Internal Error
+ ******************************************************************/
+ static ACF2_API_Return_Codes ACF2_Compare_User_And_Group
+              (char   *UID,
+               UG_typ  Group,
+               char   *UIDs_list,
+               ADDINFO_rec_ptr laddinfo,
+               ADMIN_PARAMS_rec_typ * admin_params)    /*WS10076A*
+               CTSAMSG_DEST_TABLE_rec_typ  * dest,
+               CTSAMSG_HANDLE_rec_typ      * msgs)               */
+  {
+
+   ACF2_API_Return_Codes ACF2_rc = ACF2_OK;
+   ESA_RC                rc      = ESA_OK;
+   int  i, reason_code = 0;
+   int  Group_UID_Count = 0;
+   UIDMASK  Group_UID[ACF2_MAX_GRP_UIDMASKS];
+   char temp_uids[9600]="";
+   char *current_user_uid;
+   char  entry_sep[2];
+   CTSAMSG_HANDLE_rec_ptr     msgs;                     /*WS10076A*/
+   CTSAMSG_DEST_TABLE_rec_ptr dest;                     /*WS10076A*/
+
+   entry_sep[0] = ADDINFO_LIST_ENTRY;
+   entry_sep[1] = NULL_CHAR;
+
+ /*-------------------------------------------------------------------*/
+ /* Position to Group                                                 */
+ /*-------------------------------------------------------------------*/
+   ADDINFO_empty(laddinfo);
+   ACF2_rc = ACF2_Get_Group(GDB_Exact_Locate,
+                            Group,
+                            laddinfo,
+                            NULL, NULL,                  /* WS10076 */
+                            admin_params);               /* WS10076A*/
+
+   if (ACF2_rc NE ACF2_OK)
+     goto exit;
+
+   /*----------------------------------------------------------*/
+   /* Get Group UIDMASKS                                       */
+   /*----------------------------------------------------------*/
+   rc = ACF2_Get_Group_UIDMASKS(Group,
+                                &Group_UID_Count,
+                                Group_UID,
+                                laddinfo,
+                                &reason_code,
+                                admin_params);            /*WS10076A*
+                                dest,
+                                msgs);                              */
+
+   if (rc NE ESA_OK)
+   {
+     ACF2_rc = ACF2_Internal_Error;
+     goto exit;
+   };
+
+   /*----------------------------------------------------------*/
+   /* Do we have only one UID per user ? (not MULTI VALUE)     */
+   /*----------------------------------------------------------*/
+   if (UIDs_list[0] EQ NULL_CHAR)
+   {
+     /*----------------------------------------------------------*/
+     /* Check Group UIDMASKS against User UID                    */
+     /*----------------------------------------------------------*/
+     for (i=0;i LT Group_UID_Count;i++)
+     {
+       ESA_DIAG_printf(ESA_COMP_GTUG2UC, DEBUG_SHOW_REGULAR,
+                       "UID %d of Group %s is (%s)",
+                       i,Group,Group_UID[i]);
+       if (ACF2_Match_Id_to_Mask(UID_Object,UID,Group_UID[i]) EQ TRUE)
+         goto Group_Found;
+     };
+
+      goto Group_Not_Found;
+   };
+
+   /*----------------------------------------------------------*/
+   /* Handle MULTI-VALUE UIDs                                  */
+   /*----------------------------------------------------------*/
+   strcpy (temp_uids, UIDs_list);
+
+   current_user_uid = strtok (temp_uids, entry_sep);
+
+   while (current_user_uid NE NULL)
+   {
+     ESA_DIAG_printf(ESA_COMP_GTUG2UC, DEBUG_SHOW_IMPORTANT,
+                     "Current User UID is (%s)",
+                     current_user_uid);
+
+     /*----------------------------------------------------------*/
+     /* Check UIDMASKS against current User UID                  */
+     /*----------------------------------------------------------*/
+     for (i=0;i LT Group_UID_Count;i++)
+     {
+       ESA_DIAG_printf(ESA_COMP_GTUG2UC, DEBUG_SHOW_REGULAR,
+                       "UID %d of Group %s is (%s)",
+                       i,Group,Group_UID[i]);
+       if (ACF2_Match_Id_to_Mask(UID_Object,
+                                 current_user_uid,
+                                 Group_UID[i]) EQ TRUE)
+         goto Group_Found;
+     };
+
+     current_user_uid = strtok (NULL, entry_sep);
+   };
+
+   ESA_DIAG_printf(ESA_COMP_GTUG2UC, DEBUG_SHOW_REGULAR,
+                   "No match found between user and group(%s)",
+                   Group);
+
+  /*----------------------------------------------------------*/
+  /* All group DB scanned, no connection found                */
+  /*----------------------------------------------------------*/
+  Group_Not_Found:
+   ACF2_rc = ACF2_Not_Found;
+   goto exit;
+
+  /*----------------------------------------------------------*/
+  /* Connection Found                                         */
+  /*----------------------------------------------------------*/
+  Group_Found:
+   ACF2_rc = ACF2_OK;
+   goto exit;
+
+  exit:;
+   return ACF2_rc;
+ }
+ /* End of PS0339 */
+
+/******************************************************************
+ * Procedure Name: Build_UT
+ ******************************************************************
+ * Description   : Build Incore table (UT) of UIDMASK<->Group pairs
+ *                 Mode 1: Supply UG vector of intersting groups
+ *                 Mode 2: Read Entire GDB into memory
+ *
+ * Input         : ug_num       : entries in UG vector
+ *                                if <0, Build All Groups
+ *                 ug           : interesting ug vec
+ *                 laddinfo     - pre-allocated laddinfo
+ *                 ctsamsg stuff
+ *
+ * Output        : UT_p         : Pointer to In-Core Table
+ *
+ * Return Value  : ACF2_OK        - Table Built
+ *               : otherwise      - Table Built Error
+ *
+ * Special Considerations: UT is expanding automatically as entries
+ *                         are being added to it
+ ******************************************************************/
+static ACF2_API_Return_Codes  Build_UT(short ug_num,
+                                  UG_typ ug[1],
+                                  int     *UT_Entries,
+                                  UT_entry **UT_p,
+                                  ADDINFO_rec_ptr laddinfo,
+  /*WS10076A*/                    ADMIN_PARAMS_rec_typ * admin_params)
+  /*WS10076A                      CTSAMSG_DEST_TABLE_rec_typ  * dest,
+                                  CTSAMSG_HANDLE_rec_typ      * msgs)
+                           * BS2306 - added dest+msgs parms         */
+{
+ ACF2_API_Return_Codes ACF2_rc = ACF2_OK;
+ ESA_RC                rc = ESA_OK;
+
+ int i=0 , j=0, Group_UID_Count = 0, reason_code = 0;
+
+ int UT_size = 100, UT_index = 0;
+
+ UIDMASK  Group_UID[ACF2_MAX_GRP_UIDMASKS];               /* BS2306 */
+ UT_entry              *UT;
+ UG_typ                Current_Group = "";
+ static char func[] = "Build_UT";                       /*WS10076A*/
+ CTSAMSG_HANDLE_rec_ptr     msgs;                       /*WS10076A*/
+ CTSAMSG_DEST_TABLE_rec_ptr dest;                       /*WS10076A*/
+
+ ESA_DIAG_enter(PLT_COMP_API_ACF2, 2, func);            /*WS10076A*/
+ msgs = admin_params->ctsamsg_handle;                   /*WS10076A*/
+ dest = admin_params->ctsamsg_dest;                     /*WS10076A*/
+  /*----------------------------------------------------------*/
+  /* Initially allocate UT                                    */
+  /*----------------------------------------------------------*/
+  (*UT_p) = (UT_entry *) calloc(sizeof(UT_entry)*UT_size,1);
+  UT = (*UT_p);
+
+
+ ADDINFO_empty(laddinfo);
+
+  /*----------------------------------------------------------*/
+  /* According to mode: Get Next group from GDB of from UG Vec*/
+  /*----------------------------------------------------------*/
+ if (ug_num LT 0)
+  {
+   ACF2_rc = ACF2_Get_Group(GDB_Generic_Locate,
+                      Current_Group,
+                      laddinfo,
+                      NULL, NULL,                        /* WS10076 */
+                      admin_params);                     /* WS10076A*/
+  }
+ else
+   strcpy(Current_Group,ug[i]);
+
+  /*----------------------------------------------------------*/
+  /* Loop thru all UGs                                        */
+  /*----------------------------------------------------------*/
+ while(ACF2_rc EQ ACF2_OK)
+  {
+  /*----------------------------------------------------------*/
+  /* Get UG UIDMASKS                                          */
+  /*----------------------------------------------------------*/
+    rc = ACF2_Get_Group_UIDMASKS(Current_Group,
+                                 &Group_UID_Count,
+                                 Group_UID,
+                                 laddinfo,
+                                 &reason_code,
+                                 admin_params);           /*WS10076A*
+                                 dest,                     * BS2306 *
+                                 msgs);                    * BS2306 */
+
+    if (rc NE ESA_OK)
+     {
+      switch(reason_code)
+       {
+        case 8: goto Next_Group;
+        default:
+          ACF2_rc = ACF2_Internal_Error;
+          goto exit;
+        };
+     };
+
+  /*----------------------------------------------------------*/
+  /* Insert UG<->UIDMASK pairs into UT                        */
+  /*----------------------------------------------------------*/
+    for (j=0;j LT Group_UID_Count;j++)
+     {
+      if (UT_index EQ UT_size)
+       {
+        UT_size += UT_size;
+        (*UT_p) = realloc(UT,sizeof(UT_entry)*UT_size);
+        UT = *UT_p;
+       };
+      strcpy(UT[UT_index].UT_uidmask,Group_UID[j]);
+      strcpy(UT[UT_index].UT_ug_name,Current_Group);
+      UT_index++;
+     };
+
+  /*----------------------------------------------------------*/
+  /* Process Next Group                                       */
+  /*----------------------------------------------------------*/
+ Next_Group:;
+
+ i++;
+
+ ADDINFO_empty(laddinfo);
+
+ if (ug_num LT 0)
+  {
+   ACF2_rc = ACF2_Get_Group(GDB_Next_Locate,
+                      Current_Group,
+                      laddinfo,
+                      NULL, NULL,                        /* WS10076 */
+                      admin_params);                     /* WS10076A*/
+  }
+ else
+  if (i LT ug_num)
+   strcpy(Current_Group,ug[i]);
+  else
+   break;
+
+ };
+
+  /*----------------------------------------------------------*/
+  /* Mark Last Entry of UT with NULL_CHAR                     */
+  /*----------------------------------------------------------*/
+ UT[UT_index].UT_uidmask[0] = NULL_CHAR;
+
+ exit:
+  *UT_Entries = UT_index;
+  ESA_DIAG_exit(PLT_COMP_API_ACF2, 2, func, ACF2_rc);      /*WS10076S*/
+  return ACF2_rc;
+}
+
+/******************************************************************
+ * Procedure Name: Get_UT
+ ******************************************************************
+ * Description   : Get an entry from UT table matching parm UID.
+ *
+ *                 - If positioned to an entry within UT, scan from
+ *                   there on.
+ *                 - If end of UT reached return ACF2_Not_Found.
+ *
+ * Input         : UID          - UID to match with UT entries.
+ *                 UT           - UT table pointer.
+ *
+ * Output        : Current_UG_Name - Matching Group
+ *
+ * Input/Output  : Current_UT     - UT entry to continue processing
+ *
+ * Return Value  : ACF2_OK        - Matching Group Found
+ *               : ACF2_Not_Found - Matching Group Not Found
+ *               : otherwise      - ACF2 Internal Error
+ *
+ * Comment       : After processing, Current_UT points to NEXT entry
+ *                 and not Matched entry (opposed to ACF2 GetNext
+ *                 logic).
+ ******************************************************************/
+static ACF2_API_Return_Codes  Get_UT(char     *uid,
+                                     UT_entry *UT,
+                                     int      *Current_UT,
+                                     UG_typ   Current_UG_Name)
+{
+ static char func[] = "Get_UT";
+
+ ACF2_API_Return_Codes ACF2_rc = ACF2_OK;
+
+ ESA_DIAG_enter(PLT_COMP_API_ACF2, DEBUG_SHOW_ALL, func);
+
+ /*----------------------------------------------------------*/
+ /* Scan from Current_UT entry to end of UT                  */
+ /*----------------------------------------------------------*/
+ while (UT[*Current_UT].UT_uidmask[0] NE NULL_CHAR)
+  {
+   /*----------------------------------------------------------*/
+   /* Match UIDMASK in UT with parm UID                        */
+   /*----------------------------------------------------------*/
+   if (ACF2_Match_Id_to_Mask(UID_Object,uid,UT[*Current_UT].UT_uidmask)
+          EQ TRUE)
+     {
+     strcpy(Current_UG_Name,UT[*Current_UT].UT_ug_name);
+     (*Current_UT)++;
+     goto exit;
+     };
+     (*Current_UT)++;
+  };
+
+ ACF2_rc = ACF2_Not_Found;
+
+ exit:;
+
+ ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_ALL, func, ACF2_rc);
+
+ return ACF2_rc;
+}
+
+/******************************************************************
+ * Procedure Name: Build_U2UG
+ ******************************************************************
+ * Description   : Build User-to_Group Connection object
+ *
+ * Input         : User         - User in connection
+ *               : Group        - Group In connection
+ *
+ * Output        : U2UG         - Connection Structure
+ *
+ * Return Value  : None
+ ******************************************************************/
+static void Build_U2UG(USER_typ User,
+                       UG_typ   Group,
+                       U2UG_PARAMS_rec_typ *U2UG)
+{
+  static char func[] = "Build_U2UG";
+
+  ESA_DIAG_enter(PLT_COMP_API_ACF2, DEBUG_SHOW_ALL, func);
+
+  /*----------------------------------------------------------*/
+  /* Set User & Group                                         */
+  /*----------------------------------------------------------*/
+  strcpy(U2UG->user,Trim(User));
+  /* BS10097 strcpy(U2UG->group,Trim(Group));                        */
+  strcpy(U2UG->group,Group);                              /* BS10097 */
+
+  /*----------------------------------------------------------*/
+  /* Set Connection Attributes (defaults, No ACF2 meaning)    */
+  /*----------------------------------------------------------*/
+  U2UG->u2ug_admin_data = U2UG_ADM_NONE;
+  U2UG->u2ug_attr_data = U2UG_ATTR_REGULAR;
+  strcpy(U2UG->def_group,"");
+
+  ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_ALL, func, ACF2_OK);
+}
+
+/******************************************************************
+ * Procedure Name: Cleanup
+ ******************************************************************
+ * Description   : Perform API Handle cleanup
+ *
+ * Input         : h            - handle strcuture pointer
+ *                 handle       - API handle paramter
+ *
+ * Return Value  : None.
+ ******************************************************************/
+static void Cleanup(ACF2_Get_Conns_Handle *h,
+                    void **handle,
+                    ADMIN_PARAMS_rec_typ * admin_params,
+                    ERR_STRUCT_rec_typ   * err)
+{
+  static char                func[]="Cleanup";            /* BS10061 */
+  *handle = NULL;
+  ESA_DIAG_enter(ESA_COMP_GTUG2UC,DEBUG_SHOW_IMPORTANT,func);/*BS10061*/
+
+  if (h NE NULL)
+   {
+    if (h->UIDs_List NE NULL)                             /* PS0339 */
+      free(h->UIDs_List);                                 /* PS0339 */
+
+    ADDINFO_free(&(h->laddinfo));
+
+    if (h->UT NE NULL)
+     free(h->UT);
+
+    free(h);
+   };
+
+  if (GDB_Opened EQ TRUE)
+   {
+    GDB_Set_Mode(GDB_Closed,admin_params,err);
+    GDB_Opened = FALSE;
+   };
+
+  if (UDB_Opened EQ TRUE)
+   {
+    UDB_Set_Mode(UDB_Closed,admin_params,err);
+    UDB_Opened = FALSE;
+   };
+
+  conn_count = 0;
+  ESA_DIAG_exit(ESA_COMP_GTUG2UC, DEBUG_SHOW_IMPORTANT, func, ACF2_OK);
+                                                          /* BS10061 */
+}

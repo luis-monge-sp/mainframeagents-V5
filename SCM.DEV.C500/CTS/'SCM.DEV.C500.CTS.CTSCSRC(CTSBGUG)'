@@ -1,0 +1,4155 @@
+/**************************************************************
+*                                                             *
+* Title            : Get Group information (ACF2)             *
+*                                                             *
+* File Name        : ctsbgug.c                                *
+*                                                             *
+* Author           : Yishay Yovel                             *
+*                                                             *
+* Creation Date    : 20/07/97                                 *
+*                                                             *
+* Description      :                                          *
+*                                                             *
+* Assumptions and                                             *
+*   Considerations : ACF2 has no builtin Group entity. The    *
+*                    API implememted group is combined of     *
+*                    logical group name and one or more       *
+*                    uidmasks. These entites are kept in a    *
+*                    special API database called GDB.         *
+**************************************************************/
+
+/**************************************************************
+* Mod.Id   Who          When     Description                  *
+* -------- --------  -------  ------------------------------- *
+* PS0364   Guy      24/12/98 Remove EMULATE stuff             *
+* WS10062  SeligT   26/10/17 Refresh GDB At Start of Group    *
+*                            Aggregation                      *
+* WS10067  SeligT   22/01/18 Update GDB dynamically when      *
+*                            access or resource rules are     *
+*                            added/modified                   *
+* BS10091  SeligT   28/06/18 Opening GDB Twice With 1 Close   *
+*                            So ACF2 Group Aggregation Hangs  *
+* BS10093  SeligT   12/08/18 Add and Delete Group Functions   *
+*                            Not Working After CCID BS10091   *
+* BS10097  SeligT   19/11/18 ACF2 Group Aggregation Endless   *
+*                            Loop                             *
+* IS10178  SeligT   18/12/18 Supporting LID Anywhere in UID   *
+* WS10076S SeligT   05/11/19 Manage Permissions as Account    *
+*                            and Group Attributes - Phase 2   *
+* WS10076A AvnerL   19/01/19 Add admin_params 2 ACF2_Get_Group*
+* WS10078KG KailasP 23/04/20 Add support for Roles & Sources  *
+* WS10078S SeligT   19/05/20 Trying to find storage leak      *
+* BS10105  NuritY   28/06/20 EOF is not handled correctly for *
+*                            permission, roles and sources.   *
+* BS10108  NuritY   09/09/20 1. Prevent duplicate messages.   *
+*                            2. Move XREF routine to CTSBSRV. *
+* BS10108T ThomaS   02/10/20 1. Replace parsing code          *
+*                               that determines GROUP or not  *
+*                               with Parse_Xref_Record.       *
+*                            2. Support #is#multi#rec         *
+*                            3. Issue CTS3891I if the role    *
+*                               has no permissions at all     *
+* BS10110T ThomaS   15/11/20 Remove CTS3891I and issue diag   *
+*                            instead                          *
+* WS10079K KailasP  18/11/20 Move routine ACF2_Get_Xref to    *
+*                            CTSBSRV                          *
+* WS10079T ThomaS   03/01/21 JPMC phase2                      *
+* BS10111  NuritY   16/12/20 Support ruob above the bar.      *
+* BS10113  NuritY   16/03/21 Fix xref record length calc.     *
+* WS10084  ThomaS   30/06/23 Repalce ACFRPTRX
+* WS10082  MauriC   07/11/22 Recompile for new ADDINFO macros *
+* IS10189  AvnerL   05/11/24 Storage free issues corrections  *
+**************************************************************/
+
+#include   <globs.h>
+
+/*
+ *   Standard include files
+ */
+
+#include   STDIO
+#include   STDLIB
+#include   STRING
+
+/*
+ *   ESA include files
+ */
+
+#include   ESA_API
+#include   ESA_DIAG
+#include   ESA_CTSAMSG
+#include   ESA_API_CODES
+
+#include   API_AUTH
+#include   API_ADDINFO
+
+#include   MVS_COMP
+#include   MVS_OS_CLI
+#include   MVS_CODES                                     /* BS10108T */
+#include   ACF2_CODES
+#include   ACF2
+
+ASM_RTN_TYP           cts2ver;                           /* WS10078T */
+
+static char   component[]="GETUGS" ;
+/* WS10067 static char end_marker[]="UID(f)";             // WS10062 */
+/* WS10067 static int  LID_In_UID, LID_Offset, LID_Length;// WS10062 */
+/* WS10067 #define LRECL   133                            // WS10062 */
+/* WS10067 #define BLKSIZE 1330                           // WS10062 */
+
+ typedef struct {
+   UG_typ                       Current_Group;
+   int                          Current_Group_ptr;
+   ADDINFO_rec_ptr              laddinfo;
+   int    refresh_gdb;                                    /* WS10076 */
+   int    with_perm;                                      /* WS10076 */
+   struct PBhandle            * ptr_2_PBhandle;           /* WS10076 */
+   } ACF2_Get_Groups_Handle;
+
+
+ /* WS10079T - start */
+ typedef struct {
+   void                      * getxref_handle;            /* WS10079N */
+   XBhandle_rec_typ            xbhandle;
+   LID_PERM_handle_rec_typ     lid_perm_handle;
+   char                        Permissions_neededYN;
+   } ACF2_Get_RoleSource_Handle;
+
+ typedef struct {
+   char                         type[4];  /* handle type GRP/XRF */
+   union
+    {
+     ACF2_Get_Groups_Handle     g_h;
+     ACF2_Get_RoleSource_Handle rs_h;
+    };
+   PB_Build_Request_typ    * PB_Req;                       /* WS10084 */
+   } ACF2_GetUG_Handle;
+ /* WS10079T - end   */
+
+/* WS10079T - start  the handle has changed and moved to CTSBACF
+/@ WS10078KG - Start @/
+ typedef struct {
+   REXX@UTL_output_blk_rec_typ * pruob;
+   Get_XREF_Rec_Handle         * h;
+   LID_PERM_handle_rec_typ     * lid_perm_handle;
+   int                           with_perm;
+   char                          recparm[9];
+   } ACF2_Get_Xref_Handle;
+/@ This is temporary.The handle should be defined in CTSCCLI CMAC@/
+   WS10079 - end */
+
+/* BS10113 #define OUTPUT_AREA_LEN 16384 /@ copied from CTSBPHR @/ */
+/* WS10078KG - end */
+
+/* WS10067 These 3 routines were moved to module CTSBSRV.
+ static ESA_RC ACF2_Refresh_GDB(                          // WS10062 //
+                    ADMIN_PARAMS_rec_typ * admin_params,  // WS10062 //
+                    ERR_STRUCT_rec_typ   * err);          // WS10062 //
+
+ static ACF2_API_Return_Codes ACF2_Clean_GDB(void);       // WS10062 //
+
+ static ESA_RC find_groups(                               // WS10062 //
+                    char          * buffer,               // WS10062 //
+                    ADDINFO_rec_ptr caddinfo,             // WS10062 //
+                    ADMIN_PARAMS_rec_typ * admin_params); // WS10062 */
+
+ static ESA_RC Build_Group_Object(
+                        UG_typ                group,
+                        UG_PARAMS_rec_ptr     ug_params,
+                        ADDINFO_rec_ptr       addinfo,
+                        ADDINFO_rec_ptr       laddinfo,
+                        CTSAMSG_HANDLE_rec_typ     * msgs,
+                        CTSAMSG_DEST_TABLE_rec_typ * dest);
+
+static void Cleanup(/* ACF2_Get_Groups_Handle *h,         WS10079T */
+                    void **handle,
+                    ADMIN_PARAMS_rec_typ * admin_params,
+                    ERR_STRUCT_rec_typ   * err);
+
+ /* WS10079K - Move ACF2_Get_Xref to CTSBSRV */
+ /*
+ /@ WS10078KG - Start @/
+static ACF2_API_Return_Codes ACF2_Get_Xref(
+                        GET_GROUP_MODE          mode,
+                        UG_PARAMS_rec_ptr       ug_params,
+                        ADDINFO_rec_ptr         addinfo,
+                        ACF2_Get_Xref_Handle  * xref_handle,
+                        ADMIN_PARAMS_rec_typ  * admin_params);
+ /@ WS10078KG - End @/
+ /* WS10079K - End */
+ /*      start WS10078TG                                              */
+ /* BS10108 - routine was changed to be external and moved to CTSBSRV
+static   ESA_RC Parse_XREF_Record(
+                            UG_PARAMS_rec_ptr       ug_params,
+                            ADDINFO_rec_ptr         addinfo,
+                            char                  * xref_record,
+                            ADMIN_PARAMS_rec_typ  * admin_params);
+ /*  End of moved code - BS10108 */
+
+static   ESA_RC Get_ROLE_Permissions(
+                            char                    * LID,
+             /* WS10084     LID_PERM_handle_rec_typ * lid_perm_handle,*/
+             /* WS10084 */  PB_Build_Request_typ    * PB_Req,
+                            ADDINFO_rec_ptr           addinfo,
+                            char                    * call_type,
+                            ADMIN_PARAMS_rec_typ    * admin_params);
+ /*      End   WS10078TG                                              */
+
+static int group_count = 0;
+
+static int GDB_Opened = FALSE;
+
+/*********************************************************************
+*
+* Function      : CTSGetUgs
+*
+* Description   : Get one, two, many or all user groups
+*
+* Input         : mode         - ALL,
+*                                MANY (or one),
+*                                WILD (wildcard - not implemented).
+*                 max_ugs      - # of elements in ug_params & addinfo
+*                                arrays.
+*                 num_ugs_in   - # of elements in ug_params_in.
+*                 ug_params_in - array of num_ugs_in, filled with
+*                                ugs requested.
+*                 admin_params -
+*
+* Output        : actual_num   - # of ugs returned.
+*                 have_more    - HAVE_MORE if more ugs, else NO_MORE.
+*                 err          - error indication, message, etc.
+*                 objs_exist   - array of max_ugs:
+*                                OBJ_EXIST if ug exists, else
+*                                OBJ_NOT_EXIST.
+*                 ug_params    - array of max_ugs:
+*                                callee fills with groups returned.
+*
+* Input/Output  : addinfo      - array of max_Groups pointers:
+*                                add.info per group, Caller puts
+*                                requested keywords, callee returns
+*                                actual add.info.
+*                 handle       - NULL on first call, filled by callee,
+*                                used by callee to keep track.
+*                                Freed by caller.
+*
+* Return Value  : ESA_RC
+*
+* Side Effects  : Callee allocates handle; Caller MUST free when done.
+*
+* Comments      : Caller must reset I/O params to their initial values
+*                 when using subsequent calls (if HAVE_MORE).
+*
+* Scope         : Global
+*
+*********************************************************************/
+
+ESA_RC CTSGetUGs (GET_GROUP_MODE         mode,
+                  OE_typ                 oe,
+                  short                  max_ugs,
+                  short                * actual_num,
+                  HAVE_MORE_typ        * have_more,
+                  void                ** handle,
+                  short                  num_ugs_in,
+                  UG_PARAMS_rec_typ      ug_params_in[1],
+                  UG_PARAMS_rec_typ      ug_params[1],
+                  ADDINFO_rec_ptr        addinfo[1],
+                  OBJ_EXISTS_typ         objs_exist[1],
+                  ADMIN_PARAMS_rec_typ * admin_params,
+                  ERR_STRUCT_rec_typ   * err)
+{
+
+ static char func[]="CTSGetUGs";
+
+/*
+ *    Variables
+ */
+
+ ESA_RC rc = ESA_OK ;
+ PERM_BLK_UID_rec_typ  * Save_curUIDinPB = NULL;          /* WS10084 */
+ ESA_RC pb_rc = ESA_OK ;                                  /* WS10084 */
+ char   msg[80]      = "";
+ int    first_time = FALSE;                               /* WS10062 */
+ int    build_pb   = FALSE;                               /* WS10084 */
+ /* WS10067 char   parm_get[81] = "";                     // WS10062 */
+ char   parm_get[81] = "";                                /* WS10076 */
+ char   errmsg[125];                                      /* WS10076 */
+ PBhandle_typ * PBh = NULL;                               /* WS10076 */
+ PB_Build_Request_typ * PB_Req = NULL;                    /* WS10084 */
+ GDB_Codes GDB_rc   = GDB_OK;                             /* WS10076 */
+ int    numgrps     = 0;                                  /* WS10076 */
+ ONE_FIELD_rec_ptr gdb_pair    = NULL;                    /* WS10076 */
+
+ ACF2_Get_Groups_Handle *h;
+ /* ACF2_Get_Xref_Handle   *xref_handle;  /@ WS10078KG @/   WS10079T */
+ void                  **xref_handle;                    /* WS10079N */
+ XBhandle_rec_typ       *xbhandle;                       /* WS10079T */
+ ACF2_API_Return_Codes   aarc;
+ char                    entity[7];         /* WS10078KG */
+
+ CTSAMSG_HANDLE_rec_ptr msgs;
+ CTSAMSG_DEST_TABLE_rec_ptr dest;
+
+ /* WS10079N int    i; */
+ int    i = 0;                                            /* WS10079N*/
+ int                           LID_In_UID, LID_Offset;    /* BS10097 */
+ int                           LID_Length;                /* IS10178 */
+ ACF2_PARAMS_rec_typ         * params_ptr = NULL;         /* BS10097 */
+ ONE_FIELD_rec_ptr             pair = NULL;               /* BS10097 */
+ int                         rc_asm=0;                    /* WS10078T */
+ char                        acf_version[5]="";           /* WS10078T */
+ char                     acf2_ver_ok_for_xref=NULL_CHAR; /* WS10078T */
+ int                        dbg_lvl=0;                    /* WS10078T */
+ char                          xtype[8]="";               /* WS10078T */
+ char                          xtype_1[8]="";             /* WS10079T */
+ char                          xtran[21]="";              /* WS10078T */
+ char                          block_read = NULL_CHAR;    /* WS10079T */
+ /* WS10079N char            xrefname_out[19] = "";        WS10079T   */
+ ACF2_GetUG_Handle           * m_h  = NULL;               /* WS10079T */
+ ACF2_Get_RoleSource_Handle  * rs_h = NULL;               /* WS10079T */
+ LID_PERM_handle_rec_typ     * lid_perm_handle = NULL;    /* WS10079T */
+ char                          xname[19] = "";            /* WS10079T */
+ char                          ActiveYN   = NULL_CHAR;    /* WS10079T */
+ int                           rcd =  ESA_FATAL;          /* WS10079T */
+ char                        ftype = 'N';                 /* WS10079T */
+ char                        * action = NULL;             /* WS10079T */
+ char with_sysid[] = "with SYSID as follows: name(sysid)";/* WS10079T */
+ char without_sysid[] = "without SYSID";                  /* WS10079T */
+
+ ESA_DIAG_enter(ESA_COMP_GETUGS, DEBUG_SHOW_REGULAR, func);
+
+ msgs = admin_params->ctsamsg_handle;
+ dest = admin_params->ctsamsg_dest;
+
+ /* WS10084
+ ESA_DIAG_printf(ESA_COMP_GETUGS, 0,
+                 "Mode = %d, Num UGs = %d, Group(1) = (%s)",
+                 mode, num_ugs_in, ug_params_in[0].group);
+    WS10084  */
+ ESA_DIAG_printf(ESA_COMP_GETUGS, DEBUG_SHOW_IMPORTANT,
+                 "Mode = %d, Num UGs = %d, Group(1) = (%s)",
+                 mode, num_ugs_in, ug_params_in[0].group);
+ /* WS10079T start */
+ ESA_DIAG_printf (ESA_COMP_GETUGS,DEBUG_SHOW_IMPORTANT,
+                    "num_pairs = %d, max_pairs = %d",
+                    addinfo[0]->num_pairs, addinfo[0]->max_pairs);
+ /* WS10079T end   */
+ /* WS10079T - start */
+ if (*handle EQ NULL)
+ {
+ /*******************
+  *                 *
+  * Initialization  *
+  *                 *
+  *******************/
+    *handle = (void *) calloc(1, sizeof(ACF2_GetUG_Handle));
+
+    if (*handle EQ NULL)
+    {
+       CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+         "ACF2_GetUG_Handle", sizeof(ACF2_GetUG_Handle));
+       rc = ESA_FATAL ;
+       goto exit;
+    };
+
+    m_h = (ACF2_GetUG_Handle *)*handle;
+
+    /* WS10084  start */
+    PB_Req = calloc (1, sizeof(PB_Build_Request_typ));
+
+    if (NOT PB_Req)
+    {
+       CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+               "PB_Req", sizeof(PB_Build_Request_typ));
+       rc = ESA_FATAL;
+       goto exit;
+    }
+    m_h->PB_Req = PB_Req;
+    build_pb   = TRUE;
+    PB_Req->Groups_PBhandle_ptr = NULL;
+    PB_Req->Users_PBhandle_ptr  = NULL;
+    PB_Req->Roles_XBhandle_ptr  = NULL;
+    PB_Req->lid[0]              = NULL_CHAR;
+    PB_Req->GroupDirect         = FALSE;
+    PB_Req->AccountDirect       = FALSE;
+    PB_Req->AccountIndirect     = FALSE;
+    PB_Req->AccountRoleDirect   = FALSE;
+    PB_Req->AccountRoleIndirect = FALSE;
+    PB_Req->RoleDirect          = FALSE;
+    PB_Req->PB_rules_nf         = FALSE;
+    PB_Req->PB_xref_nf          = FALSE;
+    PB_Req->PBbldErr            = FALSE;
+    PB_Req->PBErr               = FALSE;
+   /* WS10084  end   */
+
+    /****************
+     *              *
+     *  Role/Source *
+     *              *
+     ****************/
+    if (  (mode EQ GET_ALL_ROLES)    OR
+          (mode EQ GET_MANY_ROLES)   )
+    {
+      /*
+       *  Validate minimum ACF2 version
+       */
+      acf2_ver_ok_for_xref = 'N';         /* assume bad acf2 ver     */
+
+      if ((int)ESA_DIAG_get_debug_level(ESA_COMP_GETUGS) GE 6)
+         dbg_lvl=1;
+
+      rc_asm=cts2ver(&dbg_lvl, acf_version);
+      acf_version[3]=NULL_CHAR;
+
+      ESA_DIAG_printf(PLT_COMP_XREF, 6,"ACF2 ver=<%s>",acf_version);
+
+      if (strcmp(acf_version,"160") GE 0) /* ACF2 ver must be >= 160 */
+          acf2_ver_ok_for_xref = 'Y';     /* ACF2 ver ok for xref    */
+
+      if ( acf2_ver_ok_for_xref EQ 'N' )  /* ver ok for xref?        */
+      {
+       ESA_DIAG_printf(PLT_COMP_XREF, 6,"bad ACF2 ver");
+       /* issue an error message about unsupported ver for xref  */
+       CTSAMSG_print(ACF2_MIN_VER,
+                     msgs, NULL, dest,"16.0","Roles","Roles");
+       rc = ESA_FATAL;
+       goto exit;
+      }
+    }
+
+    if (  (mode EQ GET_ALL_ROLES)    OR
+          (mode EQ GET_ALL_SOURCES)  OR
+          (mode EQ GET_MANY_ROLES)   OR
+          (mode EQ GET_MANY_SOURCES) )
+    {
+      strcpy(m_h->type, "XRF");
+      xref_handle = &m_h->rs_h.getxref_handle;
+      xbhandle    = &m_h->rs_h.xbhandle;
+      PB_Req->Roles_XBhandle_ptr  = xbhandle;             /* WS10084 */
+      lid_perm_handle = &m_h->rs_h.lid_perm_handle;
+      xbhandle->active_request = 'N';
+      if (ADDINFO_search("Active",
+                   ACF_ADDINFO_KWD_LEN,addinfo[0]->pair,
+                   addinfo[0]->num_pairs) NE NULL )
+         xbhandle->active_request = 'C';
+
+      xbhandle->need_rec_YN    = 'N';
+      if ( (ADDINFO_search("IncludeList",
+                   ACF_ADDINFO_KWD_LEN,addinfo[0]->pair,
+                   addinfo[0]->num_pairs) NE NULL )
+            OR
+           (ADDINFO_search("ExcludeList",
+                   ACF_ADDINFO_KWD_LEN,addinfo[0]->pair,
+                   addinfo[0]->num_pairs) NE NULL )
+            OR
+           (ADDINFO_search("Description",
+                   ACF_ADDINFO_KWD_LEN,addinfo[0]->pair,
+                   addinfo[0]->num_pairs) NE NULL ) )
+         xbhandle->need_rec_YN    = 'Y';
+
+      strcpy(xbhandle->request_type,"XREFONLY");
+      strcpy(xbhandle->xrefname,ug_params_in[0].group);
+      xbhandle->sysidYN        = NULL_CHAR;
+      xbhandle->active_check   = NULL_CHAR;
+      xbhandle->active_default = NULL_CHAR;
+      xbhandle->shortest       = NULL_CHAR;
+      xbhandle->XREF_PB_handle   = NULL;
+      xbhandle->Groups_PB_handle = NULL;
+      xbhandle->bld_err        = FALSE;
+      xbhandle->bld_nf         = FALSE;                   /* WS10079N */
+      xbhandle->XB_err         = FALSE;
+
+      if ( (mode EQ GET_ALL_ROLES)   OR
+           (mode EQ GET_MANY_ROLES)  )
+         strcpy(entity,"Role");
+      else
+         strcpy(entity,"Source");
+
+      xbhandle->PB_type = entity[0];
+
+      if ( (entity[0] EQ 'R')  AND
+           (ADDINFO_search("RoleDirectPermissions",
+                           ACF_ADDINFO_KWD_LEN,
+                           addinfo[0]->pair,
+                           addinfo[0]->num_pairs) NE NULL )  )
+         {
+           m_h->rs_h.Permissions_neededYN = 'Y';
+           /* WS10079N lid_perm_handle->RolesBlk   = NULL;  */
+           /* WS10079N lid_perm_handle->SourcesBlk = NULL;  */
+           /* lid_perm_handle->lidra_vec  = NULL;         WS10084 */
+           lid_perm_handle->RequiredPermissions= PERM_TYPE_ROLE;
+           PB_Req->RoleDirect = TRUE;                      /* WS10084 */
+         }
+      else
+         m_h->rs_h.Permissions_neededYN = 'N';
+
+      if ( (mode EQ GET_ALL_ROLES)    OR
+           (mode EQ GET_ALL_SOURCES)  )
+      {
+
+         strcpy(xbhandle->xrefname,"-");
+         strcpy(lid_perm_handle->lid,"*");
+      }
+      else
+      {
+         strcpy(xname,ug_params_in[0].group);
+         strtok(xname,"(");
+         strcpy(lid_perm_handle->lid,xname);
+      }
+
+
+    }
+    else if (mode NE GET_FREE_HANDLE_GROUPS)
+    /**************
+     *            *
+     *  Group     *
+     *            *
+     **************/
+    {
+      strcpy(m_h->type, "GRP");
+      h = (ACF2_Get_Groups_Handle *)&m_h->g_h;
+
+      if (ADDINFO_alloc(func, ACF2_ADDINFO,&(h->laddinfo), dest, msgs)
+                        NE ESA_OK)
+      {
+        CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+                 "laddinfo alloc failed", 16,__LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+      }
+
+      first_time = TRUE;
+      ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+                     "first_time=TRUE");
+      h->refresh_gdb = FALSE;
+      rc = admin_params->cs_func.rssprm_get_opt_ptr(
+                                        admin_params->rss_name,
+                                        "REFRESH_GDB",
+                                        sizeof(parm_get),
+                                        parm_get,
+                                        OPT_TRUE,
+                                        OPT_TRUE);
+      if (rc EQ ESA_OK)
+      {
+         ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+                         "REFRESH_GDB = |%s|", parm_get);
+         if ( (strcmp (parm_get, "Y") EQ 0) AND
+              (Global_UDB_Active() EQ TRUE) )
+         {
+            h->refresh_gdb = TRUE;
+            ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+                            "will implement refresh GDB process");
+         }
+         else
+            ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+                "will not implement refresh GDB process");
+      }
+      else
+         ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+             "will not implement refresh GDB process");
+
+      /*----------------------------------------------------------*/
+      /* Check whether addinfo contains GROUPDIRECTPERMISSIONS,   */
+      /* i.e., the user wants to display each groups' direct      */
+      /* permissions. If yes, set with_perm to TRUE.              */
+      /*----------------------------------------------------------*/
+
+      h->with_perm = FALSE;
+      if (ADDINFO_search("GROUPDIRECTPERMISSIONS",
+                        ACF_ADDINFO_KWD_LEN,
+                        addinfo[0]->pair,
+                        addinfo[0]->num_pairs) NE NULL)
+        h->with_perm = TRUE;
+
+    }  /* group */
+ }     /* *handle EQ NULL  */
+ else
+ {
+   m_h = (ACF2_GetUG_Handle *)*handle;
+   if(strcmp(m_h->type, "GRP") EQ 0)
+      h = &m_h->g_h;
+   else
+   if(strcmp(m_h->type, "XRF") EQ 0)
+   {
+      xref_handle = &m_h->rs_h.getxref_handle;
+      xbhandle    = &m_h->rs_h.xbhandle;
+      lid_perm_handle = &m_h->rs_h.lid_perm_handle;
+   }
+   else
+   {
+      sprintf(errmsg,
+      "Invalid eyecatcher in GetUG_Handle. Address=%p, area=<%.20X>",
+      m_h,m_h);
+      CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+              func, errmsg, 16, __LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+   };
+
+   PB_Req = m_h->PB_Req;                                   /* WS10084 */
+   /*  WS10084
+   if (PB_Req NE NULL)
+   ESA_DIAG_printf (ESA_COMP_GETUGS,0,
+    "PB_Req->Roles_XBhandle_ptr = %p "
+    "PB_Req->RoleDirect         = %d ",
+     PB_Req->Roles_XBhandle_ptr,
+     PB_Req->RoleDirect);
+       WS10084  */
+ }
+ /* WS10079T end   */
+ /* WS10079T start
+    else                   /@ WS10078KG - Remove spaces * WS10062 @/
+       first_time = FALSE; /@ WS10078KG - Remove spaces * WS10062 @/
+
+   h = (ACF2_Get_Groups_Handle *) *handle;
+ }
+ /@ WS10078KG start - We dont want to allocate handle   *
+              if its ROLES or SOURCE aggregation.       *
+    The following code is realigned as per if statement @/
+ if( (mode NE GET_ALL_ROLES) AND (mode NE GET_ALL_SOURCES) AND
+     (mode NE GET_MANY_ROLES) AND (mode NE GET_MANY_SOURCES) )
+ {
+   /@ WS10078KG - end @/
+   /@----------------------------------------------------------------@/
+   /@ Allocate Handle (One time processing for every API cycle of    @/
+   /@                  user(s) information retrieval)                @/
+   /@----------------------------------------------------------------@/
+   /@ - Allocate handle                                              @/
+   /@ - Allocate temporary additional info object (ACF2_ADDINFO size)@/
+   /@----------------------------------------------------------------@/
+   if ( (@handle EQ NULL) AND (mode NE GET_FREE_HANDLE_GROUPS) )
+    {
+     group_count = 0;
+     /@ WS10078S Reversing calloc parameters
+     @handle = (void @) calloc (sizeof(ACF2_Get_Groups_Handle), 1);  @/
+     @handle = (void @) calloc (1, sizeof(ACF2_Get_Groups_Handle));
+     h = (ACF2_Get_Groups_Handle @) @handle;
+     /@ @ @ WS10078S start @ @ @/
+     if (h NE NULL)
+        ALLOC_STORAGE_DIAG(h, sizeof(ACF2_Get_Groups_Handle), func)
+     /@ @ @ WS10078S end @ @ @/
+     if (ADDINFO_alloc(func, ACF2_ADDINFO, &(h->laddinfo), dest, msgs)
+                        NE ESA_OK)
+      {
+        CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+                 "laddinfo alloc failed", 16,__LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+      }
+     /@ WS10078KG - delete spaces for below three lines @
+                   to fit in 72 cols.                   @/
+     first_time = TRUE;                                 /@ WS10062 @/
+     ESA_DIAG_printf(ESA_COMP_GETUGS, 6,                /@ BS10091 @/
+                     "Creating handle - first_time=TRUE");/@ BS10091 @/
+       WS10079T end  */
+     /* We do not need to open the GDB now.  Whether we will   BS10091
+        be processing code in the ACF2_Refresh_GDB routine or  BS10091
+        not, we will open the GDB after the return from the    BS10091
+        ACF2_Refresh_GDB routine.  The following open is not   BS10091
+        necessary.                                             BS10091
+        The reason we must do this is because users without    BS10091
+        REFRESH_GDB=Y will be issuing 2 ReadOnly opens and     BS10091
+        only 1 close.  In reality, the close will not really   BS10091
+        be executed because the file is still open. This       BS10091
+        means that the next time group aggregation is attemp-  BS10091
+        ted, we will again be issuing 2 ReadOnly opens but     BS10091
+        the file is already open so no real open is done.      BS10091
+        This means that the file pointer is pointing to EOF    BS10091
+        and this second group aggregation displays this        BS10091
+        message and then hangs:                                BS10091
+        CTS1318I Aggregation Processed....                     BS10091
+                0 containers, 0 users, 0 groups, 0 connections BS10091
+        This only occurs when REFRESH_GDB=N or is not present  BS10091
+        in RSSPARM. If REFRESH_GDB=Y, this problem does not    BS10091
+        occur.                                                 BS10091
+     if (GDB_Set_Mode(GDB_ReadOnly,admin_params,err) NE GDB_OK)
+      {
+       CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+                "Open GDB for READ failed", 16,__LINE__);
+       rc = ESA_FATAL;
+       goto exit;
+      };
+     GDB_Opened = TRUE;             *  *WS10078KG - remove spaces */
+
+   /* * * * * * * * Start BS10093 * * * * * * * */
+   /* What I wrote above is incorrect.  It solved the Group Aggregation
+      hang problem (mode = GET_ALL_GROUPS) but when mode =
+      GET_MANY_GROUPS (for example, SYNC request when attempting an Add
+      or Delete Group), we fail with the following error message (and
+      the Add and Sync Group does not complete (Note: The Delete Group
+      itself completes but the Sync Group afterwards fails)) because we
+      have not opened the GDB file:
+      CTS1508S Internal error. Comp.: GETUGS, func: CTSGetUGs, desc:
+               GET_MANY: ACF2_Get_Group failed
+               user=****************GRP18 rc=3, rc: 16 , line: 448
+      This new fix will restore the next few lines which open the GDB
+      file for ReadOnly. The new responsibility of the ACF2_Refresh_GDB
+      routine will be to restore the open/close state of the GDB, i.e.,
+      if the GDB was closed, open for ReadOnly, or open for ReadWrite,
+      that is what the GDB file must be in when we return from the
+      routine. Bottom line: The GDB file will be opened here for
+      ReadOnly and then closed in the Cleanup routine.  Note: When
+      mode = GET_ALL_GROUPS, the ACF2_Refresh_GDB routine may close and
+      reopen the GDB file for ReadWrite but will always restore the
+      open/close state of the GDB file to what it was when it was
+      called.                                                        */
+   /* We will open the GDB later, not here. Depending on     WS10076
+      the value of the REFRESH_GDB RSSPARM parameter, the    WS10076
+      GDB will either be opened for ReadWrite or ReadOnly.   WS10076
+   if (GDB_Set_Mode(GDB_ReadOnly,admin_params,err) NE GDB_OK)
+    {
+     CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+              "Open GDB for READ failed", 16,__LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+    };
+   GDB_Opened = TRUE;                                                */
+     /* * * * * * * * End BS10093 * * * * * * * */
+
+     /* * * * * * * * Start WS10076 * * * * * * * */
+
+     /*----------------------------------------------------------*/
+     /* Check whether REFRESH_GDB is set to "Y".  If yes, set    */
+     /* refresh_gdb to TRUE.                                     */
+     /*----------------------------------------------------------*/
+     /*  WS10079T start   moved to initialization
+     h->refresh_gdb = FALSE;
+     rc = admin_params->cs_func.rssprm_get_opt_ptr(
+                                       admin_params->rss_name,
+                                       "REFRESH_GDB",
+                                       sizeof(parm_get),
+                                       parm_get,
+                                       OPT_TRUE,
+                                       OPT_TRUE);
+     if (rc EQ ESA_OK)
+     {
+        ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+                        "REFRESH_GDB = |%s|", parm_get);
+        if ( (strcmp (parm_get, "Y") EQ 0) AND
+             (Global_UDB_Active() EQ TRUE) )
+        {
+           h->refresh_gdb = TRUE;
+           ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+                           "will implement refresh GDB process");
+        }
+        else
+           ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+               "will not implement refresh GDB process");
+     }
+     else
+        ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+            "will not implement refresh GDB process");
+
+     /@----------------------------------------------------------@/
+     /@ Check whether addinfo contains GROUPDIRECTPERMISSIONS,   @/
+     /@ i.e., the user wants to display each groups' direct      @/
+     /@ permissions. If yes, set with_perm to TRUE.              @/
+     /@----------------------------------------------------------@/
+
+     h->with_perm = FALSE;
+     if (ADDINFO_search("GROUPDIRECTPERMISSIONS",
+                        ACF_ADDINFO_KWD_LEN,
+                        addinfo[0]->pair,
+                        addinfo[0]->num_pairs) NE NULL)
+        h->with_perm = TRUE;
+
+     /@ @ @ @ @ @ @ @ End WS10076 @ @ @ @ @ @ @ @/
+
+    }
+    else                   /@ WS10078KG - Remove spaces @ WS10062 @/
+       first_time = FALSE; /@ WS10078KG - Remove spaces * WS10062 @/
+
+   h = (ACF2_Get_Groups_Handle *) *handle;
+ } /@ WS10078KG End if @/
+      WS10079T end */
+ /*----------------------------------------------------------------*/
+ /* Select processing mode ...                                     */
+ /*----------------------------------------------------------------*/
+
+ /* Start WS10078T    */
+ if (  (mode EQ GET_ALL_ROLES)    OR
+       (mode EQ GET_ALL_SOURCES)  OR
+       (mode EQ GET_MANY_ROLES)   OR
+       (mode EQ GET_MANY_SOURCES) )
+ {
+    /* WS10079T start (code moved to initialization)
+    acf2_ver_ok_for_xref = 'N';         /@ assume bad acf2 ver     @/
+
+    if ((int)ESA_DIAG_get_debug_level(ESA_COMP_GETUGS) GE 6)
+       dbg_lvl=1;
+
+    rc_asm=cts2ver(&dbg_lvl, acf_version);
+    acf_version[3]=NULL_CHAR;
+
+    ESA_DIAG_printf(PLT_COMP_XREF, 6,"ACF2 ver=<%s>",acf_version);
+
+    if (strcmp(acf_version,"160") GE 0) /@ ACF2 ver must be >= 160 @/
+        acf2_ver_ok_for_xref = 'Y';     /@ ACF2 ver ok for xref    @/
+
+    if ( acf2_ver_ok_for_xref EQ 'N' )  /@ ver ok for xref?        @/
+    {
+     ESA_DIAG_printf(PLT_COMP_XREF, 6,"bad ACF2 ver");
+     /@ issue an error message about unsupported ver for xref  @/
+     CTSAMSG_print(ACF2_MIN_VER,
+                   msgs, NULL, dest,"16.0","XREF","XREF");
+     rc = ESA_FATAL;
+     goto exit;
+    }
+       WS10079T end  */
+
+    params_ptr = admin_params->apiinit_handle;
+    if ( (mode EQ GET_ALL_ROLES)    OR
+         (mode EQ GET_MANY_ROLES) )
+       {                                                 /* WS10079T */
+       strcpy(xtype,"Roles");
+       strcpy(xtype_1,"Role");                           /* WS10079T */
+       }                                                 /* WS10079T */
+    if ( (mode EQ GET_ALL_SOURCES)  OR
+         (mode EQ GET_MANY_SOURCES) )
+       {                                                 /* WS10079T */
+       strcpy(xtype,"Sources");
+       strcpy(xtype_1,"Source");                         /* WS10079T */
+       }                                                 /* WS10079T */
+
+    if ( (mode EQ GET_ALL_ROLES)    OR
+         (mode EQ GET_ALL_SOURCES) )
+       strcpy(xtran,"Group Aggregation");
+    if ( (mode EQ GET_MANY_ROLES)   OR
+         (mode EQ GET_MANY_SOURCES) )
+       strcpy(xtran,"Group Synchronization");
+
+    if   (ADDINFO_search(
+                    "IncludeList",
+                    ACF_ADDINFO_KWD_LEN,
+                    addinfo[0]->pair,
+                    addinfo[0]->num_pairs) EQ NULL)
+       {
+         CTSAMSG_print(PRE_REQ_ATTRIBUTE,
+         msgs, NULL, dest,"IncludeList",xtype,xtran);
+         rc = ESA_FATAL;
+         goto exit;
+       }
+
+ }
+ /* End   WS10078T    */
+
+ switch(mode)
+ {
+ /*----------------------------------------------------------------*/
+ /* Get ALL Groups mode (each iteration returnes one Group)        */
+ /*----------------------------------------------------------------*/
+  case GET_ALL_GROUPS :
+      strcpy(entity,"Group");       /* WS10078KG */
+      /* * * * * * * * * WS10062 start * * * * * * * * */
+      /*-------------------------------------------------------*/
+      /* Refresh GDB at start of full group aggregation        */
+      /*-------------------------------------------------------*/
+      if (first_time EQ TRUE)
+      {
+         /* WS10067 This check and the ACF2_Refresh_GDB routine
+                    was moved to module CTSBSRV so it could be
+                    used as a common routine for CTSBGUG when
+                    doing full group aggregation ("FGA") and
+                    CTSBINT when doing single group interception
+                    ("SGI").
+         rc = admin_params ->
+          cs_func.rssprm_get_opt_ptr(admin_params -> rss_name,
+                                     "REFRESH_GDB",
+                                     sizeof(parm_get),
+                                     parm_get,
+                                     OPT_TRUE,
+                                     OPT_TRUE);
+         if (rc EQ ESA_OK)
+         {
+            ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+                            "REFRESH_GDB = %s", parm_get);
+            if (strcmp (parm_get, "Y") EQ 0)
+            {
+               ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+                               "now calling ACF2_Refresh_GDB");
+               rc = ACF2_Refresh_GDB(admin_params, err);
+               ESA_DIAG_printf(ESA_COMP_GETUGS,1,
+                               "ACF2_Refresh_GDB return code = %d", rc);
+               if (rc NE ESA_OK)
+                  goto exit;
+            }
+         }                                                           */
+
+         /*  The following routine is no longer in use.      WS10076
+         //
+          *  Call the ACF2_Refresh_GDB routine. The routine  WS10067
+          *  will clear the GDB and will recreate the file   WS10067
+          *  based on all access and resource rules at the   WS10067
+          *  site.                                           WS10067
+          //
+
+         rc = ACF2_Refresh_GDB("FGA", "", "", NULL,       // WS10067 //
+                               admin_params, err);        // WS10067 //
+
+         ESA_DIAG_printf(ESA_COMP_GETUGS, 6,              // WS10067 //
+             "ACF2_Refresh_GDB return code = %d", rc);    // WS10067 //
+
+         if (rc NE ESA_OK)                                // WS10067 //
+            goto exit;                                    // WS10067 */
+
+      /* * * * * * * * Start BS10093 * * * * * * * */
+      /* The new responsibility of the ACF2_Refresh_GDB routine is to
+         restore the open/close state of the GDB file, i.e., if the GDB
+         was closed, open for ReadOnly, or open for ReadWrite, that is
+         the open/close state the GDB file will be in when returning
+         from the routine.  Thus, these few lines will be commented out
+         because they will already have been done by ACF2_Refresh_GDB.
+
+         GDB_Set_Mode(GDB_Closed,admin_params,err);        * BS10091 *
+         if (GDB_Set_Mode(GDB_ReadOnly,admin_params,err)   * WS10067 *
+                                              NE GDB_OK)   * WS10067 *
+          {
+           CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,   * WS10067 *
+                         component,func,                   * WS10067 *
+                         "GDB_ReadOnly Open failed",       * BS10091 *
+                         16,__LINE__);                     * WS10067 *
+           rc = ESA_FATAL;                                 * WS10067 *
+           goto exit;                                      * WS10067 *
+          };
+         GDB_Opened = TRUE;                                * WS10067 *
+                                                                     */
+      /* * * * * * * * End BS10093 * * * * * * * */
+
+         /* * * * * * * * Start WS10076 * * * * * * * */
+
+         /*----------------------------------------------------------*/
+         /* Check whether REFRESH_GDB is set to "Y"                  */
+         /*----------------------------------------------------------*/
+
+         if (h->refresh_gdb EQ TRUE)
+         {
+            /*--------------------------------------------------------*/
+            /* Allocate PBhandle and set 2 PBhandle fields            */
+            /*--------------------------------------------------------*/
+
+            h->ptr_2_PBhandle = calloc (1, sizeof(PBhandle_typ));
+
+            if (NOT h->ptr_2_PBhandle)
+            {
+               CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                       "PBhandle", sizeof(PBhandle_typ));
+               rc = ESA_FATAL;
+               goto exit;
+            }
+            ALLOC_STORAGE_DIAG(h->ptr_2_PBhandle,        /* WS10078S */
+                               sizeof(PBhandle_typ),     /* WS10078S */
+                               func)                     /* WS10078S */
+
+            strcpy (h->ptr_2_PBhandle->uid, "*");
+            if (h->with_perm EQ TRUE)
+               h->ptr_2_PBhandle->WithPermissions = 'Y';
+            else
+               h->ptr_2_PBhandle->WithPermissions = 'N';
+
+            /*--------------------------------------------------------*/
+            /* Open GDB for ReadWrite and clear the entire GDB        */
+            /*--------------------------------------------------------*/
+
+            if (GDB_Set_Mode(GDB_ReadWrite,admin_params,err) NE GDB_OK)
+            {
+              CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                      func,"Open GDB (ReadWrite) failed",16,__LINE__);
+              rc = ESA_FATAL;
+              goto exit;
+            };
+            GDB_Opened = TRUE;
+
+            if (ACF2_Clean_GDB() NE ACF2_OK)
+            {
+              CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                      func, "Clear GDB failed", 16, __LINE__);
+              rc = ESA_FATAL;
+              goto exit;
+            };
+         }
+         else
+         {
+            /*--------------------------------------------------------*/
+            /* REFRESH_GDB was not set to "Y" so open GDB for ReadOnly*/
+            /*--------------------------------------------------------*/
+
+            if (GDB_Set_Mode(GDB_ReadOnly,admin_params,err) NE GDB_OK)
+            {
+              CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                      func, "Open GDB (ReadOnly) failed", 16, __LINE__);
+              rc = ESA_FATAL;
+              goto exit;
+            }
+            GDB_Opened = TRUE;
+         }
+
+         /* * * * * * * * End WS10076 * * * * * * * */
+      }
+      /* * * * * * * * * WS10062 end * * * * * * * * */
+
+      /* The following logic is no longer in use.  This has  WS10076
+      /* been true for several years.                        WS10076
+      //-------------------------------------------------------//
+      // Handle Download Restart Logic                         //
+      //-------------------------------------------------------//
+      if ( (h->Current_Group[0] EQ NULL_CHAR) AND (num_ugs_in EQ 1) )
+           {
+             RESTORE_ENDING_BLANK(ug_params_in[0].group,
+                                  ESA_COMP_GETUGS);       // BS10097 //
+             strcpy(h->Current_Group,ug_params_in[0].group);
+           }                                                         */
+
+      /*-------------------------------------------------------*/
+      /* Fetch Next Group                                      */
+      /* ----------------                                      */
+      /* Get Next Logic is derived from the h->Current_Group   */
+      /* (see function documentation).                         */
+      /*-------------------------------------------------------*/
+
+       PBh = h->ptr_2_PBhandle;                           /* WS10076N */
+       ADDINFO_empty(h->laddinfo);
+       PB_Req->Groups_PBhandle_ptr       = PBh;           /* WS10084 */
+       PB_Req->GroupDirect               = h->with_perm;  /* WS10084 */
+
+       rc = ACF2_Get_Group(GDB_Next_Locate,
+                           h->Current_Group,
+                           h->laddinfo,
+                           addinfo[0],                    /* WS10076 */
+                      /*   PBh,            /@ WS10076 @/     WS10084 */
+                           PB_Req,                        /* WS10084 */
+                           admin_params);                 /* WS10076A*/
+
+       switch(rc)
+       {
+          case ACF2_OK:
+           break;
+
+          case ACF2_Not_Found:
+           goto No_More_Groups;
+
+          default:
+           sprintf(msg,"GET_ALL: Get Group failed (last is %s)",
+                        h->Current_Group);
+           CTSAMSG_print(ERR_INTERNAL2,msgs, NULL,dest,component,func,
+                    msg, 16,__LINE__);
+           rc = ESA_FATAL;
+           goto exit;
+       };
+
+       /* * * * * * * * Start WS10076 * * * * * * * */
+
+       /*----------------------------------------------------------*/
+       /* If REFRESH_GDB was set to "Y", insert Current_Group      */
+       /* (uid AKA group) into GDB (this code snippet came from    */
+       /* CTSBSRV)                                                 */
+       /*----------------------------------------------------------*/
+
+       if (h->refresh_gdb EQ TRUE)
+       {
+
+          rc = GDB_Convert_to_Record(GDB_RECORD_TYPE_GROUP,
+                                     h->Current_Group,
+                                     h->laddinfo);
+
+          if (rc NE ESA_OK)
+          {
+             sprintf(errmsg,"Build GDB Record Failed");
+             CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, errmsg, 16, __LINE__);
+             rc = ESA_FATAL;
+             goto exit;
+          };
+
+          GDB_rc = GDB_Insert();
+
+          switch(GDB_rc)
+          {
+            case GDB_OK:
+             numgrps++;
+             ESA_DIAG_printf(PLT_COMP_PERMISSION, 6,
+                      "Group |%s| added to the GDB (# %d)",
+                      h->Current_Group, numgrps);
+             break;
+
+            default:
+             sprintf(errmsg,"Insert failed for Group %s (rc=%d)",
+                     h->Current_Group, GDB_rc);
+             CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, errmsg, 16, __LINE__);
+             rc = ESA_FATAL;
+             goto exit;
+          };
+       }
+
+       /* * * * * * * * End WS10076 * * * * * * * */
+
+     /*-------------------------------------------------------*/
+     /* Build Resulting Group object from GDB  and ESS info   */
+     /*-------------------------------------------------------*/
+     rc = Build_Group_Object(h->Current_Group,
+                            &(ug_params[0]),
+                            addinfo[0],
+                            h->laddinfo,
+                            msgs,
+                            dest);
+
+     if (rc NE ESA_OK)
+      {
+        sprintf(msg,"GET_ALL: Build_Group_Object failed for %s",
+                     h->Current_Group);
+        CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+                 msg, 16,__LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+      };
+
+     /*--------------------------------------------------------*/
+     /* Complete Single Group Returned, More to come           */
+     /*--------------------------------------------------------*/
+     REPLACE_ENDING_BLANK(ug_params[0].group,
+                          ESA_COMP_GETUGS);               /* BS10097 */
+
+     pair = ADDINFO_search ("UIDMASKS",                   /* BS10097 */
+                            ACF_ADDINFO_KWD_LEN,          /* BS10097 */
+                            addinfo[0]->pair,             /* BS10097 */
+                            addinfo[0]->num_pairs);       /* BS10097 */
+
+     /* changing the next few lines to remove the goto       WS10076
+     if (pair EQ NULL)             goto skip_UIDMASKS;    // BS10097 //
+     if (pair->value EQ NULL_CHAR) goto skip_UIDMASKS;    // BS10097 */
+     if ( (pair NE NULL) AND                              /* WS10076 */
+          (pair->value[0] NE NULL_CHAR) )                 /* WS10079N */
+          /* WS10079N (pair->value NE NULL_CHAR) )           WS10076 */
+        REPLACE_ENDING_BLANK(pair->value,
+                             ESA_COMP_GETUGS);            /* BS10097 */
+
+     /* WS10076N skip_UIDMASKS:                          * BS10097 * */
+     *actual_num = 1;
+     *have_more = HAVE_MORE;
+     objs_exist[0] = OBJ_EXIST;
+
+     break;
+
+ /*----------------------------------------------------------------*/
+ /* Get multiple specific Groups according to input (one shot)     */
+ /*----------------------------------------------------------------*/
+ case GET_MANY_GROUPS:
+
+   strcpy(entity,"Group");       /* WS10078KG */
+   ESA_DIAG_printf(ESA_COMP_GETUGS,1,
+                   "Get_Many: Num ugs: %d",num_ugs_in);
+
+   /* * * * * * * * Start WS10076 * * * * * * * */
+   if (first_time EQ TRUE)
+   {
+      if ( (h->refresh_gdb EQ TRUE) AND
+           (h->with_perm   EQ TRUE) )
+      {
+         /*----------------------------------------------------------*/
+         /* Allocate PBhandle and set 2 PBhandle fields              */
+         /*----------------------------------------------------------*/
+
+         h->ptr_2_PBhandle = calloc (1, sizeof(PBhandle_typ));
+
+         if (NOT h->ptr_2_PBhandle)
+         {
+            CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                    "PBhandle", sizeof(PBhandle_typ));
+            rc = ESA_FATAL;
+            goto exit;
+         };
+         ALLOC_STORAGE_DIAG(h->ptr_2_PBhandle,           /* WS10078S */
+                            sizeof(PBhandle_typ),        /* WS10078S */
+                            func)                        /* WS10078S */
+
+         h->ptr_2_PBhandle->WithPermissions = 'Y';
+
+         if (num_ugs_in EQ 1)
+         {
+            RESTORE_ENDING_BLANK(ug_params_in[0].group,
+                                 PLT_COMP_PERMISSION);
+            strcpy (h->ptr_2_PBhandle->uid, ug_params_in[0].group);
+         }
+         else
+            strcpy (h->ptr_2_PBhandle->uid, "*");
+      }
+      else
+      {
+         if (GDB_Set_Mode(GDB_ReadOnly,admin_params,err) NE GDB_OK)
+         {
+           CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                   func, "Open GDB (ReadOnly) failed", 16, __LINE__);
+           rc = ESA_FATAL;
+           goto exit;
+         }
+         GDB_Opened = TRUE;
+      }
+   }
+   /* * * * * * * * End WS10076 * * * * * * * */
+
+   PBh = h->ptr_2_PBhandle;                              /* WS10076N */
+   PB_Req->Groups_PBhandle_ptr       = PBh;              /* WS10084 */
+   PB_Req->GroupDirect               = h->with_perm;     /* WS10084 */
+   for(i=0; i LT num_ugs_in; i++)
+    {
+     RESTORE_ENDING_BLANK(ug_params_in[i].group,
+                          ESA_COMP_GETUGS);               /* BS10097 */
+
+     ESA_DIAG_printf(ESA_COMP_GETUGS,1,
+                     "Get_Many: Group = %s, seq# = %d",
+                     ug_params_in[i].group,i);
+
+     ug_params[i] = ug_params_in[i];
+     objs_exist[i] = OBJ_EXIST;
+
+     strcpy(h->Current_Group,ug_params_in[i].group);
+
+    /*------------------------------------*/
+    /* Get Specific Group                 */
+    /*------------------------------------*/
+
+     ADDINFO_empty(h->laddinfo);
+
+     rc = ACF2_Get_Group(GDB_Exact_Locate,
+                         h->Current_Group,
+                         h->laddinfo,
+                         addinfo[i],                      /* WS10076 */
+                    /*   PBh,              /@ WS10076 @/     WS10084 */
+                         PB_Req,                          /* WS10084 */
+                         admin_params);                   /* WS10076A*/
+
+     switch(rc)
+      {
+        case ACF2_OK:
+
+         ESA_DIAG_printf(ESA_COMP_GETUGS,1,
+                   "Get_Many: build group = %s",h->Current_Group);
+
+         /*------------------------------------*/
+         /* Build Resulting Group Object       */
+         /*------------------------------------*/
+         rc = Build_Group_Object(h->Current_Group,
+                                 &(ug_params[i]),
+                                 addinfo[i],
+                                 h->laddinfo,
+                                 msgs,dest);
+         if (rc NE ESA_OK)
+          {
+            sprintf(msg,"GET_MANY: Build_Group_Object failed for %s",
+                        h->Current_Group);
+           CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+                   msg, 16,__LINE__);
+            rc = ESA_FATAL;
+            goto exit;
+          };
+
+         REPLACE_ENDING_BLANK(ug_params[i].group,
+                              ESA_COMP_GETUGS);           /* BS10097 */
+
+         pair = ADDINFO_search ("UIDMASKS",               /* BS10097 */
+                                ACF_ADDINFO_KWD_LEN,      /* BS10097 */
+                                addinfo[i]->pair,         /* BS10097 */
+                                addinfo[i]->num_pairs);   /* BS10097 */
+
+         /* changing the next few lines to remove the goto   WS10076
+         if (pair EQ NULL)             goto skip_UIDMSKS; // BS10097 //
+         if (pair->value EQ NULL_CHAR) goto skip_UIDMSKS; // BS10097 */
+
+         if ( (pair NE NULL) AND                          /* WS10076 */
+              (pair->value[0] NE NULL_CHAR) )          /* WS10079N */
+              /* WS10079N (pair->value NE NULL_CHAR) )      WS10076 */
+            REPLACE_ENDING_BLANK(pair->value,
+                                 ESA_COMP_GETUGS);        /* BS10097 */
+
+         /* WS10076N skip_UIDMSKS:                       * BS10097 * */
+         break;
+
+        case ACF2_Not_Found:
+          objs_exist[i] = OBJ_NOT_EXIST;
+          break;
+
+        default:
+          sprintf(msg,"GET_MANY: ACF2_Get_Group failed group=%s rc=%d",
+                      h->Current_Group,
+                      rc);
+          CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+                 msg, 16,__LINE__);
+          rc = ESA_FATAL;
+          goto exit;
+      };
+    };
+
+     *actual_num = num_ugs_in;
+     *have_more = NO_MORE;
+     break;
+
+ /*----------------------------------------------------------------*/
+ /* Get Subtree Users (not supported)                              */
+ /*----------------------------------------------------------------*/
+ case GET_SUBTREE_GROUPS:
+    rc = ESA_NOT_SUPP;
+    goto exit;
+
+ /*-----------------------------------------------------------*
+  * WS10078KG - Start                                         *
+  *-----------------------------------------------------------*/
+ case GET_ALL_ROLES:
+ case GET_ALL_SOURCES:
+
+    /*  WS10079T  start (initialization moved above)
+    if (*handle EQ NULL)
+    {
+       *handle = (void *) calloc (1, sizeof(ACF2_Get_Xref_Handle));
+       xref_handle = (ACF2_Get_Xref_Handle *) *handle;
+       if(NOT xref_handle)
+       {
+          CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                        "Xref Handle", sizeof(PBhandle_typ));
+          rc = ESA_FATAL;
+          goto exit;
+       }
+       else
+       ESA_DIAG_printf(PLT_COMP_XREF,9,
+                 " allocated xref_handle - %p", xref_handle);
+       ALLOC_STORAGE_DIAG(xref_handle,                   /@ WS10078S @/
+                          sizeof(ACF2_Get_Xref_Handle),  /@ WS10078S @/
+                          func)                          /@ WS10078S @/
+
+       /@ Set recparm to '-' as we want to read all XREF records @/
+       strcpy(xref_handle->recparm,"-");
+       if( mode EQ GET_ALL_ROLES )
+       {
+          strcpy(entity,"Role");
+          if(ADDINFO_search("RoleDirectPermissions",
+                       ACF_ADDINFO_KWD_LEN,addinfo[0]->pair,
+                       addinfo[0]->num_pairs) NE NULL )
+              xref_handle->with_perm=TRUE;
+       }
+       else
+            strcpy(entity,"Source");
+       ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+                "ACF2_Get_Xref_Handle - %p", xref_handle);
+    }
+    else
+       xref_handle = (ACF2_Get_Xref_Handle *) *handle;
+    /@ The handle is initialized @/
+        WS10079T  end  */
+
+
+    *actual_num = 0;
+    for(i=0; i<max_ugs; i++)
+    {
+       /*  WS10079T
+       aarc = ACF2_Get_Xref(mode,&(ug_params[i]), addinfo[i],
+                            xref_handle, admin_params);  WS10079T */
+       /*  WS10079T start */
+       aarc = ACF2_Get_Xref(
+                     "GETNEXT",
+                     xbhandle,
+                     xref_handle,                     /* WS10079N */
+                     'X',
+                     &block_read,
+                     NULL,
+                     ug_params[i].group,
+                     addinfo[i],
+                     ESA_COMP_GETUGS,
+                     admin_params);
+       /*  WS10079T end   */
+
+       switch(aarc)
+       {
+          case ACF2_OK:
+               if (m_h->rs_h.Permissions_neededYN EQ 'Y')
+               {
+                 pair = ADDINFO_search("Active",
+                                     ACF_ADDINFO_KWD_LEN,
+                                     addinfo[i]->pair,
+                                     addinfo[i]->num_pairs);
+                 if (pair NE NULL)
+                    ActiveYN = pair->value[0];
+                 else
+                    ActiveYN = xbhandle->active_default;
+
+                 /* WS10084 start */
+                 strcpy(xname,ug_params[i].group);
+                 strtok(xname,"(");
+
+                 PBh = PB_Req->Roles_XBhandle_ptr->XREF_PB_handle;
+                 /*
+                 ESA_DIAG_printf(PLT_COMP_XREF, 0,
+                    "1 xname = %s  UID (Role) in curUIDinPB = |%s| ",
+                     xname, PBh->curUIDinPB->uid); */
+                 /* WS10084 end   */
+
+                 if (ActiveYN EQ 'Y')
+                 {
+                   /* WS10084 start */
+                   if (build_pb)
+                   {
+                     Save_curUIDinPB = PBh->curUIDinPB;
+                     build_pb = FALSE;
+                     /*
+                     ESA_DIAG_printf(ESA_COMP_GETUGS,0,
+                        "Calling Permissions_block_Build"); */
+
+                     ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                         "Before Permissions_block_Build");
+                     pb_rc =  Permissions_block_Build ("BUILD",
+                                              PB_Req,
+                                              ESA_COMP_GETUGS,
+                                              admin_params);
+                     ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                         "After  Permissions_block_Build");
+
+                     PBh->curUIDinPB = Save_curUIDinPB;
+                     if (pb_rc EQ ESA_KEY_NOT_FOUND)
+                     {
+                        PBh->PBnf = TRUE;
+                        PB_Req->PB_xref_nf = TRUE;
+                        rc = ACF2_Not_Found;
+                        goto exit;
+                     }
+                     else
+                       if ( (pb_rc NE ESA_OK) OR (PBh->PBptr EQ NULL) )
+                       {
+                          PBh->PBbldErr = TRUE;
+                          PB_Req->PBbldErr = TRUE;
+                          rc = ACF2_Internal_Error;
+                          goto exit;
+                       }
+                     /*
+                     ESA_DIAG_printf(PLT_COMP_XREF, 0,
+                      "2 xname = %s  UID (Role) in curUIDinPB = |%s| ",
+                       xname, PBh->curUIDinPB->uid); */
+
+                   }
+                   /*Todo: check what to do at exit with above errors */
+                   /* WS10084 end   */
+                   /* strcpy(xname,ug_params[i].group);
+                    strtok(xname,"(");                        WS10084 */
+                    /* WS10084
+                    rcd = ESA_FATAL;  /* assume not in filter @/
+                    ftype = 'N';
+                    if (params_ptr->DROP_GROUP_PERMS[0] NE NULL_CHAR)
+                      rcd = Drop_Perms_Match(
+                              "DROP_GROUP_PERMS",
+                              params_ptr->DROP_GROUP_PERMS,
+                              xname,
+                              'R',
+                              &ftype,
+                              ESA_COMP_GETUGS,
+                              admin_params);
+
+                    if (rcd NE ESA_OK) /* not in filter - need perms @/
+                    {                                        WS10084 */
+                   rc = Get_ROLE_Permissions(xname,
+                               /* WS10084    lid_perm_handle,  */
+                               /* WS10084 */ PB_Req,
+                                             addinfo[i],
+                                             "GET",
+                                             admin_params);
+
+                   if(rc NE ESA_OK)
+                   {
+                      sprintf(errmsg,
+                      "Get_ROLE_Permissions for %s ended with error",
+                      xname);
+                      CTSAMSG_print(ERR_INTERNAL2, msgs,NULL,dest,
+                         component,func, errmsg,
+                         rc, __LINE__);
+                      aarc = ACF2_Internal_Error;
+                      goto exit;
+                   }
+                   ESA_DIAG_printf(ESA_COMP_GETUGS, 9,
+                      "Permissions for ROLE=<%s> added",
+                       xname);
+                    /* WS100084
+                    }
+                    else
+                      ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+                         "Permissions for ROLE=<%s> filtered out",
+                          xname);                           WS10084 */
+                 }
+               }
+
+               (*actual_num)++;
+               *have_more = HAVE_MORE;
+               objs_exist[i] = OBJ_EXIST;
+               rc = ESA_OK;
+               break;
+          case ACF2_Not_Found:
+               *have_more  = NO_MORE;
+               /* WS10084 start
+               ESA_DIAG_printf(PLT_COMP_XREF, 0,
+               "At case ACF2_Not_Found");
+                  WS10084 end */
+               rc = ESA_OK;
+               goto exit;
+          default:
+               sprintf(msg,"GET_ALL_%s failed",
+                       (mode EQ GET_ALL_ROLES) ? "ROLES" : "SOURCES");
+               CTSAMSG_print(ERR_INTERNAL2,msgs, NULL,dest,component,
+                             func,msg, 16,__LINE__);
+               rc = ESA_FATAL;
+               *actual_num = 0;
+               *have_more  = NO_MORE;
+               goto exit;                                 /* BS10108 */
+       };
+
+      ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+                 "%dth Group=%s, have_more=%d, actual_num=%d",
+                 i, ug_params[i].group, *have_more, *actual_num);
+
+      /* WS10079N - start */
+      if (ESA_DIAG_get_debug_level(ESA_COMP_GETUGS) GE 6)
+      {
+         ESA_DIAG_printf(ESA_COMP_GETUGS, 6, "Printing output addinfo");
+         ADDINFO_dump(addinfo[i], 1);
+      };
+      /* WS10079N - end   */
+
+    }/*End for loop */
+    /* WS10084 start
+    ESA_DIAG_printf(PLT_COMP_XREF, 0,
+     "After For Loop ACF2_Get_Xref + Get_ROLE_Permissions");
+       WS10084 end */
+    goto exit;
+
+    case GET_MANY_ROLES:
+    case GET_MANY_SOURCES:
+
+    /*  WS10079T  start (initialization moved above)
+       if (*handle EQ NULL)
+       {
+
+          *handle = (void *) calloc (1, sizeof(ACF2_Get_Xref_Handle));
+          xref_handle = (ACF2_Get_Xref_Handle *) *handle;
+          if(NOT xref_handle)
+          {
+             CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                           "Xref Handle", sizeof(PBhandle_typ));
+             rc = ESA_FATAL;
+             goto exit;
+          }
+          else
+          ESA_DIAG_printf(PLT_COMP_XREF,6,
+                    " allocated xref_handle - %p", xref_handle);
+          ALLOC_STORAGE_DIAG(xref_handle,                /@ WS10078S @/
+                             sizeof(ACF2_Get_Xref_Handle),/@WS10078S @/
+                             func);                      /@ WS10078S @/
+
+          if( mode EQ GET_MANY_ROLES )
+          {
+               strcpy(entity,"Role");
+               if(ADDINFO_search("RoleDirectPermissions",
+                               ACF_ADDINFO_KWD_LEN,addinfo[0]->pair,
+                               addinfo[0]->num_pairs) NE NULL )
+                 xref_handle->with_perm=TRUE;
+          }
+          else
+             strcpy(entity,"Source");
+
+          ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+                   "ACF2_Get_Xref_Handle - %p", xref_handle);
+       }
+       else
+          xref_handle = (ACF2_Get_Xref_Handle *) *handle;
+       /@ The handle is initialized @/
+       /@ Set recparm to 'group name to read one XREF records @/
+       strcpy(xref_handle->recparm,ug_params_in[0].group);
+
+       /@ BS10108T - start  @/
+       if(ADDINFO_search("#is#multi#rec",
+                          ACF_ADDINFO_KWD_LEN,addinfo[0]->pair,
+                          addinfo[0]->num_pairs) NE NULL )
+         ESA_DIAG_printf(PLT_COMP_XREF, 6,
+             "#is#multi#rec found");
+       /@ BS10108T - end    @/
+        WS10079T  end  */
+       /*  WS10079T  start  */
+       rc = XREF_Validate_name(ug_params_in[0].group,
+                               ESA_COMP_GETUGS,
+                               admin_params);
+       if (rc NE ESA_OK)
+        {
+         /* WS10079T
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+              func, "xref name is not valid", 16, __LINE__); WS10079T */
+         if(params_ptr->XREF_SYSID_SCOPE[0] EQ 'a')       /* WS10079T */
+           action = with_sysid;                           /* WS10079T */
+         else                                             /* WS10079T */
+           action = without_sysid;                        /* WS10079T */
+         sprintf(errmsg,"GET %s %s: %s is invalid.",      /* WS10079T */
+                  xtype_1,ug_params_in[0].group,          /* WS10079T */
+                  ug_params_in[0].group);                 /* WS10079T */
+         CTSAMSG_print(ACF2_PRVD_VALID_NAME_OR_AGGR,      /* WS10079T */
+                  msgs, NULL, dest,                       /* WS10079T */
+                  errmsg,                                 /* WS10079T */
+                  xtype_1,                                /* WS10079T */
+                  action);                                /* WS10079T */
+         rc = ESA_FATAL;
+         goto exit;
+        }
+
+       /* WS10079T - start */
+       if (ESA_DIAG_get_debug_level(ESA_COMP_GETUGS) GE 6)
+       {
+          ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+                          "Printing addinfo before ACF2_Get_Xref ");
+          ADDINFO_dump(addinfo[0], 1);
+       };
+       /* WS10079T - end   */
+
+       *actual_num = 0;
+       aarc = ACF2_Get_Xref(
+                     "GETTHIS",
+                     xbhandle,
+                     xref_handle,                         /* WS10079N */
+                     'X',
+                     &block_read,
+                     ug_params_in[0].group,
+     /* WS10079N     xrefname_out,  */
+                     ug_params[0].group,                  /* WS10079N */
+                     addinfo[0],
+                     ESA_COMP_GETUGS,
+                     admin_params);
+       /* WS10079T
+       aarc = ACF2_Get_Xref(mode, ug_params, addinfo[0], xref_handle,
+                          admin_params);                  WS10079T */
+
+       switch(aarc)
+       {
+          case ACF2_OK:
+               /* WS10079T  start */
+               if (strcmp(ug_params[0].group,ug_params_in[0].group))
+               {
+                  sprintf(errmsg,
+                   "ACF2_Get_Xref GETTHIS returned %s %s which differs "
+                   "from requested %s %s",
+                   xtype_1, ug_params[0].group,
+                   xtype_1, ug_params_in[0].group);
+                  CTSAMSG_print(ERR_INTERNAL2, msgs,NULL,dest,
+                     component,func, errmsg,
+                     16, __LINE__);
+                  rc = ESA_FATAL;
+                  goto exit;
+               }
+               /* WS10079T  end   */
+
+               if (m_h->rs_h.Permissions_neededYN EQ 'Y')
+               {
+                 /* Check if we need to provide permissions, but   */
+                 /* assume we do not...                            */
+                 m_h->rs_h.Permissions_neededYN = 'N';
+
+                 pair = ADDINFO_search("Active",
+                                     ACF_ADDINFO_KWD_LEN,
+                                     addinfo[0]->pair,
+                                     addinfo[0]->num_pairs);
+                 if (pair NE NULL)
+                       ActiveYN = pair->value[0];
+                 else
+                 {
+                    /* WS10079N
+                    if(params_ptr->XREF_SYSID_SCOPE[0] EQ 'a')
+                       ActiveYN = 'N';   */
+                    ActiveYN = xbhandle->active_default; /* WS10079N */
+                 }
+
+                 if (ActiveYN EQ 'Y')
+                 {
+
+                     strcpy(xname,ug_params_in[0].group);
+                     strtok(xname,"(");
+                     /* WS10084
+                     rcd = ESA_FATAL;  /* assume not in filter @/
+                     ftype = 'N';
+                     if (params_ptr->DROP_GROUP_PERMS[0] NE NULL_CHAR)
+                         rcd = Drop_Perms_Match(
+                              "DROP_GROUP_PERMS",
+                              params_ptr->DROP_GROUP_PERMS,
+                              xname,
+                              'R',
+                              &ftype,
+                              ESA_COMP_GETUGS,
+                              admin_params);
+
+                     if (rcd NE ESA_OK) /* not in filter, need perms @/
+                     {
+                       WS10084 */
+                       /* Permissions are required          WS10079N  */
+                       m_h->rs_h.Permissions_neededYN = 'Y';/*WS10079N*/
+                       /* WS10084 start */
+                       PB_Req->RoleDirect = TRUE;
+                       PB_Req->Roles_XBhandle_ptr        = xbhandle;
+                       PB_Req->Groups_PBhandle_ptr       = NULL;
+                       PB_Req->Users_PBhandle_ptr        = NULL;
+                       PB_Req->GroupDirect               = FALSE;
+                       PB_Req->AccountDirect             = FALSE;
+                       PB_Req->AccountIndirect           = FALSE;
+                       PB_Req->AccountRoleDirect         = FALSE;
+                       PB_Req->AccountRoleIndirect       = FALSE;
+                       PB_Req->PB_rules_nf               = FALSE;
+                       PB_Req->PB_xref_nf                = FALSE;
+                       PB_Req->PBbldErr                  = FALSE;
+                       PB_Req->PBErr                     = FALSE;
+
+                       pb_rc =  Permissions_block_Build ("BUILD",
+                                                PB_Req,
+                                                ESA_COMP_GETUGS,
+                                                admin_params);
+
+                       PBh =
+                       PB_Req->Roles_XBhandle_ptr->XREF_PB_handle;
+                       if (pb_rc EQ ESA_KEY_NOT_FOUND)
+                       {
+                          PBh->PBnf = TRUE;
+                          PB_Req->PB_xref_nf = TRUE;
+                          rc = ACF2_Not_Found;
+                          goto exit;
+                       }
+                       else
+                         if ( (pb_rc NE ESA_OK) OR (PBh->PBptr EQ NULL) )
+                         {
+                            PBh->PBbldErr = TRUE;
+                            PB_Req->PBbldErr = TRUE;
+                            rc = ACF2_Internal_Error;
+                            goto exit;
+                         }
+                       /* WS10084 end   */
+                       rc = Get_ROLE_Permissions(xname,
+                                   /* WS10084    lid_perm_handle,  */
+                                   /* WS10084 */ PB_Req,
+                                                 addinfo[0],
+                                                 "GET",
+                                                 admin_params);
+
+                       if(rc NE ESA_OK)
+                       {
+                         sprintf(errmsg,
+                         "Get_ROLE_Permissions for %s ended with error",
+                          xname);
+                          CTSAMSG_print(ERR_INTERNAL2, msgs,NULL,dest,
+                             component,func, errmsg,
+                             rc, __LINE__);
+                          aarc = ACF2_Internal_Error;
+                          goto exit;
+                       }
+                       ESA_DIAG_printf(ESA_COMP_GETUGS, 9,
+                          "Permissions for ROLE=<%s> added",
+                           xname);
+                     /* WS10084
+                     }
+                     else
+                       ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+                          "Permissions for ROLE=<%s> filtered out",
+                           xname);
+                        WS10084 */
+                 }
+               }
+               *actual_num = 1;
+               *have_more = NO_MORE;
+               objs_exist[0] = OBJ_EXIST;
+               rc = ESA_OK;
+               break;
+          case ACF2_Not_Found:
+               *have_more  = NO_MORE;
+               rc = ESA_OK;
+               break;                                    /* WS10079T */
+               /* WS10079T goto exit; */
+          default:
+               /* WS10079T
+               sprintf(msg,"GET_ALL_%s failed",
+                       (mode EQ GET_ALL_ROLES) ? "ROLES" : "SOURCES");
+                  WS10079T */
+               /* WS10079T start */
+               sprintf(msg,"GET_MANY_%s failed",
+                       (mode EQ GET_MANY_ROLES) ? "ROLES" : "SOURCES");
+               CTSAMSG_print(ERR_INTERNAL2,msgs, NULL,dest,component,func,
+                             msg, 16,__LINE__);
+               /* WS10079T end   */
+               rc = ESA_FATAL;
+               *actual_num = 0;
+               *have_more  = NO_MORE;
+       };
+
+       /* WS10079N - start */
+       if (ESA_DIAG_get_debug_level(ESA_COMP_GETUGS) GE 6)
+       {
+          ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+                          "Printing output addinfo");
+          ADDINFO_dump(addinfo[0], 1);
+       };
+       /* WS10079N - end   */
+
+    goto exit;
+
+ /* WS10078KG - Ends */
+
+ /*----------------------------------------------------------------*/
+ /* Free handle and local addinfo                                  */
+ /*----------------------------------------------------------------*/
+ case GET_FREE_HANDLE_GROUPS:
+   ESA_DIAG_printf(ESA_COMP_GETUGS, 6,                    /* BS10091 */
+                 "Processing GET_FREE_HANDLE_GROUPS");    /* BS10091 */
+   Cleanup(/* WS10079T h,*/ handle,admin_params,err);
+   rc = ESA_OK;
+   goto exit;
+
+ default:;
+ };
+
+ /*----------------------------------------------------------------*/
+ /* A Group Returned (or one-shot many groups)                     */
+ /*----------------------------------------------------------------*/
+ /*  WS10079T start */
+ if (  (mode EQ GET_ALL_ROLES)    OR
+       (mode EQ GET_ALL_SOURCES)  OR
+       (mode EQ GET_MANY_ROLES)   OR
+       (mode EQ GET_MANY_SOURCES) )
+ {
+ ESA_DIAG_printf(ESA_COMP_GETUGS, DEBUG_SHOW_IMPORTANT,
+                "Number of %s returned: %d",
+                xtype,*actual_num);
+ }
+ else
+ {
+ /*  WS10079T end   */
+ group_count++;
+ ESA_DIAG_printf(ESA_COMP_GETUGS, DEBUG_SHOW_IMPORTANT,
+  /* WS10078KG   "Group returned: |%s| (# %d)", ug_params[0].group,*
+     WS10078KG   group_count); */
+  /* WS10078KG */ "%s returned: |%s| (# %d)", entity,
+  /* WS10078KG */ ug_params[0].group, group_count);
+ }                                                      /* WS10079T */
+ rc = ESA_OK;
+ goto exit;
+
+ /*----------------------------------------------------------------*/
+ /* No More Groups to Return                                       */
+ /*----------------------------------------------------------------*/
+ No_More_Groups:
+   group_count = 0;
+   *actual_num = 0;
+   *have_more  = NO_MORE;
+   rc = ESA_OK;
+
+ exit : ;
+
+ /*
+  *  Finish
+  */
+
+ if ( (rc NE ESA_OK) OR (*have_more EQ NO_MORE) ) {
+  ESA_DIAG_printf(ESA_COMP_GETUGS, 6,                     /* BS10091 */
+                  "Calling Cleanup routine");             /* BS10091 */
+  Cleanup(handle,admin_params,err);                       /* WS10079T */
+ }                                                        /* WS10079T */
+    /* WS10079T  start
+    /@ WS10078KG - Start @/
+    if ( (mode EQ GET_ALL_ROLES) OR (mode EQ GET_ALL_SOURCES) OR
+         (mode EQ GET_MANY_ROLES) OR (mode EQ GET_MANY_SOURCES) )
+    {
+       if(xref_handle NE NULL)
+       {
+          free(xref_handle);
+          FREE_STORAGE_DIAG(xref_handle, func)           /@ WS10078S @/
+       }
+    }
+    else
+    {
+       Cleanup(h,handle,admin_params,err);
+    }
+    /@ WS10078KG - End @/
+ }
+       WS10079T  end   */
+
+ ESA_DIAG_exit(ESA_COMP_GETUGS, DEBUG_SHOW_REGULAR, func, rc);
+
+ return rc ;
+
+}
+
+/******************************************************************
+ * Procedure Name: Build_Group_Object
+ ******************************************************************
+ * Description   : Build Group Structure to return to Caller
+ *
+ * Input         : group_ent    - group id
+ *                 laddinfo     - addinfo retrieved from GDB
+ *                 CTSAMSG stuff
+ *
+ * Output        : ug_params    - Target UG_PARAMS object
+ *
+ * Input/Output  : addinfo      - Caller ADDINFO to set with GDB
+ *                                values
+ * Return Value  : ESA_RC
+ ******************************************************************/
+ static ESA_RC Build_Group_Object(
+                        UG_typ                group_ent,
+                        UG_PARAMS_rec_ptr     ug_params,
+                        ADDINFO_rec_ptr       addinfo,
+                        ADDINFO_rec_ptr       laddinfo,
+                        CTSAMSG_HANDLE_rec_typ     * msgs,
+                        CTSAMSG_DEST_TABLE_rec_typ * dest)
+  {
+
+  static char func[]="Build_Group_Object";
+
+  ESA_RC rc = ESA_OK;
+
+  ESA_DIAG_enter(ESA_COMP_GETUGS, DEBUG_SHOW_REGULAR, func);
+
+ /*
+  *  Set ug_params defaults
+  */
+
+  strcpy(ug_params->group,group_ent);
+  ug_params->parent_group[0] = NULL_CHAR;
+  ug_params->parent_oe[0]    = NULL_CHAR;
+
+  ADDINFO_masupd(addinfo,laddinfo,ADDINFO_masupd_NoMerge,dest,msgs);
+
+  exit:
+
+  ESA_DIAG_exit(ESA_COMP_GETUGS, DEBUG_SHOW_REGULAR, func, rc);
+  return rc;
+}
+/* * * * * * * * WS10062 Start * * * * * * * */
+/* WS10067 The ACF2_Refresh_GDB routine and its subroutines were moved
+           to module CTSBSRV so they could be used as common routines
+           for CTSBGUG when doing full group aggregation ("FGA") and
+           CTSBINT when doing single group interception ("SGI").
+/******************************************************************
+ * Procedure Name: ACF2_Refresh_GDB
+ ******************************************************************
+ * Description   : Refresh GDB (when GET_ALL_GROUPS)
+ *
+ * Input         : admin_params
+ *                 err
+ * Return Value  : ESA_OK
+ *                 ESA_FATAL
+ ******************************************************************
+static ESA_RC ACF2_Refresh_GDB(ADMIN_PARAMS_rec_typ * admin_params,
+                               ERR_STRUCT_rec_typ   * err)
+{
+  static char func[] = "ACF2_Refresh_GDB";
+
+  ESA_RC                       rc         = ESA_OK ;
+  ESA_RC                       fetch_rc   = ESA_OK ;
+  ESA_RC                       output_rc  = ESA_OK ;
+  ADDINFO_rec_ptr              caddinfo   = NULL;
+  int                          i, tso_rc;
+  short                        output_len;
+  char                         output_buffer[BLKSIZE];
+  char                         exec_cmd[8192];
+  char                       * work;
+  char                       * ddnx;
+  char                         cmd[81];
+  char                         buffer_line[BLKSIZE+1];
+  char                         copy_of_buffer[BLKSIZE+6];
+  char                         UIDdescription[256] = "";
+  int                          UID_Field_Count     = 0;
+  UID_Structure                UIDtab[ACF2_UID_SIZE];
+  char                         UID_Is_MULTI        = 'N';
+  FILE                       * stream     = NULL;
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+
+  ESA_DIAG_enter(ESA_COMP_GETUGS, 1, func);
+
+  msgs          = admin_params->ctsamsg_handle;
+  dest          = admin_params->ctsamsg_dest;
+  LID_In_UID    = FALSE;
+  LID_Offset    = 0;
+  LID_Length    = 0;
+  end_marker[4] = 0xFF;
+
+  //--------------------------------------------------------------//
+  // Get UID Structure                                            //
+  //--------------------------------------------------------------//
+
+  ACF2_Get_UID_Info( UIDdescription,
+                     &UID_Field_Count,
+                     UIDtab,
+                     &UID_Is_MULTI,
+                     admin_params);
+
+  ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+                  "UID Field Count = (%d)", UID_Field_Count);
+
+  if (ESA_DIAG_get_debug_level(ESA_COMP_GETUGS) GE 1)
+  {
+     for(i=0; i LT UID_Field_Count; i++)
+     {
+   ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+   "UID fld(%d) is (%s) uid_off=(%d) uid_len(%d) fld_off=(%d) mul=(%c)",
+                       i+1,
+                       UIDtab[i].UID_Part_Field_Name,
+                       UIDtab[i].UID_Part_Offset,
+                       UIDtab[i].UID_Part_Length,
+                       UIDtab[i].UID_Field_Offset,
+                       UIDtab[i].UID_Part_Multi);
+     }
+  }
+
+  //--------------------------------------------------------------//
+  // Get several LID-related fields from the ACF2 global data     //
+  // area and from other static areas                             //
+  //--------------------------------------------------------------//
+
+  LID_In_UID = ACF2_Is_LID_In_UID(&LID_Offset);
+
+  if (LID_In_UID)
+   {
+    for(i=0; i LT UID_Field_Count; i++)
+     {
+      if (LID_Offset EQ UIDtab[i].UID_Part_Offset)
+         LID_Length = UIDtab[i].UID_Part_Length;
+     };
+   };
+
+  ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+           "LID_In_UID = %d, LID_Offset = %d, LID_Length = %d",
+           LID_In_UID, LID_Offset, LID_Length);
+
+  //--------------------------------------------------------------//
+  // Allocate an ADDINFO area                                     //
+  //--------------------------------------------------------------//
+
+  if (ADDINFO_alloc(func, ACF2_ADDINFO, &caddinfo, dest, msgs)
+                    NE ESA_OK)
+   {
+     CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+              "caddinfo alloc failed", 16,__LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+  //--------------------------------------------------------------//
+  // Prepare command to get access and resource rules             //
+  //--------------------------------------------------------------//
+
+  sprintf(cmd,"ACF2 RULE LIST LIKE(-) ");
+  ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+                  "Command header prepared (%s)", cmd);
+  ddnx = EXECOUT_DDNAME;
+  work = strstr(EXECOUT_DDNAME, "DD:");
+  if (work NE NULL)
+    ddnx = work + 3;
+
+  sprintf(exec_cmd, "%%CTSBCMD %s %s %s",
+          ddnx, admin_params->admin_uname, cmd);
+
+  ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+                  "Complete command (%s)", exec_cmd);
+
+  //--------------------------------------------------------------//
+  // Issue command to get access and resource rules. The output   //
+  // is returned so that we can process it here.                  //
+  //--------------------------------------------------------------//
+
+  rc = ESA_CLI_exec_wait(EXECOUT_DDNAME, exec_cmd, &tso_rc, dest, msgs);
+
+  ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+                  "rc from exec_wait=(%d) tso_rc=(%d)", rc, tso_rc);
+
+  //--------------------------------------------------------------//
+  // Check return code and rule command completion code           //
+  //--------------------------------------------------------------//
+
+  if ((rc NE ESA_OK) OR (tso_rc NE ESA_OK))
+   {
+    CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+                  "Rules command failed", 16,__LINE__);
+    rc = ESA_FATAL;
+    goto exit;
+   };
+
+  //--------------------------------------------------------------//
+  // Close GDB (for ReadOnly) and then Open GDB for ReadWrite     //
+  //--------------------------------------------------------------//
+  if (GDB_Opened EQ TRUE)
+   {
+    GDB_Set_Mode(GDB_Closed,admin_params,err);
+    GDB_Opened = FALSE;
+   };
+
+  if (GDB_Set_Mode(GDB_ReadWrite,admin_params,err) NE GDB_OK)
+   {
+    CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+             "Open GDB for READWRITE failed", 16,__LINE__);
+    rc = ESA_FATAL;
+    goto exit;
+   };
+  GDB_Opened = TRUE;
+
+  //--------------------------------------------------------------//
+  // Clear GDB                                                    //
+  //--------------------------------------------------------------//
+  if (ACF2_Clean_GDB() NE ACF2_OK)
+   {
+    CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+             "Clear GDB failed", 16,__LINE__);
+    rc = ESA_FATAL;
+    goto exit;
+   };
+
+  //--------------------------------------------------------------//
+  // Get rule command output and process it                       //
+  //--------------------------------------------------------------//
+
+  while (fetch_rc EQ ESA_OK) {
+     output_len =  BLKSIZE;
+     fetch_rc = ESA_CLI_fetch_output(EXECOUT_DDNAME,
+                                 &stream,
+                                 output_buffer,
+                                 &output_len,
+                                 dest,
+                                 msgs );
+
+     ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+         "fetch_output rc=(%d) output_len=(%d)",
+         fetch_rc, output_len);
+
+     if (ESA_DIAG_get_debug_level(ESA_COMP_GETUGS) GE 1)
+     {
+        for (i=0; i LT BLKSIZE; i += LRECL) {
+           memset (buffer_line, 0X00, sizeof(buffer_line));
+           strncpy (buffer_line, output_buffer+i,  100);
+           ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+                           "buffer line: %s", buffer_line);
+        }
+     }
+
+     // If fetch_rc = ESA_EOF, this means that we now have the last //
+     // (partial) block. We must process the block and leave. The   //
+     // file is already closed.                                     //
+     //                                                             //
+     // While testing: Make sure 133*10 is a good number whether    //
+     //                it is an FB or FBA file. We do not want to   //
+     //                break lines and get part of a line, e.g.,    //
+     //                UID(abcdefg  and hijkl) on the next line     //
+
+     if ( (fetch_rc EQ ESA_OK) OR (fetch_rc EQ ESA_EOF) ) {
+        // copy the output buffer to a larger buffer and place an
+           end marker at the end so we don't 'fall off the end of
+           the buffer' (and get a S0C4).                            //
+        memset (copy_of_buffer, 0X00, sizeof(copy_of_buffer));
+        strncpy (copy_of_buffer, output_buffer, output_len);
+        if (output_len EQ BLKSIZE) {
+          strncpy(copy_of_buffer+BLKSIZE,end_marker,sizeof(end_marker));
+        }
+        else {
+           strncpy (copy_of_buffer+output_len-sizeof(end_marker),
+                                        end_marker, sizeof(end_marker));
+           ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+                           "end marker set on short buffer");
+        }
+
+        rc = find_groups(copy_of_buffer, caddinfo, admin_params);
+
+        if (rc NE ESA_OK) {
+           CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+                         "find_groups routine failed", 16,__LINE__);
+           rc = ESA_FATAL;
+           goto exit;
+        };
+     }
+  }
+
+  if (fetch_rc EQ ESA_EOF) {
+     ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+                     "calling ESA_CLI_delete_output now");
+     output_rc = ESA_CLI_delete_output(EXECOUT_DDNAME, dest, msgs );
+     ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+                     "ESA_CLI_delete_output rc=%d", output_rc);
+
+     if (output_rc NE ESA_OK) {
+        ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+                        "ESA_CLI_delete_output failed");
+     CTSAMSG_print(ERR_3_STRINGS, msgs, NULL, dest,
+     "Warning:ESA_CLI_delete_output failed.Processing continues","","");
+     }
+  }
+
+  //--------------------------------------------------------------//
+  // After processing the output completely, close the GDB for    //
+  // ReadWrite, open it for ReadOnly, and return to CTSGetUgs.    //
+  //--------------------------------------------------------------//
+
+  if (GDB_Opened EQ TRUE) {
+    GDB_Set_Mode(GDB_Closed,admin_params,err);
+    GDB_Opened = FALSE;
+    ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+                    "we just closed the GDB file");
+  }
+  if (GDB_Set_Mode(GDB_ReadOnly,admin_params,err) NE GDB_OK)
+    {
+     ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+                     "Open GDB file for READ failed");
+     CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+              "Open GDB for READ failed", 16,__LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+    }
+  ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+                  "we just reopened the GDB file");
+  GDB_Opened = TRUE;
+  rc = ESA_OK;
+
+  if (caddinfo NE NULL)
+    ADDINFO_free(&caddinfo);
+
+  exit:;
+
+  ESA_DIAG_exit(ESA_COMP_GETUGS, 1, func, rc);
+  return rc;
+}
+
+/******************************************************************
+ * Procedure Name: ACF2_Clean_GDB
+ ******************************************************************
+ * Description   : Delete all entries from GDB (when GET_ALL_GROUPS)
+ *
+ * Input         : None
+ * Return Value  : ACF2_OK
+ *                 ACF2_Internal_Error
+ * Intermediate
+ * error (in
+ * GDB_rc) may be
+ * one of these  : GDB_EOF
+ *                 GDB_Not_Found
+ *                 GDB_Wrong_Mode
+ *                 GDB_GetNext_Failed
+ *                 GDB_Delete_Failed
+ ******************************************************************
+static ACF2_API_Return_Codes ACF2_Clean_GDB(void)
+{
+  static char func[] = "ACF2_Clean_GDB";
+
+  ACF2_API_Return_Codes ACF2_rc = ACF2_OK;
+  GDB_Codes GDB_rc = GDB_OK;
+
+  ESA_DIAG_enter(ESA_COMP_GETUGS, 1, func);
+
+ //---------------------------------------------------------------*
+  * Delete each GDB record one at a time                          *
+  *---------------------------------------------------------------//
+ while(GDB_rc EQ GDB_OK)
+  {
+    GDB_rc = GDB_GetNext(GDB_RECORD_TYPE_GROUP, NULL);
+    if (GDB_rc EQ GDB_OK) GDB_rc = GDB_Delete();
+  };
+
+  ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+           "ACF2_Clean_GDB: Leaving loop with GDB_rc = %d", GDB_rc);
+
+  if (GDB_rc NE GDB_Not_Found) ACF2_rc = ACF2_Internal_Error;
+  if (GDB_rc EQ GDB_EOF)       ACF2_rc = ACF2_OK;
+
+  exit:;
+
+  ESA_DIAG_exit(ESA_COMP_GETUGS, 1, func, ACF2_rc);
+  return ACF2_rc;
+}
+
+/******************************************************************
+ * Procedure Name: find_groups
+ ******************************************************************
+ * Description   : Go through the output of the access and resource
+ *                 rules and look for / examine the UIDs looking for
+ *                 ACF2 groups
+ *
+ * Input         : buffer
+ * Return Value  : ESA_OK
+ ******************************************************************
+static ESA_RC find_groups(char * buffer,
+                          ADDINFO_rec_ptr caddinfo,
+                          ADMIN_PARAMS_rec_typ * admin_params)
+{
+  static char func[] = "find_groups";
+
+  int           i, len, last, excess, rc = ESA_OK;
+  GDB_Codes     GDB_rc                = GDB_OK;
+  char        * from;
+  char        * to;
+  char        * next;
+  char          uid[ACF2_UID_SIZE] = "";
+  UG_typ        group;
+  char          errmsg[125];
+  char          buffer_line[BLKSIZE+1];
+  ONE_FIELD_rec_ptr           pair = NULL;
+  CTSAMSG_HANDLE_rec_ptr      msgs;
+  CTSAMSG_DEST_TABLE_rec_ptr  dest;
+
+  ESA_DIAG_enter(ESA_COMP_GETUGS, 1, func);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  if (ESA_DIAG_get_debug_level(ESA_COMP_GETUGS) GE 1)
+  {
+     for (i=0; i LT BLKSIZE; i += LRECL) {
+        memset (buffer_line, 0X00, sizeof(buffer_line));
+        strncpy (buffer_line, buffer+i,  100);
+        ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+                 "buffer line: %X %s", buffer+i, buffer_line);
+     }
+  }
+
+  //------------------------------------------------------------------//
+  // Basic logic pseudo-code:                                         //
+  //   look for: UID(                                                 //
+  //   if it is UID(xff) - finished with this buffer - leave routine  //
+  //   if it is UID(*) or UID(-) - it is a group                      //
+  //   set from and to pointers, set len field, and copy the uid      //
+  //   set next pointer (for next search)                             //
+  //   now examine this uid and either add the group or continue . . .//
+  //   after this uid, update ptrs and go back up to top              //
+  //------------------------------------------------------------------//
+
+  from = strstr (buffer, "UID(");                    // look for UID( //
+
+  while (TRUE) {
+     ESA_DIAG_printf(ESA_COMP_GETUGS, 1, "from = %X %s", from, from);
+     if (from EQ NULL)                              // no UID(, error //
+      {
+       sprintf(errmsg,"No UID( in copied buffer");
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+                errmsg, 16,__LINE__);
+       rc = ESA_FATAL;
+       goto exit;
+      };
+     if (strncmp (from, end_marker, 6) EQ 0) goto exit;
+     if ( (strncmp (from, "UID(*)", 6) EQ 0) OR
+          (strncmp (from, "UID(-)", 6) EQ 0) )  {
+        from += 4;                                 // point to * or - //
+        to = from + 1;                           // point to past uid //
+        len = 1;                                 // set len for later //
+        memset (uid, 0X00, sizeof(uid));      // init local uid field //
+        strncpy (uid, from, len);       // copy uid to temp uid field //
+        ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+                        "uid = |%s|", uid);
+        next = to + 2;                 // begin next search from here //
+        goto add_group;                           // go add the group //
+     }
+     // This is the mainline. We have a UID and we must deal with it. //
+     from += 4;                              // point to start of uid //
+     to = strstr (from, ")");                  // point to end of uid //
+     len = to - from;                            // get length of uid //
+     memset (uid, 0X00, sizeof(uid));         // init local uid field //
+     strncpy (uid, from, len);          // copy uid to temp uid field //
+     ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+                     "uid = |%s|", uid);
+     next = to + 2;                    // begin next search from here //
+     last = len - 1;                              // last char of uid //
+     excess = len - LID_Offset;            // num of LID chars in uid //
+     if (NOT (LID_In_UID))                     // all uids are groups //
+        goto add_group;                           // go add the group //
+
+     // Now that we have localized the UID, we need to look at the  //
+     // site's LID_Offset and LID_Length to determine whether this  //
+     // UID represents a group or individual user.                  //
+     //                                                             //
+     // In this release we are not dealing with the possibility     //
+     // that the LID is in the middle of the UID                    //
+     // ( (LID_Offset GT 0) AND                                     //
+     //                 (LID_Offset+LID_Length LT UID_Length) ).    //
+     //                                                             //
+     // This applies if the LID is at the tail-end of the UID       //
+     // (LID_Offset GT 0):                                          //
+     // (These examples assume LID_Offset = 16 and LID_Length = 8)  //
+     //      case 1) 1                    no LID at all - yes group //
+     //      case 1) 1b                   no LID at all - yes group //
+     //      case 1) 12345678             no LID at all - yes group //
+     //      case 1) 12345678b            no LID at all - yes group //
+     //      case 1) 1234567890123456     no LID at all - yes group //
+     //      case 2) 1234567890123456ABCDEFGH  full LID - not group //
+     //      case 2) 1234567890123456ABCDEFG* generic LID-yes group //
+     //      case 3) 1234567890123456Ab    specific LID - not group //
+     //      case 3) 1234567890123456ABCDEFGb spe'c LID - not group //
+     //      case 4) 1234567890123456A        generic LID-yes group //
+     //      case 4) 1234567890123456ABCDEFG  generic LID-yes group //
+     //                                                             //
+     // case 1) if len LT/EQ LID_Offset - a group (because no LID)  //
+     //         if len GT    LID_Offset -                           //
+     // case 2)              if excess EQ LID_Length - not a group  //
+     //                                                unless last  //
+     //                                                char=* / -   //
+     // case 3)              if excess ends in blank - not a group  //
+     // case 4)              if excess LT LID_Length - a group      //
+     //                                                             //
+     //                                                             //
+     // This applies if the LID is in the front of the UID          //
+     // (LID_Offset = 0) (In this release we are not dealing with   //
+     // anything following the LID.):                               //
+     // (These examples assume LID_Offset = 0 and LID_Length = 8)   //
+     //      case 5) ABCDEFGH                  full LID - not group //
+     //      case 5) ABCDEFG-               generic LID - yes group //
+     //      case 6) ABb                   specific LID - not group //
+     //      case 6) ABCDEFGb              specific LID - not group //
+     //      case 7) AB                     generic LID - yes group //
+     //      case 7) ABCDEFG                generic LID - yes group //
+     //                                                             //
+     // case 5) if len EQ    LID_Length - not a group unless last   //
+     //                                                  char=* / - //
+     // case 6) if len LT/EQ LID_Length AND ends in blank           //
+     //                                 - not a group               //
+     // case 7) if len LT    LID_Length - a group                   //
+     //                                                             //
+
+     if (LID_Offset GT 0) {
+       if (len LE LID_Offset) goto add_group;               // case 1 //
+                                               // no LID so yes group //
+       else if (len GT LID_Offset) {
+         if ( (excess EQ LID_Length) AND ( (uid[last] NE '*') AND
+                                           (uid[last] NE '-') ) )
+                                           goto not_group;  // case 2 //
+                                             // full LID so not group //
+         if ( (excess EQ LID_Length) AND ( (uid[last] EQ '*') OR
+                                           (uid[last] EQ '-') ) )
+                                           goto add_group;  // case 2 //
+                                          // generic LID so yes group //
+         if (uid[last] EQ ' ') goto not_group;              // case 3 //
+                                         // specific LID so not group //
+         if (excess LT LID_Length) goto add_group;          // case 4 //
+                                          // generic LID so yes group //
+       }
+     }
+     if (LID_Offset EQ 0) {
+       if ( (len EQ LID_Length) AND ( (uid[last] NE '*') AND
+                                      (uid[last] NE '-') ) )
+                                      goto not_group;       // case 5 //
+                                             // full LID so not group //
+       if ( (len EQ LID_Length) AND ( (uid[last] EQ '*') OR
+                                      (uid[last] EQ '-') ) )
+                                      goto add_group;       // case 5 //
+                                          // generic LID so yes group //
+       if ( (len LE LID_Length) AND (uid[last] EQ ' ') )
+                                      goto not_group;       // case 6 //
+                                         // specific LID so not group //
+       if (len LT LID_Length) goto add_group;               // case 7 //
+                                          // generic LID so yes group //
+     }
+
+     add_group:
+     //
+      *    Build Group Record (some of this came from CTSBIUG)
+      //
+
+     pair = ADDINFO_search("UIDMASKS",
+                           ACF_ADDINFO_KWD_LEN,
+                           caddinfo->pair,
+                           caddinfo->num_pairs);
+     if (pair NE NULL)
+        ADDINFO_updval(uid, ACF_ADDINFO_VAL_LEN, pair);
+     else
+        ADDINFO_insert(TYPE_1B, "UIDMASKS", uid, caddinfo,
+                      ACF_ADDINFO_KWD_LEN,
+                      ACF_ADDINFO_VAL_LEN,
+                      UNIQUE);
+
+     strcpy (group, uid);
+     rc = GDB_Convert_to_Record(GDB_RECORD_TYPE_GROUP,
+                                group,
+                                caddinfo);
+
+     if (rc NE ESA_OK)
+      {
+       sprintf(errmsg,"Build GDB Record Failed");
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+                errmsg, 16,__LINE__);
+       rc = ESA_FATAL;
+       goto exit;
+      };
+
+     //
+      *    Insert New Group Record
+      //
+
+     ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+              "GDB_Insert of group |%s|", group);
+
+     GDB_rc = GDB_Insert();
+
+     switch(GDB_rc)
+      {
+       case GDB_OK:                         // insert worked - great! //
+        break;
+
+       case GDB_Duplicate_Key:        // group already there - great! //
+        break;
+
+       default:
+        sprintf(errmsg,"Insert failed for Group %s (rc=%d)",
+                group, GDB_rc);
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+                 errmsg, 16,__LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+      };
+
+     not_group:
+     ESA_DIAG_printf(ESA_COMP_GETUGS, 1, "next = %X %s", next, next);
+     from = strstr (next, "UID(");    // look for UID( and go back up //
+  }
+
+  exit:;
+
+  ESA_DIAG_exit(ESA_COMP_GETUGS, 1, func, rc);
+  return rc;
+}
+/* * * * * * * * WS10062 End * * * * * * * */
+
+/******************************************************************
+ * Procedure Name: Cleanup
+ ******************************************************************
+ * Description   : Perform API Handle cleanup
+ *
+ * Input         : h    - handle strcuture pointer removed by WS10079T
+ *                 handle       - API handle paramter
+ *
+ * Return Value  : None.
+ ******************************************************************/
+static void Cleanup(/* ACF2_Get_Groups_Handle *h,           WS10079T */
+                    void **handle,
+                    ADMIN_PARAMS_rec_typ * admin_params,
+                    ERR_STRUCT_rec_typ   * err)
+{
+ static char func[]="Cleanup";                           /* BS10091 */
+ ESA_RC rc = ESA_OK;                                     /* WS10076 */
+ ACF2_GetUG_Handle           * m_h  = NULL;              /* WS10079T */
+ ACF2_Get_RoleSource_Handle  * rs_h = NULL;              /* WS10079T */
+ ACF2_Get_Groups_Handle      * h    = NULL;              /* WS10079T */
+ void                       ** xref_handle = NULL;       /* WS10079N */
+ XBhandle_rec_typ            * xbhandle    = NULL;       /* WS10079T */
+ LID_PERM_handle_rec_typ     * lid_perm_handle = NULL;   /* WS10079T */
+ PB_Build_Request_typ        * PB_Req = NULL;            /* WS10084 */
+
+ /* *handle = NULL;                                        WS10079T */
+
+ ESA_DIAG_enter(ESA_COMP_GETUGS, 1, func);               /* BS10091 */
+
+ /* WS10079T start  */
+ if (*handle NE NULL)
+ {
+   m_h = (ACF2_GetUG_Handle *)*handle;
+
+   PB_Req =  m_h->PB_Req;                                /* WS10084 */
+   if(strcmp(m_h->type, "XRF") EQ 0)
+   {
+     xref_handle = &m_h->rs_h.getxref_handle;
+     xbhandle    = &m_h->rs_h.xbhandle;
+     lid_perm_handle = &m_h->rs_h.lid_perm_handle;
+     /*  XREF cleanup   */
+     if (*xref_handle NE NULL)
+     {
+        rc = ACF2_Get_Xref("TERM",
+            xbhandle,
+            xref_handle,                                  /* WS10079N */
+            NULL_CHAR,
+            NULL,
+            NULL,
+            NULL,
+            NULL,
+            ESA_COMP_GETUGS,
+            admin_params);
+        ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+       "ACF2_Get_Xref TERM rc<%d>",rc);
+
+       /* WS10084 start */
+       if (PB_Req NE NULL)
+       {
+         /*Permissions_block_Build ("FREE",
+                                 PB_Req,
+                                 ESA_COMP_GETUGS,
+                                 admin_params); */
+         free(PB_Req);
+         PB_Req = NULL;
+       }
+       /* WS10084 end   */
+       /*IS10189 drop it as we do it in any event at the end of routine
+        * WS10084 start *
+       if (*handle NE NULL)
+       {
+         free(*handle);
+         FREE_STORAGE_DIAG(*handle, func)
+         *handle = NULL;
+       }
+        * WS10084 end   *
+        * IS10189 end   */
+     }
+
+     /* WS10084
+     if (m_h->rs_h.Permissions_neededYN EQ 'Y')
+     {
+        rc = Get_ROLE_Permissions("TERMNAME",
+                             /*lid_perm_handle,            WS10084 @/
+                               PB_Req,                  /* WS10084 @/
+                               NULL,
+                               "TERM",
+                               admin_params);
+        ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+       "Get_ROLE_Permissions TERM rc<%d>",rc);
+     }
+        WS10084 */
+
+   }
+
+   if(strcmp(m_h->type, "GRP") EQ 0)
+   {
+      /*  group cleanup  */
+      h = &m_h->g_h;
+   /* WS10079T end    */
+
+    /* WS10084 start */
+    if (PB_Req NE NULL)
+    {
+      Permissions_block_Build ("FREE",
+                              PB_Req,
+                              ESA_COMP_GETUGS,
+                              admin_params);
+      free(PB_Req);
+      PB_Req = NULL;
+    }
+    /* WS10084 end   */
+
+    if (h NE NULL)
+    {
+      if (h->laddinfo NE NULL)
+       ADDINFO_free(&(h->laddinfo));
+      if(h->ptr_2_PBhandle NE NULL) /*WS10084 dropped it by IS10189*/
+        free(h->ptr_2_PBhandle);    /*mistake.              IS10189*/
+
+      /* WS10084
+      if (h->ptr_2_PBhandle NE NULL)
+      {
+        Permissions_block_Build ("FREE",                  /* WS10076 @/
+                                 h->ptr_2_PBhandle,       /* WS10076 @/
+                                 ESA_COMP_GETUGS,         /* WS10076 @/
+                                 admin_params);           /* WS10076 @/
+
+        free(h->ptr_2_PBhandle);                          /* WS10076 @/
+        FREE_STORAGE_DIAG(h->ptr_2_PBhandle, func)       /* WS10078S @/
+      };
+        WS10084 */
+      /* WS10079T
+      free(h);
+      FREE_STORAGE_DIAG(h, func)             WS10079T */ /* WS10078S */
+    };
+
+    if (GDB_Opened EQ TRUE)
+     {
+      GDB_Set_Mode(GDB_Closed,admin_params,err);
+      GDB_Opened = FALSE;
+      ESA_DIAG_printf(ESA_COMP_GETUGS, 6,                 /* BS10091 */
+                      "Just closed the GDB file");        /* BS10091 */
+     };
+
+    group_count = 0;
+   }                                                     /* WS10079T */
+
+   free(*handle);                                        /* WS10079T */
+   FREE_STORAGE_DIAG(*handle, func)                      /* WS10079T */
+   *handle = NULL;                                       /* WS10079T */
+ }                                                       /* WS10079T */
+
+ ESA_DIAG_exit(ESA_COMP_GETUGS, 1, func, 0);             /* BS10091 */
+
+}
+
+/* WS10079K - Move ACF2_get_xref to CTSBSRV */
+/*
+/@ WS10078KG - Start @/
+/@*****************************************************************
+ * Procedure Name: ACF2_Get_Xref
+ ******************************************************************
+ * Description   : This function retrievs returns the Roles or
+ *                 Sources read from ACF2 database.
+ *
+ * Input         : mode       - GET_ALL_ROLES   To get all XROLs
+ *                            - GET_ALL_SOURCES To get all XSGPs
+ *                             - PB handle                // WS10076S //
+ *
+ * Input/Output  : ug_params   - Role or Source returned
+ *                 addinfo     - ADDINFO containing Include/Exclude
+ *                               list for Source.
+ *                               more two parameters Description and
+ *                               RoleDirectPermissions for Role.
+ *
+ * Return Value  : ACF2_API_Return_Codes
+ *                 ACF2_OK             - The XREF record Retrieved
+ *                 ACF2_Not_Found      - No record to retrieve (EOF)
+ *                 ACF2_Internal_Error - Error while processing records
+ ********************************************************************@/
+static ACF2_API_Return_Codes ACF2_Get_Xref(
+                       GET_GROUP_MODE          mode,
+                       UG_PARAMS_rec_ptr       ug_params,
+                       ADDINFO_rec_ptr         addinfo,
+                       ACF2_Get_Xref_Handle   *xref_handle,
+                       ADMIN_PARAMS_rec_typ   *admin_params)
+{
+   static        char func[]="ACF2_Get_Xref";
+   ACF2_API_Return_Codes aarc = ACF2_OK;
+   ESA_RC rc = ESA_OK;
+   char rectype[7];   /@ This can be "X(ROL)" or "X(SGP)" @/
+   char recparm[9];   /@ This is either name of XREF record or '-' @/
+   char errmsg[100] = "", output_buffer[OUTPUT_AREA_LEN]="";
+   char *output_buffer_ptr = NULL;
+   int  i, j=0, output_buffer_len = OUTPUT_AREA_LEN;
+   REXX@UTL_output_blk_rec_typ *p_ruob = NULL;
+   Get_XREF_Rec_Handle    *xref_handle_to_get = NULL;
+   short getNext = TRUE, isXrefRec = FALSE;
+   LID_PERM_handle_rec_typ * lid_perm_handle = NULL;
+   ONE_FIELD_rec_ptr           pair = NULL;            /@ BS10108T @/
+
+   REXX@UTL_output_ignlist_rec_typ ignore_list[] =
+        {
+          { 10,  0,    "1ACF0C038 "      },
+          { 6,   0,    " READY"          },
+          { 10,  0,    " 1ACF0C038"      },
+          { 3,   0,    "  ?"             },
+          { 13,  0,    "   SET X(ROL)"   },
+          { 13,  0,    "   SET X(SGP)"   },
+          { 15,  0,    "   LIST LIKE(-)" },
+          { 4,   0,    " END"            },
+          { 5,   0,    "READY"           },
+          { 1,   0xFF, " "               },
+        };
+
+   CTSAMSG_HANDLE_rec_ptr      msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr  dest;
+
+   ESA_DIAG_enter(PLT_COMP_XREF, 1, func );
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   p_ruob = (REXX@UTL_output_blk_rec_typ*) xref_handle->pruob;
+   xref_handle_to_get = (Get_XREF_Rec_Handle*) xref_handle->h;
+
+   ESA_DIAG_printf(PLT_COMP_XREF,20,
+                   "p_ruob = %p, xref_handle_to_get=%p",
+                   p_ruob,xref_handle_to_get);
+
+   if ( p_ruob EQ NULL )
+   {
+     if( (mode EQ GET_ALL_ROLES) OR (mode EQ GET_MANY_ROLES) )
+        strcpy(rectype,"X(ROL)");
+     else
+        if( (mode EQ GET_ALL_SOURCES) OR (mode EQ GET_MANY_SOURCES) )
+           strcpy(rectype,"X(SGP)");
+        else
+        {
+           sprintf(errmsg,"Invalid mode = %d", mode);
+           CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                         component,func, errmsg, 16, __LINE__);
+           aarc = ACF2_Internal_Error;
+           goto exit;
+        }
+
+     if(strlen(xref_handle->recparm) GT 0)
+        strcpy(recparm,xref_handle->recparm);
+     else
+        strcpy(recparm,"-");
+
+     rc = ACF2_Cmd2Mem(rectype,
+                       recparm,
+                       ignore_list,
+                       &p_ruob,
+                       PLT_COMP_XREF,
+                       admin_params);
+
+     /@ BS10108T - start  @/
+     /@
+     if ( (rc NE ESA_OK) OR (p_ruob EQ NULL) )
+     {
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+                      "ACF2_Cmd2Mem ended with error. Null p_ruob",
+                      16, __LINE__);
+        aarc = ACF2_Internal_Error;
+        goto exit;
+     }
+     @/
+
+     if (rc NE ESA_OK)
+     {
+        CTSAMSG_print(WARN_INT1, msgs, NULL, dest, component,func,
+                    "ACF2_Cmd2Mem failed to retrieve roles/sources,"
+                    " or there are none. "
+                    "Refer to preceding CTS3816I messages for details",
+                     16, __LINE__);
+        aarc = ACF2_Internal_Error;
+        goto exit;
+     }
+     else
+     if (p_ruob EQ NULL)
+     {
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+                      "ACF2_Cmd2Mem returned null p_ruob",
+                      16, __LINE__);
+        aarc = ACF2_Internal_Error;
+        goto exit;
+     }
+     /@ BS10108T - end    @/
+
+     xref_handle->pruob=(REXX@UTL_output_blk_rec_typ*) p_ruob;
+   }
+   /@ Loop to get one record which is either ROLE    *
+    * or SOURCE. The GROUP records are to be ignored @/
+   do
+   {
+      rc = Get_XREF_Record("GETNEXT",
+                           &xref_handle_to_get,
+                           p_ruob,
+                           output_buffer,
+                           output_buffer_len,
+                           admin_params);
+
+      ESA_DIAG_printf(PLT_COMP_XREF,6,
+                "Get_XREF_Record returned rc = %d", rc);
+
+      switch(rc)
+      {
+        case ESA_OK:
+
+           xref_handle->h=(Get_XREF_Rec_Handle*) xref_handle_to_get;
+          /@ We are good and have data to process @/
+          /@ Check if the line ends with SOURCE or ROLE @/
+          /@ Call parse routine to parse the output buffer @/
+          ESA_DIAG_printf(PLT_COMP_XREF,9,
+                    "Get_XREF_Record returned output_buffer=<%s>",
+                     output_buffer);
+          isXrefRec=FALSE;
+
+          /@   BS10108T  - start  @/
+          rc = Parse_XREF_Record(
+                                 ug_params->group,
+                                 addinfo,
+                                 output_buffer,
+                                 'N',      /@ no group records @/
+                                 NULL,
+                                 admin_params);
+
+          if(rc EQ ESA_SKIP)   /@ if it is a group then skip it@/
+          {
+             rc = ESA_OK;
+             break;
+          }
+
+          if(rc NE ESA_OK)
+          {
+             CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                           component,func,
+                           "Parse_XREF_Record ended with error",
+                           rc, __LINE__);
+             aarc = ACF2_Internal_Error;
+             goto exit;
+          }
+
+          isXrefRec=TRUE;
+
+          if( (mode EQ GET_MANY_SOURCES)
+              OR
+              (mode EQ GET_MANY_ROLES) )
+          {
+            /@ caller may request to check if there are multiple
+               entities in the record (same name, different SYSID),
+               by adding the #is#muli#rec attribute                @/
+
+            ESA_DIAG_printf(PLT_COMP_XREF,6,
+                    "GET_MANY mode");
+
+            pair = ADDINFO_search("#is#multi#rec",
+                                  ACF_ADDINFO_KWD_LEN,
+                                  addinfo->pair,
+                                  addinfo->num_pairs);
+
+            if (pair NE NULL)
+            {
+               /@ check if there are any more elements in the record
+                  by issueing another GETNEXT                        @/
+
+               ESA_DIAG_printf(PLT_COMP_XREF,6,
+                    "#is#multi#rec attribute requested");
+
+               rc = Get_XREF_Record("GETNEXT",
+                                    &xref_handle_to_get,
+                                    p_ruob,
+                                    output_buffer,
+                                    output_buffer_len,
+                                    admin_params);
+
+               if (  (rc EQ ESA_OK)      /@ found another element ?  @/
+                     OR
+                     (rc EQ ESA_FATAL) ) /@ ESA_FATAL is most likely @/
+                                         /@ overflow                 @/
+
+                   /@ yes, there are more elements                   @/
+                   rc = ADDINFO_updval("Y",ACF_ADDINFO_VAL_LEN, pair);
+               else
+                   /@ no, there are no more elements                 @/
+                   rc = ADDINFO_updval("N",ACF_ADDINFO_VAL_LEN, pair);
+
+               if (rc NE ESA_OK)
+                  {
+                   sprintf(errmsg,
+                   "Updating xref=<%s> #is#muli#rec failed with rc=%d",
+                    ug_params->group, rc);
+
+                   CTSAMSG_print(ERR_INTERNAL2,msgs,
+                                 NULL, dest, component,
+                                 func, errmsg, 16,__LINE__);
+                    rc = ESA_FATAL;
+                    goto exit;
+                  };
+
+               rc = ESA_OK;
+            }
+            else
+
+               ESA_DIAG_printf(PLT_COMP_XREF,6,
+                    "#is#multi#rec attribute not requested");
+          }
+          break;
+
+          /@   Following parsing to get non group elements is not
+               needed since the modified Parse_Xref_Record above
+               supports ignoring group elements.
+
+          @* Lets read from last and put NULL_CHAR  *
+           * at the end to trim the string          *@
+          for( i = ( strlen(output_buffer)-1 ); i GT 0; i-- )
+          {
+             if( (output_buffer[i] EQ ' ')
+                    OR (output_buffer[i] EQ '\n') )
+             {
+               output_buffer[i] = NULL_CHAR;
+             }
+             else
+             {
+               break;
+             }
+          }@* End for loop *@
+
+          if( (i LT 7) )
+          {
+            @* If there are less than 7 char it means the  *
+             * data is wrong. This is an error.            *@
+            sprintf(errmsg, "Invalid line - <%s>", output_buffer);
+            CTSAMSG_print(ERR_INTERNAL2,msgs, NULL,dest,component,func,
+                          errmsg, 16,__LINE__);
+            aarc = ACF2_Internal_Error;
+            goto exit;
+          }
+          else
+          {
+            @* Lets check if last 4 characters are ROLE or 6 *
+             * characters are SOURCE                         *@
+             if(strcmp(output_buffer + (i-3) ,"ROLE") EQ 0)
+             {
+                isXrefRec=TRUE;
+                ESA_DIAG_printf(PLT_COMP_XREF,7,
+                           "ROLE - <%.4s>", output_buffer + (i-3));
+             }
+             else
+             {
+                if(strcmp(output_buffer + (i-5),"SOURCE") EQ 0)
+                {
+                  isXrefRec=TRUE;
+                  ESA_DIAG_printf(PLT_COMP_XREF,7,
+                          "SOURCE - <%.7s>", output_buffer + (i-5));
+                }
+             }
+          }
+          if(isXrefRec EQ TRUE)
+          {
+            rc = Parse_XREF_Record(ug_params, addinfo, output_buffer,
+                              admin_params);
+            if(rc NE ESA_OK)
+            {
+               CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                             component,func,
+                             "Parse_XREF_Record ended with error",
+                             rc, __LINE__);
+               aarc = ACF2_Internal_Error;
+               goto exit;
+            }
+            else
+            {
+               ESA_DIAG_printf(PLT_COMP_XREF,9,
+                 "XREF Record =<%s> added", ug_params->group);
+               aarc = ACF2_OK;
+            }
+          }
+          else
+          {
+            ESA_DIAG_printf(PLT_COMP_XREF,9,
+                            "Parse_Xref_Record not called");
+          }
+          break;
+          @/
+          /@   BS10108T  - end    @/
+        case ESA_EOF:
+          /@ There is no data to process lets return@/
+          aarc = ACF2_Not_Found;
+          break;
+        case ESA_SKIP:
+          /@ The buffer is small. should this be error@/
+          CTSAMSG_print(ERR_INTERNAL2,msgs, NULL,dest,component,func,
+                     "Error small buffer!!", 16,__LINE__);
+          aarc = ACF2_Internal_Error;
+          break;
+        default:
+          /@ In all other cases we consider it as an error and exit @/
+          CTSAMSG_print(ERR_INTERNAL2,msgs, NULL,dest,component,func,
+                     "Error!!!", 16,__LINE__);
+          aarc = ACF2_Internal_Error;
+          goto exit;
+      };
+
+   } while((NOT isXrefRec) AND (rc EQ ESA_OK));
+
+   /@ We have Role data. Lets check if we should  *
+    * be getting permissions along with Roles     @/
+   if( (xref_handle->with_perm EQ TRUE) AND (aarc EQ ACF2_OK) )
+   {
+      lid_perm_handle =
+              (LID_PERM_handle_rec_typ *) xref_handle->lid_perm_handle;
+      if(lid_perm_handle EQ NULL)
+      {
+         lid_perm_handle = (LID_PERM_handle_rec_typ *)
+                          calloc (1, sizeof(LID_PERM_handle_rec_typ));
+         if (lid_perm_handle EQ NULL)
+         {
+            CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                          "LID_PERM handle",
+                          sizeof(LID_PERM_handle_rec_typ));
+            rc = ESA_FATAL;
+            goto exit;
+         }
+         else
+         {
+            ALLOC_STORAGE_DIAG(lid_perm_handle,          /@ WS10078S @/
+                               sizeof(LID_PERM_handle_rec_typ),
+                               func)                     /@ WS10078S @/
+            lid_perm_handle->RolesBlk   = NULL;
+            lid_perm_handle->SourcesBlk = NULL;
+            lid_perm_handle->lidra_vec  = NULL;
+            lid_perm_handle->RequiredPermissions= PERM_TYPE_ROLE;
+
+            if( (strlen(xref_handle->recparm) GT 0)
+               AND (strcmp(xref_handle->recparm,"-") NE 0) )
+               strcpy(lid_perm_handle->lid,xref_handle->recparm);
+            else
+               strcpy(lid_perm_handle->lid,"*");/@Run ACFRPTRX for * @/
+            xref_handle->lid_perm_handle =
+                           (LID_PERM_handle_rec_typ *) lid_perm_handle;
+         }
+      }
+      rc = Get_ROLE_Permissions(ug_params->group,
+                                lid_perm_handle,
+                                addinfo,
+                                "GET",
+                                admin_params);
+
+      if(rc NE ESA_OK)
+      {
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                       component,func,
+                       "Get_ROLE_Permissions ended with error",
+                        rc, __LINE__);
+         aarc = ACF2_Internal_Error;
+         goto exit;
+      }
+      ESA_DIAG_printf(PLT_COMP_XREF,9,
+                      "Permissions for ROLE=<%s> added",
+                      ug_params->group);
+   }
+
+   exit:
+     if( (aarc NE ACF2_OK) OR
+         (mode EQ GET_MANY_ROLES) OR (mode EQ GET_MANY_SOURCES) )
+     {
+    /@ moved  after Get_ROLE_Permissions TERM            WS10078T
+       rc = Get_XREF_Record( "TERM",
+                             &xref_handle_to_get,
+                             p_ruob,
+                             output_buffer,
+                             output_buffer_len,
+                             admin_params);
+
+       rc = ESA_CLI_del_RUOB(p_ruob, admin_params);
+       p_ruob=NULL;                                            @/
+
+       if (xref_handle->with_perm EQ TRUE)
+       {
+                                             /@ start WS10078T @/
+          lid_perm_handle =
+              (LID_PERM_handle_rec_typ *) xref_handle->lid_perm_handle;
+
+          ESA_DIAG_printf(PLT_COMP_XREF,6,
+             "Calling Get_ROLE_Permissions TERM. lid_perm_handle=%p",
+              lid_perm_handle);
+                                             /@ end   WS10078T @/
+
+          rc = Get_ROLE_Permissions(ug_params->group,
+                                    lid_perm_handle,
+                                    addinfo,
+                                    "TERM",
+                                    admin_params);
+          if(lid_perm_handle NE NULL)
+          {
+            free(lid_perm_handle);
+            FREE_STORAGE_DIAG(lid_perm_handle, func)     /@ WS10078S @/
+          }
+       }
+    /@ moved  here from above                            WS10078T @/
+       rc = Get_XREF_Record( "TERM",
+                             &xref_handle_to_get,
+                             p_ruob,
+                             output_buffer,
+                             output_buffer_len,
+                             admin_params);
+
+       rc = ESA_CLI_del_RUOB(p_ruob, admin_params);
+       p_ruob=NULL;                                   /@ WS10078T @/
+
+
+     }
+
+     ESA_DIAG_exit(PLT_COMP_XREF, 1, func, aarc);
+     return aarc;
+
+}
+/@ WS10078KG - End @/
+/* WS10079K - End */
+
+/* BS10108 - The routine below was moved to CTSBSRV
+/@********************************************************************
+        Start WS10078TG
+
+        Parse_XREF_Record
+
+        The routine parses a ROLE/SOURCE record from SET X(ROL)/X(SGP)
+        LIST LIKE(-) output, and updates ug_params & addinfo.
+
+        A sample ROLE record will look as follows:
+ TLVB / ROLR341 LAST CHANGED BY TLVKP ON 04/13/20-05:44
+                      DESCRIPT('THIS IS DESCRIPTION')
+                      EXCLUDE(ROLR11A ROLR31A ROLR31B ROLR32B ...
+                      ROLR34N ROLR34O ROLR34P ROLR34Q ROLR34R ...
+                      ROLR35Y ROLR35Z ROLR36H ROLR36V ROLR37A ...
+                      ROLR39Z)
+                      INCLUDE(ROLR321 ROLR322 ROLR323 ROLR324 ...
+                      ROLR345 ROLR346 ROLR347 ROLR348 ROLR349 ...
+                      ROLR357 ROLR358 ROLR359 ROLR360 ROLR361 ...
+                      ROLR391 ROLR392 ROLR393) ROLE
+TOTAL RECORD LENGTH= 986 BYTES, 24 PERCENT UTILIZED
+
+Note: the leading blanks on all lines which are not the first and the
+      last are dropped by Get_XREF_Record (some extra blanks may remain
+      on the right side of continued lines).
+*********************************************************************@/
+static   ESA_RC Parse_XREF_Record(
+                            UG_PARAMS_rec_ptr       ug_params,
+                            ADDINFO_rec_ptr         addinfo,
+                            char                  * xref_record,
+                            ADMIN_PARAMS_rec_typ  * admin_params)
+{
+  static char func[] = "Parse_XREF_Record";
+
+  ESA_RC              rc   = ESA_OK;
+  ESA_RC              rcc  = ESA_OK;
+  ONE_FIELD_rec_ptr   pair = NULL;
+  char              * p1   = NULL;
+  char              * p2   = NULL;
+  char              * j    = NULL;
+  char              * val  = NULL;
+  char              * from = NULL;
+  char              * to   = NULL;
+  UG_typ              name;
+  int                 name_size = 0;
+  char                errmsg[125] = "";
+  CTSAMSG_HANDLE_rec_ptr      msgs;
+  CTSAMSG_DEST_TABLE_rec_ptr  dest;
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  ESA_DIAG_enter(PLT_COMP_XREF, 1, func);
+
+  /@  locate the xref name and update ug_params group               @/
+
+  ESA_DIAG_printf(PLT_COMP_XREF,6,
+        "input xref record area = <%s>",xref_record);
+
+  /@  Locate the role|source name                                   @/
+
+  p1 = strstr(xref_record, " LAST CHANGED");
+  if (p1  EQ NULL)
+   {
+      sprintf(errmsg,
+        "LAST CHANGED not found in XREF record area");
+
+      CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,
+                             func, errmsg, 16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  p2 = p1 - XREF_NAME_SIZE;
+  for (j=p1-1; j GE p2; j--)
+        {
+          if (*j EQ ' ') break;  /@ break only from this for @/
+        };
+
+  if ((*j NE ' ') OR (j EQ (p1-1)) )
+   {
+
+      ESA_DIAG_printf(PLT_COMP_XREF,6,
+      "Could not locate a valid name p1=%p p2=%p<%s> j=%p(%c)",
+      p1,p2,p2,j,*j);
+
+      sprintf(errmsg,
+        "Could not locate the precedng blank of XREF name");
+
+      CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,
+                             func, errmsg, 16,__LINE__);
+
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  name_size = p1 - j -1;
+
+  if (name_size GT (XREF_NAME_SIZE - 1))
+   {
+
+      ESA_DIAG_printf(PLT_COMP_XREF,6,
+      "Could not locate a valid name p1=%p p2=%p j=%p name_size=%d",
+      p1,p2,j,name_size);
+
+
+      sprintf(errmsg,
+       "XREF name size too large = %d",name_size);
+
+      CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,
+                             func, errmsg, 16,__LINE__);
+
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  strncpy(name,++j,name_size);
+  name[name_size] = NULL_CHAR;
+  strcpy(ug_params->group,name);
+
+  ESA_DIAG_printf(PLT_COMP_XREF,6,"name = <%s>", name);
+
+  /@  locate the description and update addinfo with the value of the
+      Description attribute                                         @/
+
+  from = p1 + sizeof(" LAST CHANGED") -1;
+  p1 = strstr(from, "DESCRIPT(");
+
+  if (p1  EQ NULL)
+     ESA_DIAG_printf(PLT_COMP_XREF,6,"DESCRIPT( not found");
+  else
+   {
+     ESA_DIAG_printf(PLT_COMP_XREF,6,"DESCRIPT( found");
+
+     from = p1 + sizeof("DESCRIPT(") -1;
+     to = strstr(from, ")");
+
+     if (to  EQ NULL)
+     {
+        ESA_DIAG_printf(PLT_COMP_XREF,6,
+          "DESCRIPT closing parenthesis not found");
+
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, "DESCRIPT closing parenthesis not found",
+                     16, __LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+     }
+
+     *to = NULL_CHAR;
+     val = from;
+     from = to + 1;   /@ for next search   @/
+
+     ESA_DIAG_printf(PLT_COMP_XREF,6,"DESCRIPT=<%s>",val);
+
+     pair = ADDINFO_search("Description",
+                                ACF_ADDINFO_KWD_LEN,
+                                addinfo->pair,
+                                addinfo->num_pairs);
+
+     if (pair NE NULL)
+      {
+         rc = ADDINFO_updval(val, ACF_ADDINFO_VAL_LEN, pair);
+
+         if (rc NE ESA_OK)
+         {
+           sprintf(errmsg,
+                "Updating xref=<%s> Description=<%s> failed with rc=%d",
+                 name,val,rc);
+
+           CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,
+                                func, errmsg, 16,__LINE__);
+           rc = ESA_FATAL;
+           goto exit;
+         };
+      };
+
+   }
+
+  /@  locate the exclude list and update addinfo with the value of the
+      ExcludeList attribute                                         @/
+
+   p1 = strstr(from, "EXCLUDE(");
+
+   if (p1  EQ NULL)
+      ESA_DIAG_printf(PLT_COMP_XREF,6,"EXCLUDE( not found");
+   else
+   {
+     ESA_DIAG_printf(PLT_COMP_XREF,6, "EXCLUDE( found");
+
+     from = p1 + sizeof("EXCLUDE(") -1;
+     to = strstr(from, ")");
+
+     if (to  EQ NULL)
+     {
+        ESA_DIAG_printf(PLT_COMP_XREF,6,
+          "EXCLUDE closing parenthesis not found");
+
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, "EXCLUDE closing parenthesis not found",
+                     16, __LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+     }
+
+     *to = NULL_CHAR;
+     val = from;
+     from = to + 1;   /@ for next search   @/
+
+     ESA_DIAG_printf(PLT_COMP_XREF,6,"EXCLUDE list=<%s>",val);
+
+     pair = ADDINFO_search("ExcludeList",
+                                ACF_ADDINFO_KWD_LEN,
+                                addinfo->pair,
+                                addinfo->num_pairs);
+
+     if (pair NE NULL)
+      {
+        rc = ADDINFO_updval(val, ACF_ADDINFO_VAL_LEN, pair);
+
+        if (rc NE ESA_OK)
+        {
+
+          sprintf(errmsg,
+              "Updating xref=<%s> ExcludeList=<%s> failed with rc=%d",
+               name,val,rc);
+
+          CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,
+                               func, errmsg, 16,__LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+        };
+      };
+   }
+
+  /@  locate the include list and update addinfo with the value of the
+      IncludeList attribute                                      @/
+
+   p1 = strstr(from, "INCLUDE(");
+
+   if (p1  EQ NULL)
+      ESA_DIAG_printf(PLT_COMP_XREF,6,"INCLUDE( not found");
+   else
+   {
+     ESA_DIAG_printf(PLT_COMP_XREF,6, "INCLUDE( found");
+
+     from = p1 + sizeof("INCLUDE(") -1;
+     to = strstr(from, ")");
+
+     if (to  EQ NULL)
+     {
+        ESA_DIAG_printf(PLT_COMP_XREF,6,
+          "INCLUDE closing parenthesis not found");
+
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, "INCLUDE closing parenthesis not found",
+                     16, __LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+     }
+
+     *to = NULL_CHAR;
+     val = from;
+     from = to + 1;   /@ for next search   @/
+
+     ESA_DIAG_printf(PLT_COMP_XREF,6,"INCLUDE list=<%s>",val);
+
+     pair = ADDINFO_search("IncludeList",
+                                ACF_ADDINFO_KWD_LEN,
+                                addinfo->pair,
+                                addinfo->num_pairs);
+
+     if (pair NE NULL)
+      {
+        rc = ADDINFO_updval(val, ACF_ADDINFO_VAL_LEN, pair);
+
+        if (rc NE ESA_OK)
+        {
+
+          sprintf(errmsg,
+              "Updating xref=<%s> IncludeList=<%s> failed with rc=%d",
+               name,val,rc);
+
+          CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,
+                               func, errmsg, 16,__LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+        };
+      };
+   }
+
+
+  exit:
+  ESA_DIAG_exit(PLT_COMP_XREF, 1, func, rc);
+  return rc;
+
+}
+    End of moved code   - BS10108    */
+
+/******************************************************************
+ * Procedure Name: Get_ROLE_Permissions
+ ******************************************************************
+ * WS10084       : Radicaly changed to perform the following:
+ * Description   : Permissions_Block_Get (PERMNEXT) for all
+ *                 permissions of the role
+ *
+ * Input         : ROLE
+ *                 pointer to PB_Build_Request
+ *                 addinfo
+ *                 call type: GET
+ * Output        : addinfo - permissions are copied here
+ * Return Value  : ESA_OK    - ended ok
+ *                 ESA_EOF   - end_of_file reached
+ ******************************************************************/
+static ESA_RC Get_ROLE_Permissions(char               * ROLE,
+               /* WS10084   LID_PERM_handle_rec_typ * lid_perm_handle,*/
+               /* WS10084 */  PB_Build_Request_typ    * PB_Req,
+                              ADDINFO_rec_ptr           addinfo,
+                              char                    * call_type,
+                              ADMIN_PARAMS_rec_typ    * admin_params)
+{
+  static char func[] = "Get_ROLE_Permissions";
+
+  ESA_RC     rc = ESA_OK;
+  ESA_RC     rcc = ESA_OK;                                 /* WS10084 */
+  ESA_RC     pb_rc = ESA_OK;                               /* WS10084 */
+  PBhandle_typ * PBh = NULL;                               /* WS10084 */
+  char       perm_data[ACF2_MAX_PERMISSN_SIZE] = "";       /* WS10084 */
+  ONE_FIELD_rec_ptr        perm_pair  = NULL;              /* WS10084 */
+  ONE_FIELD_rec_ptr        pair       = NULL;              /* WS10084 */
+  /* char     * from = NULL;                                  WS10084 */
+  /* char     * to = NULL;                                    WS10084 */
+  /* int      i = 0, first_time = 0, role_found = 0, len = 0; WS10084 */
+  int        perms_exist = FALSE;                        /* BS10108T */
+  int        issue_no_permissions_message = TRUE;        /* BS10108T */
+  /* char       resource_type[4] = "";                        WS10084 */
+  char       type[4] = "";
+  char       role[XREF_NAME_SIZE] = "";
+  char       inputROLE[XREF_NAME_SIZE] = "";
+  /* char       rule_record[ACF2_MAX_PERMISSN_SIZE] = "";     WS10084 */
+  char       errmsg[125] = "";
+  /* char       function[10];                                 WS10084 */
+  /* Permission_Record_Type   requested_record_type;          WS10084 */
+  /* Permission_Record_Type   returned_record_type;           WS10084 */
+  /* BS10111 GET_LINE_PTR             get_line_ptr;  */
+  /* ONE_FIELD_rec_ptr        direct_pair = NULL;             WS10084 */
+  /* ONE_FIELD_rec_ptr        indirect_pair = NULL;           WS10084 */
+  /* RULE_TYPE_PERM_rec_typ * rule_type_perm_vec;             Ws10084 */
+  /* BS10111 IDB_GETRUOBLINE_rec_typ   input_desc_block;  */
+
+  CTSAMSG_HANDLE_rec_ptr      msgs;
+  CTSAMSG_DEST_TABLE_rec_ptr  dest;
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  ESA_DIAG_enter(PLT_COMP_XREF, 1, func);
+  ESA_DIAG_printf(PLT_COMP_XREF, 6,
+         "strlen of ROLE = %d",strlen(ROLE));
+
+  strcpy(inputROLE, ROLE);
+  ESA_DIAG_printf(PLT_COMP_XREF, 6,
+         "Pre-trim  ROLE/inputROLE = |%.8s|/|%.8s| ",
+                    ROLE,inputROLE);
+  Trim(inputROLE);
+  ESA_DIAG_printf(PLT_COMP_XREF, 6,
+         "Post-trim ROLE/inputROLE = |%.8s|/|%.8s| ",
+                     ROLE,inputROLE);
+
+  /* BS10111 get_line_ptr = &ESA_CLI_get_RUOB_line;   */
+
+  /* WS10084
+  if (strcmp(call_type, "TERM") EQ 0)
+  {
+     ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                     "Processing TERM request. lid_perm_handle=%p",
+                     lid_perm_handle);
+
+   if ( (lid_perm_handle NE NULL)  AND              /* WS10079T @/
+        (lid_perm_handle->lidra_vec NE NULL) )      /* WS10079T @/
+    {
+     for (i=0; i LT lid_perm_handle->lidra_vec_num; i++)
+     {
+        /* BS10111 - Not needed because ACF2_Get_ACFRPTRX_Report
+                     call with "TERM" will do it.
+        rcc = ESA_CLI_del_RUOB(lid_perm_handle->lidra_vec[i].lidra,
+                               admin_params);
+        ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                     "ESA_CLI_del_RUOB i = %d rc = %d",
+                     i,rcc);
+
+        if (rcc NE ESA_OK)
+        {
+          sprintf(errmsg,
+                  "ESA_CLI_del_RUOB returned rc = %d  for ruob = %p",
+                  rcc, lid_perm_handle->lidra_vec[i].lidra);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                        func, errmsg, 12, __LINE__);
+        }
+        else
+          lid_perm_handle->lidra_vec[i].lidra = NULL;
+        @/
+
+
+        rc = Get_Rule_Record(
+               "TERM",
+               &(lid_perm_handle->lidra_vec[i].get_rule_record_handle),
+   /* BS10111  get_line_ptr,   @/
+   /* BS10111  &input_desc_block,  @/
+               lid_perm_handle->lidra_vec[i].lidra,       /* BS10111 @/
+               requested_record_type,
+               sizeof(rule_record),
+               "ACFRPTRX",
+               &returned_record_type,
+               rule_record,
+               resource_type,
+               admin_params);
+
+        ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                     "Get_Rule_Record TERM i = %d rc = %d",
+                     i,rc);
+
+     }
+
+     rc = ACF2_Get_ACFRPTRX_Report("TERM",
+                             lid_perm_handle,
+                             admin_params);
+
+     ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                    "ACF2_Get_ACFRPTRX_Report TERM rc = %d",
+                    rc);
+
+
+     if (lid_perm_handle->rule_type_perm_vec NE NULL)    /* WS10079T @/
+     {                                                   /* WS10079T @/
+     free(lid_perm_handle->rule_type_perm_vec);
+     FREE_STORAGE_DIAG(lid_perm_handle->rule_type_perm_vec,
+                       func)                             /* WS10078S @/
+     }                                                   /* WS10079T @/
+
+    };
+     goto exit;
+  };
+
+    WS10084 */
+
+  if (strcmp(call_type, "GET") NE 0)
+  {
+     /* WS10079T start */
+     sprintf(errmsg,
+       "ROLE %s: "
+       "invalid input function parameter = <%.20s>",
+       call_type,
+       inputROLE);                                 /* WS10079T end */
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                   func, errmsg ,                  /* WS10079T */
+                   16, __LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+  }
+  /*----------------------------------------------------------*/
+  /* process the get request                                  */
+  /*----------------------------------------------------------*/
+  ESA_DIAG_printf(PLT_COMP_XREF, 6,
+         "Processing GET request for ROLE/inputROLE = |%.8s|/|%.8s| ",
+                     ROLE,inputROLE);
+
+  /* WS10084 start */
+  /*ESA_DIAG_printf(PLT_COMP_XREF, 0,
+         "inputROLE = |%.8s| ",
+         inputROLE);  */
+
+  PBh = PB_Req->Roles_XBhandle_ptr->XREF_PB_handle;
+ /*
+    No need for calling Permissions_block_Get (UIDTHISN,...) because
+    after the call the ACF2_Get_XREF, curUIDinPB already points
+    to the UID (Role) entry in the block so we only need to request
+    PERMNEXT.
+ */
+  ESA_DIAG_printf(PLT_COMP_XREF, 6,
+         "UID (Role) in curUIDinPB = |%s| ",
+          PBh->curUIDinPB->uid);
+  /*
+  ESA_DIAG_printf(PLT_COMP_XREF, 0,
+         "UID (Role) in curUIDinPB = |%s| ",
+          PBh->curUIDinPB->uid);
+  */
+
+  perm_pair = ADDINFO_search("RoleDirectPermissions",
+                        ACF_ADDINFO_KWD_LEN,
+                        addinfo->pair,
+                        addinfo->num_pairs);
+  if (perm_pair EQ NULL)
+  {
+    ESA_DIAG_printf(PLT_COMP_XREF, 6,
+         "Attribute RoleDirectPermissions not found");
+    goto exit;
+  }
+
+  do
+  {
+    PBh->PBptr->skip_extYN = 'Y';
+    pb_rc = Permissions_block_Get("PERMNEXT",
+                                  PBh,
+                                  role,
+                                  perm_data,
+                                  sizeof(perm_data),
+                                  PLT_COMP_XREF,
+                                  admin_params);
+    PBh->PBptr->skip_extYN = 'N';
+
+    ESA_DIAG_printf(PLT_COMP_XREF, 6,
+       "Permission_block_get: rc = %d, |%s|", pb_rc, perm_data);
+
+  /*
+    ESA_DIAG_printf(PLT_COMP_XREF, 0,
+       "Permission_block_get: rc = %d, |%s|", pb_rc, perm_data);
+  */
+
+    if (pb_rc  EQ  ESA_OK)  /* when ok, take the permission */
+    {
+       issue_no_permissions_message = FALSE;
+       rcc = ADDINFO_addval (perm_data,
+                             ACF_ADDINFO_VAL_LEN,
+                             ADDINFO_LIST_ENTRY,
+                             perm_pair, dest, msgs);
+       if (rcc EQ ESA_EOF)
+       {
+         CTSAMSG_print(ACF2_MISSING_PERM, msgs, NULL, dest,
+                       perm_pair->keyword, role, perm_data,
+                       strlen(perm_data), perm_pair->vallen,
+                       "permissions");
+
+         rcc = ESA_OK;
+         pair = ADDINFO_search("isIncomplete",
+                               ACF_ADDINFO_KWD_LEN,
+                               addinfo->pair,
+                               addinfo->num_pairs);
+         if (pair NE NULL)
+         {
+            if( pair->value[0] NE 'Y')
+               rcc = ADDINFO_updval("Y", ACF_ADDINFO_VAL_LEN,
+                                    pair);
+            if (rcc NE ESA_OK)
+            {
+               sprintf(errmsg,
+                       "Insert <%s> keyword failed. rc=%d",
+                       "isIncomplete",rc);
+               CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                             dest, component,func,
+                             errmsg, 16,__LINE__);
+            }
+         }
+         pb_rc = ESA_EOF; /* fake EOF        */
+       }
+    }
+  } while (pb_rc EQ ESA_OK  OR    /* While perm was returned or */
+           pb_rc EQ ESA_ERR);     /* permission is too long.    */
+
+  if (pb_rc EQ ESA_EOF)
+     rc = ACF2_OK;
+  else
+     rc = ACF2_Internal_Error;
+
+  if (issue_no_permissions_message EQ TRUE)
+    {
+     ESA_DIAG_printf(PLT_COMP_XREF, 3,
+      "No permissions for ROLE=%s",
+         inputROLE);
+    }
+
+  exit:
+  ESA_DIAG_exit(PLT_COMP_XREF, 1, func, rc);
+  return rc;
+
+}
+  /* WS10084 end   */
+  /* WS10084
+  memset (function, 0X00, sizeof(function));
+  if (lid_perm_handle EQ NULL)
+  {
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+             func, "LID Permissions handle pointer NULL",
+             16, __LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+  if (lid_perm_handle->error EQ TRUE)
+  {
+     ESA_DIAG_printf(PLT_COMP_XREF, 17,
+                     "LID Permissions handle error indicator on");
+     rc = ESA_OK;
+     goto exit;
+  }
+
+
+  if (lid_perm_handle->lidra_vec EQ NULL)
+
+     {
+        lid_perm_handle->lidra_vec_num = 0;
+
+
+        ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                  "Processing GET request for ROLE |%.8s|", inputROLE);
+
+        rc = ACF2_Get_ACFRPTRX_Report("GET",
+                             lid_perm_handle,
+                             admin_params);
+
+        ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                     "ACF2_Get_ACFRPTRX_Report GET rc = %d",
+                     rc);
+
+        if (rc NE ESA_OK)
+        {
+           lid_perm_handle->error = TRUE;
+           /* WS10079T start @/
+           sprintf(errmsg,
+            "ROLE %s: "
+            "ACF2_Get_ACFRPTRX_Report GET rc = %d",
+            inputROLE);                              /* WS10079T end @/
+           CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                   func, errmsg,                     /* WS10079T @/
+                   16, __LINE__);
+           rc = ESA_FATAL;
+           goto exit;
+        }
+
+        rule_type_perm_vec = lid_perm_handle->rule_type_perm_vec ;
+
+
+        ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                     "1: rule_type_perm_vec = <%p>",
+                      rule_type_perm_vec);
+
+        if (NOT lid_perm_handle->rule_type_perm_vec)
+            rule_type_perm_vec = (RULE_TYPE_PERM_rec_typ *)
+                     calloc (lid_perm_handle->lidra_vec_num,
+                                   sizeof(RULE_TYPE_PERM_rec_typ));
+        if (NOT rule_type_perm_vec)
+        {
+           CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                         "RULE_TYPE_PERM handle vector",
+                                   sizeof(RULE_TYPE_PERM_rec_typ));
+           rc = ESA_FATAL;
+           goto exit;
+        };
+        ALLOC_STORAGE_DIAG(rule_type_perm_vec,           /* WS10078S @/
+                           lid_perm_handle->lidra_vec_num*
+                           sizeof(RULE_TYPE_PERM_rec_typ),
+                           func)                         /* WS10078S @/
+
+        lid_perm_handle->rule_type_perm_vec = rule_type_perm_vec;
+
+        for (i=0; i LT lid_perm_handle->lidra_vec_num; i++)
+        {
+           strcpy (rule_type_perm_vec[i].rules_type,
+                   lid_perm_handle->lidra_vec[i].rules_type);
+        };
+     };
+
+     rule_type_perm_vec = lid_perm_handle->rule_type_perm_vec ;
+
+     ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                     "2: rule_type_perm_vec = <%p>",
+                      rule_type_perm_vec);
+
+
+
+  role_found = FALSE;
+
+  /*----------------------------------------------------------@/
+  /* Outermost loop: Loop through LID rule area vector (same  @/
+  /* index used for rule type permissions handle vector).     @/
+  /*----------------------------------------------------------@/
+
+  ESA_DIAG_printf(PLT_COMP_XREF, 17,
+                  "About to start outer loop");
+
+  for (i=0; i LT lid_perm_handle->lidra_vec_num; i++)
+  {
+     /* BS10105  - start */
+     /*
+     if ( (rule_type_perm_vec[i].permError_indicator
+                                                           EQ TRUE) OR
+          (lid_perm_handle->lidra_vec[i].IOError_indicator EQ TRUE) OR
+          (lid_perm_handle->lidra_vec[i].EOF_indicator     EQ TRUE) ) @/
+     ESA_DIAG_printf(PLT_COMP_XREF,6,
+          "i=%d: prm_error = %d  io_error = %d   EOF - %d",
+          i, rule_type_perm_vec[i].permError_indicator,
+          lid_perm_handle->lidra_vec[i].IOError_indicator,
+          lid_perm_handle->lidra_vec[i].EOF_indicator);
+
+     if ( (rule_type_perm_vec[i].permError_indicator
+                                                           EQ TRUE) OR
+          (lid_perm_handle->lidra_vec[i].IOError_indicator EQ TRUE) )
+     /* BS10105  - end   @/
+        continue;
+
+     ESA_DIAG_printf(PLT_COMP_XREF,6,
+          "1: i=%d inputROLE=<%s> last_read=<%s> last_processed=<%s>",
+          i,inputROLE,rule_type_perm_vec[i].last_lid_read,
+          rule_type_perm_vec[i].last_lid_processed);
+
+     if ( (rule_type_perm_vec[i].last_lid_read[0] NE NULL_CHAR)
+
+          AND
+          (strcmp(rule_type_perm_vec[i].last_lid_read,
+                  rule_type_perm_vec[i].last_lid_processed) LT 0) )
+     {
+           /* WS10079T start @/
+           sprintf(errmsg,
+            "ROLE %s: "
+            "last LID read less than last LID processed",
+            inputROLE);                              /* WS10079T end @/
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+               func, errmsg,                         /* WS10079T @/
+               16, __LINE__);
+       rule_type_perm_vec[i].permError_indicator = TRUE;
+       continue;
+     }
+
+     /* BS10105  - start @/
+     /* if we reached EOF and now need to process a role which is
+        higher than the role that was processed, we have nothing
+        to do becasue this role do not have permissions.           @/
+     if ( (lid_perm_handle->lidra_vec[i].EOF_indicator EQ TRUE)
+         AND
+          (strcmp(inputROLE,
+                  rule_type_perm_vec[i].last_lid_processed) GT 0) )
+       continue;
+     /* BS10105  - end   */
+
+
+     /* BS10111 - removed -not needed any more
+     /@----------------------------------------------------------@/
+     /@ Initialize the input descriptor block (for the           @/
+     /@ Get_Rule_Record routine) and get to work.                @/
+     /@----------------------------------------------------------@/
+
+     input_desc_block.blk = lid_perm_handle->lidra_vec[i].lidra;
+       end of removed code  - BS10111 */
+
+     /*----------------------------------------------------------@/
+     /* If last_lid_read is empty . . .                          @/
+     /*    If input_LID LE last_lid_processed . . .              @/
+     /*----------------------------------------------------------@/
+
+     if (rule_type_perm_vec[i].last_lid_read[0] EQ NULL_CHAR)
+
+     {
+        ESA_DIAG_printf(PLT_COMP_XREF, 17,
+                        "Last lid read is empty");
+        requested_record_type = ROLE_LINE;
+        if (strcmp(inputROLE,
+                   rule_type_perm_vec[i].last_lid_processed) LE 0)
+           strcpy(function, "GETFIRST");
+        else
+           strcpy(function, "GETNEXT");
+        ESA_DIAG_printf(PLT_COMP_XREF, 17, /*WS10078A@/
+                        "function=<%s>",function);
+     }  /* end of 'last_lid_read' empty @/
+     else
+     {
+        ESA_DIAG_printf(PLT_COMP_XREF, 17,
+                 "Last lid read is |%s|",
+                  rule_type_perm_vec[i].last_lid_read);
+        if (strcmp(inputROLE, rule_type_perm_vec[i].last_lid_read) EQ 0)
+        {
+           role_found = TRUE;
+           ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                     "inputROLE=<%s> found(last_read)",inputROLE);
+           memset(rule_type_perm_vec[i].last_lid_read, 0X00,
+                  sizeof(rule_type_perm_vec[i].last_lid_read));
+        }
+        else if (strcmp(inputROLE,
+                 rule_type_perm_vec[i].last_lid_read) GT 0)
+        {
+           requested_record_type = ROLE_LINE;
+           strcpy(function, "GETNEXT");
+           memset(rule_type_perm_vec[i].last_lid_read, 0X00,
+                  sizeof(rule_type_perm_vec[i].last_lid_read));
+        }
+        else if (strcmp(inputROLE,
+                        rule_type_perm_vec[i].last_lid_read) LT 0)
+        {
+           if (strcmp(inputROLE,
+                      rule_type_perm_vec[i].last_lid_processed) LT 0)
+           {
+              requested_record_type = ROLE_LINE;
+              strcpy(function, "GETFIRST");
+              memset(rule_type_perm_vec[i].last_lid_read, 0X00,
+                     sizeof(rule_type_perm_vec[i].last_lid_read));
+           }
+           else /* input_LID GE last_lid_processed @/
+           {
+              continue;
+           }
+        }
+     }; /* end of 'last_lid_read' is not empty . . . @/
+
+     /* BS10105  - start @/
+     /*
+      *   If function is GETFIRST clear the EOF flag because we
+      *   are not at the end of the report any more...
+      @/
+     if (strcmp(function, "GETFIRST") EQ 0)
+       lid_perm_handle->lidra_vec[i].EOF_indicator = FALSE;
+     /* BS10105  - end   @/
+
+     /*----------------------------------------------------------@/
+     /* Set the last_lid_processed (with the input_LID) and      @/
+     /* clear the last_lid_read                                  @/
+     /*----------------------------------------------------------@/
+
+     ESA_DIAG_printf(PLT_COMP_XREF, 17,
+                     "Setting last lid processed to |%s|", inputROLE);
+
+     strcpy(rule_type_perm_vec[i].last_lid_processed, inputROLE);
+     memset(rule_type_perm_vec[i].last_lid_read, 0X00,
+            sizeof(rule_type_perm_vec[i].last_lid_read));
+
+     ESA_DIAG_printf(PLT_COMP_XREF,6,
+          "2: i=%d inputROLE=<%s> last_read=<%s> last_processed=<%s>",
+          i,inputROLE,rule_type_perm_vec[i].last_lid_read,
+          rule_type_perm_vec[i].last_lid_processed);
+
+     ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                "requested_record_type=<%d>",requested_record_type);
+     if (role_found EQ FALSE)
+      {
+        do
+        {
+         ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                "Calling Get_Rule_Record requesting :ROLE line");
+
+         rc = Get_Rule_Record(
+              function,
+              &(lid_perm_handle->lidra_vec[i].get_rule_record_handle),
+  /* BS10111  get_line_ptr,   @/
+  /* BS10111  &input_desc_block,  @/
+              lid_perm_handle->lidra_vec[i].lidra,        /* BS10111 @/
+              requested_record_type,
+              sizeof(rule_record),
+              "ACFRPTRX",
+              &returned_record_type,
+              rule_record,
+              resource_type,
+              admin_params);
+
+         ESA_DIAG_printf(PLT_COMP_XREF, 6,
+          "Get_Rule_Record GET ROLE Line i = %d rc = %d recType=<%d>",
+            i,rc,returned_record_type);
+
+         if (rc NE ESA_OK)
+         {
+           if (rc EQ ESA_WARN) /* end_of_user indication @/
+           {
+              ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                              "end of user condition encountered");
+              rc = ESA_OK;
+              break;
+           }
+           else if (rc EQ ESA_EOF)  /* end_of_file indication @/
+           {
+              ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                              "end of file condition encountered");
+              lid_perm_handle->lidra_vec[i].EOF_indicator = TRUE;
+              rc = ESA_OK;
+              break;
+           }
+       /*  else if (rc EQ ESA_SKIP)
+           {
+              ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                  "permission output area not large enough");
+              rc = ESA_OK;
+              continue;
+           }    @/
+           else
+           {
+              ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                  "serious Get_Rule_Record error encountered");
+              lid_perm_handle->lidra_vec[i].IOError_indicator = TRUE;
+              break;
+           }
+         }  /* end rc NE ESA_OK  @/
+
+         strcpy(function, "GETNEXT");
+
+         if (returned_record_type EQ ROLE_LINE)
+         {
+            ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                     "Get_Rule_Record returned a ROLE line");
+            from = strstr(rule_record, "ROLE: ");
+            from += 6;                   /* point to start of role @/
+            to = strchr(from, ' ');             /* look for blank @/
+            if (to EQ NULL)
+               {
+                len = strlen(from);
+                ESA_DIAG_printf(PLT_COMP_XREF, 6 ,
+                  "No blank: ROLE len = %d",len);
+               }
+            else
+               {
+                len = to - from;                /* calc length of lid @/
+                ESA_DIAG_printf(PLT_COMP_XREF, 6 ,
+                  "Blank: ROLE len = %d",len);
+               }
+            memset (role, 0X00, sizeof(role));  /* clear lid field @/
+            strncpy (role, from, len);     /* copy lid from record @/
+            ESA_DIAG_printf(PLT_COMP_XREF, 6 ,
+                  ":ROLE line for role |%s|", role);
+            if (strcmp (role, inputROLE) EQ 0)
+            {
+                strcpy(rule_type_perm_vec[i].last_lid_processed,
+                       inputROLE);
+                role_found = TRUE ;
+                ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                     "inputROLE=<%s> found",inputROLE);
+
+           ESA_DIAG_printf(PLT_COMP_XREF,6,
+             "3: i=%d inputROLE=<%s> last_read=<%s> last_processed=<%s>",
+              i,inputROLE,rule_type_perm_vec[i].last_lid_read,
+              rule_type_perm_vec[i].last_lid_processed);
+
+            }
+            else
+            if (strcmp (role, inputROLE) LT 0)
+               continue;
+            else if (strcmp (role, inputROLE) GT 0)
+            {
+               strcpy(rule_type_perm_vec[i].last_lid_read, role);
+               rc = ESA_WARN; /* end_of_role indication @/
+            }
+         }
+         else
+         {
+            ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                     "Get_Rule_Record returned unrequested line");
+            rule_type_perm_vec[i].permError_indicator = TRUE;
+            rc = ESA_FATAL;
+            break;
+         }
+        } while ( (rc EQ ESA_OK) AND (role_found EQ FALSE) );
+
+        ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                     "Get_Rule_Record while loop rc = %d",rc);
+      }
+
+     ESA_DIAG_printf(PLT_COMP_XREF, 6,
+        "role=<%s> inputROLE=<%s>",role,inputROLE);
+
+     if (rc EQ ESA_SKIP)
+        rc = ESA_OK;
+
+     if (rc EQ ESA_WARN)
+        rc = ESA_OK;
+
+     if (rc EQ ESA_FATAL)
+     {
+       sprintf(errmsg,"Error while processing ROLE %s", inputROLE);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+               component, func, errmsg, 16, __LINE__);
+       lid_perm_handle->lidra_vec[i].IOError_indicator = TRUE;
+       break;
+     }
+
+     if (strcmp (role, inputROLE) EQ 0)
+     {
+        if (  (lid_perm_handle NE NULL)
+              AND
+              (lid_perm_handle->error EQ FALSE)
+           )
+             {
+              perms_exist = FALSE;                       /* BS10108T @/
+              rcc = Get_user_permissions(
+                      inputROLE,lid_perm_handle, addinfo, "GET",
+                      i,
+                      &perms_exist,                      /* BS10108T @/
+                      admin_params);
+
+              if (perms_exist EQ TRUE)                   /* BS10108T @/
+                 issue_no_permissions_message = FALSE;   /* BS10108T @/
+
+              /*  BS10108T - start @/
+              ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                 "Get_user_Permissions  rc = %d; perms_exist = %d",
+                  rcc,perms_exist);
+              /*  BS10108T - end   @/
+
+              /* ESA_DIAG_printf(PLT_COMP_XREF, 6,
+                    "Get_user_Permissions  rc = %d",rcc);  BS10108T @/
+
+
+              if (rcc NE ESA_OK)
+                {
+                 sprintf(errmsg,
+                  "ROLE %s: "
+                  "Get_user_Permissions ended with rc = %d",
+                  inputROLE, rcc);               /* WS10079T end @/
+
+                 CTSAMSG_print(ERR_INTERNAL2,msgs,NULL,dest,component,
+                            func, errmsg, 16, __LINE__);
+                }
+             }
+     }
+  role_found=FALSE;
+  } /* for (i=0; i LT lid_perm_handle->lidra_vec_num; i++) outer loop @/
+
+  /*  BS10108T - start @/
+  if (issue_no_permissions_message EQ TRUE)
+    {
+     ESA_DIAG_printf(PLT_COMP_XREF, 3,                    /* BS10110T @/
+      "No permissions for ROLE=%s, maybe due to NOUIDALL",/* BS10110T @/
+         inputROLE);                                      /* BS10110T @/
+     /*BS10110T   CTSAMSG_print(ACF2_NO_PERMISSION, msgs, NULL, dest,
+                    "ROLE",inputROLE);                       BS10110T @/
+    }
+  /*  BS10108T - end   @/
+
+  exit:
+  ESA_DIAG_exit(PLT_COMP_XREF, 1, func, rc);
+  return rc;
+
+}
+  WS10084 */
+/*      End   WS10078TG                                              */

@@ -1,0 +1,634 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Manage ACF2 Global Information           *
+ *                                                             *
+ * File Name        : ctsbglb.c                                *
+ *                                                             *
+ * Author           : Yishay Yovel                             *
+ *                                                             *
+ * Creation Date    : 20/07/1997                               *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who    When       Description                      *
+ * -------- ------ ---------- -------------------------------- *
+ * PS0234   Guy    16/02/1998 Added two fields to global data  *
+ * PS0364   Guy    24/12/1998 Remove EMULATE stuff             *
+ * WS2358   Guy    12/10/1999 Added virt. res info to globals  *
+ * BS2420   Guy    10/02/2000 Wrong date format checked        *
+ * BS2440   Michael07/12/2000 CTS1508S invalid ACF2 date format*
+ * BS2509   RamiK  03/03/2002 internal errors in online intrcptr*
+ * WS10054  SeligT 04/08/2016 Add ENQ/DEQ SYSTEMS RNL Parameter*
+ * IS10139  SeligT 28/08/2016 Update OS Functions for Agents   *
+ * BS10076  SeligT 11/12/2017 Organize Connector Locking       *
+ *                            Functions and Structures         *
+ * IS10178  SeligT 18/12/2018 Supporting LID Anywhere in UID   *
+ * WS10082  MauriC 07/11/2022 Recompile for new ADDINFO macros *
+ **************************************************************/
+
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_CTSAMSG
+ #include ESA_INIT
+ #include ESA_API
+ #include ESA_API_CODES
+
+ #include MVS_COMP
+ #include MVS_OS_CLI
+
+ /* IS10139 #include <CTSCSRV.h>                             WS10054 */
+ #include API_ADDINFO
+ #include ACF2_CODES
+ #include ACF2
+
+ #define DEFAULT_QNAME "CTSA   "
+
+ static     char  component[]="CTSBGLB";                  /* WS10054 */
+ static struct {
+  char ACF2_Date_Format[9];
+  /* char ACF2_QNAME[9];                                     WS10054 */
+  /* BS10076 int  ACF2_Total_Wait_Lock_Time;                         */
+  /* BS10076 int  ACF2_Retry_Wait_Lock_Time;                         */
+  char ACF2_UDB_Active[8] ;
+  int  ACF2_LID_In_UID    ;                               /* PS0234 */
+  int  ACF2_UID_LID_Offset;                               /* PS0234 */
+  int  ACF2_UID_LID_Length;                               /* IS10178 */
+  char ACF2_Virtual_ResName[41];                          /* WS2358 */
+  } ACF2_Global_Data;
+
+ /*
+    This routine will no longer be called from this module
+    after the WS10054 change in CTSBGDB and CTSBUDB so the
+    prototype was 'deleted'.
+ extern ESA_RC ctsagtq(int         *debug_level,
+                       char        *qname,
+                       int         *reason_code);                    */
+
+ static void Read_External_Parameters(char * rss_name,
+                                     RSSPRM_GET_FUNC_PTR func,
+             /* WS2358 */            RSSPRM_GET_OPT_FUNC_PTR func2,
+                                     CTSAMSG_DEST_TABLE_rec_ptr dest,
+                                     CTSAMSG_HANDLE_rec_ptr     msgs);
+ static debug_level = 0;
+
+/******************************************************************
+ * Procedure Name: ACF2_Set_Global_Data
+ ******************************************************************
+ * Description   : During API initialization, this function fills a
+ *                 static area of variables with ACF2 basic info
+ *
+ * Input         : admin,err
+ *
+ * Output        : laddinfo - Update ADDINFO
+ *
+ * Return Value  : ESA_RC
+ *                 ESA_OK    - Update ADDINFO generated
+ *                 ESA_ERR   - User UID dont match UID Mask
+ *                 ESA_FATAL - Failure
+ ******************************************************************/
+ ESA_RC ACF2_Set_Global_Data( ADMIN_PARAMS_rec_typ * admin_params,
+                     ERR_STRUCT_rec_typ   * err)
+ {
+
+  /*
+   *   Static Variables
+   */
+
+   static char                 func[]="ACF2_Set_Global";
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                     rc = ESA_OK;
+   ADDINFO_rec_ptr            laddinfo = NULL;
+   ONE_FIELD_rec_ptr          pair = NULL;
+   RSS_PARAMS_rec_typ         rss_params;
+   CTSAMSG_HANDLE_rec_ptr     msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr dest;
+
+   ESA_DIAG_enter(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   memset(&ACF2_Global_Data,0X00,sizeof(ACF2_Global_Data));
+
+   /*-----------------------------------------------------------*/
+   /* Read External Parameters                                  */
+   /*-----------------------------------------------------------*/
+   Read_External_Parameters(admin_params->rss_name,
+                            admin_params->cs_func.rssprm_get_ptr,
+      /* WS2358 */          admin_params->cs_func.rssprm_get_opt_ptr,
+                            dest,
+                            msgs);
+
+   /*-----------------------------------------------------------*/
+   /* Allocate temporary addinfo                                */
+   /*-----------------------------------------------------------*/
+   if (ADDINFO_alloc(func, ACF2_ADDINFO, &laddinfo, dest, msgs)
+                      NE ESA_OK)
+    {
+      CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, PLT_COMP_API_ACF2,
+               func, "laddinfo alloc failed", 16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+    }
+
+   /*-----------------------------------------------------------*/
+   /* Fetch ACF2 Date format via GetRssParm API function        */
+   /*-----------------------------------------------------------*/
+   ADDINFO_insert(TYPE_1A, /* BS2440 */
+                  "OPTS",
+                  "",
+                  laddinfo, ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                  UNIQUE);
+
+   ADDINFO_insert(TYPE_1A,
+                  ACF2_DATE_FORMAT,
+                  "",
+                  laddinfo, ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                  UNIQUE);
+
+   rc = CTSGetRSSParams(&rss_params,
+                        laddinfo,
+                        admin_params,
+                        err);
+
+   if (rc NE ESA_OK)
+    {
+      /* start of BS2509 */
+      CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, PLT_COMP_API_ACF2,
+        func, "error retrieving ACF2 RSS parameters", 16,__LINE__);
+      /* end of BS2509 */
+      rc = ESA_FATAL;
+      goto exit;
+    };
+
+   /*-----------------------------------------------------------*/
+   /* Check ACF2 Date Format was retrieved                      */
+   /*-----------------------------------------------------------*/
+   pair =  ADDINFO_search(ACF2_DATE_FORMAT,
+                          ACF_ADDINFO_KWD_LEN,
+                          laddinfo->pair,
+                          laddinfo->num_pairs);
+   if (pair EQ NULL)
+    {
+      CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, PLT_COMP_API_ACF2,
+                    func, "ACF2 OPTS.DATE not found", 16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+    };
+
+   /*----------------------------------------------------------------*/
+   /* Convert ACF2 date format to API date conversion routine format */
+   /*----------------------------------------------------------------*/
+   if (strcmp(pair->value,"DMY") EQ 0)
+    strcpy(ACF2_Global_Data.ACF2_Date_Format,"DD/MM/YY");
+   else
+   if (strcmp(pair->value,"MDY") EQ 0)
+    strcpy(ACF2_Global_Data.ACF2_Date_Format,"MM/DD/YY");
+   else
+ /* BS2420 - wrong date format. fix follows
+   if (strcmp(pair->value,"YDM") EQ 0)
+ */
+   if (strcmp(pair->value,"YMD") EQ 0)                    /* BS2420 */
+    strcpy(ACF2_Global_Data.ACF2_Date_Format,"YY/MM/DD");
+   else
+    {
+      CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, PLT_COMP_API_ACF2,
+                    func, "invalid ACF2 date format", 16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+     }
+
+   /*-----------------------------------------------------------*/
+   /* Finish ...                                                */
+   /*-----------------------------------------------------------*/
+
+   exit:
+
+   if (laddinfo NE NULL)
+    ADDINFO_free(&laddinfo);
+
+   ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func, rc);
+
+   return rc;
+
+ }
+
+/******************************************************************
+ * Procedure Name: ACF2_Set_LID_In_UID
+ ******************************************************************
+ * Description   : Set the ACF2_LID_In_UID, ACF2_UID_LID_Offset,
+ *                 and ACF2_UID_LID_Length fields during API
+ *                 initialization
+ *
+ * Input         : None
+ *
+ * Output        : None
+ *
+ * Return Value  : None
+ *
+ * Note          : Until CCID IS10178, this routine used to set the
+ *                 LID_Offset field but not the LID_Length field.
+ *                 Now, with CCID IS10178, this routine sets both
+ *                 fields.
+ ******************************************************************/
+ /* IS10178 We are adding admin_parms to the routine's parameter list
+ void ACF2_Set_LID_In_UID(void)                                      */
+ void ACF2_Set_LID_In_UID(ADMIN_PARAMS_rec_typ * admin_params)
+ {
+   char             UIDdescription[256] = "";             /* IS10178 */
+   int              UID_Field_Count     = 0;              /* IS10178 */
+   UID_Structure    UIDtab[ACF2_UID_SIZE];                /* IS10178 */
+   char             UID_Is_MULTI        = 'N';            /* IS10178 */
+   int              LID_In_UID          = FALSE;          /* IS10178 */
+   int              LID_Offset          = 0;              /* IS10178 */
+   int              LID_Length          = 0;              /* IS10178 */
+   int              i;                                    /* IS10178 */
+
+   ACF2_Global_Data.ACF2_LID_In_UID =
+    Is_LID_In_UID(&(ACF2_Global_Data.ACF2_UID_LID_Offset));
+
+   /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+   /* * * * * * * * * * * * * IS10178 start * * * * * * * * * * * * */
+   /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+   /*--------------------------------------------------------------*/
+   /* Get UID Structure                                            */
+   /*--------------------------------------------------------------*/
+
+   ACF2_Get_UID_Info( UIDdescription,
+                      &UID_Field_Count,
+                      UIDtab,
+                      &UID_Is_MULTI,
+                      admin_params);
+
+   ESA_DIAG_printf(PLT_COMP_API_ACF2, 6,
+                   "UID Field Count = (%d)", UID_Field_Count);
+
+   if (ESA_DIAG_get_debug_level(PLT_COMP_API_ACF2) GE 6)
+   {
+      for(i=0; i LT UID_Field_Count; i++)
+      {
+        ESA_DIAG_printf(PLT_COMP_API_ACF2, 6,
+           "UID fld(%d) is (%s) uid_off=(%d) uid_len(%d) fld_off=(%d) mul=(%c)",
+           i+1,
+           UIDtab[i].UID_Part_Field_Name,
+           UIDtab[i].UID_Part_Offset,
+           UIDtab[i].UID_Part_Length,
+           UIDtab[i].UID_Field_Offset,
+           UIDtab[i].UID_Part_Multi);
+      }
+   }
+
+   /*--------------------------------------------------------------*/
+   /* Get the LID_Offset field from the ACF2 global data area.     */
+   /* Please note: In the following call to ACF2_Is_LID_In_UID,    */
+   /*              only the LID_Offset field will contain a valid  */
+   /*              value.  The LID_Length field will not contain   */
+   /*              a valid value because we will be setting the    */
+   /*              ACF2_Global_Data.ACF2_UID_LID_Length field      /*
+   /*              immediately below in this very routine.         /*
+   /*--------------------------------------------------------------*/
+
+   LID_In_UID = ACF2_Is_LID_In_UID(&LID_Offset, &LID_Length);
+
+   if (LID_In_UID)
+    {
+     for(i=0; i LT UID_Field_Count; i++)
+      {
+       if (LID_Offset EQ UIDtab[i].UID_Part_Offset)
+          LID_Length = UIDtab[i].UID_Part_Length;
+      };
+     ACF2_Global_Data.ACF2_UID_LID_Length = LID_Length;
+    };
+
+   /* IS10178 Make this message a bit more user-friendly
+   ESA_DIAG_printf(PLT_COMP_API_ACF2, 6,
+            "LID_In_UID = %d, LID_Offset = %d, LID_Length = %d",
+            LID_In_UID, LID_Offset, LID_Length);                      */
+   ESA_DIAG_printf(PLT_COMP_API_ACF2, 6,                   /* IS10178 */
+            "LID_In_UID = %s, LID_Offset = %d, LID_Length = %d",
+            LID_In_UID ? "TRUE" : "FALSE", LID_Offset, LID_Length);
+   /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+   /* * * * * * * * * * * * * IS10178  end  * * * * * * * * * * * * */
+   /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ }
+
+/******************************************************************
+ * Procedure Name: ACF2_Is_LID_In_UID
+ ******************************************************************
+ * Description   : Get ACF2_LID_In_UID, ACF2_UID_LID_Offset, and
+ *                 ACF2_UID_LID_Length fields             // IS10178 //
+ *
+ * Input         : None
+ *
+ * Output        : LID offset and LID length              // IS10178 //
+ *
+ * Return Value  : TRUE or FALSE
+ *
+ * Note          : Until CCID IS10178, this routine used to return
+ *                 the LID_Offset field but not the LID_Length field.
+ *                 Now, with CCID IS10178, this routine returns both
+ *                 fields.
+ ******************************************************************/
+ int ACF2_Is_LID_In_UID(int *LID_Offset, int *LID_Length) /* IS10178 */
+ {
+   if (ACF2_Global_Data.ACF2_LID_In_UID)
+    {
+     *LID_Offset = ACF2_Global_Data.ACF2_UID_LID_Offset;
+     *LID_Length = ACF2_Global_Data.ACF2_UID_LID_Length;  /* IS10178 */
+    }
+
+   return ACF2_Global_Data.ACF2_LID_In_UID;
+ }
+
+/* WS2358 */
+/******************************************************************
+ * Procedure Name: ACF2_Is_Virtual_Resource
+ ******************************************************************
+ * Description   : Check if given resource is the virtual resource
+ *
+ * Input         : Res_Name : Resource Name
+ *
+ * Output        : None
+ *
+ * Return Value  : TRUE or FALSE
+ ******************************************************************/
+ int ACF2_Is_Virtual_Resource(char *Res_Name)
+ {
+   static char   func[]="ACF2_Is_Virtual_Resource";
+
+   int           is_virtual;
+   char          virtual_rname[41] = "";
+
+   ESA_DIAG_enter(ESA_COMP_GETRES, DEBUG_SHOW_IMPORTANT, func);
+
+   is_virtual = FALSE;
+
+   Global_Get_Virtual_Res (virtual_rname);
+
+   if ( strcmp(Res_Name,virtual_rname) EQ 0 )
+     is_virtual = TRUE;
+
+   ESA_DIAG_exit(ESA_COMP_GETRES,
+                 DEBUG_SHOW_IMPORTANT, func, is_virtual);
+
+   return is_virtual;
+ }
+ /* End of WS2358 */
+
+/******************************************************************
+ * Procedure Name: ACF2_Get_Date_Format
+ ******************************************************************
+ * Description   : Retrieve ACF2 date format stored in static structure
+ *
+ * Output        : Date_Format - ACF2 Date Format
+ *
+ * Return Value  : None
+ ******************************************************************/
+ void Global_ACF2_Date_Format(char *Date_Format)
+ {
+   static char                 func[]="ACF2_Get_Date_Format";
+
+   ESA_DIAG_enter(PLT_COMP_API_ACF2, DEBUG_SHOW_ALL, func);
+   strcpy(Date_Format,ACF2_Global_Data.ACF2_Date_Format);
+   ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_ALL, func, ESA_OK);
+ }
+
+/******************************************************************
+ * Procedure Name: Global_UDB_Active
+ ******************************************************************
+ * Description   : Return UDB mode
+ *
+ * Return Value  : TRUE - UDB is used
+ *                 FALSE- UDB is not used
+ ******************************************************************/
+int Global_UDB_Active()
+ {
+   static char                 func[]="Global_UDB_Active";
+   int rc;
+
+   ESA_DIAG_enter(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func);
+
+   if (strcmp(ACF2_Global_Data.ACF2_UDB_Active,UDB_ACTIVE) EQ 0)
+     rc = TRUE;
+   else
+     rc = FALSE;
+
+   ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func, rc);
+   return rc;
+}
+/* * * * * * * BS10076 start * * * * * * *
+This fix removes these 2 routines.
+/******************************************************************
+ * Procedure Name: Global_Total_Wait_Lock_Time
+ ******************************************************************
+ * Description   : Return Wait Lock Time (sec)
+ *
+ * Return Value  : value of parm
+ ******************************************************************
+int Global_Total_Wait_Lock_Time()
+ {
+   static char                 func[]="Global_Total_Wait_Lock_Time";
+
+   ESA_DIAG_enter(PLT_COMP_API_ACF2, DEBUG_SHOW_ALL, func);
+   ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_ALL, func, ESA_OK);
+
+   return(ACF2_Global_Data.ACF2_Total_Wait_Lock_Time);
+}
+
+/******************************************************************
+ * Procedure Name: Global_Retry_Wait_Lock_Time
+ ******************************************************************
+ * Description   : Return Wait Lock Time (sec)
+ *
+ * Return Value  : value of parm
+ ******************************************************************
+int Global_Retry_Wait_Lock_Time()
+ {
+   static char                 func[]="Global_Retry_Wait_Lock_Time";
+
+   ESA_DIAG_enter(PLT_COMP_API_ACF2, DEBUG_SHOW_ALL, func);
+   ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_ALL, func, ESA_OK);
+
+   return(ACF2_Global_Data.ACF2_Retry_Wait_Lock_Time);
+}
+* * * * * * * BS10076 end * * * * * * */
+
+/******************************************************************
+ * Procedure Name: Global_Get_QNAME
+ ******************************************************************
+ * Description   : Return QNAME for GDB locks
+ *
+ * Return Value  : value of parm
+ *
+ * This routine will no longer be used after the WS10054 change in
+ * CTSBGDB and CTSBUDB so it was 'deleted'.
+ *
+ ******************************************************************
+char *Global_Get_QNAME()
+ {
+   static char                 func[]="Global_Retry_Wait_Lock_Time";
+
+   ESA_DIAG_enter(PLT_COMP_API_ACF2, DEBUG_SHOW_ALL, func);
+   ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_ALL, func, ESA_OK);
+
+   return(ACF2_Global_Data.ACF2_QNAME);
+}                                                                    */
+
+/* WS2358 */
+/******************************************************************
+ * Procedure Name: Global_Get_Virtual_Res
+ ******************************************************************
+ * Description   : Retrieve Virtual Resource name
+ *
+ * Output        : ResName - Virtual resource name
+ *
+ * Return Value  : None
+ ******************************************************************/
+ void Global_Get_Virtual_Res(char *ResName)
+ {
+   static char                 func[]="Global_Get_Virtual_Res";
+
+   ESA_DIAG_enter(ESA_COMP_GETRES, DEBUG_SHOW_IMPORTANT, func);
+   strcpy(ResName,ACF2_Global_Data.ACF2_Virtual_ResName);
+
+   ESA_DIAG_printf(ESA_COMP_GETRES, DEBUG_SHOW_IMPORTANT,
+                   "VIRTUAL RESOURCE NAME=(%s)",
+                   ResName);
+
+   ESA_DIAG_exit(ESA_COMP_GETRES, DEBUG_SHOW_IMPORTANT, func, ESA_OK);
+ }
+ /* End of WS2358 */
+
+/******************************************************************
+ * Procedure Name: Read_External_Parameters
+ ******************************************************************
+ * Description   : Read External Parameters from RSSPARM
+ *
+ * Return Value  : None
+ ******************************************************************/
+static void Read_External_Parameters(char *rss_name,
+                                     RSSPRM_GET_FUNC_PTR rsspget,
+             /* WS2358 */            RSSPRM_GET_OPT_FUNC_PTR rsspopt,
+                                     CTSAMSG_DEST_TABLE_rec_ptr dest,
+                                     CTSAMSG_HANDLE_rec_ptr     msgs)
+
+ {
+   static char                 func[]="Read_External_Parameters";
+   /* WS10054 int reason_code, rc1 = 0;                         */
+   ESA_RC rc = ESA_OK;
+   char Wait_Lock[6] = "" ;
+
+   ESA_DIAG_enter(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func);
+   /*-----------------------------------------------------------*/
+   /* Get Qname                                                 */
+   /*                                                           */
+   /* These instructions will no longer be needed after the     */
+   /* WS10054 change in CTSBGDB and CTSBUDB so they were        */
+   /* 'deleted'.                                                */
+   /*-----------------------------------------------------------*/
+   /*
+   rc1 = ctsagtq(&debug_level, ACF2_Global_Data.ACF2_QNAME,
+                &reason_code);
+
+   if (rc1 NE 0)
+    {
+     strcpy( ACF2_Global_Data.ACF2_QNAME , DEFAULT_QNAME );
+    };
+
+    ESA_DIAG_printf(PLT_COMP_API_ACF2,DEBUG_SHOW_REGULAR,
+               "GDB QNAME = (%s)",ACF2_Global_Data.ACF2_QNAME); */
+
+   /*-----------------------------------------------------------*/
+   /* UDB usage                                                 */
+   /*-----------------------------------------------------------*/
+   rc = rsspget(rss_name, GLOBAL_UDB_ACTIVE,
+                sizeof(ACF2_Global_Data.ACF2_UDB_Active),
+                ACF2_Global_Data.ACF2_UDB_Active);
+
+   if (rc NE ESA_OK)
+     strcpy(ACF2_Global_Data.ACF2_UDB_Active,DEFAULT_UDB_ACTIVE);
+
+    ESA_DIAG_printf(PLT_COMP_API_ACF2,DEBUG_SHOW_REGULAR,
+               "ACF2 UDB Active is (%s)",
+               ACF2_Global_Data.ACF2_UDB_Active);
+
+   /* * * * * * * BS10076 start * * * * * * *
+   This fix removes these 2 pieces of code.
+   //-----------------------------------------------------------//
+   // Total Wait Lock Time                                      //
+   //-----------------------------------------------------------//
+   rc = rsspget(ALL_RSS,GLOBAL_TOTAL_WAIT_LOCK_TIME,
+                sizeof(Wait_Lock),Wait_Lock);
+
+   if (rc NE ESA_OK)
+      ACF2_Global_Data.ACF2_Total_Wait_Lock_Time =
+             DEFAULT_TOTAL_WAIT_LOCK_TIME;
+   else
+      ACF2_Global_Data.ACF2_Total_Wait_Lock_Time =
+             atoi(Wait_Lock);
+
+    ESA_DIAG_printf(PLT_COMP_API_ACF2,DEBUG_SHOW_REGULAR,
+               "TOTAL Wait Lock Time is (%d)",
+               ACF2_Global_Data.ACF2_Total_Wait_Lock_Time);
+
+   //-----------------------------------------------------------//
+   // Retry Wait Lock Time                                      //
+   //-----------------------------------------------------------//
+   rc = rsspget(ALL_RSS,GLOBAL_RETRY_WAIT_LOCK_TIME,
+                sizeof(Wait_Lock),Wait_Lock);
+
+   if (rc NE ESA_OK)
+      ACF2_Global_Data.ACF2_Retry_Wait_Lock_Time =
+               DEFAULT_RETRY_WAIT_LOCK_TIME;
+   else
+      ACF2_Global_Data.ACF2_Retry_Wait_Lock_Time =
+               atoi(Wait_Lock);
+
+    ESA_DIAG_printf(PLT_COMP_API_ACF2,DEBUG_SHOW_REGULAR,
+               "RETRY Wait Lock Time is (%d)",
+               ACF2_Global_Data.ACF2_Retry_Wait_Lock_Time);
+   * * * * * * * BS10076 end * * * * * * */
+
+   /* WS2358 */
+   /*-----------------------------------------------------------*/
+   /* Virtual Resource Name                                     */
+   /*-----------------------------------------------------------*/
+   rc = rsspopt(rss_name,GLOBAL_VIRTUAL_RES_NAME,
+                sizeof(ACF2_Global_Data.ACF2_Virtual_ResName),
+                ACF2_Global_Data.ACF2_Virtual_ResName,
+                OPT_TRUE, OPT_TRUE);
+
+   if (rc NE ESA_OK)
+     strcpy(ACF2_Global_Data.ACF2_Virtual_ResName,
+            DEFAULT_VIRTUAL_RES_NAME);
+
+    ESA_DIAG_printf(PLT_COMP_API_ACF2,DEBUG_SHOW_REGULAR,
+               "VIRTUAL Resource Name is (%s)",
+               ACF2_Global_Data.ACF2_Virtual_ResName);
+   /* End of WS2358 */
+
+   ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func, ESA_OK);
+}

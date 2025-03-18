@@ -1,0 +1,1816 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Update a user group (ACF2)               *
+ *                                                             *
+ * File Name        : ctsbuug.c                                *
+ *                                                             *
+ * Author           : Yishay Yovel                             *
+ *                                                             *
+ * Creation Date    : 20/07/97                                 *
+ *                                                             *
+ * Description      : Update User Group                        *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ * Updating UIDMASKS of Group is very dangerous because it     *
+ * changes the meanning of the Group (causing massive de-assoc *
+ * of users). The API depends on the action exit NOT to allow  *
+ * such updates if the Group is connected to any JobCode.      *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------- -------------------------------- *
+ * BS2306   Guy      28/10/97 Added dest+msgs parms            *
+ * BS2309   Guy      02/11/97 Added local copy of addinfo      *
+ * PS0234   Guy      20/01/98 Truncate UIDMASKs before write   *
+ * IS10088  NuritY   03/06/13 S0C4 when UID < 24.  (BS10030)   *
+ * IS10128  AvnerL   28/09/14 Allow correlated UIDs for IIQ.   *
+ * BS10097  SeligT   19/11/18 ACF2 Group Aggregation Endless   *
+ *                            Loop                             *
+ * IS10178  SeligT   18/12/18 Supporting LID Anywhere in UID   *
+ * WS10076A AvnerL   19/01/20 add admin_params 2 ACF2_Get_Group*
+ * WS10079  ThomaS   24/12/20 JPMC phase 2                     *
+ * WS10079N NuritY   13/01/21 JPMC phase2                      *
+ * WS10084  ThomaS   13/07/23  Replace ACFRPTRX                *
+ * BS10134  AvnerL   18/02/24 S0C4 when Sources aggregation    *
+ * WS10082  MauriC   07/11/22 Recompile for new ADDINFO macros *
+ **************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+ #include   TIME
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_API
+ #include ESA_API_CODES
+ #include ESA_CTSAMSG                                     /* WS10079 */
+
+ #include API_ADDINFO
+ #include API_AUTH
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_OS_CLI
+ #include MVS_COMP                                        /* WS10079 */
+ #include MVS_CODES
+
+ #include ACF2_CODES                                      /* WS10079 */
+ #include ACF2
+ ASM_RTN_TYP           cts2ver;                          /* WS10079T */
+
+/* WS10079N - end  */
+static ESA_RC Restore_XREF_commands(
+                  char                 * type,
+                  char                 * xref_name,
+                  char                 * command_ops_to_restore,
+                  XREF_Operations_Lists_typ * include_op_lists,
+                  XREF_Operations_Lists_typ * exclude_op_lists,
+                  ESA_DIAG_COMP_typ      diag_comp,
+                  ADMIN_PARAMS_rec_typ * admin_params);
+/* WS10079N - end  */
+
+ /*
+  *     RKT for Update Group
+  *         (Reserved Keywords Table)
+  */
+
+
+ static ADDINFO_RKTE_rec_typ rkt[] = {
+    "" };      /* a null string indicate end-of-rkt */
+
+ static   char   component[]="UPDGROUP";
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : CTSUpdUG                                   *
+ *                                                             *
+ * DESCRIPTION    : Update an ACF2 virtual user group          *
+ *                                                             *
+ * INPUT          : ug_params - Update Group                   *
+ *                  addinfo   - updated fields addinfo         *
+ *                  admin, err                                 *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC CTSUpdUG (UG_PARAMS_rec_typ    * ug_params,
+                  ADDINFO_rec_typ      * addinfo,
+                  ADMIN_PARAMS_rec_typ * admin_params,
+                  ERR_STRUCT_rec_typ   * err)
+ {
+
+   static char                   func[]="CTSUpdUG";
+
+  /*
+   *     Variables
+   */
+
+   ESA_RC                        rc = ESA_OK;
+   ESA_RC                        temp_rc = ESA_OK;        /* BS10134 */
+   ACF2_API_Return_Codes         ACF2_rc = ACF2_OK;
+   GDB_Codes                     GDB_rc = GDB_OK;
+   CTSAMSG_HANDLE_rec_typ      * msgs;
+   CTSAMSG_DEST_TABLE_rec_typ  * dest;
+   /*char                        errmsg[128]="";             WS10079 */
+   char                          errmsg[2048]="";         /* WS10079 */
+   UG_typ                        Group = "";
+   UG_typ                        cgroup = "";
+   ADDINFO_rec_ptr               laddinfo = NULL;
+   ADDINFO_rec_ptr               caddinfo = NULL;         /* BS2309 */
+   ACF2_PARAMS_rec_typ * params_ptr = NULL;               /* IS10128 */
+   char                iiqAcf2Groups = ' ';               /* IS10128 */
+   int                           LID_In_UID, LID_Offset;  /* BS10097 */
+   int                           LID_Length;              /* IS10178 */
+   /* WS10079  start                                                 */
+   ONE_FIELD_rec_ptr             pair             = NULL;
+   ONE_FIELD_rec_ptr             t_pair           = NULL; /* WS10079 */
+   int                           GDB_open         = FALSE;
+   char                          type[20]         = NULL_STRING;
+   char                          xrefname_out[19] = NULL_STRING;
+   char                          parm_get[81]     = NULL_STRING;
+   XREF_Cmd_Struct_typ           xref_command_struct;
+   char                          xref_type[4]     = "";
+   ONE_FIELD_rec_ptr             i_pair           = NULL;
+   ONE_FIELD_rec_ptr             e_pair           = NULL;
+   XREF_Operations_Lists_typ   * include_op_lists = NULL;
+   XREF_Operations_Lists_typ   * exclude_op_lists = NULL;
+   XBhandle_rec_typ            * xbhandle         = NULL;
+   void                        * get_xref_handle  = NULL;
+   char                          block_read       = NULL_CHAR;
+   char                        * new_inc_add_list = NULL;
+   char                        * new_inc_del_list = NULL;
+   char                        * new_exc_add_list = NULL;
+   char                        * new_exc_del_list = NULL;
+   char                          command_ops_to_restore[7] = "";
+   char                        * rollback         = NULL;
+   int                           rc_asm=0;
+   char                          acf_version[5]="";
+   int                           dbg_lvl=0;
+   int                           i = 0;
+   /* WS10079  end                                                   */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_UPDUG, DEBUG_SHOW_IMPORTANT, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+  /*     Start WS10079                                             */
+
+   xref_command_struct.add_command = NULL;
+   xref_command_struct.del_command = NULL;
+   xref_command_struct.rep_command = NULL;
+   xref_command_struct.ref_command = NULL;
+
+  /*
+   *   If there is no TYPE, or if TYPE is Group then skip handling
+   *   XREF commands
+   */
+
+   t_pair = ADDINFO_search("TYPE", ACF_ADDINFO_KWD_LEN,
+                         addinfo->pair,
+                         addinfo->num_pairs);
+   if (t_pair EQ NULL)
+       goto group_code;                    /* this is not XREF stuff */
+   else
+    {
+       ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+           "TYPE = <%.8s>",
+            t_pair->value);
+
+       if (strcmp(t_pair->value,"Group" ) EQ 0)
+          goto group_code;                 /* this is not XREF stuff */
+
+       if ( (strcmp(t_pair->value,"Role") NE 0)
+             AND
+            (strcmp(t_pair->value,"Source") NE 0)  )
+        {
+          sprintf(errmsg,
+          "Invalid Type in addinfo: %.40s", t_pair->value);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+          rc = ESA_FATAL;
+          goto exit;
+        }
+    }
+   /*
+    *   Now we have Role or Source
+    */
+   if (strcmp(t_pair->value,"Role") EQ 0)
+    {
+      strcpy(xref_type,"ROL");
+      /*
+       *   Validate ACF2 version GE 16.0
+       */
+
+       if ((int)ESA_DIAG_get_debug_level(ESA_COMP_UPDUG) GE 6)
+          dbg_lvl=1;
+
+       rc_asm=cts2ver(&dbg_lvl, acf_version);
+       acf_version[3]=NULL_CHAR;
+       ESA_DIAG_printf(ESA_COMP_UPDUG,6,"ACF2 ver=<%s>",
+                       acf_version);
+       if (strcmp(acf_version,"160") LT 0)
+       {
+        sprintf(errmsg,
+            "Update %s %s: ",
+            t_pair->value,
+            ug_params->group);
+        CTSAMSG_print(ACF2_MIN_VER2,
+                      msgs, NULL, dest,
+                      errmsg,
+                      "16.0","Roles",
+                      "Update Role request rejected");
+        rc = ESA_FATAL;
+        goto exit;
+       }
+    }
+   if (strcmp(t_pair->value,"Source") EQ 0)
+      strcpy(xref_type,"SGP");
+
+   ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+       "full xref_name=<%.18s>",
+        ug_params->group);
+
+   /*
+    *   Validate that the xref name provided is valid
+    */
+
+   rc = XREF_Validate_name(ug_params->group,
+                           ESA_COMP_UPDUG,
+                           admin_params);
+   if (rc NE ESA_OK)
+    {
+     /* WS10079T
+     sprintf(errmsg,
+            "%s name <%.40s> is not valid",
+            t_pair->value,
+            ug_params->group);
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+            func, "errmsg", 16, __LINE__);            WS10079T */
+     sprintf(errmsg,                                   /* WS10079T */
+            "Update %s %s: %s is invalid.",            /* WS10079T */
+            t_pair->value,                             /* WS10079T */
+            ug_params->group,                          /* WS10079T */
+            ug_params->group);                         /* WS10079T */
+     CTSAMSG_print(ACF2_AGGR_RCMND,                    /* WS10079T */
+                   msgs, NULL, dest,                   /* WS10079T */
+                   errmsg,                             /* WS10079T */
+                   t_pair->value);                     /* WS10079T */
+     rc = ESA_FATAL;
+     goto exit;
+    }
+
+   /*
+    *   IncludeList/ExcludeList can't have blanks or commas.
+    *   If it has blanks or commas then it means that the
+    *   customer provided more than 1 name for 1 entry of the
+    *   multi-value list
+    */
+
+   i_pair = ADDINFO_search("IncludeList",
+                     ACF_ADDINFO_KWD_LEN,
+                     addinfo->pair,
+                     addinfo->num_pairs);
+
+   if (  (strchr(i_pair->value,' ') NE NULL)
+          OR
+         (strchr(i_pair->value,',') NE NULL)   )
+    {
+     sprintf(errmsg,
+            "Update %s %s: "
+            "IncludeList value contains multiple names:<%.40s>",
+            t_pair->value,
+            ug_params->group,
+            i_pair->value);
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+         func, errmsg, 16, __LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+    }
+
+   e_pair = ADDINFO_search("ExcludeList",
+                     ACF_ADDINFO_KWD_LEN,
+                     addinfo->pair,
+                     addinfo->num_pairs);
+   if (e_pair NE NULL)
+     if (  (strchr(e_pair->value,' ') NE NULL)
+            OR
+           (strchr(e_pair->value,',') NE NULL)   )
+      {
+         sprintf(errmsg,
+            "Update %s %s: "
+            "ExcludeList value contains multiple names:<%.40s>",
+            t_pair->value,
+            ug_params->group,
+            e_pair->value);
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+            func, errmsg, 16, __LINE__);
+         rc = ESA_FATAL;
+         goto exit;
+      }
+   if ( (i_pair NE NULL) OR (e_pair NE NULL)  )
+    {
+      rc = XREF_Extract_Inc_Exc_Lists (
+                 addinfo,
+                 &include_op_lists,
+                 &exclude_op_lists,
+                 ESA_COMP_UPDUG,
+                 admin_params);
+
+      ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+           "Update %s %s: "
+           "XREF_Extract_Inc_Exc_Lists rc = %d",
+            t_pair->value,
+            ug_params->group,
+            rc);
+      if ( rc NE ESA_OK)
+         {
+           sprintf(errmsg,
+            "Update %s %s: "
+            "XREF_Extract_Inc_Exc_Lists rc = %d",
+            t_pair->value,
+            ug_params->group,
+            rc);
+           CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                   dest, component, func,
+                   errmsg,
+                   16, __LINE__);
+           rc = ESA_FATAL;
+           goto exit;
+         }
+
+      if (include_op_lists NE NULL)
+       {
+
+        if (include_op_lists->add_list NE NULL)
+            ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+                "Update %s %s: "
+                "Include add_list = %s",
+                t_pair->value,
+                ug_params->group,
+                include_op_lists->add_list);
+
+        if (include_op_lists->del_list NE NULL)
+            ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+                "Update %s %s: "
+                "Include del_list = %s",
+                t_pair->value,
+                ug_params->group,
+                include_op_lists->del_list);
+       }
+
+      if (exclude_op_lists NE NULL)
+       {
+        if (exclude_op_lists->add_list NE NULL)
+            ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+                "Update %s %s: "
+                "Exclude add_list = %s",
+                t_pair->value,
+                ug_params->group,
+                exclude_op_lists->add_list);
+
+        if (exclude_op_lists->del_list NE NULL)
+            ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+                "Update %s %s: "
+                "Exclude del_list = %s",
+                t_pair->value,
+                ug_params->group,
+                exclude_op_lists->del_list);
+       }
+
+      if (  (include_op_lists NE NULL)   OR
+            (exclude_op_lists NE NULL)   )
+       {
+        xbhandle = calloc(1, sizeof(XBhandle_rec_typ));
+        if (xbhandle EQ NULL)
+         {
+            CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+            "XBhandle", sizeof(XBhandle_rec_typ));
+            rc = ESA_FATAL;
+            goto exit;
+         }
+        strcpy(xbhandle->request_type,"XREFONLY");
+        strcpy(xbhandle->xrefname,ug_params->group);
+        xbhandle->PB_type        = xref_type[0];
+        xbhandle->active_request = 'N';
+        xbhandle->need_rec_YN    = 'Y';
+        xbhandle->sysidYN        = NULL_CHAR;
+        xbhandle->active_check   = NULL_CHAR;
+        xbhandle->active_default = NULL_CHAR;
+        xbhandle->shortest       = NULL_CHAR;
+        xbhandle->XREF_PB_handle   = NULL;
+        xbhandle->Groups_PB_handle = NULL;
+        xbhandle->bld_err        = FALSE;
+        xbhandle->XB_err         = FALSE;
+        xbhandle->bld_nf         = FALSE;                 /* WS10079N */
+
+        if (ADDINFO_alloc(func, ACF2_ADDINFO, &laddinfo, dest,
+            msgs)  NE ESA_OK)
+         {
+           CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                     component,func,
+                    "laddinfo alloc failed", 16,__LINE__);
+           rc = ESA_FATAL;
+           goto exit;
+         }
+
+        rc = ADDINFO_insert(TYPE_1B,
+                            "IncludeList",
+                            NULL,
+                            laddinfo,
+                            ACF_ADDINFO_KWD_LEN,
+                            ACF_ADDINFO_VAL_LEN,
+                            UNIQUE);
+
+        if (rc NE ESA_OK)
+           {
+            sprintf(errmsg,
+              "Insert IncludeList keyword failed. rc=%d",rc);
+            CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                 dest, component,func,
+                 errmsg, 16,__LINE__);
+            rc = ESA_FATAL;
+            goto exit;
+           }
+
+        rc = ADDINFO_insert(TYPE_1B,
+                            "ExcludeList",
+                            NULL,
+                            laddinfo,
+                            ACF_ADDINFO_KWD_LEN,
+                            ACF_ADDINFO_VAL_LEN,
+                            UNIQUE);
+
+        if (rc NE ESA_OK)
+           {
+            sprintf(errmsg,
+              "Insert ExcludeList keyword failed. rc=%d",rc);
+            CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                 dest, component,func,
+                 errmsg, 16,__LINE__);
+            rc = ESA_FATAL;
+            goto exit;
+           }
+
+        /* WS10079N rc = ACF2_Get_Xref(  */
+        ACF2_rc = ACF2_Get_Xref(                          /* WS10079N */
+                      "GETTHIS",
+                      xbhandle,
+                      &get_xref_handle,
+                      'X',
+                      &block_read,
+                      ug_params->group,
+                      xrefname_out,
+                      laddinfo,
+                      ESA_COMP_UPDUG,
+                      admin_params);
+
+        /* WS10079N if ( rc NE ESA_OK) */
+        if ( ACF2_rc NE ACF2_OK)                          /* WS10079N */
+           {
+             if ( ACF2_rc EQ ACF2_Not_Found)              /* WS10079N */
+             {                                            /* WS10079N */
+               CTSAMSG_print(ACF2_XREF_NOT_FOUND,         /* WS10079N */
+                       msgs, NULL, dest,                  /* WS10079N */
+                       (xbhandle->PB_type EQ 'R'?         /* WS10079N */
+                                      "Role" : "Source"), /* WS10079N */
+                       ug_params->group);                 /* WS10079N */
+             }                                            /* WS10079N */
+             else                                         /* WS10079N */
+             {                                            /* WS10079N */
+               sprintf(errmsg,
+                  "Update %s %s: "
+                  "ACF2_Get_Xref GETTHIS rc =%d",
+                  t_pair->value,
+                  ug_params->group,
+                  ACF2_rc);
+               CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                       dest, component, func,
+                       errmsg,
+                       16, __LINE__);
+             }                                            /* WS10079N */
+             rc = ESA_FATAL;
+             goto exit;
+           }
+        /*** BS10134 start ***/
+        /* Althoiugh we did not add isIncomlete to the addinfo,   */
+        /* we may get is back if the role/source is too long.     */
+        /* If isIncomplete=Y, we do not have the whole role.      */
+        /* We will fail the request because we cannot use it for  */
+        /* validating and executing the request.                  */
+        else /* ACF2_rc EQ ESA_OK */
+           {
+            pair = ADDINFO_search("isIncomplete",
+                     ACF_ADDINFO_KWD_LEN,
+                     laddinfo->pair,
+                     laddinfo->num_pairs);
+            if (pair NE NULL)
+            {
+             if(pair->value[0] EQ 'Y')
+             {
+               sprintf(errmsg,
+                  "Cannot update %s %s becasue it is too long",
+                  t_pair->value, ug_params->group);
+              CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                   dest, component, func,
+                   errmsg,
+                   16, __LINE__);
+              rc = ESA_FATAL;
+              goto exit;
+             }
+            }
+           }
+        /*** BS10134 end   ***/
+
+         ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+                "Update %s %s: "
+                "GETTHIS found item. xrefname_out = %s",
+                t_pair->value,
+                ug_params->group,
+                xrefname_out);
+        /*
+         *   Item exists and its IncludeList & ExcludeList are now in
+         *   laddinfo.
+         */
+
+
+        /**********************************************
+         *                                            *
+         *   Handle adding items to the IncludeList   *
+         *                                            *
+         **********************************************/
+        if ( (include_op_lists NE NULL)           AND
+             (include_op_lists->add_list NE NULL) )
+        {
+           new_inc_add_list  = calloc(1,
+                  strlen(include_op_lists->add_list)+1);
+
+           if (new_inc_add_list EQ NULL)
+            {
+              CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                 "new_inc_add_list",
+                 strlen(include_op_lists->add_list)+1);
+              rc = ESA_FATAL;
+              goto exit;
+            }
+
+           new_inc_add_list[0] = NULL_CHAR;
+
+           pair = ADDINFO_search("IncludeList",
+                           ACF_ADDINFO_KWD_LEN,
+                           laddinfo->pair,
+                           laddinfo->num_pairs);
+
+           if (pair NE NULL)
+           {
+             /*
+              *   Generate a new list consisting of items to be added
+              *   but that do not already exist
+              */
+             ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+               "User list of items to add to IncludeList = <%.*s>",
+               strlen(include_op_lists->add_list),
+               include_op_lists->add_list);
+             ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+               "Existing items in IncludeList = <%.*s>",
+               strlen(pair->value),
+               pair->value);
+
+             for (i=0; include_op_lists->add_list[i] NE NULL_CHAR; i++)
+                  include_op_lists->add_list[i] =
+                  toupper(include_op_lists->add_list[i]);
+
+             rc = ADDINFO_list_diff(
+                          include_op_lists->add_list,
+                          pair->value,
+                          new_inc_add_list,
+                          ADDINFO_LIST_ENTRY,
+                          ADDINFO_LIST_ENTRY);
+             if ( rc NE ESA_OK)
+                {
+                  sprintf(errmsg,
+                    "Update %s %s: "
+                    "ADDINFO_list_diff for include rc=%d",
+                    t_pair->value,
+                    ug_params->group,
+                    rc);
+                  CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                          dest, component, func,
+                          errmsg,
+                          16, __LINE__);
+                  rc = ESA_FATAL;
+                  goto exit;
+                }
+
+             ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+               "Final list of items to add to IncludeList = <%.*s>",
+               strlen(new_inc_add_list),
+               new_inc_add_list);
+
+             /*
+              *   If all items are already there, issue a warning
+              *   and continue
+              */
+             if (new_inc_add_list[0] EQ NULL_CHAR)
+             {
+                 CTSAMSG_print(ACF2_LIST_ALRDY_INC,
+                   msgs, NULL, dest,
+                   t_pair->value,
+                   ug_params->group,
+                   "IncludeList",
+                   t_pair->value,
+                   ug_params->group,
+                   strlen(include_op_lists->add_list),
+                   include_op_lists->add_list);
+
+                 free(new_inc_add_list);
+                 new_inc_add_list = NULL;
+             }
+
+             /*
+              *   Free the original include_op_lists->add_list
+              *   and save the filtered list (even if NULL) to add in
+              *   include_op_lists->add_list
+              */
+             free(include_op_lists->add_list);
+             include_op_lists->add_list = new_inc_add_list;
+           }
+
+        } /* end of include add_list not NULL   */
+
+        /**********************************************
+         *                                            *
+         *   Handle adding items to the ExcludeList   *
+         *                                            *
+         **********************************************/
+        if ( (exclude_op_lists NE NULL)           AND
+             (exclude_op_lists->add_list NE NULL) )
+        {
+           new_exc_add_list  = calloc(1,
+                  strlen(exclude_op_lists->add_list)+1);
+
+           if (new_exc_add_list EQ NULL)
+            {
+              CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                 "new_exc_add_list",
+                 strlen(exclude_op_lists->add_list)+1);
+              rc = ESA_FATAL;
+              goto exit;
+            }
+
+           new_exc_add_list[0] = NULL_CHAR;
+
+           pair = ADDINFO_search("ExcludeList",
+                           ACF_ADDINFO_KWD_LEN,
+                           laddinfo->pair,
+                           laddinfo->num_pairs);
+
+           if (pair NE NULL)
+           {
+             /*
+              *   Generate a new list consisting of items to be added
+              *   but that do not already appear in the existing list.
+              */
+             ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+               "User list of items to add to ExcludeList = <%.*s>",
+               strlen(exclude_op_lists->add_list),
+               exclude_op_lists->add_list);
+             ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+               "Existing items in ExcludeList = <%.*s>",
+               strlen(pair->value),
+               pair->value);
+
+             for (i=0; exclude_op_lists->add_list[i] NE NULL_CHAR; i++)
+                  exclude_op_lists->add_list[i] =
+                  toupper(exclude_op_lists->add_list[i]);
+
+             rc = ADDINFO_list_diff(
+                          exclude_op_lists->add_list,
+                          pair->value,
+                          new_exc_add_list,
+                          ADDINFO_LIST_ENTRY,
+                          ADDINFO_LIST_ENTRY);
+             if ( rc NE ESA_OK)
+                {
+                  sprintf(errmsg,
+                    "Update %s %s: "
+                    "ADDINFO_list_diff rc=%d",
+                    t_pair->value,
+                    ug_params->group,
+                    rc);
+                  CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                          dest, component, func,
+                          errmsg,
+                          16, __LINE__);
+                  rc = ESA_FATAL;
+                  goto exit;
+                }
+
+             ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+               "Final list of items to add to ExcludeList = <%.*s>",
+               strlen(new_exc_add_list),
+               new_exc_add_list);
+
+
+             /*
+              *   If all items are already there, issue a warning
+              *   and continue
+              */
+             if (new_exc_add_list[0] EQ NULL_CHAR)
+             {
+                 CTSAMSG_print(ACF2_LIST_ALRDY_INC,
+                   msgs, NULL, dest,
+                   t_pair->value,
+                   ug_params->group,
+                   "ExcludeList",
+                   t_pair->value,
+                   ug_params->group,
+                   strlen(exclude_op_lists->add_list),
+                   exclude_op_lists->add_list);
+
+                 free(new_exc_add_list);
+                 new_exc_add_list = NULL;
+             }
+
+             /*
+              *   Free the original exclude_op_lists->add_list
+              *   and save the filtered list (even if NULL) to add in
+              *   exclude_op_lists->add_list
+              */
+             free(exclude_op_lists->add_list);
+             exclude_op_lists->add_list = new_exc_add_list;
+           }
+
+
+        } /* end of exclude add_list not NULL   */
+
+        /***********************************************
+         *                                             *
+         *   Handle deleting items from the IncludeList*
+         *                                             *
+         ***********************************************/
+        if ( (include_op_lists NE NULL)           AND
+             (include_op_lists->del_list NE NULL) )
+        {
+           new_inc_del_list  = calloc(1,
+                  strlen(include_op_lists->del_list)+1);
+
+           if (new_inc_del_list EQ NULL)
+            {
+              CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                 "new_inc_del_list",
+                 strlen(include_op_lists->del_list)+1);
+              rc = ESA_FATAL;
+              goto exit;
+            }
+
+           new_inc_del_list[0] = NULL_CHAR;
+
+           pair = ADDINFO_search("IncludeList",
+                           ACF_ADDINFO_KWD_LEN,
+                           laddinfo->pair,
+                           laddinfo->num_pairs);
+
+           if (pair NE NULL)
+           {
+             /*
+              *   Generate a new list consisting of items to be deleted
+              *   but are not already missing in the existing list.
+              */
+             ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+               "User list of items to del from IncludeList = <%.*s>",
+               strlen(include_op_lists->del_list),
+               include_op_lists->del_list);
+             ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+               "Existing items in IncludeList = <%.*s>",
+               strlen(pair->value),
+               pair->value);
+
+             for (i=0; include_op_lists->del_list[i] NE NULL_CHAR; i++)
+                  include_op_lists->del_list[i] =
+                  toupper(include_op_lists->del_list[i]);
+
+             rc = ADDINFO_list_match(
+                          include_op_lists->del_list,
+                          pair->value,
+                          new_inc_del_list,
+                          ADDINFO_LIST_ENTRY,
+                          ADDINFO_LIST_ENTRY);
+             if ( rc NE ESA_OK)
+                {
+                  sprintf(errmsg,
+                       "Update %s %s: "
+                       "ADDINFO_list_match rc=%d",
+                       t_pair->value,
+                       ug_params->group,
+                       rc);
+                  CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                          dest, component, func,
+                          errmsg,
+                          16, __LINE__);
+                  rc = ESA_FATAL;
+                  goto exit;
+                }
+
+             ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+               "Final list of items to del from IncludeList = <%.*s>",
+               strlen(new_inc_del_list),
+               new_inc_del_list);
+
+
+             /*
+              *   If all items are already not there, issue a warning
+              *   and continue
+              */
+             if (new_inc_del_list[0] EQ NULL_CHAR)
+             {
+                 CTSAMSG_print(ACF2_LIST_ALRDY_DOESNT_INC,
+                   msgs, NULL, dest,
+                   t_pair->value,
+                   ug_params->group,
+                   "IncludeList",
+                   t_pair->value,
+                   ug_params->group,
+                   strlen(include_op_lists->del_list),
+                   include_op_lists->del_list);
+
+                 free(new_inc_del_list);
+                 new_inc_del_list = NULL;
+             }
+
+             /*
+              *   Free the original include_op_lists->del_list
+              *   and save the filtered list (even if NULL) to del in
+              *   include_op_lists->del_list
+              */
+             free(include_op_lists->del_list);
+             include_op_lists->del_list = new_inc_del_list;
+           }
+
+
+        } /* end of include del_list not NULL   */
+
+
+        /***********************************************
+         *                                             *
+         *   Handle deleting items from the ExcludeList*
+         *                                             *
+         ***********************************************/
+        if ( (exclude_op_lists NE NULL)           AND
+             (exclude_op_lists->del_list NE NULL) )
+        {
+           new_exc_del_list  = calloc(1,
+                  strlen(exclude_op_lists->del_list)+1);
+
+           if (new_exc_del_list EQ NULL)
+            {
+              CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                 "new_exc_del_list",
+                 strlen(exclude_op_lists->del_list)+1);
+              rc = ESA_FATAL;
+              goto exit;
+            }
+
+           new_exc_del_list[0] = NULL_CHAR;
+
+           pair = ADDINFO_search("ExcludeList",
+                           ACF_ADDINFO_KWD_LEN,
+                           laddinfo->pair,
+                           laddinfo->num_pairs);
+
+           if (pair NE NULL)
+           {
+             /*
+              *   Generate a new list consisting of items to be deleted
+              *   but are not already missing in the existing list.
+              */
+             ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+               "User list of items to del from ExcludeList = <%.*s>",
+               strlen(exclude_op_lists->del_list),
+               exclude_op_lists->del_list);
+             ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+               "Existing items in ExcludeList = <%.*s>",
+               strlen(pair->value),
+               pair->value);
+
+             for (i=0; exclude_op_lists->del_list[i] NE NULL_CHAR; i++)
+                  exclude_op_lists->del_list[i] =
+                  toupper(exclude_op_lists->del_list[i]);
+
+             rc = ADDINFO_list_match(
+                          exclude_op_lists->del_list,
+                          pair->value,
+                          new_exc_del_list,
+                          ADDINFO_LIST_ENTRY,
+                          ADDINFO_LIST_ENTRY);
+             if ( rc NE ESA_OK)
+                {
+                  sprintf(errmsg,
+                       "Update %s %s: "
+                       "ADDINFO_list_match rc=%d",
+                       t_pair->value,
+                       ug_params->group,
+                       rc);
+                  CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                          dest, component, func,
+                          errmsg,
+                          16, __LINE__);
+                  rc = ESA_FATAL;
+                  goto exit;
+                }
+
+             ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+               "Final list of items to del from ExcludeList = <%.*s>",
+               strlen(new_exc_del_list),
+               new_exc_del_list);
+
+
+             /*
+              *   If all items are already not there, issue a warning
+              *   and continue
+              */
+             if (new_exc_del_list[0] EQ NULL_CHAR)
+             {
+                 CTSAMSG_print(ACF2_LIST_ALRDY_DOESNT_INC,
+                   msgs, NULL, dest,
+                   t_pair->value,
+                   ug_params->group,
+                   "ExcludeList",
+                   t_pair->value,
+                   ug_params->group,
+                   strlen(exclude_op_lists->del_list),
+                   exclude_op_lists->del_list);
+
+                 free(new_exc_del_list);
+                 new_exc_del_list = NULL;
+             }
+
+             /*
+              *   Free the original exclude_op_lists->del_list
+              *   and save the filtered list (even if NULL) to del in
+              *   exclude_op_lists->del_list
+              */
+             free(exclude_op_lists->del_list);
+             exclude_op_lists->del_list = new_exc_del_list;
+           }
+
+
+        } /* end of exclude del_list not NULL   */
+
+       } /* end of inc op lists or exc op lists NE NULL */
+
+    }   /* end of i_pair or e_pair not null     */
+
+
+   /*
+    *   XREF_Commands_Create builds XREF commands for the CHA
+    *   request in xxx_command areas pointed by xref_command_struct.
+    *   We will need to free these xxx_command areas at the end.
+    */
+
+   rc = XREF_Commands_Create(
+               xref_type,
+               addinfo,
+               ug_params->group,
+               "CHA",
+               include_op_lists,
+               exclude_op_lists,
+               &xref_command_struct,
+               ESA_COMP_UPDUG,
+               admin_params);
+
+
+   if (rc NE ESA_OK)
+    {
+     sprintf(errmsg,
+            "Update %s %s: "
+            "XREF_Commands_Create rc = %d",
+            t_pair->value,
+            ug_params->group,
+            rc);
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+         func, errmsg, 16, __LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+    }
+
+
+  if (ADDINFO_alloc(func,1,&caddinfo,dest,msgs)
+                    NE ESA_OK)
+   {
+    sprintf(errmsg,"ADDINFO_alloc of caddinfo failed. rc=%d",rc);
+    CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+           func, errmsg, 16, __LINE__);
+    rc = ESA_FATAL;
+    goto exit;
+   };
+
+   /*
+    *   If ADD created, issue it first
+    */
+
+   if (xref_command_struct.add_command NE NULL)
+     {
+      /*
+       *   Now go issue the command created in
+       *   xref_command_struct.add_command area
+       */
+
+      ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+               "Calling ACF2cmd with add command = %s",
+               xref_command_struct.add_command);
+
+
+      rc = ACF2cmd(func,
+                    EXECOUT_DDNAME,
+                    admin_params->admin_uname,
+                    xref_command_struct.add_command,
+                    MAX_OK_RC_0,
+                    0,
+                    &caddinfo,
+                    NULL,
+                    NULL,
+                    admin_params,
+                    CMDOUT_YES,
+                    ACF2_YES);
+
+      ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+       "ACF2cmd rc = %d", rc);
+
+      if (rc EQ ESA_FATAL)
+       {
+         sprintf(errmsg,
+                 "CHA ADD for %s failed with rc=%d.\n"
+                 "Failed command = <%.*s>",
+                 ug_params->group, rc,
+                 strlen(xref_command_struct.add_command),
+                 xref_command_struct.add_command);
+         ESA_DIAG_printf(ESA_COMP_UPDUG, 6, errmsg);
+
+         CTSAMSG_print(ACF2_CMD_FAILURE, msgs, NULL, dest,
+                 "Update",
+                 t_pair->value,
+                 ug_params->group,
+                 rc);
+         rc = ESA_FATAL;
+         goto exit;
+       }
+
+      strcat(command_ops_to_restore,"ADD");
+     }
+
+   /*
+    *   If DEL created, issue it
+    */
+
+
+   if (xref_command_struct.del_command NE NULL)
+     {
+      /*
+       *   Now go issue the command created in
+       *   xref_command_struct.del_command area
+       */
+
+      ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+               "Calling ACF2cmd with del command = %s",
+               xref_command_struct.del_command);
+
+      rc = ACF2cmd(func,
+                    EXECOUT_DDNAME,
+                    admin_params->admin_uname,
+                    xref_command_struct.del_command,
+                    MAX_OK_RC_0,
+                    0,
+                    &caddinfo,
+                    NULL,
+                    NULL,
+                    admin_params,
+                    CMDOUT_YES,
+                    ACF2_YES);
+
+      ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+                     "ACF2cmd rc = %d", rc);
+
+      if (rc EQ ESA_FATAL)
+         {
+           sprintf(errmsg,
+                   "CHA DEL for %s failed with rc=%d.\n"
+                   "Command = <%.*s>",
+                   ug_params->group, rc,
+                   strlen(xref_command_struct.del_command),
+                   xref_command_struct.del_command);
+           ESA_DIAG_printf(ESA_COMP_UPDUG, 6, errmsg);
+
+           CTSAMSG_print(ACF2_CMD_FAILURE, msgs, NULL, dest,
+                   "Update",
+                   t_pair->value,
+                   ug_params->group,
+                   rc);
+           if (command_ops_to_restore[0] EQ NULL_CHAR)
+            {
+             rc = ESA_FATAL;
+             goto exit;
+            }
+           else
+            {
+              if (strncmp(command_ops_to_restore,"ADD",3) NE 0)
+               {
+                  sprintf(errmsg,
+                    "Update %s %s: "
+                    "Unexpected operation to roll back = %s. "
+                    "Expected = ADD. Roll back skipped",
+                    t_pair->value,
+                    ug_params->group,
+                    command_ops_to_restore);
+                    CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                    component,func, errmsg, 16, __LINE__);
+                    rc = ESA_FATAL;
+                    goto exit;
+               }
+              CTSAMSG_print(ACF2_ROLLING_BACK, msgs, NULL, dest,
+                   "Update",
+                   t_pair->value,
+                   ug_params->group,
+                   strlen(xref_command_struct.add_command),
+                   xref_command_struct.add_command);
+              rc = Restore_XREF_commands(                /* WS10079N */
+                             xref_type,
+                             ug_params->group,
+                             command_ops_to_restore,
+                             include_op_lists,
+                             exclude_op_lists,
+                             ESA_COMP_UPDUG,
+                             admin_params);
+              rc = ESA_FATAL;
+              goto exit;
+            };
+         };
+      strcpy(command_ops_to_restore,"DEL");
+     }
+
+
+   /*
+    *   If REP created, issue it
+    */
+
+   if (xref_command_struct.rep_command NE NULL)
+     {
+      /*
+       *   Now go issue the command created in
+       *   xref_command_struct.rep_command area
+       */
+
+      ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+               "Calling ACF2cmd with rep command = %s",
+               xref_command_struct.rep_command);
+
+
+      rc = ACF2cmd(func,
+                    EXECOUT_DDNAME,
+                    admin_params->admin_uname,
+                    xref_command_struct.rep_command,
+                    MAX_OK_RC_0,
+                    0,
+                    &caddinfo,
+                    NULL,
+                    NULL,
+                    admin_params,
+                    CMDOUT_YES,
+                    ACF2_YES);
+
+      ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+       "ACF2cmd rc = %d", rc);
+
+      if (rc EQ ESA_FATAL)
+        if (command_ops_to_restore[0] EQ NULL_CHAR)
+         {
+           sprintf(errmsg,
+                   "CHA REP for %s failed with rc=%d.\n"
+                   "Failed command = <%.*s>",
+                   ug_params->group, rc,
+                   strlen(xref_command_struct.rep_command),
+                   xref_command_struct.rep_command);
+           ESA_DIAG_printf(ESA_COMP_UPDUG, 6, errmsg);
+
+           CTSAMSG_print(ACF2_CMD_FAILURE, msgs, NULL, dest,
+                   "Update",
+                   t_pair->value,
+                   ug_params->group,
+                   rc);
+           rc = ESA_FATAL;
+           goto exit;
+         }
+        else
+         {
+           if ( (strlen(command_ops_to_restore) EQ 6)
+                 AND
+                (strncmp(command_ops_to_restore,"DEL",3) EQ 0)
+                 AND
+                (strncmp(command_ops_to_restore+3,"ADD",3) EQ 0) )
+                 sprintf(errmsg,
+                   "Update %s %s: "
+                   "Rolling back previous successful 2 commands:\n "
+                   "Rolling back command 1 = <%.*s>\n"
+                   "Rolling back command 2 = <%.*s>\n",
+                   t_pair->value,
+                   ug_params->group,
+                   strlen(xref_command_struct.del_command),
+                   xref_command_struct.del_command,
+                   strlen(xref_command_struct.add_command),
+                   xref_command_struct.add_command);
+           else
+           if ( (strlen(command_ops_to_restore) EQ 3)
+                 AND
+                ((strncmp(command_ops_to_restore,"DEL",3) EQ 0)
+                  OR
+                (strncmp(command_ops_to_restore,"ADD",3) EQ 0)) )
+              {
+                 if ((strncmp(command_ops_to_restore,"DEL",3) EQ 0))
+                    rollback=xref_command_struct.del_command;
+                 else
+                    rollback=xref_command_struct.add_command;
+
+                 sprintf(errmsg,
+                   "Update %s %s: "
+                   "Rolling back previous successful command = <%.*s>",
+                   t_pair->value,
+                   ug_params->group,
+                   strlen(rollback),
+                   rollback);
+              }
+           else
+            {
+               sprintf(errmsg,
+                 "Update %s %s: "
+                 "Unexpected operation(s) to roll back = <%s>. "
+                 "Expected DEL followed by ADD, or one of DEL/ADD. "
+                 "Roll back skipped",
+                 t_pair->value,
+                 ug_params->group,
+                 command_ops_to_restore);
+                 CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                 component,func, errmsg, 16, __LINE__);
+                 rc = ESA_FATAL;
+                 goto exit;
+            }
+
+           CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+           component,func, errmsg, 16, __LINE__);
+
+           rc = Restore_XREF_commands(                    /* WS10079N */
+                          xref_type,
+                          ug_params->group,
+                          command_ops_to_restore,
+                          include_op_lists,
+                          exclude_op_lists,
+                          ESA_COMP_UPDUG,
+                          admin_params);
+
+           ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+               "Restore_XREF_commands rc = %d", rc);
+
+           rc = ESA_FATAL;
+           goto exit;
+         };
+
+     }
+
+   /*
+    *   If REFRESH was requested then go issue the command in
+    *   xref_command_struct.ref_command area
+    */
+
+   if (xref_command_struct.ref_command NE NULL)
+    {
+
+      ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+               "Calling ACF2cmd with REFRESH command = %s",
+               xref_command_struct.ref_command);
+
+      rc = ACF2cmd(func,
+                 EXECOUT_DDNAME,
+                 admin_params->admin_uname,
+                 xref_command_struct.ref_command,
+                 MAX_OK_RC_0,
+                 0,
+                 &caddinfo,
+                 NULL,
+                 NULL,
+                 admin_params,
+                 CMDOUT_YES,
+                 ACF2_YES);
+
+      ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+       "ACF2cmd rc = %d", rc);
+
+      /*
+       *   If REFRESH command failed we don't want to fail the
+       *   transaction, just issue a warning
+       */
+
+      if (rc NE ESA_OK)      /* refresh failed?  */
+        {
+          sprintf(errmsg,
+                 "Update %s %s: REFRESH",
+                 t_pair->value,
+                 ug_params->group);
+          CTSAMSG_print(ACF2_RESULTS_UNCERTAIN,
+             msgs, NULL, dest,
+             errmsg,rc);
+          rc = ESA_WARN;
+          goto exit;
+        };
+    };
+   goto exit;
+
+   group_code:
+   pair = NULL;
+   /*----------------------------------------------------------*/
+   /* Check whether REFRESH_GDB is set to "Y".  If yes,        */
+   /* display error message and return to caller.              */
+   /*----------------------------------------------------------*/
+
+   rc = admin_params->cs_func.rssprm_get_opt_ptr(
+                                     admin_params->rss_name,
+                                     "REFRESH_GDB",
+                                     sizeof(parm_get),
+                                     parm_get,
+                                     OPT_TRUE,
+                                     OPT_TRUE);
+   if (rc EQ ESA_OK)
+   {
+      ESA_DIAG_printf(ESA_COMP_ADDUG, DEBUG_SHOW_IMPORTANT,
+                      "REFRESH_GDB = |%s|", parm_get);
+      if ( (strcmp (parm_get, "Y") EQ 0) AND
+           (Global_UDB_Active() EQ TRUE) )
+      {
+         CTSAMSG_print(ACF2_CANT_ADDGRP, msgs, NULL, dest);
+         rc = ESA_FATAL;
+         goto exit;
+      }
+   }
+
+   /* * * * * * * * End WS10079 * * * * * * * */
+   RESTORE_ENDING_BLANK(ug_params->group, ESA_COMP_UPDUG);/* BS10097 */
+
+  /*
+   *   Check that Reserved Keywords were not used
+   */
+
+   if (ADDINFO_rkt_check(func, 1, &addinfo, rkt, dest, msgs) NE ESA_OK)
+    {
+      rc = ESA_FATAL;
+      goto exit;
+     };
+
+  /*
+   *   Obtain a local addinfo buffer
+   */
+
+   if (ADDINFO_alloc(func,ACF2_ADDINFO,&laddinfo,dest,msgs) NE ESA_OK)
+    {
+      rc = ESA_FATAL;
+      goto exit;
+     };
+
+  /* **BS2309 START** */
+
+  /*
+   *   Obtain a local addinfo buffer
+   */
+
+   if (ADDINFO_alloc(func,ACF2_ADDINFO,&caddinfo,dest,msgs) NE ESA_OK)
+    {
+      rc = ESA_FATAL;
+      goto exit;
+     };
+
+   ADDINFO_copy(caddinfo, addinfo);
+
+  /* **BS2309 END** */
+
+  /*
+   *   Open GDB for Update
+   */
+   GDB_rc = GDB_Set_Mode(GDB_ReadWrite,admin_params,err);
+   switch(GDB_rc)
+    {
+     case GDB_OK:
+      GDB_open = TRUE;                                    /* WS10079 */
+      break;
+
+     case GDB_Update_Lock_Failed:
+      sprintf(errmsg,"Unable to obtain lock on group database");
+      CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+
+     default:
+      sprintf(errmsg,"Open GDB for Update failed, rc = %d",GDB_rc);
+      CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+    };
+
+  /*
+   *    Check group's UIDMASKS are valid
+   */
+
+   rc = Check_Group_UIDMASKS(ug_params->group,
+                             caddinfo,                    /* BS2309 */
+                             admin_params);               /*IS10128*/
+  /* drop as pass admin_params dest,
+                               msgs);                       IS10128*/
+
+   if (rc NE ESA_OK)
+    goto exit;
+
+  /*
+   *   Locate Group, Is it There?
+   */
+    strcpy(Group,ug_params->group);
+    ACF2_rc = ACF2_Get_Group(GDB_Exact_Locate,
+                             Group,
+                             laddinfo,
+                             NULL,NULL,
+                             admin_params);            /*WS10076A*/
+
+    switch(ACF2_rc)
+     {
+       case ACF2_OK:
+        break;
+
+       case ACF2_Not_Found:
+        CTSAMSG_print(ERR_NO_GROUP, msgs, NULL, dest, ug_params->group);
+        rc = ESA_FATAL;
+        goto exit;
+
+       default:
+        sprintf(errmsg,"Locate failed for Group %s (rc=%d)",
+                ug_params->group,ACF2_rc);
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+                 errmsg, 16,__LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+     };
+
+  /*
+   *   Locate UIDMASKS field, If It is updated, apply Correllation test
+   *   as in Insert Group.
+   */
+   if (ADDINFO_search("UIDMASKS",
+                      ACF_ADDINFO_KWD_LEN,
+                      caddinfo->pair,                     /* BS2309 */
+                      caddinfo->num_pairs) NE NULL)       /* BS2309 */
+    {
+   params_ptr = admin_params->apiinit_handle;             /*IS10128*/
+   iiqAcf2Groups = params_ptr->rssparm_IIQACF2GROUPS[0];  /*IS10128*/
+   if (iiqAcf2Groups NE 'Y')                              /*IS10128*/
+   {                                                      /*IS10128*/
+     /* IS10088 if (Check_Group_Correllation(ug_params->group, */
+     rc=Check_Group_Correllation(ug_params->group,
+                                caddinfo,                 /* BS2309 */
+                                cgroup,
+                                laddinfo,
+                                dest,                     /* BS2306 */
+                                msgs, /*IS10088*/         /* BS2306 */
+                                admin_params);            /*IS10088*/
+     /* IS10088                 admin_params) NE ESA_OK)          */
+     if (rc NE ESA_OK) {                                   /*IS10088*/
+       if (rc NE ESA_SKIP) /*msg was not issued yet         *IS10088*/
+         CTSAMSG_print(ACF2_UG_CORRELLATE, msgs, NULL, dest,
+                      ug_params->group,cgroup);
+       rc = ESA_FATAL;
+       goto exit;
+      };
+    }; /* end of (iiqAcf2Groups NE 'Y')                      IS10128*/
+    };
+
+  /*
+   *   Re-Position GDB after correllation test
+   */
+    ADDINFO_empty(laddinfo);
+    ACF2_rc = ACF2_Get_Group(GDB_Exact_Locate,
+                             Group,
+                             laddinfo,
+                             NULL,NULL,
+                             admin_params);            /*WS10076A*/
+
+  /*
+   *   Update Group fields from addinfo
+   */
+    ADDINFO_masupd(laddinfo, caddinfo, ADDINFO_masupd_Merge,
+                   dest, msgs);                           /* BS2309 */
+
+  Trunc_UIDMASKS (laddinfo);                              /* PS0234 */
+
+  /*
+   *   Prepare for Update
+   */
+    GDB_Convert_to_Record(GDB_RECORD_TYPE_GROUP,
+                          Group,
+                          laddinfo);
+
+  /*
+   *   Update
+   */
+    GDB_rc = GDB_Update();
+
+    if (GDB_rc NE GDB_OK)
+     {
+      sprintf(errmsg,"Update failed for Group %s (rc=%d)",
+              ug_params->group,GDB_rc);
+      CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+     };
+  /*
+   *   Finish
+   */
+
+   exit:;
+
+  /*
+   *   Close GDB
+   */
+   if (GDB_open EQ TRUE)                                  /* WS10079 */
+   {                                                      /* WS10079 */
+     GDB_rc = GDB_Set_Mode(GDB_Closed,admin_params,err);
+
+     if (GDB_rc NE GDB_OK)
+      {
+        sprintf(errmsg,"GDB close failed, rc = %d",GDB_rc);
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+                 errmsg, 16,__LINE__);
+        rc = ESA_FATAL;
+      } /* ; WS10079 */
+     else                                                 /* WS10079 */
+        GDB_open = FALSE;                                 /* WS10079 */
+   }                                                      /* WS10079 */
+
+   if (laddinfo NE NULL)
+    ADDINFO_free(&laddinfo);
+
+   if (caddinfo NE NULL)                                  /* BS2309 */
+    ADDINFO_free(&caddinfo);                              /* BS2309 */
+
+   /* WS10079  start */
+   if (include_op_lists NE NULL)
+      {
+        if (include_op_lists->add_list NE NULL)
+           free(include_op_lists->add_list);
+        if (include_op_lists->del_list NE NULL)
+           free(include_op_lists->del_list);
+        free(include_op_lists);
+      }
+   if (exclude_op_lists NE NULL)
+      {
+        if (exclude_op_lists->add_list NE NULL)
+           free(exclude_op_lists->add_list);
+        if (exclude_op_lists->del_list NE NULL)
+           free(exclude_op_lists->del_list);
+        free(exclude_op_lists);
+      }
+   if (xref_command_struct.add_command NE NULL)
+      free(xref_command_struct.add_command);
+   if (xref_command_struct.del_command NE NULL)
+      free(xref_command_struct.del_command);
+   if (xref_command_struct.rep_command NE NULL)
+      free(xref_command_struct.rep_command);
+   if (xref_command_struct.ref_command NE NULL)
+      free(xref_command_struct.ref_command);
+   /* WS10079  end   */
+   /* WS10084  start */
+   if (get_xref_handle NE NULL)
+   {
+      /* BS10134 rc = ACF2_Get_Xref(   */
+      temp_rc = ACF2_Get_Xref(                            /* BS10134 */
+                 "TERM",
+                 xbhandle,
+                 get_xref_handle,
+                 NULL_CHAR,
+                 NULL,
+                 NULL,
+                 NULL,
+                 NULL,
+                 ESA_COMP_UPDUG,
+                 admin_params);
+       ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+      "ACF2_Get_Xref TERM rc<%d>",temp_rc);               /* BS10134 */
+      /* BS10134 "ACF2_Get_Xref TERM rc<%d>",rc);  */
+      /*  BS10034 - start */
+      if (temp_rc NE ESA_OK)
+      {
+       sprintf(errmsg,"ACF2_Get_XREF failed for TERM call with rc = %d",
+               temp_rc);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+                  errmsg, 16,__LINE__);
+      }
+      /*  BS10034 - end   */
+   }
+   /* WS10084  end   */
+   ESA_DIAG_exit(ESA_COMP_UPDUG, DEBUG_SHOW_IMPORTANT, func, rc);
+
+   return rc;
+
+}
+
+ /* WS10079N - start */
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : Restore_XREF_commands                      *
+ *                                                             *
+ * DESCRIPTION    : Restore commands that failed               *
+ *                                                             *
+ * INPUT            type                ROL/SGP           (I)  *
+ *                  xref_name                             (I)  *
+ *                  command_ops_to_restore                (I)  *
+ *                                   - list of 3 char ops      *
+ *                                     (ADD and/or DEL)   (I)  *
+ *                                     to be restored     (I)  *
+ *                  include_op_lists - pointer to existing     *
+ *                                      op lists          (I)  *
+ *                  exclude_op_lists - pointer to existing     *
+ *                                      op lists          (I)  *
+ *                  diag_comp                             (I)  *
+ *                  admain_params                         (I)  *
+ *                                                             *
+ * OUTPUT         :                                            *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ * WS10079N:                                                   *
+ * =========                                                   *
+ * This code in this routine was moved from                    *
+ * XREF_Commands_Restore (which resides in CTSBSRV) in order   *
+ * to save the need to add CTSBCMD (for Acf2Cmd) to the        *
+ * LONKCARDs of CTSCONI nd CTSCOFI. Both programs have         *
+ * CTSBSRV in their LINKCARD so adding a code that calls       *
+ * ACf2Cmd requires changing their LINKCARDs. To save this     *
+ * need, XREF_COmmands_Restore was changed to prepare the      *
+ * commands and its callers will issue them.                   *
+ *                                                             *
+ **************************************************************/
+
+static ESA_RC Restore_XREF_commands(
+                  char                 * type,
+                  char                 * xref_name,
+                  char                 * command_ops_to_restore,
+                  XREF_Operations_Lists_typ * include_op_lists,
+                  XREF_Operations_Lists_typ * exclude_op_lists,
+                  ESA_DIAG_COMP_typ      diag_comp,
+                  ADMIN_PARAMS_rec_typ * admin_params)
+{
+
+ static char    func[]="Restore_XREF_commands";
+
+/*
+ *     Variables
+ */
+
+ ESA_RC                      rc                  = ESA_OK;
+ int                         i                   = 0;
+ char                        op[4]               = "";
+ char                        rst[4]              = "";
+ char                        errmsg[125]         = "";
+ char                      * pos                 = NULL;
+ char                      * cmd                 = NULL;
+ XREF_Cmd_Struct_typ         xref_command_struct;
+ ADDINFO_rec_ptr             caddinfo            = NULL;
+ CTSAMSG_HANDLE_rec_ptr      msgs;
+ CTSAMSG_DEST_TABLE_rec_ptr  dest;
+
+ msgs = admin_params->ctsamsg_handle;
+ dest = admin_params->ctsamsg_dest;
+
+ ESA_DIAG_enter(diag_comp, 1, func);
+
+/*
+ *     Alocate an empty ADDINFO fro ACF2cmd
+ */
+
+ if (ADDINFO_alloc(func,1,&caddinfo,dest,msgs) NE ESA_OK)
+ {
+   sprintf(errmsg,"ADDINFO_alloc of caddinfo failed. rc=%d",rc);
+   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+                 errmsg, 16,__LINE__);
+   rc = ESA_FATAL;
+   goto exit;
+ };
+
+ /*
+  *    Prepare the commands
+  */
+ rc = XREF_Commands_Restore(
+                type,
+                xref_name,
+                command_ops_to_restore,
+                include_op_lists,
+                exclude_op_lists,
+                &xref_command_struct,
+                diag_comp,
+                admin_params);
+ if (rc NE ESA_OK)      /* restore failed?  */
+ {
+   sprintf(errmsg,
+           "Prepare roll back commands (XREF_Commands_Restore) rc=%d "
+           "Roll back will not be performed.",
+           rc);
+   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                func, errmsg, 16,__LINE__);
+   rc = ESA_FATAL;
+   goto exit;
+ };
+
+ /*
+  *  Execute the commands
+  */
+ for (i = strlen(command_ops_to_restore) / 3; i GE 1; i--)
+ {
+   pos = command_ops_to_restore + (i-1)*3;
+   if (strncmp(pos,"ADD",3) EQ 0)
+      {
+       cmd = xref_command_struct.del_command;
+       strcpy(op,"ADD");
+       strcpy(rst,"DEL");
+      }
+   else
+   if (strncmp(pos,"DEL",3) EQ 0)
+      {
+       cmd = xref_command_struct.add_command;
+       strcpy(op,"DEL");
+       strcpy(rst,"ADD");
+      }
+
+   ESA_DIAG_printf(diag_comp, 6,
+                  "Calling ACF2cmd with %s to restore %s",
+                  rst,op);
+
+   rc = ACF2cmd(func,
+           EXECOUT_DDNAME,
+           admin_params->admin_uname,
+           cmd,
+           MAX_OK_RC_0,
+           0,
+           &caddinfo,
+           NULL,
+           NULL,
+           admin_params,
+           CMDOUT_YES,
+           ACF2_YES);
+
+   if (rc NE ESA_OK)      /* Roll back failed?  */
+     {
+       CTSAMSG_print(ACF2_RESULTS_UNCERTAIN,
+          msgs, NULL, dest,
+         "Roll back",rc);
+       rc = ESA_FATAL;
+       goto exit;
+     };
+  }
+
+ exit:
+
+  if (caddinfo NE NULL)
+    ADDINFO_free(&caddinfo);
+
+  if (xref_command_struct.add_command NE NULL)
+    free(xref_command_struct.add_command);
+
+  if (xref_command_struct.del_command NE NULL)
+    free(xref_command_struct.del_command);
+
+  if (xref_command_struct.rep_command NE NULL)
+    free(xref_command_struct.rep_command);
+
+  if (xref_command_struct.ref_command NE NULL)
+    free(xref_command_struct.ref_command);
+
+  ESA_DIAG_exit(diag_comp, 1, func, rc);
+  return rc;
+
+}
+/* WS10079N - end */

@@ -1,0 +1,2796 @@
+/**************************************************************
+*                                                             *
+* Title            : ESA - user REXX/CLIST interface          *
+*                                                             *
+* File Name        : ctscvar.c                                *
+*                                                             *
+* Author           : Alexander Shvartsman                     *
+*                                                             *
+* Creation Date    : 20/07/94                                 *
+*                                                             *
+**************************************************************/
+
+/**************************************************************
+* Mod.Id   Who      When     Description                      *
+* -------- -------- -------  -------------------------------- *
+* as1101   A.Shv    11/01/96 Correct delete RCODE var instead *
+*                            RCODE should be CTSA1.RCODE      *
+*                                                             *
+* BS2005   AS       09/03/97 Delete vars improvement          *
+* PS0107   AS       18/06/97 Add "NOTIFY" mode                *
+* PS0311   Alex     16/09/98 List fields handling             *
+*                            (See BS2363 for V210)            *
+* WS0363   Alex     11/26/00 "SEND RSSPARM TO SCRIPT" SUPPORT *
+* IS10094  Nurity   11/06/13 BS10032 changes:                 *
+*                            1. Do not handle value "/" as    *
+*                               delete request.               *
+*                            2. Abend S0C4/S0C6 when error    *
+*                               message is too long.          *
+* IS10098  Nurity   01/07/13 Abend S0C4 when value is too     *
+*                            long. (BS10035)                  *
+* SAS2IBMT SeligT   12/07/16 SAS/C to IBM C Conversion Project*
+* SAS2IBMN NuritY   25/07/16 SAS/C to IBM C Conversion:       *
+*                            Replace execshv with IRXEXCOM.   *
+*                            See details below.               *
+* BS10094  NuritY   12/08/18 Abend S0C4 in put_rexx_var when  *
+*                            moving the value.                *
+* WS10076  SeligT   19/01/20 Manage Permissions as Account    *
+*                            and Group Attributes - Phase 2   *
+* IS10184  NuritY   31/08/21 Improve scripts performance      *
+* WS10082  NuritY   20/09/23 Update per ADDINFO new structure *
+* WS10082N NuritY   03/12/23 Storage leak issue.              *
+* WS10082K KailasP  23/02/23 OC4 Abend.                       *
+**************************************************************/
+/****************************************************
+* Procedure Name: ctscvar
+* Description   : ESA - user REXX/CLIST interface
+*                 main routine. Invoked by "call " REXX command
+*
+* Input         : argv[1] - option code .
+*                 'GET' - create REXX variables from addinfo inform
+*                 'PUT' - create addinfo from REXX variables
+*                 'NOTIFY' - send interceptions event
+*                 'RC - return the value assed in ar[3] as  IS10184
+*                       CTSA1.rcode value.                  is10184
+*
+*                 argv[2] - address of header structure
+*
+*                 argv[3] - for RC - the return code set    IS10184
+*                           by the script in CTSA1.RCODE.   IS10184
+*                                                           IS10184
+*                 argv[n] - EXCOM(<irxexcom address>)       IS10184
+*                           optional. If exists, will be    IS10184
+*                           the last.                       IS10184
+*                                                           IS10184
+* Return Value  : ESA_OK, ESA_FATAL
+*                 CTSA1.RCODE - variable
+*
+* Comments      : The program is reusable.                  IS10184
+* Scope         :
+****************************************************/
+/******(*******************************************************
+*
+* Replace execshv with IRXEXCOM
+* -----------------------------
+*
+* execshv is a SAS/C service to handle REXX variables. When
+* migrating to IBM C, this service has to be replaced with
+* the IRXEXCOM REXX routine which provides similar services.
+*
+* The program calling IRXEXCOM should be invoked under an
+* active REXX environment. In our case CTSCVAR is called by
+* CTSAVAR, which is invoked by the pre/post scrips using the
+* ADDRESS TSO command.
+*
+* The variables to be handled by IRXEXCOM are described by
+* the IRXSHVB control block. IBM provides a mapping DESCT for
+* this block. We used the EDCDSECT IBM C utility to convert
+* this DSECT to a C structure, saved in member IRXSHVB in the
+* CMAC library.
+*
+* Variables processing
+* --------------------
+*
+* GET/PUT function:
+* 1. fetch() IRXEXCOM.
+*
+* GET function:
+* 1. Create a IXRSHVB block for each variable to be created.
+*    Chain the first block on first_shvblk, which is a dummy
+*    IRXSHVB block used to hold the pointer to the real first
+*    block. The address of the last IRXSHVC created is saved
+*    so that the next block can be chained on the last.
+* 2. Call IRXEXCOM with the Set function, and pass the pointer
+*    to the first IRXSHVB block in chain (the one pointed bu
+*    first_shvblk).
+*
+* PUT function:
+* 1. Call IRXEXCOM with the NEXT function, to retrieve the
+*    a variable. first_shvblk is used as the IRXSHVB block for
+*    the variable name and value.
+* 2. Update the ADDINFO pair according to the varibale value.
+* 3. Repeat steps 2 and 3 until all variables were retrieved.
+*
+* Cleanup:
+* 1. If IRXEXCOM was fetched, release() it.
+* 2. If an IRXSHVB chain was created, free the blocks.
+*
+*
+* IRXEXCOM is described in TSO/E REXX programming services
+* manual under the title "Variable access routine - IRXEXCOM".
+*
+*
+****************************************************************/
+/******(*******************************************************
+*
+* Changes included in IS10184:
+* ----------------------------
+* 1. the program is changed to be reusable and will be loaded
+*    only once. Values saved in static variables will be seen by
+*    subsequent invocations.  Therefore, static variables which
+*    are used in order to share data between routines but not
+*    between calls should be cleared before used.
+*
+* 2. New call type - RC.
+*    The parameters for R are the token and CTSA1.RCODE value.
+*    The program kust puts CTSA1.RCODE value in the header.
+*    No REXX varibales are retrieved and addinfo is not
+*    updated.
+*
+* 3. If EXCOM(addr) is passed as last parameter, skip fetching
+*    IRXEXCOM and use the passed address.
+*
+* 4. The program will be called using BASR and not LINK. This is
+*    a change in the caller, but we'd better know this here as
+*    well.
+*
+*  Note:
+*  The program is not link-edited as reusable because there
+*  is no need for this. We load it once and then find its address
+*  and branch to it, so the system does not have to look for it.
+*  If there wil be a need to link-edit it as reusable, all
+*  modules link-edited to it should be link-edited as reusable as
+*  well, to prevent linkage editor warning message and non=0 rc.
+*  (these programs are called multiple times which means that they
+*  are written as reusable, but they are not link-edited as such).
+*
+****************************************************************/
+
+#define  THIS_IS_MAIN
+
+#include <globs.h>
+
+/*
+ *   Standard include files
+ */
+
+#include STRING
+#include STDIO
+#include STDLIB
+#include CTYPE
+/* SAS2IBMN #include EXEC  */
+/* SAS2IBMT #include LCIO  */
+
+/*
+ *   ESA include files
+ */
+
+#include ESA_API
+#include ESA_CS_OS
+#include ESA_DIAG
+#include ESA_API_CODES
+
+/*
+ *   MVS include files
+ */
+
+#include MVS_CODES
+#include MVS_OS_MVS
+#include MVS_OS_DYNAM
+
+/*
+ *   RACF include files
+ */
+
+#include API_ADDINFO
+
+/* SAS2IBMN - start */
+#include <irxshvb.h>
+#define  IRXRC_NO_LE           28
+#define  IRXRC_INVALID_PARMS   32
+#define  IRXRC_VARIABLE_ERROR  100
+
+#define  irxshvb               struct shvblock
+
+#define  GET_VAR_FETCH         'F'
+#define  GET_VAR_NEXT          'N'
+/* SAS2IBMN - end */
+
+/*
+ *   Internal subroutines
+ */
+
+static ESA_RC return_ctsa1_rcode(OS_HEADER_typ * header,  /* IS10184 */
+                                 char          * rcode);  /* IS10184 */
+
+static ESA_RC create_rexx_vars(OS_HEADER_typ *header);
+
+static ESA_RC create_rexx_var(char                       *prefix,
+                              ADDINFO_rec_ptr             addinfo,
+                              int                         rcf,
+                              CTSAMSG_HANDLE_rec_ptr      msgs,
+                              CTSAMSG_DEST_TABLE_rec_ptr  dest);
+
+static ESA_RC create_rexx_ctsa_var(int                         i,
+                                   char                       *prefix,
+                                   char                       *keyword,
+                                   char                       *value,
+             /* SAS2IBMN           int                        *shvrc,*/
+             /* SAS2IBMN */        CTSAMSG_HANDLE_rec_ptr      msgs,
+             /* SAS2IBMN */        CTSAMSG_DEST_TABLE_rec_ptr  dest);
+/* SAS2IBMN - start */
+/* static ESA_RC put_rexx_var(char *keyword,char *value,int *shvrc); */
+static ESA_RC put_rexx_var(char                       *keyword,
+                           char                       *value,
+                           CTSAMSG_HANDLE_rec_ptr      msgs,
+                           CTSAMSG_DEST_TABLE_rec_ptr  dest);
+
+static ESA_RC set_rexx_vars(int                        *shvrc,
+                            CTSAMSG_HANDLE_rec_ptr      msgs,
+                            CTSAMSG_DEST_TABLE_rec_ptr  dest);
+/* SAS2IBMN - end */
+
+static ESA_RC create_addinfo(OS_HEADER_typ *header) ;
+
+static char * get_msg_code(int shvrc);
+
+static char * get_IRXEXCOM_code(unsigned char  request);  /* SAS2IBMN */
+
+static void   send_msg(ESA_RC                     rc,
+    /* SAS2IBMN        char                       *var_name,  */
+    /* SAS2IBMN        char                       *var_val,   */
+                       char                       *msg,   /* SAS2IBMN */
+                       CTSAMSG_HANDLE_rec_ptr     msgs,
+                       CTSAMSG_DEST_TABLE_rec_ptr dest);
+
+/* SAS2IBMN - start */
+static void   send_var_msg(irxshvb                   *shvblk,
+                           CTSAMSG_HANDLE_rec_ptr     msgs,
+                           CTSAMSG_DEST_TABLE_rec_ptr dest);
+
+static int    is_var_error(irxshvb    *shvblk);
+/* SAS2IBMN - start */
+
+static void say(char  *msg) ;
+
+static void do_say(char  *msg,                            /* SAS2IBMN */
+                   int   diag);                           /* SAS2IBMN */
+
+static ESA_RC put_addinfo_var(char          *stem,
+                              OS_HEADER_typ *header) ;
+
+static ESA_RC put_to_addinfo(ADDINFO_rec_ptr            addinfo,
+                             char                      *keyword,
+                             char                      *value,
+                             OS_HEADER_typ             *header,
+                             CTSAMSG_HANDLE_rec_ptr     msgs,
+                             CTSAMSG_DEST_TABLE_rec_ptr dest) ;
+
+/* SAS2IBMN - start */
+ static ESA_RC get_rexx_var(char                       req_code,
+                            char                      *keyword,
+                            int                        max_key_len,
+                            char                      *value,
+                            int                        max_val_len,
+                            int                       *val_len,
+                            CTSAMSG_HANDLE_rec_ptr     msgs,
+                            CTSAMSG_DEST_TABLE_rec_ptr dest);
+/* SAS2IBMN - end */
+
+static void get_script_rc(OS_HEADER_typ    *header,
+                          char             *valbuf,
+                          ESA_RC           *script_rc) ;
+
+static ESA_RC rc_is_digit(char   *rc_value);
+
+static ESA_RC intercept_events(int               argc,
+                               char            **argv ,
+                               OS_HEADER_typ    *header);
+
+static ESA_DIAG_LEVEL_typ   dlvl[ESA_MAX_COMPS];
+
+static  char err_parm_list[] = "INVALID PARAMETER LIST";
+static  char component[] = "CTSCVAR";
+
+#define SCRIPT_LIST_ENTRY       ','                  /* PS0311 */
+#define SCRIPT_LIST_SUBFIELD    ';'                  /* PS0311 */
+
+#define SCRIPT_SEP_ENTRY_PRM    "SCRIPT_SEP_ENTRY"   /* PS0311 */
+#define SCRIPT_SEP_FIELD_PRM    "SCRIPT_SEP_FIELD"   /* PS0311 */
+
+static  char   script_sep_entry;                     /* PS0311 */
+static  char   script_sep_field;                     /* PS0311 */
+
+/* SAS2IBMN - start */
+/*
+ *  Error codes to be used in send_msg)
+ */
+#define INSUFFICIENT_STORAGE 97
+#define FETCH_FAILED    98
+#define UNKNOWN_PARM    99
+
+/*
+ *   Define the IRXEXCOM routine
+ *
+ *   The #pragma tells C to call the routine is standard
+ *   parameters table and set the high-order bit on in the
+ *   last entry of the parameters table.
+ *
+ *   We need it here because IRXEXCOM fails the call with
+ *   a return code of 32 is this bit is not set.
+ */
+
+static  ASM_RTN_TYP * irxexcom;     /* IRXEXCOM address.              */
+#define IRXEXCOM    "IRXEXCOM"
+
+typedef void RTN_TYP ();
+/* IS10184 static  RTN_TYP  * p_rtn;/* IRXEXCOM address for release() */
+
+/*
+ *   IRXEXCOM parameter block.
+ *
+ *   For 'set' requests,first_shvblk is used as a dummy shvblock
+ *   to hold the address of the first real shvblk.
+ *   for 'fetch' requests, first_shvblk is used for the request.
+ */
+static char   eye_c[] = IRXEXCOM;
+static irxshvb first_shvblk;
+static irxshvb *p_last_shvblk = NULL;
+/* SAS2IBMN - end  */
+
+/* WS10082 - admin_params address for addinfo routines call */
+ADMIN_PARAMS_rec_typ * admin_params_copy;                 /* WS10082 */
+
+static CTSAMSG_HANDLE_rec_ptr           msgs = NULL;      /* WS10082 */
+static CTSAMSG_DEST_TABLE_rec_ptr       dest = NULL;      /* WS10082 */
+/*
+ *   Main program
+ */
+
+/* SAS2IBMN ESA_RC main(int argc, char **argv) */
+int    main(int argc, char **argv)                        /* SAS2IBMN */
+
+{
+
+   static char func[] = "ctscvar";
+
+  /*
+   *    Variables
+   */
+
+   ESA_RC        rc = ESA_OK ;
+   int           intrc;
+   int           shvrc;
+   char          temp[10];          /* PS0311 */
+   OS_HEADER_ptr header  = NULL;
+   void          *handle = NULL;
+   /* int           i;     */
+   /* SAS2IBMN - start */
+   irxshvb       *p_c_shvblk;       /*  pointers used for shvblk...  */
+   irxshvb       *p_n_shvblk;       /*  ... chain storage release    */
+   RTN_TYP      * p_rtn; /* IRXEXCOM address for release()   IS10184 */
+   char           excom_c[8];                             /* IS10184 */
+
+   /* WS10082 CTSAMSG_HANDLE_rec_ptr           msgs;                 */
+   /* WS10082 CTSAMSG_DEST_TABLE_rec_ptr       dest;                 */
+   CTSAMSG_MSG_typ msg_buff;
+   /* SAS2IBMN - end */
+
+  /*
+   *    Start of code
+   */
+
+  /* printf("ctscvar:argc=%d\n",argc);
+   * for (i=0; i LE argc; i++)
+   *    printf("ctscvar:argv(%d)=%s\n",i,argv[i]);
+   */
+
+   if ( argc LT 3 )
+     goto exit_parm_err ;
+
+  /*
+   *    Check valid/no token addr ( ptr to header structure )
+   */
+
+   rc = get_token_addr(argv[2],&header) ;
+   if ( rc NE ESA_OK )
+     goto exit_parm_err ;
+
+   msgs = header->msgs ;                                  /* SAS2IBMN */
+   dest = header->dest ;                                  /* SAS2IBMN */
+   ADDINFO_spi_init(header->admin_params);                /* WS10082 */
+   irxexcom = NULL;                                       /* IS10184 */
+   script_sep_entry = NULL_CHAR;                          /* IS10184 */
+   script_sep_field = NULL_CHAR;                          /* IS10184 */
+
+  /*
+   *    Initialize diagnostics
+   */
+
+   dlvl[ESA_COMP_OS_SCRIPT] = header->debug_level;
+
+   ESA_DIAG_initialize ("PRTDBG", NULL, "CTSAVAR", &handle);
+   ESA_DIAG_set_debug_levels(dlvl);
+
+   ESA_DIAG_enter(ESA_COMP_OS_SCRIPT, 1, func);
+
+
+   /* IS10184 ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,   /@ SAS2IBMN @/
+               "IRXEXCOM address = %8X", irxexcom);   /@ SAS2IBMN @/ */
+
+                                                          /* IS10184 */
+   /* Check if RC                         */
+   if ( strcmp(argv[1],"RC" ) EQ 0 )                      /* IS10184 */
+   {                                                      /* IS10184 */
+     if ( argc LT 4 )                                     /* IS10184 */
+       goto exit_parm_err;                                /* IS10184 */
+                                                          /* IS10184 */
+     get_script_rc(header, argv[3], &header->rc_script);  /* IS10184 */
+     ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,                /* IS10184 */
+                     "script rc=%d/%s",                   /* IS10184 */
+                      header->rc_script,                  /* IS10184 */
+                      ESA_rc2str(header->rc_script) );    /* IS10184 */
+     rc = ESA_OK;                                         /* IS10184 */
+   }                                                      /* IS10184 */
+   else                                                   /* IS10184 */
+     /* Check if GET or PUT                 */            /* IS10184 */
+     if ( (strcmp(argv[1],"GET" ) EQ 0)   OR              /* IS10184 */
+          (strcmp(argv[1],"PUT" ) EQ 0) )                 /* IS10184 */
+     {                                                    /* Is10184 */
+       /*  User defined entry separator */                 /* PS0311 */
+       rc = header->rssprm_get_opt(header->rss_name,       /* PS0311 */
+                           SCRIPT_SEP_ENTRY_PRM,           /* PS0311 */
+                           sizeof(temp) - 1,               /* PS0311 */
+                           temp, OPT_TRUE, OPT_TRUE);      /* PS0311 */
+       if (rc EQ ESA_OK)                                   /* PS0311 */
+         script_sep_entry = temp[0];                       /* PS0311 */
+       else                                                /* PS0311 */
+         script_sep_entry = SCRIPT_LIST_ENTRY;             /* PS0311 */
+
+       /*  User defined subfield separator */              /* PS0311 */
+       rc = header->rssprm_get_opt(header->rss_name,       /* PS0311 */
+                           SCRIPT_SEP_FIELD_PRM,           /* PS0311 */
+                           sizeof(temp) - 1,               /* PS0311 */
+                           temp, OPT_TRUE, OPT_TRUE);      /* PS0311 */
+       if (rc EQ ESA_OK)                                   /* PS0311 */
+         script_sep_field = temp[0];                       /* PS0311 */
+       else                                                /* PS0311 */
+         script_sep_field = SCRIPT_LIST_SUBFIELD;          /* PS0311 */
+
+       ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,               /* PS0311 */
+                   "List entry sep=%c subfield sep=%c",    /* PS0311 */
+                   script_sep_entry, script_sep_field);    /* PS0311 */
+
+    /* SAS2IBMN - start */
+    /* IS10184 - this "if" was moved up
+    /@
+     @   If GET or PUT, prepare to handle REXX variables.
+     @/
+     if ( (strcmp(argv[1],"GET" ) EQ 0)   OR
+          (strcmp(argv[1],"PUT" ) EQ 0) )
+     {     end of moved code - IS10184 */
+      /*
+       *   Fetch IRXEXCOM
+       *
+       *   Fetch it into a void *() type variable because
+       *   release() requires this type of address.
+       *
+       *   We do it here because we need the routine in ca
+       *   of parameters error.
+       *
+       */
+       /* IS10184 - start */
+       if (argc GT 3)
+       {
+          ESA_DIAG_printf (ESA_COMP_OS_SCRIPT, 2,
+                           "argv[last] = %s", argv[argc-1]);
+
+         /* Check if last parm is EXCOM(addr).  If it is, use the  */
+         /* address passed as IRXEXCOM address.                    */
+         if (strncmp(argv[argc-1], "EXCOM(", 6) EQ 0)
+         {
+           strncpy(excom_c, argv[argc-1]+6, 8); /* address in char */
+           sscanf(excom_c, "%8x", (int *)&irxexcom); /* get address */
+           ESA_DIAG_printf (ESA_COMP_OS_SCRIPT, 2,
+                            "excom_c = %8s  irxexcom = %p",
+                             excom_c, irxexcom);
+         }
+       };
+
+       if (irxexcom EQ NULL)
+       {
+       /* IS10184  - end   */
+         p_rtn = fetch(IRXEXCOM);
+         irxexcom = (ASM_RTN_TYP *)p_rtn;  /* Copy with corect type */
+         if (irxexcom EQ NULL)
+           goto exit_no_irxexcom;          /* fetch failed.        */
+       };                                                 /* IS10184 */
+
+       ESA_DIAG_printf (ESA_COMP_OS_SCRIPT, 2,            /* IS10184 */
+                "irxexcom to be used  = %p", irxexcom);   /* IS10184 */
+
+      /*
+       *  Reset IRXEXCOM parameter blocks.
+       */
+       memset((void *)&first_shvblk, 0X00, shvblen);
+       p_last_shvblk = NULL;
+
+      /* SAS2IBMN - end */
+
+       if ( strcmp(argv[1],"GET" ) EQ 0 )
+           rc = create_rexx_vars(header);
+
+       else if ( strcmp(argv[1],"PUT" ) EQ 0 )
+           rc = create_addinfo(header);
+     }                                                  /* SAS2IBMN */
+     else if ( strcmp(argv[1],"NOTIFY" ) EQ 0 )         /* PS0107 */
+         rc = intercept_events(argc, argv , header);    /* PS0107 */
+
+       else
+         goto exit_parm_err;
+
+   if ( rc NE ESA_OK )
+   /* SAS2IBMN {            */
+      rc = ESA_FATAL;
+      /* SAS2IBMN goto exit; */
+   /* SAS2IBMN }            */
+   /* SAS2IBMN else         */
+   /* SAS2IBMN goto exit ;  */
+
+  /* SAS2IBMN - start */
+  /*
+   *    Cleanup:
+   *    1. release IRXEXCOM.
+   *    2. Free shvblk chain.
+   */
+
+   if (p_rtn NE NULL)                  /* release the fetched routine */
+   {
+     ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+               "Release IRXEXCOM. addr = %8X", p_rtn);
+     intrc = release(p_rtn);
+     if (intrc NE 0)
+        ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,0,
+               "Release of IRXEXCOM failed. rc = %d", intrc);
+   }
+
+   if (first_shvblk.shvnext NE NULL) /* release the shvblk chain */
+   {
+     p_c_shvblk = first_shvblk.shvnext; /* -> first allocated shvblk */
+     first_shvblk.shvnext = NULL;
+     do
+     {
+       ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+               "Release shvblk at = %8X   (next = %8X)",
+                p_c_shvblk, p_c_shvblk->shvnext);
+       p_n_shvblk = p_c_shvblk->shvnext; /* save next                */
+       free(p_c_shvblk);               /* free                       */
+       p_c_shvblk = p_n_shvblk;        /* set next as current        */
+     } while (p_c_shvblk NE NULL); /* continue until current is null */
+   }
+
+   goto exit;
+
+  /*
+   *    Exit: Fetch for IRXEXCOM failed.
+   */
+
+  exit_no_irxexcom: ;
+
+   CTSAMSG_print(OS_CS_NO_IRXEXCOM,
+                 msgs, msg_buff, NULL);
+   send_msg(FETCH_FAILED, msg_buff, msgs, dest);
+   rc=ESA_FATAL ;
+   goto exit;
+  /*  SAS2IBMN - end */
+
+  /*
+   *    Exit invalid parameter list
+   */
+
+  exit_parm_err: ;         /* Exit when Diags were not initialzied   */
+
+   /* SAS2IBMN put_rexx_var("CTSA1.RCODE", "FATAL", &shvrc);         */
+   rc=ESA_FATAL ;
+   if (header NE NULL)   /* if diags available               SAS2IBMN */
+   {                                                      /* SAS2IBMN */
+     /* SAS2IBMN say(err_parm_list);                                 */
+     ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,0,                /* SAS2IBMN */
+               "Unknown parameter %s", argv[1]);          /* SAS2IBMN */
+     send_msg(UNKNOWN_PARM, NULL, msgs, dest);            /* SAS2IBMN */
+     goto exit;
+   }                                                      /* SAS2IBMN */
+   else                  /* diags were not initialzied.      SAS2IBMN */
+   {                                                      /* SAS2IBMN */
+     do_say(err_parm_list, 0);                            /* SAS2IBMN */
+     goto exit_nodiag;                                    /* SAS2IBMN */
+   }                                                      /* SAS2IBMN */
+
+  exit: ;
+
+   ESA_DIAG_exit(ESA_COMP_OS_SCRIPT, 1, func, rc);
+
+   ESA_DIAGR_terminate(handle);                           /* WS10082N */
+
+  exit_nodiag: ;                                          /* SAS2IBMN */
+
+   return rc;
+
+ }
+
+/****************************************************
+ * Procedure Name: get_token_addr
+ * Description   : Check entered header ptr,converte to ptr form
+ * Input         : 1.char ctsa_token
+ * Output        : 1.header ptr
+ * Return Value  : ESA_OK, ESA_ERR, ESA_FATAL
+ *
+ * called by     : CTSAVAR
+ *
+ * calls to      : ESA_DIAG_enter
+ *                 ESA_DIAG_exit
+ *                 ESA_DIAG_printf
+ *                 OS_MVS_checksum
+ *
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+
+ static ESA_RC get_token_addr(char           * token,
+                              OS_HEADER_typ ** header)
+ {
+
+  /*
+   *   Variables
+   */
+
+   int                     l;
+   ESA_RC                  rc=ESA_OK;
+   int                     c_symb;
+   int                     chk_symb;
+   void                  * header_ptr;
+   int                     header_ptr_i;
+   char                    local_token[10];
+   OS_HEADER_typ         * chk_ptr;
+
+  /*
+   *   Initialize
+   */
+
+   l=strlen(token);      /* length of char ptr + control symbol */
+   if ( l LE 1 )         /* length must be GT 1                 */
+   {
+      rc = ESA_ERR;
+      goto exit;
+   }
+
+   strcpy(local_token,token);
+   c_symb=local_token[l-1];    /* control symbol */
+   local_token[l-1]=NULL_CHAR;
+
+  /*
+   *   Check valid/no ptr to header structure
+   */
+
+   rc = OS_MVS_checksum(local_token,&chk_symb);
+   if ( rc NE ESA_OK )
+   {
+      rc = ESA_ERR;
+      goto exit;
+   }
+
+  /*
+   *   Ptr to header structure err
+   */
+
+   if ( c_symb NE chk_symb )
+   {
+      rc = ESA_ERR;
+      goto exit;
+   }
+
+  /*
+   *   Convert char ptr to header structure to ptr form
+   */
+
+   sscanf(local_token,"%x",&header_ptr_i);
+
+   /* SAS2IBMN if ( header_ptr_i EQ NULL ) */
+   header_ptr = (void *)header_ptr_i;                     /* SAS2IBMN */
+   if ( header_ptr EQ NULL )                              /* SAS2IBMN */
+   {
+       rc=ESA_ERR;
+       goto exit;
+   }
+
+   /* SAS2IBMN header_ptr = (void *)header_ptr_i; */
+   *header = (OS_HEADER_ptr ) header_ptr ;
+
+  /*
+   *    Eye catcher checking
+   */
+
+   chk_ptr = (OS_HEADER_ptr ) header_ptr ;
+   if ( memcmp(chk_ptr->eyecatcher,
+               SCR_EYECATCHER, 4 ) NE 0 )
+   {
+       rc=ESA_ERR;
+       goto exit;
+   }
+
+
+   exit: ;
+
+   return rc ;
+
+ }
+
+/****************************************************
+ * Procedure Name: create_rexx_vars
+ * Description   : Create REXX vars from addinfo
+ * Input         : 1.header ptr
+ * Output        : REXX variables
+ * Return Value  : ESA_OK, ESA_ERR
+ *
+ * called by     : CTSAVAR
+ *
+ * calls to      : ESA_DIAG_enter
+ *                 ESA_DIAG_exit
+ *                 ESA_DIAG_printf
+ *                 create_rexx_var
+ *                 set_rexx_vars
+ *
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+
+ static ESA_RC create_rexx_vars(OS_HEADER_typ *header)
+ {
+
+   static char func[] = "create_rexx_vars";
+
+   /*
+    *   Variables
+    */
+
+    ESA_RC                           rc=ESA_OK ;
+    ADDINFO_rec_ptr                  addinfo;
+    CTSAMSG_HANDLE_rec_ptr           msgs;
+    CTSAMSG_DEST_TABLE_rec_ptr       dest;
+    int                              shvrc;               /* SAS2IBMN */
+
+   /*
+    *    Initialize msgs, dest ptr for CTSAMSG service
+    */
+
+    ESA_DIAG_enter(ESA_COMP_OS_SCRIPT, 2, func);
+
+    msgs = header->msgs ;
+    dest = header->dest ;
+
+    ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+                    "msgs=%x dest=%x",msgs,dest);
+
+   /*
+    *   Create REXX var from addinfo information
+    *   in form CTSA0.keyword = value
+    *           CTSA0.i       = keyword
+    */
+
+    addinfo = header->entity_info;
+    ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+                    "CTSA0 - entity addinfo=%X", addinfo);
+
+    rc = create_rexx_var("CTSA0.", addinfo, 0, msgs, dest );
+    if ( rc NE ESA_OK )
+    {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+
+   /*
+    *   Create REXX var from addinfo information
+    *   in form CTSA1.keyword = value
+    *           CTSA1.i       = keyword
+    */
+
+    addinfo=header->addinfo;
+    ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+                    "CTSA1 - addinfo=%X", addinfo);
+    if ( addinfo )
+      ADDINFO_delete(addinfo,"CTSA1.RCODE");
+
+    rc = create_rexx_var("CTSA1.", addinfo, 1, msgs, dest );
+    if ( rc NE ESA_OK )
+    {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+
+   /*
+    *   Create REXX var from addinfo information
+    *   in form CTSA2.keyword = value
+    *           CTSA2.i       = keyword
+    */
+
+    addinfo = header->cur_addinfo;
+    ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+                    "CTSA2 - addinfo=%X", addinfo);
+    rc = create_rexx_var("CTSA2.", addinfo, 0, msgs, dest );
+    if ( rc NE ESA_OK )
+    {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+
+   /*
+    *   WS0363
+    *   Create REXX var from addinfo information
+    *   in form CTSA9.keyword = value
+    *           CTSA9.i       = keyword
+    */
+
+    addinfo = header->RssPrmInfo;
+    ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+                    "CTSA9 - addinfo=%X", addinfo);
+    rc = create_rexx_var("CTSA9.", addinfo, 0, msgs, dest );
+    if ( rc NE ESA_OK )
+    {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+
+   /*  SAS2IBMN - start */
+    rc = set_rexx_vars(&shvrc, msgs, dest);
+    if ( rc NE ESA_OK )
+    {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+   /*  SAS2IBMN - start */
+
+    exit :;
+    ESA_DIAG_exit(ESA_COMP_OS_SCRIPT,2, func, rc);
+
+    return rc ;
+
+ }
+
+/****************************************************
+ * Procedure Name: create_rexx_var
+ * Description   : Create REXX var from addinfo
+ * Input         : 1.prefix
+ *                 2.addinfo ptr
+ *                 3.CTSAMSG parameters
+ * Output        : REXX variables
+ * Return Value  : ESA_OK, ESA_ERR
+ *
+ * called by     : CTSAVAR
+ *
+ * calls to      : ESA_DIAG_enter
+ *                 ESA_DIAG_exit
+ *                 ESA_DIAG_printf
+ *                 create_rexx_ctsa_var
+ *                 put_rexx_var
+ *                 send_msg
+ *
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+
+ static ESA_RC create_rexx_var(char                       *prefix,
+                               ADDINFO_rec_ptr             addinfo,
+                               int                         rcf,
+                               CTSAMSG_HANDLE_rec_ptr      msgs,
+                               CTSAMSG_DEST_TABLE_rec_ptr  dest)
+ {
+
+   static char func[] = "create_rexx_var";
+
+   /*
+    *   Variables
+    */
+
+    ESA_RC                           rc=ESA_OK ;
+    int                              i;
+    int                              shvrc;
+    int                              max_var_cnt = 0;
+    char                             prefix_tmp[80];
+    ONE_FIELD_rec_ptr                f_ptr;
+    /* WS10082 ONE_FIELD_rec_typ                a_field;      */
+    char      value[ADDINFO_16K_VAL_LEN+1] = "";          /* WS10082 */
+    char      char_i_max[20];
+    CTSAMSG_MSG_typ                  msg_buff;
+    /* buffer for keywords  */
+    /* WS10082 char      var_name[MAX_RSS_ADDINFO_KWD_LEN+10] ;  */
+    /* buffer for values    */
+    /* WS10082 char      var_val[MAX_RSS_ADDINFO_VAL_LEN+10];    */
+
+
+   /*
+    *    Initialize
+    */
+
+    ESA_DIAG_enter(ESA_COMP_OS_SCRIPT, 2, func);
+
+   /*
+    *   Create REXX var from addinfo information
+    *   in form XXXXX.keyword = value
+    *           CTSA1.i       = keyword
+    *   where XXXXX - prefix
+    */
+
+    i = 0;
+    if ( addinfo )
+    {
+      /* WS10082 - start */
+      /*  The code below is replaced by WS10082
+      f_ptr = addinfo->pair;
+      while ( i LT addinfo->num_pairs)
+      {
+         ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+                         "ctsa1.pair no.%d:kwd=%s(%d-%d) val=%s(%d)",
+                         i+1,
+                         f_ptr->keyword, f_ptr->keylen, f_ptr->add_typ,
+                         f_ptr->value,f_ptr->vallen);
+         memcpy( (char *)&a_field, (char *)f_ptr,
+                 sizeof(ONE_FIELD_rec_typ));
+
+        /@
+         *   Convert lists internal separators to
+         *   scripts separators
+         @/
+
+         if ( (a_field.add_typ EQ TYPE_1B) OR
+              (a_field.add_typ EQ TYPE_2B)  )
+
+ /@ Del by PS0311
+  *         ADDINFO_convert_list_sep( a_field.value,
+  *                 ADDINFO_LIST_ENTRY, ADDINFO_LIST_SUBFIELD,
+  *                 ',', ',' );
+  @/
+
+         ADDINFO_convert_list_sep( a_field.value,          /@ PS0311 @/
+                ADDINFO_LIST_ENTRY, ADDINFO_LIST_SUBFIELD, /@ PS0311 @/
+                script_sep_entry,   script_sep_field);     /@ PS0311 @/
+
+         rc=create_rexx_ctsa_var(i+1, prefix,
+                                 a_field.keyword, a_field.value,
+                                 msgs, dest);             /@ SAS2IBMN @/
+               /@ SAS2IBMN  a_field.keyword, a_field.value,&shvrc);  @/
+         if ( rc NE ESA_OK )
+         {
+            strcpy(var_name,a_field.keyword);
+            strcpy(var_val, a_field.value);
+            goto exit ;
+         }
+       }
+       f_ptr++;
+       end of replaced code  */
+
+      /*  WS10082 code replacing the code above          */
+
+      while ( i LT addinfo->num_pairs)
+      {
+         f_ptr = ppairi(addinfo->pair, i);  /* take real pair  */
+         ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+           "ctsa1.pair no.%d:kwd=%s(%d-%d) val=%.*s(%d)",
+           i+1,
+           f_ptr->keyword, f_ptr->keylen, f_ptr->add_typ,
+           ((f_ptr->vallen GT MAX_RSS_ADDINFO_VAL_LEN) ?
+                                   100 : f_ptr->vallen),
+           f_ptr->value, f_ptr->vallen);
+
+         /*  We create rexx variables for attributes having a value   */
+         /*  not longer than 16K. Longer attributes will be ignored   */
+         /*  and a warning message will be written for each.          */
+
+         if (f_ptr->vallen LT sizeof(value))
+         {
+           memcpy( value, f_ptr->value, f_ptr->vallen);
+           value[f_ptr->vallen] = NULL_CHAR;
+
+          /*
+           *   Convert lists internal separators to
+           *   scripts separators
+           */
+
+           if ( (f_ptr->add_typ EQ TYPE_1B) OR
+                (f_ptr->add_typ EQ TYPE_2B)  )
+
+           ADDINFO_convert_list_sep(value,                   /* PS0311*/
+                  ADDINFO_LIST_ENTRY, ADDINFO_LIST_SUBFIELD, /* PS0311*/
+                  script_sep_entry,   script_sep_field);     /* PS0311*/
+
+           rc=create_rexx_ctsa_var(i+1, prefix,
+                                   f_ptr->keyword, value,
+                                   msgs, dest);           /* SAS2IBMN */
+           if ( rc NE ESA_OK )
+              goto exit ;
+
+         }
+         else     /* notify that the keyword is ignored  */
+         {
+           CTSAMSG_print(OS_CS_WARN_LONG_VAL,
+                    msgs, msg_buff, NULL ,
+                   "GET", f_ptr->keyword, f_ptr->vallen);
+           do_say(msg_buff, 1);
+         }
+
+         i++;
+         /* WS10082 - end of replacing code */
+
+       }
+
+      max_var_cnt = i;  /* max vars number */
+    }
+
+   /*
+    *    Create RCODE var
+    */
+
+    if ( rcf )              /* Create RCODE var */
+    {
+     /*
+      *   Create REXX var "CTSA1.RCODE"
+      *           and
+      *   Update REXX var from addinfo information
+      *   in form CTSA1.0       = count of created variables
+      */
+
+      /*----------------------------------------------------
+      |         Update count of XXXXX.0  variable for acces|
+      |         to XXXXX.rcode according list of keywords  |
+      |         If not to do it acces to XXXXX.rcode only  |
+      |         via name var  XXXXX.rcode                  |
+      -----------------------------------------------------*/
+
+      max_var_cnt++;  /* update the max vars number */
+
+      rc = create_rexx_ctsa_var(max_var_cnt, prefix,
+                                "RCODE","OK", msgs, dest);/* SAS2IBMN */
+                /* SAS2IBMN     "RCODE","OK", &shvrc); */
+      if ( rc NE ESA_OK )
+      {
+         /* WS10082 strcpy(var_name, prefix);            */
+         /* WS10082 strcat(var_name, "RCODE");           */
+         /* WS10082 strcpy(var_val, "OK");               */
+         goto exit ;
+      }
+    }
+
+   /*
+    *   Create REXX var from addinfo information
+    *   in form XXXXX.0 = count of created variables
+    *   where XXXXX - prefix
+    */
+
+    sprintf(char_i_max,"%d", max_var_cnt);
+    strcpy(prefix_tmp, prefix);
+    strcat(prefix_tmp, "0");
+    /* SAS2IBMN rc=put_rexx_var(prefix_tmp,char_i_max, &shvrc); */
+    rc=put_rexx_var(prefix_tmp, char_i_max, msgs, dest); /* SAS2IBMN */
+    if ( rc NE ESA_OK )
+    {
+       /* WS10082  strcpy(var_name, prefix_tmp);       */
+       /* WS10082  strcpy(var_val,  char_i_max);       */
+       goto exit ;
+    }
+
+
+    exit : ;
+
+    /* SAS2IBMN - start
+    if ( rc NE ESA_OK )
+       send_msg(shvrc,var_name,var_val,msgs,dest);
+       SAS2IBMN - end */
+
+    ESA_DIAG_exit(ESA_COMP_OS_SCRIPT,2, func, rc);
+
+    return rc ;
+
+ }
+
+/****************************************************
+ * Procedure Name: create_rexx_ctsa_var
+ * Description   : Create REXX CTSA var
+ * Input         : 1.i        - index of var
+ *                 2.prefix   - var prefix
+ *                 3.keyword  - keyword
+ *                 4.value    - value
+ * Output        : REXX variables
+ * Return Value  : ESA_OK , ESA_ERR
+ *
+ * called by     : create_rexx_var
+ *
+ * calls to      : ESA_DIAG_enter
+ *                 ESA_DIAG_exit
+ *                 ESA_DIAG_printf
+ *                 put_rexx_var
+ *
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+
+ static ESA_RC create_rexx_ctsa_var(int                         i,
+                                    char                       *prefix,
+                                    char                       *keyword,
+                                    char                       *value,
+             /* SAS2IBMN            int                        *shvrc,*/
+             /* SAS2IBMN */         CTSAMSG_HANDLE_rec_ptr      msgs,
+             /* SAS2IBMN */         CTSAMSG_DEST_TABLE_rec_ptr  dest)
+ {
+
+   static char func[] = "create_rexx_ctsa_var";
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC            rc=ESA_OK;
+   char              keyword_buf[MAX_RSS_ADDINFO_KWD_LEN+10];
+   char              char_i[20];
+
+   ESA_DIAG_enter(ESA_COMP_OS_SCRIPT, 2, func );
+
+  /*
+   *   Create REXX var in form prefix.keyword = value
+   *                           prefix.i       = keyword
+   */
+
+   strcpy(keyword_buf,prefix);
+   strcat(keyword_buf,keyword);
+   /* SAS2IBMN rc=put_rexx_var(keyword_buf,value,shvrc);            */
+   rc=put_rexx_var(keyword_buf, value, msgs, dest);       /* SAS2IBMN */
+
+   if ( rc NE ESA_OK )
+      goto exit ;
+
+  /*
+   *   Create REXX var in form CTSA1.i  = keyword
+   */
+
+   strcpy(keyword_buf,prefix);
+   sprintf(char_i,"%d",i);
+   strcat(keyword_buf,char_i);
+   /* SAS2IBMN rc = put_rexx_var(keyword_buf,keyword,shvrc);         */
+   rc = put_rexx_var(keyword_buf, keyword, msgs, dest);   /* SAS2IBMN */
+
+   exit :;
+
+   ESA_DIAG_exit(ESA_COMP_OS_SCRIPT, 2, func, rc);
+
+   return rc ;
+
+ }
+
+/****************************************************
+ * Procedure Name: put_rexx_var
+ * Description   : Create shvblock for the new rexx           SAS2IBMN
+ *                 variable and chain it on the shvblock      SAS2IBMN
+ *                 chain.                                     SAS2IBMN
+ * Input         : 1.keyword  - keyword
+ *                 2.value    - value
+ * Output        : REXX variables
+ * Return Value  : ESA_OK , ESA_ERR
+ *
+ * called by     : create_rexx_var
+ *                 create_rexx_ctsa_var
+ *
+ * calls to      : ESA_DIAG_enter
+ *                 ESA_DIAG_exit
+ *                 ESA_DIAG_printf
+ *
+ * Side Effects  : This routine does not define the variable. SAS2IBMN
+ *                 It just prepres the input block to the     SAS2IBMN
+ *                 service routine that defines the variables.SAS2IBMN
+ *                 Afer all blocks are chained, set_rexx_vars SAS2IBMN
+ *                 should be called, to define the varibales. SAS2IBMN
+ * Scope         :
+ ***************************************************/
+
+ /* SAS2IBMN - start */
+ /* static ESA_RC put_rexx_var(char *keyword,char *value, int *shvrc) */
+static ESA_RC put_rexx_var(char                       *keyword,
+                           char                       *value,
+                           CTSAMSG_HANDLE_rec_ptr      msgs,
+                           CTSAMSG_DEST_TABLE_rec_ptr  dest)
+ /* SAS2IBMN - end */
+ {
+
+    static char func[] = "put_rexx_var" ;
+
+   /*
+    *   Variables
+    */
+
+    ESA_RC           rc=ESA_OK;
+    /* SAS2IBMN int            rcshv;   */
+    int              keyword_len;
+    int              value_len;
+    int              shvblk_area_len;                     /* SAS2IBMN */
+    irxshvb         *p_shvblk;                            /* SAS2IBMN */
+    char            *p_keyword;                           /* SAS2IBMN */
+    char            *p_value;                             /* SAS2IBMN */
+    int              len;
+    CTSAMSG_MSG_typ  msg_buff;                            /* SAS2IBMN */
+
+    keyword_len=strlen(keyword);
+    value_len  =strlen(value);
+
+    ESA_DIAG_enter(ESA_COMP_OS_SCRIPT, 2, func );
+
+   /*
+    *   Put REXX var
+    */
+
+    ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+                    "keyword=%s(%d) value=%s(%d)",
+                    keyword,keyword_len,value,value_len);
+
+   /* SAS2IBMN - start */
+   /*
+    rcshv = execshv(SHV_SET,keyword,keyword_len,value,value_len,&len);
+    *shvrc = rcshv;
+    if ( rcshv NE 0 )
+       rc = ESA_ERR ;
+    */
+
+   /*
+    *   Create and fill the shvblock for the rexx variable.
+    */
+    shvblk_area_len = shvblen + keyword_len + value_len;
+    p_shvblk = (irxshvb *)malloc(shvblk_area_len);
+    ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+                    "New shvblk at %8X (length = %d)",
+                    p_shvblk, shvblk_area_len);
+    if (p_shvblk EQ NULL)
+    {
+      msg_buff[0] = NULL_CHAR;
+      CTSAMSG_print(ERR_MALLOC,
+                    msgs, msg_buff,NULL ,
+                   "SHVBLOCK AREA", shvblk_area_len);
+      send_msg(INSUFFICIENT_STORAGE, msg_buff, msgs, dest);
+      rc = ESA_FATAL;
+      goto exit;
+    }
+
+    p_keyword = (char *)p_shvblk + shvblen;
+    p_value = p_keyword + keyword_len;
+
+    p_shvblk->shvnext = NULL;
+    p_shvblk->shvuser = 0;
+    p_shvblk->shvcode = shvstore;
+    p_shvblk->shvret  = 0;
+    p_shvblk->shvbufl = 0;
+    /* BS10094  strcpy(p_keyword, keyword);
+    /*         strcpy can't be used here because there no place
+    /*         for the string termoinator.                          */
+    strncpy(p_keyword, keyword, keyword_len);            /* BS10094 */
+    p_shvblk->shvnama = p_keyword;
+    p_shvblk->shvnaml = keyword_len;
+    /* BS10094 strcpy(p_value, value);
+    /*         strcpy can't be used here because there no place
+    /*         for the string termoinator.                          */
+    strncpy(p_value, value, value_len);                  /* BS10094 */
+    p_shvblk->shvvala = p_value;
+    p_shvblk->shvvall = value_len;
+
+    if (p_last_shvblk EQ NULL)
+      first_shvblk.shvnext = (void *)p_shvblk;
+    else
+      p_last_shvblk->shvnext = (void *)p_shvblk;
+
+    p_last_shvblk = p_shvblk;
+
+    ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+           "shvblk chain: first = %8X   last = %8X\n",
+           first_shvblk.shvnext, p_last_shvblk);
+
+  exit: ;
+   /* SAS2IBMN - end */
+
+    ESA_DIAG_exit(ESA_COMP_OS_SCRIPT, 2, func, rc);
+
+    return rc ;
+
+ }
+
+/* SAS2IBMN - start */
+/****************************************************
+ * Procedure Name: set_rexx_vars
+ * Description   : Call IRXEXCOM to create the rexx variables.
+ * Return Value  : ESA_OK , ESA_ERR
+ *
+ * called by     : create_rexx_vars
+ *
+ * calls to      : enter
+ *                 exit
+ *                 IRXEXCOM
+ *
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+
+static ESA_RC set_rexx_vars(int                        *shvrc,
+                            CTSAMSG_HANDLE_rec_ptr      msgs,
+                            CTSAMSG_DEST_TABLE_rec_ptr  dest)
+
+{
+
+    static char func[] = "set_rexx_vars" ;
+
+   /*
+    *   Variables
+    */
+
+    ESA_RC           rc=ESA_OK;
+    int              rcshv;
+    int              p2 = 0;
+    void            *null_parm = NULL;
+
+    ESA_DIAG_enter(ESA_COMP_OS_SCRIPT, 2, func );
+
+   /*
+    *   Call IRXEXCOM to set ak variables.
+    */
+    ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+                   "Call IRXEXCOM: addr = %8X   first shvblk = %8X",
+                    irxexcom, first_shvblk.shvnext);
+    rcshv = irxexcom(eye_c, &p2, &p2, first_shvblk.shvnext);
+    ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+                    "IRXEXCOM rc = %d\n", rcshv);
+
+    *shvrc = rcshv;
+
+
+    if (rcshv NE shvrcok)
+    {
+      if ( (rcshv NE shvrcinv)     AND
+           (rcshv NE shvrcist)     AND
+           (rcshv NE IRXRC_NO_LE)  AND
+           (rcshv NE IRXRC_INVALID_PARMS) )
+        rcshv = IRXRC_VARIABLE_ERROR;
+
+      send_msg(rcshv, NULL, msgs, dest);
+
+      if (rcshv EQ IRXRC_VARIABLE_ERROR)
+        send_var_msg(first_shvblk.shvnext, msgs, dest);
+
+      rc = ESA_FATAL;
+    }
+
+  exit:
+
+    ESA_DIAG_exit(ESA_COMP_OS_SCRIPT, 2, func, rc);
+
+    return rc ;
+
+ }
+/* SAS2IBMN - end */
+
+/****************************************************
+ * Procedure Name: send_msg
+ * Description   : Send error msg
+ * Input         : 1.rc
+ *                 2.additional message
+ *                 4.msgs  - ptr to msgs header
+ *                 5.dest  - ptr to dest
+ * Output        : none
+ *
+ * called by     : create_rexx_var
+ *
+ * calls to      : ESA_DIAG_enter
+ *                 ESA_DIAG_exit
+ *                 ESA_DIAG_printf
+ *
+ * Return Value  : none
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+static void   send_msg(ESA_RC                     rc,
+    /* SAS2IBMN        char                       *var_name,  */
+    /* SAS2IBMN        char                       *var_val,   */
+                       char                       *msg,   /* SAS2IBMN */
+                       CTSAMSG_HANDLE_rec_ptr     msgs,
+                       CTSAMSG_DEST_TABLE_rec_ptr dest)
+
+ {
+
+   static char func[] = "send_msg";
+   char       *msg_code;
+
+   /*
+    *    Variables
+    */
+
+    CTSAMSG_MSG_typ msg_buff;
+    /* SAS2IBMN  char            internal_msg[100];
+    /* SAS2IBMN  int             len;                     * IS10098 */
+
+   /*
+    *    Start of code
+    */
+
+    ESA_DIAG_enter(ESA_COMP_OS_SCRIPT, 2, func );
+
+    msg_code = get_msg_code( rc ) ;
+    msg_buff[0] = NULL_CHAR;
+    CTSAMSG_print(OS_CS_ENV_ERR, msgs, msg_buff, NULL,
+                  "CTSCVAR", rc, msg_code);               /* WS10076 */
+    say(msg_buff);
+    /* SAS2IBMN - start
+       This routine was changed to issue the general REXX
+       processing error message, and additional message, if
+       provided.
+       If a message has to be issued for a specific variabele,
+       the routine that handles the variables will prepare
+       take care of it.
+
+    msg_buff[0]=NULL_CHAR;
+
+     * IS10098
+    sprintf(internal_msg, "execshv rc=%d/%s keyword=%s value=%s",
+                           rc, msg_code, var_name, var_val );  *
+    sprintf(internal_msg, "execshv rc=%d/%s keyword=%s value=",
+                          rc, msg_code, var_name);         * IS10098 *
+    len = strlen(internal_msg);   /* length used in msg      IS10098 *
+    if (len < sizeof(internal_msg)-1)                      * IS10098 *
+      sprintf(&internal_msg[len], "%.*s",  /* move value     IS10098 *
+              sizeof(internal_msg)-len-1, var_val);        * IS10098 *
+
+    msg_buff[0] = NULL_CHAR;
+    CTSAMSG_print(ERR_INTERNAL2,
+                  msgs, msg_buff, NULL, component,
+                  component, internal_msg, rc, __LINE__ );
+    say(msg_buff);
+    */
+    if (msg NE NULL)       /* issue additional message               */
+      say(msg);
+    /* SAS2IBMN - end */
+
+    ESA_DIAG_exit(ESA_COMP_OS_SCRIPT, 2, func , ESA_OK );
+
+    return ;
+
+ }
+
+/* SAS2IBMN - start */
+/****************************************************
+ * Procedure Name: send_var_msg
+ * Description   : Scans the IRXSHVB chain starting form
+ *                 the block received in parameters, and
+ *                 issues a message for each variable having
+ *                 an error return code.
+ * Input         : 1.IRXSHVB chain.
+ *                 2.msgs  - ptr to msgs header
+ *                 3.dest  - ptr to dest
+ * Output        : none
+ *
+ * called by     : create_rexx_var
+ *
+ * calls to      : ESA_DIAG_enter
+ *                 ESA_DIAG_exit
+ *                 ESA_DIAG_printf
+ *                 CTSAMSG_print
+ *
+ * Return Value  : none
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+static void   send_var_msg(irxshvb                   *shvblk_chain,
+                           CTSAMSG_HANDLE_rec_ptr     msgs,
+                           CTSAMSG_DEST_TABLE_rec_ptr dest)
+
+ {
+
+   static char func[] = "send_var_msg";
+
+   /*
+    *    Variables
+    */
+
+    irxshvb          *p_shvblk;
+    CTSAMSG_MSG_typ   msg_buff;
+    char             *request_char;
+    char             *retcode_char;
+    int               retcode;
+    char              keyword[251];
+    int               kl;
+    char              value[401];
+    int               vl;
+
+   /*
+    *    Start of code
+    */
+
+    ESA_DIAG_enter(ESA_COMP_OS_SCRIPT, 2, func );
+
+    p_shvblk = shvblk_chain;
+    msg_buff[0]=NULL_CHAR;
+
+    while (p_shvblk NE NULL)
+    {
+      if ( !(is_var_error(p_shvblk)) )     /* skip if no error */
+        continue;
+
+      request_char[0] = NULL_CHAR;
+      request_char = get_IRXEXCOM_code(p_shvblk->shvcode);
+      retcode = p_shvblk->shvret;
+      retcode_char = get_msg_code( retcode);
+
+     /*
+      *   Take keyword and value length according to
+      *   maximum value allowed to prevent storage overlay.
+      */
+      kl = p_shvblk->shvnaml LE (sizeof(keyword)-1) ?
+                                 p_shvblk->shvnaml : sizeof(keyword-1) ;
+      vl = p_shvblk->shvvall LE (sizeof(value)-1) ?
+                                 p_shvblk->shvvall : sizeof(value-1) ;
+
+      strncpy(keyword, p_shvblk->shvnama, kl);
+      keyword[kl] = NULL_CHAR;
+      strncpy(value, p_shvblk->shvvala, vl);
+      value[vl] = NULL_CHAR;
+
+     /*
+      *   Issue message
+      */
+      msg_buff[0] = NULL_CHAR;
+      CTSAMSG_print(OS_CS_ERR_IRXEXCOM_VAR,
+                    msgs, msg_buff, NULL, component,
+                    request_char, retcode, retcode_char,
+                    keyword, value);
+      say(msg_buff);
+
+     /*
+      *   Check next shvblk, if exists.
+      */
+      p_shvblk = p_shvblk->shvnext;
+
+    }
+
+    ESA_DIAG_exit(ESA_COMP_OS_SCRIPT, 2, func , ESA_OK );
+
+    return ;
+
+ }
+
+/****************************************************
+ * Procedure Name: is_var_error
+ * Description   : check the function code and return code
+ *                 in the IRXSHVRB and determine whether
+ *                 there is an error with the variable.
+ * Input         : 1.IRXSHVB chain.
+ *
+ * Output        : none
+ *
+ * called by     : send_var_msg
+ *
+ * calls to      : ESA_DIAG_enter
+ *                 ESA_DIAG_exit
+ *                 ESA_DIAG_printf
+ *
+ * Return Value  : TRUE - error.
+ *                 FALSE - no error.
+ *
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+static int    is_var_error(irxshvb    *shvblk)
+
+ {
+
+   static char func[] = "is_var_error";
+
+   /*
+    *    Variables
+    */
+
+    int               rc;
+
+   /*
+    *    Start of code
+    */
+
+    ESA_DIAG_enter(ESA_COMP_OS_SCRIPT, 2, func );
+
+    switch (shvblk->shvcode)
+    {
+      case shvfetch:
+        if (shvblk->shvret NE shvclean)
+          rc = TRUE;
+        else
+          rc = FALSE;
+        break;
+      case shvnextv:
+        if ( (shvblk->shvret NE shvclean)  AND
+             (shvblk->shvret NE shvlvar) )
+          rc = TRUE;
+        else
+          rc = FALSE;
+        break;
+      case shvlvar:
+        if ( (shvblk->shvret NE shvclean)  AND
+             (shvblk->shvret NE shvnewv) )
+          rc = TRUE;
+        else
+          rc = FALSE;
+        break;
+      break;
+    }
+
+    ESA_DIAG_exit(ESA_COMP_OS_SCRIPT, 2, func , rc );
+
+    return rc;
+
+ }
+/* SAS2IBMN - end */
+
+/****************************************************
+ * Procedure Name: create_addinfo
+ * Description   : Create addinfo from REXX var
+ * Input         : 1.header ptr
+ * Output        : addinfo
+ * Return Value  : ESA_OK, ESA_FATAL
+ *
+ * called by     : ctsavar
+ *
+ * calls to      : ESA_DIAG_enter
+ *                 ESA_DIAG_exit
+ *                 ESA_DIAG_printf
+ *                 get_script_rc
+ *                 put_addinfo_var
+ *                 get_rexx_var
+ *
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+
+ static ESA_RC create_addinfo(OS_HEADER_typ *header)
+ {
+
+   static char func[] = "create_addinfo";
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC        rc = ESA_OK;
+   /* SAS2IBMN int         shvrc; */
+   /* value buffer*/
+   char          valbuf[MAX_RSS_ADDINFO_VAL_LEN];
+   int           len;          /* real length of variable */
+   char          RCODE_keyword[] = "CTSA1.RCODE";         /* SAS2IBMN */
+
+   CTSAMSG_HANDLE_rec_ptr     msgs;                       /* SAS2IBMN */
+   CTSAMSG_DEST_TABLE_rec_ptr dest;                       /* SAS2IBMN */
+
+   ESA_DIAG_enter(ESA_COMP_OS_SCRIPT, 2, func );
+
+   msgs = header->msgs ;                                  /* SAS2IBMN */
+   dest = header->dest ;                                  /* SAS2IBMN */
+
+  /*
+   *   Check return code after user program
+   */
+
+   header->rc_script = ESA_FATAL;  /* default rc */
+
+   /* SAS2IBMN - start */
+   /*
+   shvrc=execshv(SHV_FETCH,"CTSA1.RCODE",11,valbuf,sizeof(valbuf),&len);
+   */
+   rc = get_rexx_var(GET_VAR_FETCH, RCODE_keyword,
+                     strlen(RCODE_keyword),
+                     valbuf, sizeof(valbuf), &len,
+                     msgs, dest);
+
+   /* SAS2IBMN if ( shvrc EQ 0) */
+   if ( rc EQ ESA_OK)
+   /* SAS2IBMN - end */
+   {
+      /* SAS2IBMN valbuf[len] = NULL_CHAR; */
+      get_script_rc(header, valbuf, &header->rc_script);
+      ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+                      "script rc=%d/%s",
+                       header->rc_script,
+                       ESA_rc2str(header->rc_script) );
+   }
+
+   rc = put_addinfo_var("CTSA1.",header) ;
+
+  /*
+   *   Finished
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(ESA_COMP_OS_SCRIPT, 2, func, rc);
+
+   return rc;
+
+  }
+
+/****************************************************
+ * Procedure Name: put_addinfo_var
+ * Description   : Update addinfo according REXX var
+ * Input         : 1.stem     -  ptr to stem name
+ * Output        : 2.addinfo
+ *
+ * called by     : create_addinfo
+ *
+ * calls to      : ESA_DIAG_enter
+ *                 ESA_DIAG_exit
+ *                 ESA_DIAG_printf
+ *                 put_to_addinfo
+ *
+ * Return Value  : ESA_OK, ESA_FATAL
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+
+ static ESA_RC put_addinfo_var(char                      *stem,
+                               OS_HEADER_typ             *header)
+ {
+
+   static char func[] = "put_addinfo_var";
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC    rc = ESA_OK ;
+   int       shvrc;
+   /* buffer for keywords  */
+   char      namebuf[MAX_RSS_ADDINFO_KWD_LEN+10];
+   /* buffer for values    */
+/*WS10082K char      valbuf[MAX_RSS_ADDINFO_VAL_LEN+10]; */
+   char      valbuf[ADDINFO_16K_VAL_LEN+10];    /*WS10082K*/
+   int       len;                         /* real len of var      */
+   int       stem_len;                    /* len of keyword  SAS2IBMN */
+   int       stem_indx;
+   char    * stem_indx_ptr;
+   CTSAMSG_MSG_typ      msg_buff;                         /* WS10082N */
+
+   CTSAMSG_HANDLE_rec_ptr     msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr dest;
+   ADDINFO_rec_ptr            addinfo;
+
+  /*
+   *    Initialize msgs, dest ptr for CTSAMSG service
+   */
+
+   ESA_DIAG_enter(ESA_COMP_OS_SCRIPT, 2, func );
+
+   msgs = header->msgs ;
+   dest = header->dest ;
+
+   ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+                   "msgs=%x dest=%x",msgs,dest);
+
+   addinfo = header->addinfo;
+   stem_len = strlen(stem);   /* length of stem var */
+   stem_indx_ptr = namebuf + stem_len ;
+
+   ESA_DIAG_printf(ESA_COMP_OS_SCRIPT, 3,                 /* IS10094 */
+                      "Put_addinfo_vars - start ");       /* IS10094 */
+   if (ESA_DIAG_get_debug_level(ESA_COMP_OS_SCRIPT) GE 3) /* IS10094 */
+     ADDINFO_dump(addinfo, 1);                            /* IS10094 */
+
+   /* SAS2IBMN
+   shvrc = execshv(SHV_FIRST,namebuf,sizeof(namebuf),
+                valbuf,sizeof(valbuf),&len);
+
+   while ( ( shvrc EQ 0 ) AND NOT(shvrc & SHV_LAST_VAR ) )
+   */
+   namebuf[0] = NULL_CHAR;
+   valbuf[0] = NULL_CHAR;
+   do                                                     /* SAS2IBMN */
+   {
+
+      /* SAS2IBMN - start */
+      rc = get_rexx_var(GET_VAR_NEXT, namebuf, sizeof(namebuf),
+                        valbuf, sizeof(valbuf), &len,
+                        msgs, dest);
+      if (rc NE ESA_OK)
+      {                                                   /* WS10082N */
+        if (rc EQ ESA_SKIP)  /* value was truncated ? */  /* WS10082N */
+        {                                                 /* WS10082N */
+          CTSAMSG_print(OS_CS_WARN_LONG_VAL,              /* WS10082N */
+                        msgs, msg_buff, NULL ,            /* WS10082N */
+                       "PUT-GETVAR", namebuf, 0);         /* WS10082N */
+          do_say(msg_buff, 1);                            /* WS10082N */
+          rc = ESA_OK;                                    /* WS10082N */
+        }                                                 /* WS10082N */
+        continue;
+      }                                                   /* WS10082N */
+      /* SAS2IBMN - end */
+      /*
+       *   get variables only from entered stem
+       */
+
+       /* SAS2IBMN if ( memcmp(namebuf,stem,stem_len) EQ 0 ) */
+       if  ( ( strlen(namebuf) GT stem_len)    AND        /* SAS2IBMN */
+             ( memcmp(namebuf,stem,stem_len) EQ 0 ) )     /* SAS2IBMN */
+       {
+
+          /*
+           *   Check keyword :
+           *   create addinfo from variables stem.xxxxx
+           *   where xxxxx not numeric
+           */
+
+           stem_indx=atoi(stem_indx_ptr);
+           if ( ( stem_indx EQ 0 )                     AND
+                ( strcmp(stem_indx_ptr,"0")     NE 0 )   )
+           {
+
+              /* SAS2IBMN valbuf[len] = NULL_CHAR; */
+
+              if ( strcmp(namebuf,"CTSA1.RCODE") NE 0 ) /* as1101 */
+                rc = put_to_addinfo(addinfo, stem_indx_ptr, valbuf,
+                                    header,msgs,dest);
+  /* -------> if ( rc NE ESA_OK ) */ /* Addinfo package problems */
+  /* ------->    goto exit ; -----*/ /* -------------------------*/
+
+           }
+       }     /* The keyword belongs to requested stem */
+
+       /* SAS2IBMN
+       shvrc = execshv(SHV_NEXT, namebuf, sizeof(namebuf), valbuf,
+                       sizeof(valbuf), &len);
+       */
+
+   /* SAS2IBMN }     * rexx variables loop */
+   } while (rc EQ ESA_OK);
+
+   if (rc EQ ESA_EOF)    /* all variables retrieved - OK     SAS2IBMN */
+     rc = ESA_OK;                                         /* SAS2IBMN */
+
+   ESA_DIAG_printf(ESA_COMP_OS_SCRIPT, 3,                  /* IS10094 */
+                      "Put_addinfo_vars - end ");          /* IS10094 */
+   if (ESA_DIAG_get_debug_level(ESA_COMP_OS_SCRIPT) GE 3)  /* IS10094 */
+     ADDINFO_dump(addinfo, 1);                             /* IS10094 */
+
+ exit :;
+
+   /* SAS2IBMN
+   if ( shvrc & SHV_LAST_VAR )
+       shvrc = 0;
+
+   if ( shvrc NE 0 )
+   {
+      rc = ESA_FATAL ;
+      send_msg(shvrc,namebuf,valbuf,msgs,dest);
+   }
+   */
+
+   ESA_DIAG_exit(ESA_COMP_OS_SCRIPT,2, func, rc);
+
+   return rc;
+
+ }
+
+/****************************************************
+ * Procedure Name: put_to_addinfo
+ * Description   : Update value for existing keyword
+ *                 Delete if ( value EQ '/' )
+ *                 Insert keyword value
+ * Input         : 1.addinfo    -  ptr to addinfo
+ *                 2.keyword    -  keyword
+ *                 3.value      -  value
+ * Output        : none
+ * Return Value  : ESA_OK, ESA_ERR
+ *
+ * called by     : put_addinfo_var
+ *
+ * calls to      : ESA_DIAG_enter
+ *                 ESA_DIAG_exit
+ *                 ESA_DIAG_printf
+ *                 ADDINFO_delete
+ *                 ADDINFO_search
+ *                 ADDINFO_updval
+ *                 ADDINFO_insert
+ *                 CTSAMSG_print
+ *
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+
+ static ESA_RC put_to_addinfo(ADDINFO_rec_ptr            addinfo,
+                              char                      *keyword,
+                              char                      *value,
+                              OS_HEADER_typ             *header,
+                              CTSAMSG_HANDLE_rec_ptr     msgs,
+                              CTSAMSG_DEST_TABLE_rec_ptr dest)
+ {
+
+   static char func[] = "put_to_addinfo";
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC rc=ESA_OK;
+   ONE_FIELD_rec_ptr    pair;
+   ADDINFO_typ          keyword_typ;
+   CTSAMSG_MSG_typ      msg_buff;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_OS_SCRIPT, 2, func);
+
+   ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+                   "keyword=%s value=%s", keyword,value);
+
+  /*
+   *  Delete var ( if value = "/" )
+   */
+
+   /* if ( strcmp(value, "/") EQ 0 ) {          Rem BS2005 */
+
+   /* IS10094
+   if ( (strcmp(value, "/")          EQ 0 )  OR         * Add BS2005 *
+        (strcmp(value, "__DELETE__") EQ 0 )  OR         * Add BS2005 *
+   */
+   /* WS10082 - start   */
+   pair = ADDINFO_search(keyword, MAX_RSS_ADDINFO_KWD_LEN,
+                         addinfo ->pair,addinfo ->num_pairs );
+   if (pair NE NULL)
+   {
+     /* If the value of the pair in addinfo is longer than 16K  */
+     /* we didn't pass it to the rexx so we do not allow to     */
+     /* change or delete it.                                    */
+     if (pair->vallen GT ADDINFO_16K_VAL_LEN)
+     {
+        CTSAMSG_print(OS_CS_WARN_LONG_VAL,
+                      msgs, msg_buff, NULL ,
+                     "PUT", pair->keyword, pair->vallen);
+        do_say(msg_buff, 1);
+     }
+     else
+     {
+     /* WS10082 - end     */
+       if ( (strcmp(value, "__DELETE__") EQ 0 )  OR  /* BS2005 + IS10094 */
+            (strcmp(value, "**DELETE**") EQ 0 )   )    /* Add BS2005 */
+       {
+           rc = ADDINFO_delete(addinfo,keyword);
+           rc = ESA_OK;    /* Add BS2005 */
+           /* SAS2IBMN - start *
+           /* Code below is removed because it is never executed due
+              to the command above...
+           if ( rc NE ESA_OK )
+           {
+              msg_buff[0] = NULL_CHAR;
+              CTSAMSG_print(OS_CS_ERR_DEL, msgs,msg_buff,NULL, keyword);
+              ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,"msg_buff=%s", msg_buff);
+              say(msg_buff);
+              rc = ESA_ERR ;
+           }
+           */
+           goto exit ;
+       }
+
+   /* WS10082 pair = ADDINFO_search(keyword, MAX_RSS_ADDINFO_KWD_LEN,
+                         addinfo ->pair,addinfo ->num_pairs );   */
+   /* WS10082 if (pair NE NULL)   */
+   /* Ws10082 {                     */
+
+      /*
+       *   Convert lists internal separators to
+       *   scripts separators
+       */
+
+       if ( (pair->add_typ EQ TYPE_1B) OR
+            (pair->add_typ EQ TYPE_2B)  )
+/* Del by PS0311
+ *      ADDINFO_convert_list_sep( value,
+ *                ',', ',' ,
+ *                ADDINFO_LIST_ENTRY, ADDINFO_LIST_ENTRY);
+ */
+         ADDINFO_convert_list_sep( value,                   /* PS0311 */
+                script_sep_entry,   script_sep_field,       /* PS0311 */
+                ADDINFO_LIST_ENTRY, ADDINFO_LIST_SUBFIELD); /* PS0311 */
+
+       rc = ADDINFO_updval( value, MAX_RSS_ADDINFO_VAL_LEN, pair);
+       if ( rc NE ESA_OK )
+       {
+          msg_buff[0] = NULL_CHAR;
+          CTSAMSG_print(OS_CS_ERR_UPD, msgs,msg_buff,NULL, keyword,
+                        value );
+         ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2, "msg_buff=%s", msg_buff);
+          say(msg_buff);
+          rc = ESA_ERR ;
+       }
+     }  /* pair was processed  */
+   }   /* pair was found   */
+   else   /* pair not in addinto */
+   {
+      rc = (header->get_rsskwd_typ)(header->rss_name,
+                                    header->func_id,
+                                    keyword, &keyword_typ);
+
+      ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+                      "%d(%s)=rsskwd_typ(%s, %d, %s, %d)",
+                      rc, ESA_rc2str(rc), header->rss_name,
+                      header->func_id, keyword, keyword_typ);
+
+      if ( (rc NE ESA_OK) OR (keyword_typ EQ TYPE_AI_IGNORED) )
+      {
+         msg_buff[0] = NULL_CHAR;
+         CTSAMSG_print(OS_CS_ERR_TYP, msgs,msg_buff,NULL, keyword,
+                       value );
+         ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,"msg_buff=%s", msg_buff);
+         say(msg_buff);
+         rc = ESA_ERR ;
+         /* goto exit - for error, otherwise will be warning */
+         keyword_typ = TYPE_AI_IGNORED;
+      }
+
+     /*
+      *   Convert lists internal separators to
+      *   scripts separators
+      */
+
+      if ( (keyword_typ EQ TYPE_1B) OR
+           (keyword_typ EQ TYPE_2B)  )
+/* WS10082N */
+ /* Del by PS0311
+  *     ADDINFO_convert_list_sep( value,
+  *              ',', ',' ,
+  *              ADDINFO_LIST_ENTRY, ADDINFO_LIST_ENTRY);
+  */
+        ADDINFO_convert_list_sep( value,                    /* PS0311 */
+               script_sep_entry,   script_sep_field,        /* PS0311 */
+               ADDINFO_LIST_ENTRY, ADDINFO_LIST_SUBFIELD);  /* PS0311 */
+
+      rc = ADDINFO_insert(keyword_typ, keyword, value, addinfo,
+                          MAX_RSS_ADDINFO_KWD_LEN,
+                          MAX_RSS_ADDINFO_VAL_LEN,
+                          UNIQUE);
+      if ( rc NE ESA_OK )
+      {
+         msg_buff[0] = NULL_CHAR;
+         CTSAMSG_print(OS_CS_ERR_INS, msgs,msg_buff,NULL, keyword,
+                       value );
+         ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,"msg_buff=%s", msg_buff);
+         say(msg_buff);
+         rc = ESA_ERR ;
+      }
+   }
+
+  /*
+   *  Finish
+   */
+
+   exit :;
+
+   ESA_DIAG_exit(ESA_COMP_OS_SCRIPT, 2, func, rc);
+
+   return rc;
+
+ }
+
+/* SAS2IBMN - start */
+/****************************************************
+ * Procedure Name: get_rexx_var
+ * Description   : Call IRXEXCOM to get rexx variables.
+ *
+ * Input         : 1.req_code    -  request code:
+ *                                  GET_VAR_FETCH - fetch by name.
+ *                                  GET_VAR_NEXT - fetch next var.
+ *                 2.keyword     -  for GET_VAR_FETCH:
+ *                                  area containing keyword to retrieve
+ *                                  in string format (with NULL_CHAR
+ *                                  at the end).
+ *                                  for GET_VAR_NEXT - output parameter.
+ *                 3.max_key_len -  Length of keyword area.
+ *                 4.max_value_len -  Length of value area.
+ *                 5.msgs
+ *                 6.dest
+ *
+ * Output        : 1.value
+ *                 2.value length
+ *                 For requets code N
+ *                 3.keyword
+ *                 All returned data is in string format with
+ *                 a NULL_CHAR at the end.
+ *
+ * Return Value  : ESA_OK - keyword retrieved successfully.
+ *               : ESA_SKIP- value was truncated.
+ *               : ESA_EOF - no more keywords.
+ *               : ESA_FATAL - Error retrieving keyword.
+ *
+ * called by     : create_addinfo
+ *               : put_addinfo_var
+ *
+ * calls to      : enter
+ *                 exit
+ *                 printf
+ *                 IRXEXCOM
+ *                 send_msg (when error in retrieve).
+ *                 send_var_msg (when error in retrieve).
+ *
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+
+ static ESA_RC get_rexx_var(char                       req_code,
+                            char                      *keyword,
+                            int                        max_key_len,
+                            char                      *value,
+                            int                        max_val_len,
+                            int                       *val_len,
+                            CTSAMSG_HANDLE_rec_ptr     msgs,
+                            CTSAMSG_DEST_TABLE_rec_ptr dest)
+ {
+
+   static char func[] = "get_rexx_var";
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC        rc = ESA_OK;
+   int           shvrc;
+   int           shverr = FALSE;                          /* WS10082N */
+   int           len;
+   int           msg_issued = FALSE;                      /* WS10082N */
+
+   int           p2 = 0;
+   void         *null_parm = NULL;
+
+   CTSAMSG_MSG_typ  msg_buff = "";
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_OS_SCRIPT, 2, func);
+
+   ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+                   "req_code = %1s   keyword = %s   max_len = %d / %d",
+                   req_code, keyword, max_key_len, max_val_len);
+
+   value[0] = NULL_CHAR;
+   first_shvblk.shvnext = NULL;
+   first_shvblk.shvret = 0x00;
+   first_shvblk.shvbufl = max_val_len - 1;
+   first_shvblk.shvnama = keyword;
+   first_shvblk.shvvala = value;
+   first_shvblk.shvvall = 0;
+
+  /*
+   *   Process request
+   */
+
+   switch (req_code)
+   {
+     case GET_VAR_FETCH:                      /* Fetch */
+       first_shvblk.shvuser = 0;
+       first_shvblk.shvcode = shvfetch;
+       first_shvblk.shvnaml = strlen(keyword);
+
+       shvrc = irxexcom(eye_c, &p2, &p2, &first_shvblk);
+       ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+                       "IRXEXCOM Fetch: rc = %d/%2X",
+                       shvrc, first_shvblk.shvret);
+
+       if ( shvrc EQ shvrcok)
+       {
+         if (first_shvblk.shvret EQ shvnewv)
+         {
+           shvrc = IRXRC_VARIABLE_ERROR;
+           rc = ESA_FATAL;
+         }
+         else
+         {
+           value[first_shvblk.shvvall] = NULL_CHAR;
+           *val_len = first_shvblk.shvvall;
+
+           ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+                          "IRXEXCOM returned:   %s = %s",
+                          keyword, value);
+           rc = ESA_OK;
+         }
+       }
+       /* WS10082N - start */
+       else
+         if (shvrc EQ shvtrunc)           /* value was truncated ? */
+         {
+           value[0] = NULL_CHAR;
+           *val_len = 0;
+           rc = ESA_SKIP;
+         }
+         else
+           rc = ESA_FATAL;
+       /* WS10082N - start */
+       break;
+     case GET_VAR_NEXT:                         /* Next */
+       first_shvblk.shvuser = max_key_len - 1;
+       first_shvblk.shvcode = shvnextv;
+       first_shvblk.shvnaml = 0;
+
+       shvrc = irxexcom(eye_c, &p2, &p2, &first_shvblk);
+       ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+                       "IRXEXCOM Next: rc = %d/%2X",
+                       shvrc, first_shvblk.shvret);
+
+       if ( shvrc EQ shvrcok)
+       {
+         if (first_shvblk.shvret EQ shvclean)
+         {
+           value[first_shvblk.shvvall] = NULL_CHAR;
+           *val_len = first_shvblk.shvvall;
+           keyword[first_shvblk.shvnaml] = NULL_CHAR;
+
+           ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+                          "IRXEXCOM returned:   %s = %s",
+                          keyword, value);
+           rc = ESA_OK;
+         }
+         else
+         {
+           if (first_shvblk.shvret EQ shvlvar)
+             rc = ESA_EOF;
+           else
+           {
+             shvrc = IRXRC_VARIABLE_ERROR;
+             rc = ESA_FATAL;
+           }
+         }
+       }
+       /* WS10082N - start */
+       else
+         if (shvrc EQ shvtrunc)        /* value was truncated ? */
+         {
+           value[0] = NULL_CHAR;
+           *val_len = 0;
+           keyword[first_shvblk.shvnaml] = NULL_CHAR;
+           rc = ESA_SKIP;
+         }
+         else
+           rc = ESA_FATAL;
+       /* WS10082N - start */
+       break;
+     default:                          /* Unknown request */
+       rc = ESA_FATAL;
+       msg_buff[0] = NULL_CHAR;
+       CTSAMSG_print(ERR_INTERNAL2,
+                     msgs, msg_buff, NULL, component,
+                     func, "Unknown request code", rc, __LINE__ );
+       say(msg_buff);
+       msg_issued = TRUE;                                 /* WS10082N */
+       break;
+   }
+
+   /* WS10082N if (rc EQ ESA_FATAL)   */
+   if (rc EQ ESA_FATAL  AND !msg_issued)                  /* WS10082N */
+   {
+     if ( (shvrc NE shvrcinv)     AND                     /* WS10082N */
+          (shvrc NE shvrcist)     AND                     /* WS10082N */
+          (shvrc NE IRXRC_NO_LE)  AND                     /* WS10082N */
+          (shvrc NE IRXRC_INVALID_PARMS) )                /* WS10082N */
+       shvrc = IRXRC_VARIABLE_ERROR;                      /* WS10082N */
+
+     send_msg(shvrc, NULL, msgs, dest);
+
+     if (shvrc EQ IRXRC_VARIABLE_ERROR)
+       send_var_msg(&first_shvblk, msgs, dest);
+
+   }
+  /*
+   *   Finished
+   */
+
+   exit : ;
+
+     ESA_DIAG_exit(ESA_COMP_OS_SCRIPT, 2, func, rc);
+
+   return rc;
+
+}
+/* SAS2IBMN - end */
+
+/****************************************************
+ * Procedure Name: rc_is_digit
+ * Description   : chech whether rc is digital
+ * Input         : rc_value
+ * Output        : none
+ * Return Value  : ESA_OK - rc is digital
+ *                 ESA_ERR- rc is text
+ *
+ * called by     : get_script_rc
+ *
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+ static ESA_RC rc_is_digit(char   *rc_value)
+ {
+
+    int      i,len;
+    ESA_RC   rc = ESA_OK;
+
+    len = strlen(rc_value);
+    for (i=0; i LT len; i++ )
+    {
+       if ( isdigit(rc_value[i] ) EQ 0 )
+       {
+          rc = ESA_ERR;
+          break;
+       }
+    }
+
+    return rc;
+
+ }
+
+/****************************************************
+ * Procedure Name: get_script_rc
+ * Description   : Convert ret code after users script
+ *                 to internal form
+ * Input         : 1.header     -  ptr to header
+ *                 2.valbuf     -  ret code value
+ * Output        : 1.script_rc  -  value ( internal form )
+ * Return Value  : none
+ *
+ * called by     : create_addinfo
+ *
+ * calls to      : ESA_DIAG_enter
+ *                 ESA_DIAG_exit
+ *                 ESA_DIAG_printf
+ *                 CTSAMSG_print
+ *
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+
+ static void get_script_rc(OS_HEADER_typ    *header,
+                           char             *valbuf,
+                           ESA_RC           *script_rc)
+
+ {
+
+   static char func[] = "get_script_rc";
+
+  /*
+   *   Variables
+   */
+   int             rexx_rc;
+   CTSAMSG_MSG_typ msg_buff;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_OS_SCRIPT, 2, func );
+
+ /*
+  *    script_rc after users script program :
+  *    - digital value ( version 1.2, 1.3 )
+  *    - in form OK, ERR etc. ( from version 1.4 )
+  */
+
+   ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+                   "msgs=%x valbuf=%s", header->msgs, valbuf);
+
+  /*
+   *    - digital value ( version 1.2, 1.3 )
+   */
+
+   if ( rc_is_digit(valbuf) EQ ESA_OK )
+   {
+     rexx_rc = atoi(valbuf) ;   /* script rc */
+     switch ( rexx_rc )
+     {
+       case 0: *script_rc = ESA_OK;
+               break;
+       case 1: *script_rc = ESA_SKIP;
+               break;
+       case 2: *script_rc = ESA_WARN;
+               break;
+       case 3: *script_rc = ESA_ERR;
+               break;
+       case 4: *script_rc = ESA_FATAL;
+               break;
+       default:*script_rc = ESA_FATAL;
+               msg_buff[0] = NULL_CHAR;
+               CTSAMSG_print(OS_CS_INVALID_SCRIPT_RC,
+                      header->msgs, msg_buff,NULL ,valbuf,ESA_FATAL);
+               say(msg_buff);
+     }
+   }
+
+  /*
+   *    - in form OK, ERR etc. ( from version 1.4 )
+   */
+
+   else
+   {
+     if ( strcmp(valbuf, "OK" ) EQ 0 )
+       *script_rc = ESA_OK;
+     else if ( strcmp(valbuf, "SKIP" ) EQ 0 )
+       *script_rc = ESA_SKIP;
+     else if ( strcmp(valbuf, "WARN" ) EQ 0 )
+       *script_rc = ESA_WARN;
+     else if ( strcmp(valbuf, "ERR" ) EQ 0 )
+       *script_rc = ESA_ERR;
+     else if ( strcmp(valbuf, "FATAL" ) EQ 0 )
+       *script_rc = ESA_FATAL;
+     else
+     {
+       *script_rc = ESA_FATAL;
+       msg_buff[0] = NULL_CHAR;
+       CTSAMSG_print(OS_CS_INVALID_SCRIPT_RC,
+                     header->msgs, msg_buff,NULL , valbuf, ESA_FATAL);
+       say(msg_buff);
+     }
+   }
+   /*
+    *    Finish
+    */
+
+   ESA_DIAG_exit(ESA_COMP_OS_SCRIPT, 2, func, ESA_OK );
+
+ }
+
+/****************************************************
+ * Procedure Name: say
+ * Description   : say service
+ *
+ * Input         : 1.msg        -  ptr to msg
+ *
+ * Output        : none
+ * Return Value  : none
+ *
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+
+ static void say(char  *msg)
+ /* SAS2IBMN - start */
+ {
+    do_say(msg, 1);
+ }
+
+/****************************************************
+ * Procedure Name: do_say
+ * Description   : say service
+ *
+ * Input         : 1.msg        -  ptr to msg
+ *               : 2.diag       -  TRUE - diags env. exists.
+ *               :                 FALSE - no diags env.
+ *
+ * Output        : none
+ * Return Value  : none
+ *
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+ static void do_say(char  *msg,
+                    int    diag)
+ /* SAS2IBMN - end */
+ {
+
+   static char func[] = "say";
+   static char cmd_name[] = "CTSASAY ";                   /* IS10094 */
+
+  /*
+   *   Variables
+   */
+
+   struct tso_buff_struct
+   {
+       int  len;
+       char cmd[256];
+   } tso_buff;
+   char tso_cmd[]="CMD     ";
+   int  tso_r15, tso_rc, tso_rs, tso_ab;
+   /* SAS2IBMN - start */
+   /* int  tso_dbg = ESA_DIAG_get_debug_level(ESA_COMP_OS_SCRIPT); */
+   int  tso_dbg = 0;
+   /* SAS2IBMN - end */
+
+  /*
+   *   Initialize
+   */
+
+   if (diag)                                            /* SAS2IBMN */
+   {
+     ESA_DIAG_enter(ESA_COMP_OS_SCRIPT, 1, func);
+     tso_dbg = ESA_DIAG_get_debug_level(ESA_COMP_OS_SCRIPT);
+   }
+
+  /*
+   *   Issue message
+   */
+
+   /* sprintf(tso_buff.cmd,"CTSASAY %s",msg);                IS10094 */
+                                                          /* IS10094 */
+   sprintf(tso_buff.cmd,"%s%.*s",                         /* IS10094 */
+           cmd_name,                                      /* IS10094 */
+           sizeof(tso_buff.cmd)-strlen(cmd_name)-1, msg); /* IS10094 */
+   tso_buff.len = strlen(tso_buff.cmd);
+   /* SAS2IBMT
+   tso_r15 = OS_DYNAM_call("CTSATSO ", 1, tso_cmd, &tso_rc,          */
+   tso_r15 = (*(ASM_RTN_TYP *)&OS_DYNAM_call)             /* SAS2IBMT */
+                          ("CTSATSO ", 1, tso_cmd, &tso_rc,
+                           &tso_rs, &tso_ab, &tso_dbg, &tso_buff);
+   if (diag)                                              /* SAS2IBMN */
+     ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,1,
+                   "CTSATSO r15=%d, rc=%d, rs=%d, ab=%d",
+                   tso_r15, tso_rc, tso_rs, tso_ab  );
+
+  /*
+   *   Finish
+   */
+
+   if (diag)                                              /* SAS2IBMN */
+     ESA_DIAG_exit(ESA_COMP_OS_SCRIPT, 1, func, ESA_OK );
+
+   return;
+
+ }
+
+/****************************************************
+ * Procedure Name: get_msg_code
+ * Description   : Translate return codes to string
+ * Input         : shvrc
+ * Output        :
+ * Return Value  : char *
+ ****************************************************/
+
+static char * get_msg_code(int rc )
+{
+
+   switch ( rc )
+   {
+    /* SAS2IBMN - start
+     case SHV_TRUNC_VAR      :   return "SHV_TRUNC_VAR"      ;
+     case SHV_TRUNC_VAL      :   return "SHV_TRUNC_VAL"      ;
+     case SHV_NO_SUBCOM      :   return "SHV_NO_SUBCOM"      ;
+     case SHV_NO_MEM         :   return "SHV_NO_MEM"         ;
+     case SHV_LIBERR         :   return "SHV_LIBERR"         ;
+     case SHV_INVALID_VAR    :   return "SHV_INVALID_VAR"    ;
+     case SHV_NOT_SUPPORTED  :   return "SHV_NOT_SUPPORTED"  ;
+     */
+     case shvtrunc             :   return "SHV_TRUNC_VALUE"        ;
+     case shvbadf              :   return "SHV_INVALID_FUNCTION"   ;
+     case shvbadv              :   return "SHV_INVALID_VALUE"      ;
+     case shvnewv              :   return "SHV_NO_VAR"             ;
+     case shvbadn              :   return "SHV_INVALID_VAR"        ;
+     case shvrcist             :   return "IRX_NOTENOUGH_STORAGE"  ;
+     case shvrcinv             :   return "IRX_INVALID_ENTRY_COND" ;
+     case IRXRC_NO_LE          :   return "IRXRC_NO_LE"            ;
+     case IRXRC_INVALID_PARMS  :   return "IRXRC_INVALID_PARMS"    ;
+     case FETCH_FAILED         :   return "FETCH_FAILED"           ;
+     case UNKNOWN_PARM         :   return "UNKOWN_PARM"            ;
+     case INSUFFICIENT_STORAGE :   return "INSUFFICIENT_STORAGE"   ;
+     case IRXRC_VARIABLE_ERROR :   return "IRXRC_VARIABLE_ERROR"   ;
+    /* SAS2IBMN - end  */
+     default                 :   return "UNDEFINED"          ;
+   }
+
+}
+
+/* SAS2IBMN - start */
+/****************************************************
+ * Procedure Name: get_IRXEXCOM_code
+ * Description   : Translate IRXEXCOM request code to string.
+ * Input         : request
+ * Output        :
+ * Return Value  : char *
+ ****************************************************/
+
+static char * get_IRXEXCOM_code(unsigned char  request)
+{
+
+   switch ( request )
+   {
+     case shvfetch             :   return "FETCH"         ;
+     case shvstore             :   return "SET"           ;
+     case shvdropv             :   return "DROP"          ;
+     case shvsyfet             :   return "fetch"         ;
+     case shvsyset             :   return "set"           ;
+     case shvsydro             :   return "drop"          ;
+     case shvnextv             :   return "FETCH NEXT"    ;
+     case shvpriv              :   return "FETCH_PRIVATE" ;
+     default                   :   return "UNDEFINED"     ;
+   }
+
+}
+/* SAS2IBMN - end */
+
+/****************************************************
+ * Procedure Name: intercept_events
+ * Description   : Sends interceptor event created by script
+ * Input         : argc    -  number of parameters
+ *                 argv    -  parameters are :
+ *                            argv[1] -  option
+ *                            argv[2] -  token
+ *                            argv[3] -  type (USER/GROUP/CONN/OE/RES)
+ *                            argv[4] -  object name
+ *                                       in case type CONN : conn user
+ *                                       in case type RES  : res type
+ *                            argv[5] -  additional object name
+ *                                       in case type CONN : conn group
+ *                                       in case type RES  : res name
+ * Output        :
+ * Return Value  : ESA_RC
+ ****************************************************/
+
+static ESA_RC intercept_events(int               argc,
+                               char            **argv ,
+                               OS_HEADER_typ    *header)
+{
+
+  ESA_RC                           rc = ESA_OK;
+  static                           char func[]="intercept_events";
+  CTSAMSG_HANDLE_rec_ptr           msgs;
+  CTSAMSG_DEST_TABLE_rec_ptr       dest;
+  CTSAMSG_MSG_typ                  msg_buff = "";
+  char                             internal_msg[100];
+  int                              i;
+  INTERCEPT_typ                    intercept_type = INTERCEPT_SPECIFIC;
+  INTERCEPT_obj_typ                intercept_obj_type;
+  OE_typ                           oe   = "";
+  USER_typ                         user = "";
+  UG_typ                           ug   = "";
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_OS_SCRIPT, 2, func);
+
+   msgs = header->msgs ;
+   dest = header->dest ;
+
+   ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2, "argc=%d", argc);
+   for (i=0; i LT argc; i++)
+        ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+                        "argv(%d)=%s",i,argv[i]);
+
+  /*
+   *  Check number of external parameters
+   */
+
+   if ( argc LT 5 )
+   {
+      CTSAMSG_print(OS_CS_NOTIFY_MISSING_PARAMETER,
+                    msgs, msg_buff, NULL, "Object type");
+      say(msg_buff);
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *  Convert parameter  argv[3] -  type (USER/GROUP/CONN/OE/RES)
+   */
+
+   if ( strcmp(argv[3], "USER" ) EQ 0 )
+       intercept_obj_type = INTERCEPT_USER;
+   else if ( strcmp(argv[3], "GROUP" ) EQ 0 )
+       intercept_obj_type = INTERCEPT_GROUP;
+   else if ( strcmp(argv[3], "OE" ) EQ 0 )
+       intercept_obj_type = INTERCEPT_CONTAINER;
+   else if ( ( strcmp(argv[3], "CONN" ) EQ 0 )  OR
+             ( strcmp(argv[3], "RES"  ) EQ 0 )   )
+   {
+    /*
+     *  Check existance additional parameter
+     */
+     if ( argc LT 6 )
+     {
+        CTSAMSG_print(OS_CS_NOTIFY_MISSING_PARAMETER,
+                    msgs, msg_buff, NULL, "Res/Conn details");
+        say(msg_buff);
+        rc = ESA_FATAL;
+        goto exit;
+       }
+       if ( strcmp(argv[3], "CONN" ) EQ 0 )
+          intercept_obj_type = INTERCEPT_CONNECTION;
+   }
+   else
+   {
+      CTSAMSG_print(OS_CS_NOTIFY_INVALID_PARAMETER,
+                    msgs, msg_buff, NULL, argv[3]);
+      say(msg_buff);
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *  Build additional parameters
+   */
+
+   switch (intercept_obj_type)
+   {
+     case INTERCEPT_USER       :  strcpy(user, argv[4]);
+                                  break;
+     case INTERCEPT_GROUP      :  strcpy(ug,   argv[4]);
+                                  break;
+     case INTERCEPT_CONTAINER  :  strcpy(oe,   argv[4]);
+                                  break;
+     case INTERCEPT_CONNECTION :  strcpy(user, argv[4]);
+                                  strcpy(ug,   argv[5]);
+                                  break;
+     default  :
+           sprintf(internal_msg, "Invalid obj_type=%d",
+                   intercept_obj_type);
+           CTSAMSG_print(ERR_INTERNAL2,
+                    msgs, msg_buff, NULL, component,
+                    component, internal_msg, rc, __LINE__ );
+            say(msg_buff);
+            rc = ESA_FATAL;
+            goto exit;
+   }
+
+  /*
+   * Save intercept set event
+   */
+
+   ESA_DIAG_printf(ESA_COMP_OS_SCRIPT,2,
+      "Intercept_set event %d: type=%d obj_type=%d oe=%s usr=%s ug=%s",
+      header->num_intercept_rec,
+      intercept_type, intercept_obj_type, oe, user, ug);
+
+   if ( header->num_intercept_rec GE
+                        header->num_intercept_rec_alloc )
+   {
+        CTSAMSG_print(OS_CS_NOTIFY_EXCEED_MAXIMUM,
+                      msgs, msg_buff, NULL,
+                      header->num_intercept_rec_alloc );
+        say(msg_buff);
+        rc = ESA_FATAL;
+        goto exit;
+   }
+
+   i = header->num_intercept_rec;
+   header->intercept_rec[i].type     = intercept_type;
+   header->intercept_rec[i].obj_type = intercept_obj_type;
+   strcpy( header->intercept_rec[i].oe,    oe);
+   strcpy( header->intercept_rec[i].user,  user);
+   strcpy( header->intercept_rec[i].ug,    ug);
+
+   (header->num_intercept_rec)++;
+
+  /*
+   *   Finish
+   */
+
+  exit :;
+
+   ESA_DIAG_exit(ESA_COMP_OS_SCRIPT, 2, func, rc );
+
+   return rc;
+
+}
+
+/*                 WS10082  - start
+ *   Provide msgs (handle) and dest addresses to CTSAMSG   *
+ *   These routines are called by CTSAMSG_print_direct     *
+ *   when called with handle=0 or dest=CTSAMSG_FIND_DEST   */
+CTSAMSG_HANDLE_rec_typ     * CS_get_ctsamsg_handle()
+{
+   return (msgs);
+}
+
+CTSAMSG_DEST_TABLE_rec_typ * CS_get_ctsamsg_dest()
+{
+   return (dest);
+}
+/*                  WS10082N - end                         */

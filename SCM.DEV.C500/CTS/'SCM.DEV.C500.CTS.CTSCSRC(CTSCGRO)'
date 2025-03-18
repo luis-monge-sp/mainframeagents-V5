@@ -1,0 +1,1294 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Get REXX Output Routine (common)         *
+ *                                                             *
+ * Creation Date    : 05/01/2020                               *
+ *                                                             *
+ * Description      : This module contains the Get REXX output *
+ *                    routine.  After initializing the         *
+ *                    IRXEXCOM environment, this routine gets  *
+ *                    one stem line after another (until EOF)  *
+ *                    and builds a series of REXX/Utility      *
+ *                    Output Blocks (RUOBs) chained from one   *
+ *                    to the next.                             *
+ *                                                             *
+ * Input            : argv[1] - stem variable name             *
+ *                    argv[2] - address of parameter list      *
+ *                              which came from one of the     *
+ *                              CTSBGUG secondary modules      *
+ *      IS10184       argv[3] - EXCOM(<irxexcom address>)      *
+ *      IS10184                 optional. If exists, will be   *
+ *      IS10184                 the last.                      *
+ *                                                             *
+ * Output           : pointer to first RUOB in a chain of      *
+ *                    RUOBs                                    *
+ *                                                             *
+ * Return Value     : ESA_OK    - Everything is fine.  RUOBs   *
+ *                                created and chained          *
+ *                                successfully.                *
+ *                    ESA_FATAL - Error encountered.  Examine  *
+ *                                the error messages.          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations : The program is reusable.      IS10184    *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When      Description                     *
+ * -------  -------  --------  ------------------------------- *
+ * WS10076  SeligT   05/01/20  Manage Permissions as Account   *
+ *                             and Group Attributes - Phase 2  *
+ * WS10078T ThomaS   18/05/20  Add a diag with the error msg   *
+ *                             returned by CTSASTO             *
+ * BS10111  NuritY   15/12/20  Support ruob above th bar.      *
+ * BS10117  NuritY   19/09/21 abend SDC2-0049 -  RUOB utoken   *
+ *                            collided with ATB cellpool.      *
+ * IS10184  NuritY   02/09/21 Improve scripts performance.     *
+ * WS10082  NuritY   18/10/23 Rtns to provide msgs hndle & dest*
+ * WS10082N NuritY   03/12/23 Storage leak issue.              *
+ **************************************************************/
+ /******(*******************************************************
+ *
+ * Changes included in IS10184:
+ * ----------------------------
+ * 1. the program is changed to be reusable and will be loaded
+ *    only once. Values saved in static variables will be seen by
+ *    subsequent invocations.  Therefore, static variables which
+ *    are used in order to share data between routines but not
+ *    between calls should be cleared before used.
+ *
+ * 2. If EXCOM(addr) is passed as last parameter, skip fetching
+ *    IRXEXCOM and use the passed address.
+ *
+ * 3. The program will be called using BASR and not LINK. This is
+ *    a change in the caller, but we'd better know this here as
+ *    well.
+ *
+ *  Note:
+ *  The program is not link-edited as reusable because there
+ *  is no need for this. We load it once and then find its address
+ *  and branch to it, so the system does not have to look for it.
+ *  If there wil be a need to link-edit it as reusable, all
+ *  modules link-edited to it should be link-edited as reusable as
+ *  well, to prevent linkage editor warning message and non=0 rc.
+ *  (these programs are called multiple times which means that they
+ *  are written as reusable, but they are not link-edited as such).
+ *
+ ****************************************************************/
+
+ #define  THIS_IS_MAIN
+
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+ #include   TIME
+ #include   CTYPE
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_CTSAMSG
+ #include ESA_API
+ #include ESA_API_CODES
+ #include ESA_CS_OS
+ #include API_ADDINFO
+ #include API_AUTH
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_OS_CLI
+ #include MVS_CODES
+ #include MVS_COMP
+ #include MVS_OS_MVS
+ #include MVS_OS_DYNAM
+ #include <irxshvb.h>
+ #define  irxshvb struct shvblock
+
+ #include ACF2_CODES
+ #include ACF2
+
+/*
+ *  Error codes to be used in send_msg
+ */
+#define IRXRC_NO_LE           28
+#define IRXRC_INVALID_PARMS   32
+/* BS10111 #define INSUFFICIENT_STORAGE  97   */
+#define FETCH_FAILED          98
+#define UNKNOWN_PARM          99
+#define IRXRC_VARIABLE_ERROR  100
+/* BS10111 ASM_RTN_TYP ctsasto;   */
+
+static  char err_parm_list[] = "INVALID PARAMETER LIST";
+
+static ESA_RC get_token_addr(char        * token,
+                             OS_GRO_typ ** groplist);
+
+static char * get_msg_code(int rc);
+
+static void   send_msg(ESA_RC                     rc,
+                       char                       *msg,
+                       ESA_DIAG_COMP_typ          comp,
+                       CTSAMSG_HANDLE_rec_ptr     msgs,
+                       CTSAMSG_DEST_TABLE_rec_ptr dest);
+
+static void say(char              * msg,
+                int                 diag,
+                ESA_DIAG_COMP_typ   comp);
+
+static ESA_DIAG_LEVEL_typ dlvl[ESA_MAX_COMPS];
+
+ static   char   component[]="CTSCGRO";
+ static   char   func[]="Get_REXX_output";
+
+/*
+ *   Tells C to set the high-order bit in the
+ *   last entry of the parameters table.
+ *
+ *   We need it here because IRXEXCOM fails the call with
+ *   a return code of 32 if this bit is not set.
+ */
+
+/* IS10184 typedef int IRXRTN_TYP ();                      */
+/* IS10184 #pragma linkage(IRXRTN_TYP,OS)                  */
+/* IS10184 IRXRTN_TYP * irxexcom;                          */
+#define IRXEXCOM "IRXEXCOM"
+
+/* IS10184 static RTN_TYP * p_rtn;                         */
+typedef void RTN_TYP ();                                  /* IS10184 */
+
+static char   eye_c[] = "IRXEXCOM";
+static irxshvb first_shvblk;
+
+/* WS10082 - admin_params address for addinfo routines call */
+ADMIN_PARAMS_rec_typ * admin_params_copy;                 /* WS10082 */
+
+static CTSAMSG_HANDLE_rec_ptr           msgs = NULL;      /* WS10082 */
+static CTSAMSG_DEST_TABLE_rec_ptr       dest = NULL;      /* WS10082 */
+
+/*
+ *   Main program
+ */
+
+int main(int argc, char **argv)
+{
+
+  /*
+   *    Variables
+   */
+
+   ESA_RC        rc = ESA_OK ;
+   int           i = 0;
+   int           int_rc = 0;
+   char          errmsg[125];
+   OS_GRO_ptr    groplist   = NULL;
+   void        * handle = NULL;
+   int           shvrc;
+   char          stem_line[150];
+   int           p2 = 0;
+   /* BS10111 int           tenth = 0;                              */
+   int           stem_line_num = 0;
+
+   /* stem name - up to 16 characters -+                             */
+   /* dot       - exactly 1 character  +--==> 30 characters          */
+   /* stem num  - up to 13 characters -+                             */
+   char          stem_var_name[30];
+   char          stem_var_num[13];
+
+   char          excom_c[8] = "";                         /* IS10184 */
+   RTN_TYP    *  p_rtn = NULL;                            /* IS10184 */
+   ASM_RTN_TYP * irxexcom = NULL; /* IRXEXCOM address.       IS10184 */
+
+   /* BS10111  -  not needed any more because the blocks are handled
+                  by ctsaruh
+   char        * addr_for_free = NULL;
+   REXX@UTL_output_blk_rec_typ  * first_block = NULL;
+   REXX@UTL_output_blk_rec_typ  * current_block = NULL;
+   REXX@UTL_output_blk_rec_typ  * next_block = NULL;
+   REXX@UTL_output_line_rec_typ * line = NULL;
+      end of removed code - BS10111 */
+   char                       first_block[8] = /* 64-bit addr BS10111 */
+                                {0x00, 0x00, 0x00, 0x00,  /* BS10111 */
+                                 0x00, 0x00, 0x00, 0x00}; /* BS10111 */
+   /* WS10082 CTSAMSG_HANDLE_rec_ptr           msgs;                 */
+   /* WS10082 CTSAMSG_DEST_TABLE_rec_ptr       dest;                 */
+   CTSAMSG_MSG_typ            msg_buff;
+   /* BS10111  -  not needed any more because the blocks are handled
+                  by ctsaruh
+   char                       ruobeyec[5] = "RUOB";  /@WS10076A@/
+   int                        sto_sp = _ruosp;
+   int                        sto_key = _ruokey;
+   int                        sto_loc = _ruoloc;
+   #define STO_MSG_SIZE 247
+   int                        sto_msg[STO_MSG_SIZE];    /@ WS10078T @/
+   int                        sto_msg_size;
+      end of removed code  - BS10111   */
+   int                        dbglvl = 0;
+   ASM_RTN_TYP              * p_ctsaruh = NULL;           /* BS10111 */
+   void                     * aruh_handle = NULL;         /* BS10111 */
+   int                        msg_buff_len = 0;           /* BS10111 */
+   int                        msg_len = 0;                /* BS10111 */
+   COMMON_PARAMS_rec_typ    * cmnprms = NULL;             /* BS10111 */
+   ADMIN_PARAMS_rec_typ     * admin_params;               /* IS10184 */
+   /* IS10184 DUMMY_PARAMS_rec_typ  * params_ptr = NULL; * BS10111 **/
+
+  /*
+   *    Start of code
+   */
+
+   if (argc LT 2)
+   {
+      printf("invalid parameter list");
+      rc=ESA_FATAL;
+      say(err_parm_list, 0, 0);
+      goto exit_nodiag;
+   }
+
+  /*
+   *    Make token addr (ptr to parameter list) usable
+   */
+
+   rc = get_token_addr(argv[2], &groplist);
+
+   if (rc NE ESA_OK)
+   {
+      printf("get_token_addr error");
+      rc=ESA_FATAL;
+      say(err_parm_list, 0, 0);
+      goto exit_nodiag;
+   }
+
+   /* IS10184 msgs = groplist->admin_params->ctsamsg_handl*/
+   /* IS10184 dest = groplist->admin_params->ctsamsg_dest;*/
+   admin_params = groplist->admin_params;                 /* IS10184 */
+   msgs = admin_params->ctsamsg_handle;                   /* IS10184 */
+   dest = admin_params->ctsamsg_dest;                     /* IS10184 */
+
+  /*
+   *    Initialize diagnostics
+   */
+
+   dlvl[groplist->comp] = groplist->debug_level;
+
+   ESA_DIAG_initialize ("PRTDBG", NULL, "CTSCGRO", &handle);
+
+   ESA_DIAG_set_debug_levels(dlvl);
+
+   ESA_DIAG_enter(groplist->comp, 1, func);
+
+   ESA_DIAG_printf(groplist->comp, 20,
+                   "groplist address = %8X", groplist);
+
+  /*
+   *    Initialize the environment and get to work
+   */
+
+   /* if common paramete exists, take its address.           BS10111 */
+   /* IS10184 - the code beow is replaced with a call to
+                GET_CMNPRMS_PROG
+   params_ptr = groplist->admin_params->apiinit_handle;    * BS10111 *
+   if (params_ptr NE NULL   AND                            * BS10111 *
+       params_ptr->common_params NE NULL)                  * BS10111 *
+     cmnprms = params_ptr->common_params;                  * BS10111 *
+   else                                                    * BS10111 *
+   {                                                       * BS10111 *
+     msg_buff[0] = NULL_CHAR;                              * BS10111 *
+     CTSAMSG_print(ERR_INTERNAL2,                          * BS10111 *
+           msgs, msg_buff, NULL, component, func,          * BS10111 *
+           "CTSCGRO - common_params does not exist",       * BS10111 *
+           16, __LINE__ );                                 * BS10111 *
+     say(msg_buff, 1, groplist->comp);                     * BS10111 *
+     rc = ESA_FATAL ;                                      * BS10111 *
+     goto exit;                                            * BS10111 *
+   }                                                       * BS10111 *
+
+   if (cmnprms->p_ctsaruh NE NULL)                         * BS10111 *
+     p_ctsaruh = (ASM_RTN_TYP *)cmnprms->p_ctsaruh;        * BS10111 *
+   else                                                    * BS10111 *
+   {                                                       * BS10111 *
+     msg_buff[0] = NULL_CHAR;                              * BS10111 *
+     CTSAMSG_print(ERR_INTERNAL2,                          * BS10111 *
+           msgs, msg_buff, NULL, component, func,          * BS10111 *
+           "CTSCGRO - common_params was not initialized",  * BS10111 *
+           16, __LINE__ );                                 * BS10111 *
+     say(msg_buff, 1, groplist->comp);                     * BS10111 *
+     rc = ESA_FATAL ;                                      * BS10111 *
+     goto exit;                                            * BS10111 *
+   }                                                       * BS10111 *
+      end of replaced code - IS10184 */
+                                                          /* IS10184 */
+   /* Get CTSARUH address.  When done, cmnprms contains      IS10184 */
+   /* the address of common_params.                          IS10184 */
+   GET_CMNPRMS_PROG(admin_params, cmnprms, p_ctsaruh,     /* IS10184 */
+                    p_ctsaruh, rc, errmsg)                /* IS10184 */
+   if (rc NE ESA_OK)                                      /* IS10184 */
+   {                                                      /* IS10184 */
+     msg_buff[0] = NULL_CHAR;                             /* IS10184 */
+     CTSAMSG_print(ERR_INTERNAL2,                         /* IS10184 */
+             msgs, msg_buff, NULL, component, func,       /* IS10184 */
+             errmsg, 16, __LINE__ );                      /* IS10184 */
+                                                          /* IS10184 */
+     say(msg_buff, 1, groplist->comp);                    /* IS10184 */
+     rc = ESA_FATAL ;                                     /* IS10184 */
+     goto exit;                                           /* IS10184 */
+   };                                                     /* IS10184 */
+
+   msg_buff_len = sizeof(msg_buff);                       /* BS10111 */
+   ESA_DIAG_printf(groplist->comp, 20,                    /* BS10111 */
+   "CTSARUH info:  addr = %p,  utoken = %p  ruob_size=%d",/* BS10117 */
+          p_ctsaruh, cmnprms->ruob_utkn,                  /* BS10111 */
+          groplist->RUOB_size);                           /* BS10111 */
+  /*BS10117 "CTSARUH info:  addr = %p,  utoken = %d  ruob_size=%d",  */
+
+   memset((void *)&first_shvblk, 0X00, shvblen);
+   stem_line[0] = NULL_CHAR;
+
+   /* iS10184  - start */
+   if (argc GT 2)
+   {
+     ESA_DIAG_printf (groplist->comp, 20,
+                      "argv[last] = %s", argv[argc-1]);
+
+     /* Check if last parm is EXCOM(addr).  If it is, use the  */
+     /* address passed as IRXEXCOM address.                    */
+     if (strncmp(argv[argc-1], "EXCOM(", 6) EQ 0)
+     {
+       strncpy(excom_c, argv[argc-1]+6, 8);
+       sscanf(excom_c, "%8x", (int *)&irxexcom);
+       ESA_DIAG_printf (groplist->comp, 20,
+                        "excom_c = %8s   irxexcom = %p",
+                        excom_c, irxexcom);
+     };
+   };
+
+   if (irxexcom EQ NULL)
+   {
+   /* IS10184   - end   */
+     p_rtn = fetch(IRXEXCOM);
+     irxexcom = (ASM_RTN_TYP *)p_rtn;
+   };                                                     /* IS10184 */
+
+   ESA_DIAG_printf(groplist->comp, 20,
+                   "IRXEXCOM address = %8X", irxexcom);
+
+   if (irxexcom EQ NULL)
+   {
+      CTSAMSG_print(OS_CS_NO_IRXEXCOM,
+                    msgs, msg_buff, NULL);
+      send_msg(FETCH_FAILED, msg_buff,
+               groplist->comp, msgs, dest);
+      rc=ESA_FATAL ;
+      goto exit;
+   }
+
+   dbglvl = (int)ESA_DIAG_get_debug_level(groplist->comp);
+   /* BS10111  if (dbglvl GT 0)   */
+   if (dbglvl GT 0  AND dbglvl NE 77)                     /* BS10111 */
+       dbglvl = 1;
+
+   /*   BS10111 - The code below is removed because the
+                  RUOB is now handled by CTSARUH
+   tenth = groplist->RUOB_size / 10;
+
+
+   sto_msg_size = sizeof(sto_msg);
+   for (i = groplist->RUOB_size; i GT tenth; i = i / 2)
+   {
+      ESA_DIAG_printf(groplist->comp, 6,                /@ WS10078T @/
+               "Before CTSASTO OBTAIN 1 size =%d",      /@ WS10078T @/
+                i);                                     /@ WS10078T @/
+      first_block = NULL;
+      ESA_DIAG_printf(groplist->comp, 6,
+                      "size = %d / %x", i, i);
+      sto_msg[0] = NULL_CHAR;
+      int_rc = ctsasto("OBTAIN",
+                       &i,
+                       &first_block,
+                       &sto_sp,
+                       &sto_key,
+                       &sto_loc,
+                       &sto_msg,
+                       &sto_msg_size,
+                       &dbglvl);
+      if (int_rc NE 0)
+       {
+        ESA_DIAG_printf(groplist->comp, 6,              /@ WS10078T @/
+         "After CTSASTO OBTAIN  1 rc=%d errmsg=<%s>",   /@ WS10078T @/
+         int_rc, sto_msg);                              /@ WS10078T @/
+        if (int_rc EQ 8) continue;   /@ if getmain failed, retry @/
+        else break;                  /@ else, error. @/
+       }
+
+      if (first_block NE NULL)
+      {
+         strncpy(first_block->ruoheyec, ruobeyec, 4);  /@WS10076A@/
+         first_block->ruohnext = NULL;
+         first_block->ruohlen  = i;
+         first_block->ruohsp = sto_sp;
+         first_block->ruohkey = sto_key;
+         first_block->ruohloc = sto_loc;
+         first_block->ruohdlen = 0;
+         current_block = first_block;
+         ESA_DIAG_printf(groplist->comp, 6,
+                  "first_block at %p - length = %d", first_block, i);
+         break;                                        /@WS10076A@/
+      }
+   }
+
+   if (first_block EQ NULL)
+   {
+      msg_buff[0] = NULL_CHAR;
+      CTSAMSG_print(ERR_INTERNAL2,
+                    msgs, msg_buff, NULL, component,
+                    func, sto_msg,
+                    int_rc, __LINE__ );
+
+      msg_buff[0] = NULL_CHAR;
+      CTSAMSG_print(ERR_MALLOC,
+                    msgs, msg_buff,NULL ,
+                   "first RUOB area", i);
+      send_msg(INSUFFICIENT_STORAGE, msg_buff,
+               groplist->comp, msgs, dest);
+      rc = ESA_FATAL;
+      goto exit;
+   }
+        end of removed code  - BS10111   */
+
+  /*
+   *    Loop which calls IRXEXCOM and adds each stem line
+   *    to the current RUOB block . . . . until EOF.
+   */
+
+   for (stem_line_num = 1; rc EQ ESA_OK; stem_line_num++)
+   {
+      memset (stem_var_name, 0X00, sizeof(stem_var_name));
+      strcpy(stem_var_name, argv[1]);
+      strcat(stem_var_name, ".");
+      sprintf(stem_var_num, "%d", stem_line_num);
+      strcat(stem_var_name, stem_var_num);
+      ESA_DIAG_printf(groplist->comp, 20,
+                      "call IRXEXCOM to get %s", stem_var_name);
+
+      first_shvblk.shvnext = NULL;
+      first_shvblk.shvuser = 0;
+      first_shvblk.shvcode = shvfetch;
+      first_shvblk.shvret  = 0x00;
+      first_shvblk.shvbufl = sizeof(stem_line);
+      first_shvblk.shvnama = stem_var_name;
+      first_shvblk.shvnaml = strlen(stem_var_name);
+      first_shvblk.shvvala = stem_line;
+      first_shvblk.shvvall = 0;
+
+      shvrc = irxexcom(eye_c, &p2, &p2, &first_shvblk);
+      ESA_DIAG_printf(groplist->comp, 20,
+                      "IRXEXCOM shvrc = %d   shvret = %1X",
+                      shvrc, first_shvblk.shvret);
+
+      if ( (shvrc EQ 0) AND (first_shvblk.shvret EQ shvclean) )
+      {
+         stem_line[first_shvblk.shvvall] = NULL_CHAR;
+                                              /* append terminator */
+         ESA_DIAG_printf(groplist->comp, 20,
+                         "length = %d   line = |%s|",
+                         first_shvblk.shvvall, stem_line);
+
+         if (groplist->ignore_list NE NULL)
+         {
+            int_rc = Should_Line_Be_Ignored(stem_line,
+                                        first_shvblk.shvvall,
+                                        groplist->ignore_list,
+                                        groplist->comp);
+            if (int_rc EQ TRUE) continue;
+         }
+
+        /* BS10111 - the code below is removed becasue the line
+                     is passed to CTSARUH which handles the RUOB
+        /@
+         *    The following check will avoid an 'endless loop' of
+         *    malloc requests which will very quickly end in an
+         *    'out of storage' abend condition.  This should never
+         *    occur but we will now check whether the returned stem
+         *    line length is greater that the total size of the
+         *    current block (minus the header length).
+         @/
+         if (first_shvblk.shvvall GT current_block->ruohlen - _ruohlen)
+         {
+            rc = ESA_FATAL;
+            msg_buff[0] = NULL_CHAR;
+            CTSAMSG_print(ERR_INTERNAL2,
+                          msgs, msg_buff, NULL, component,
+                          func, "Stem line length GT block length",
+                          rc, __LINE__ );
+            say(msg_buff, 1, groplist->comp);
+            goto exit;
+         };
+
+        /@
+         *    Now, we must determine whether there is enough room
+         *    in the current RUOB block to fit this new stem line.
+         *    The calculation question is: Does the top number
+         *    fit into (LE) the bottom number:
+         *    top:    data_used_until_now + size_of_this_stem_line + 1
+         *    bottom: total_current_block_len - header_length
+         @/
+         if ( (current_block->ruohdlen + first_shvblk.shvvall + 1)
+              LE
+              (current_block->ruohlen - _ruohlen) )
+         {
+            line = (REXX@UTL_output_line_rec_typ *)
+                   (&current_block->ruodata + current_block->ruohdlen);
+            ESA_DIAG_printf(groplist->comp, 20,
+                      "first block line = %p", line);
+            line->ruollen = first_shvblk.shvvall;
+            memcpy(&line->ruoldata, stem_line, line->ruollen);
+            current_block->ruohdlen = current_block->ruohdlen +
+                                      line->ruollen + 1;
+         }
+         else
+         {
+            sto_msg_size = sizeof(sto_msg);
+            for (i = current_block->ruohlen; i GT tenth; i = i / 2)
+            {
+               ESA_DIAG_printf(groplist->comp, 6,         /@ WS10078T @/
+               "Before CTSASTO OBTAIN 2 size =%d",        /@ WS10078T @/
+                i);                                       /@ WS10078T @/
+               next_block = NULL;
+               sto_msg[0] = NULL_CHAR;
+               int_rc = ctsasto("OBTAIN",
+                                &i,
+                                &next_block,
+                                &sto_sp,
+                                &sto_key,
+                                &sto_loc,
+                                &sto_msg,
+                                &sto_msg_size,
+                                &dbglvl);
+               if (int_rc NE 0)
+                ESA_DIAG_printf(groplist->comp, 6,        /@ WS10078T @/
+                "After CTSASTO OBTAIN 2: rc=%d msg=<%s>", /@ WS10078T @/
+                int_rc, sto_msg);                         /@ WS10078T @/
+                 if (int_rc EQ 8) continue; /@ if obtain failed, retry@/
+                 else break;                /@ else, error. @/
+
+               if (next_block NE NULL)
+               {
+                  current_block->ruohnext = next_block;
+                  strncpy(next_block->ruoheyec,ruobeyec,4);/@WS10076A@/
+                  next_block->ruohlen  = i;
+                  next_block->ruohsp = sto_sp;
+                  next_block->ruohkey = sto_key;
+                  next_block->ruohloc = sto_loc;
+                  next_block->ruohdlen = 0;
+                  current_block = next_block;
+                  ESA_DIAG_printf(groplist->comp, 6,
+                      "next_block at %p - length = %d", next_block, i);
+                  break;                                  /@WS10076A@/
+               }
+            }
+
+            if (next_block EQ NULL)
+            {
+              msg_buff[0] = NULL_CHAR;
+              CTSAMSG_print(ERR_INTERNAL2,
+                            msgs, msg_buff, NULL, component,
+                            func, sto_msg,
+                            int_rc, __LINE__ );
+
+              say(msg_buff, 1, groplist->comp);
+
+              msg_buff[0] = NULL_CHAR;
+              CTSAMSG_print(ERR_MALLOC,
+                            msgs, msg_buff,NULL ,
+                           "next RUOB area", i);
+              send_msg(INSUFFICIENT_STORAGE, msg_buff,
+                       groplist->comp, msgs, dest);
+              rc = ESA_FATAL;
+              goto exit;
+            }
+
+            line = (REXX@UTL_output_line_rec_typ *)
+                   (&current_block->ruodata + current_block->ruohdlen);
+            ESA_DIAG_printf(groplist->comp, 20,
+                      "next block line = %p", line);
+            line->ruollen = first_shvblk.shvvall;
+            memcpy(&line->ruoldata, stem_line, line->ruollen);
+            current_block->ruohdlen = current_block->ruohdlen +
+                                      line->ruollen + 1;
+         }
+            end of removed code    - BS10111 */
+
+         /*                                                * BS10111 *
+          *    Call CTSARUH to put the stem line in        * BS10111 *
+          *    the RUOB                                    * BS10111 *
+          */                                              /* BS10111 */
+         int_rc = p_ctsaruh(CTSARUH_REQ_PUT,              /* BS10111 */
+                            &aruh_handle,                 /* BS10111 */
+                            first_block,                  /* BS10111 */
+                            stem_line,                    /* BS10111 */
+                            &first_shvblk.shvvall,        /* BS10111 */
+                            groplist->RUOB_size,          /* BS10111 */
+                            &cmnprms->ruob_utkn,          /* BS10111 */
+                            &dbglvl,                      /* BS10111 */
+                            CTSARUH_DBGTYPE_PRTDBG,       /* BS10111 */
+                            msg_buff, &msg_buff_len,      /* BS10111 */
+                            &msg_len);                    /* BS10111 */
+         ESA_DIAG_printf(groplist->comp, 20,              /* BS10111 */
+             "CTSARUH (%s) returned with rc = %d",        /* BS10111 */
+             CTSARUH_REQ_PUT, int_rc);                    /* BS10111 */
+         if (int_rc NE 0)                                 /* BS10111 */
+         {                                                /* BS10111 */
+           if (msg_len NE 0)                              /* BS10111 */
+             say(msg_buff, 1, groplist->comp);            /* BS10111 */
+           else                                           /* BS10111 */
+           {                                              /* BS10111 */
+             msg_buff[0] = NULL_CHAR;                     /* BS10111 */
+             sprintf(errmsg,                              /* BS10111 */
+              "CTSARUH (%s) rc = %d  (line = %d - %s)",   /* BS10111 */
+               CTSARUH_REQ_PUT, int_rc,                   /* BS10111 */
+               first_shvblk.shvvall, stem_line);          /* BS10111 */
+             CTSAMSG_print(ERR_INTERNAL2,                 /* BS10111 */
+                           msgs, msg_buff, NULL,          /* BS10111 */
+                           component, func,               /* BS10111 */
+                           errmsg, rc, __LINE__ );        /* BS10111 */
+             say(msg_buff, 1, groplist->comp);            /* BS10111 */
+           }                                              /* BS10111 */
+                                                          /* BS10111 */
+           rc = ESA_FATAL;                                /* BS10111 */
+           goto exit;                                     /* BS10111 */
+         };                                               /* BS10111 */
+      }
+      else if ( (shvrc EQ 0) AND (first_shvblk.shvret EQ shvnewv) )
+      {
+         stem_line[first_shvblk.shvvall] = NULL_CHAR;
+                                              /* append terminator */
+         ESA_DIAG_printf(groplist->comp, 20,
+                         "length = %d   line = |%s|",
+                         first_shvblk.shvvall, stem_line);
+         if (strcmp(stem_line, stem_var_name) EQ 0)
+         {
+            rc=ESA_EOF;
+         }
+      }
+      else
+      {
+         rc = ESA_FATAL;
+         msg_buff[0] = NULL_CHAR;
+         sprintf(errmsg,"IRXEXCOM shvrc = %d   shvret = %1X",
+                 shvrc, first_shvblk.shvret);
+         CTSAMSG_print(ERR_INTERNAL2,
+                       msgs, msg_buff, NULL, component,
+                       func, errmsg, rc, __LINE__ );
+         say(msg_buff, 1, groplist->comp);
+         send_msg(shvrc, NULL, groplist->comp, msgs, dest);
+         goto exit;
+      }
+   } /* end of for (stem_line_num = 1; rc = ESA_OK; stem_line_num++) */
+
+  /*
+   *    Return to caller
+   */
+
+   exit:   /* when we get here, rc should be ESA_EOF or ESA_FATAL  */
+
+   /* IS10184  - start */
+   if (p_rtn  NE NULL)        /* id we fetched irxexcom- relesae it */
+   {
+     ESA_DIAG_printf(groplist->comp, 20,
+               "Release IRXEXCOM. addr = %8X", irxexcom);
+     int_rc = release((void(*)())irxexcom);
+     if (int_rc NE 0)
+        ESA_DIAG_printf(groplist->comp, 0,
+               "Release of IRXEXCOM failed. rc = %d", int_rc);
+   };
+   /* IS10184  - end   */
+
+   /*                                                      * BS10111 *
+    *    Call CTSARUH to free tha handle, if needed.       * BS10111 *
+    */                                                    /* BS10111 */
+   if (aruh_handle NE NULL)                               /* BS10111 */
+   {                                                      /* BS10111 */
+     int_rc = p_ctsaruh(CTSARUH_REQ_TERMIO,               /* BS10111 */
+                        &aruh_handle,                     /* BS10111 */
+                        NULL, NULL, NULL, NULL, NULL,     /* BS10111 */
+                        &dbglvl, CTSARUH_DBGTYPE_PRTDBG,  /* BS10111 */
+                        msg_buff, &msg_buff_len,          /* BS10111 */
+                        &msg_len);                        /* BS10111 */
+     ESA_DIAG_printf(groplist->comp, 20,                  /* BS10111 */
+         "CTSARUH (%s) returned with rc = %d",            /* BS10111 */
+         CTSARUH_REQ_TERMIO, int_rc);                     /* BS10111 */
+     if (int_rc NE 0)                                     /* BS10111 */
+     {                                                    /* BS10111 */
+       if (msg_len NE 0)                                  /* BS10111 */
+         say(msg_buff, 1, groplist->comp);                /* BS10111 */
+       else                                               /* BS10111 */
+       {                                                  /* BS10111 */
+         msg_buff[0] = NULL_CHAR;                         /* BS10111 */
+         sprintf(errmsg,                                  /* BS10111 */
+                 "CTSARUH (%s) rc = %d",                  /* BS10111 */
+                  CTSARUH_REQ_TERMIO, int_rc);            /* BS10111 */
+         CTSAMSG_print(ERR_INTERNAL2,                     /* BS10111 */
+                       msgs, msg_buff, NULL,              /* BS10111 */
+                       component, func,                   /* BS10111 */
+                       errmsg, rc, __LINE__ );            /* BS10111 */
+         say(msg_buff, 1, groplist->comp);                /* BS10111 */
+       }                                                  /* BS10111 */
+     };                                                   /* BS10111 */
+   };
+
+   if (rc EQ ESA_EOF)
+   {
+      /*  BS10111 - the code below is removed because we do not
+       *            free unused area above the bar.
+      if (current_block NE NULL)
+      {
+        i = current_block->ruohdlen +          /@ dec by 1 WS10078T @/
+            sizeof(REXX@UTL_output_blk_rec_typ)-1;      /@ used len @/
+        i = ( (i + 7) / 8 ) * 8;   /@ ...on doubleword boundary     @/
+        ESA_DIAG_printf(groplist->comp, 6,
+            "last block: len = %d  dlen = %d   used = %d   left = %d",
+            current_block->ruohlen, current_block->ruohdlen,
+            i, current_block->ruohlen - i);
+        /@ if more than 1 page was not used - free it @/
+        if (current_block->ruohlen - i  GE 4096)
+        {
+          addr_for_free = (char *)current_block + i;
+          i = current_block->ruohlen - i;
+          sto_sp = current_block->ruohsp;
+          sto_key = current_block->ruohkey;
+          sto_loc = current_block->ruohloc;
+          sto_msg[0] = NULL_CHAR;
+          ESA_DIAG_printf(groplist->comp, 6,              /@ WS10078T @/
+           "Before CTSASTO RELEASE unused ptr=%p size=%d",/@ WS10078T @/
+              addr_for_free,i);                           /@ WS10078T @/
+          int_rc = ctsasto(
+                          "RELEASE",
+                          &i,
+                          &addr_for_free,
+                          &sto_sp,
+                          &sto_key,
+                          &sto_loc,
+                          &sto_msg,
+                          &sto_msg_size,
+                          &dbglvl);
+          ESA_DIAG_printf(groplist->comp, 6,
+              "free unused area:  addr = %p   length = %d   rc = %d",
+              addr_for_free, i, int_rc);
+          if (int_rc EQ 0)
+          {
+            current_block->ruohlen = current_block->ruohlen - i;
+            ESA_DIAG_printf(groplist->comp, 6,
+              "last block after free: len = %d  dlen = %d",
+               current_block->ruohlen, current_block->ruohdlen);
+          }
+          else
+          {
+            ESA_DIAG_printf(groplist->comp, 6,            /@ WS10078T @/
+              "CTSASTO RELEASE unused: rc=%d msg=<%s>",   /@ WS10078T @/
+              int_rc,sto_msg);                            /@ WS10078T @/
+             msg_buff[0] = NULL_CHAR;
+             CTSAMSG_print(ERR_INTERNAL2,
+                           msgs, msg_buff, NULL, component,
+                           func, sto_msg,
+                           int_rc, __LINE__ );
+             say(msg_buff, 1, groplist->comp);
+             rc=ESA_FATAL;
+          }
+        }
+      }
+
+      if (rc NE ESA_FATAL)
+      {
+          end of removed code  -  BS10111  */
+
+        rc = ESA_OK;
+        /* BS10111 *(groplist->RUOBptr) = first_block;   */
+        memcpy(groplist->RUOBptr, first_block, 8);        /* BS10111 */
+      /* BS10111 }    */
+   }
+   /* BS10111 else if (rc EQ ESA_FATAL)   */
+   else    /* we should get here only when ESA_FATAL so     BS10111 */
+           /* whatever rc we get, we consider it as FATAL   BS10111 */
+   {
+   /*  BS10111 - the code below is removed. We will call CTSARUH
+                 to free the blocks.
+
+   /@ The following block of code is almost identical to the code in
+      the ESA_CLI_del_RUOB routine in CTSCCLI.  We are not using that
+      routine because we did not want to include CTSCCLI and all of
+      its required routines into the CTSCGRO load module.            @/
+
+      current_block = first_block;
+      sto_msg_size = sizeof(sto_msg);
+      while (current_block NE NULL)
+      {
+         next_block = current_block->ruohnext;
+         if (strncmp(current_block->ruoheyec, ruobeyec, 4) NE 0)
+         {
+            msg_buff[0] = NULL_CHAR;
+            CTSAMSG_print(ERR_INTERNAL2,
+                          msgs, msg_buff, NULL, component,
+                          func, "RUOB eyecatcher does not match",
+                          rc, __LINE__ );
+            say(msg_buff, 1, groplist->comp);
+            break;
+         }
+
+         sto_sp = current_block->ruohsp;
+         sto_key = current_block->ruohkey;
+         sto_loc = current_block->ruohloc;
+         sto_msg[0] = NULL_CHAR;
+         int_rc = ctsasto(
+                          "RELEASE",
+                          &(current_block->ruohlen),
+                          &current_block,
+                          &sto_sp,
+                          &sto_key,
+                          &sto_loc,
+                          &sto_msg,
+                          &sto_msg_size,
+                          &dbglvl);
+         if (int_rc NE 0)
+         {
+            ESA_DIAG_printf(groplist->comp, 6,            /@ WS10078T @/
+              "CTSASTO RELEASE         rc=%d msg=<%s>",   /@ WS10078T @/
+              int_rc,sto_msg);                            /@ WS10078T @/
+            msg_buff[0] = NULL_CHAR;
+            CTSAMSG_print(ERR_INTERNAL2,
+                          msgs, msg_buff, NULL, component,
+                          func, sto_msg,
+                          int_rc, __LINE__ );
+            say(msg_buff, 1, groplist->comp);
+            rc=ESA_FATAL;
+            goto exit;
+         }
+         current_block = next_block;
+      }
+         end of removed code - BS10111  */
+     /*                                                    * BS10111 *
+      *   If error, free the RUOB already allocted         * BS10111 *
+      */                                                  /* BS10111 */
+     int_rc = p_ctsaruh(CTSARUH_REQ_FREERUOB,             /* BS10111 */
+                        NULL, first_block,                /* BS10111 */
+                        NULL, NULL, NULL, NULL,           /* BS10111 */
+                        &dbglvl, CTSARUH_DBGTYPE_PRTDBG,  /* BS10111 */
+                        msg_buff, &msg_buff_len,          /* BS10111 */
+                        &msg_len);                        /* BS10111 */
+     ESA_DIAG_printf(groplist->comp, 20,                  /* BS10111 */
+         "CTSARUH (%s) returned with rc = %d",            /* BS10111 */
+         CTSARUH_REQ_FREERUOB, int_rc);                   /* BS10111 */
+     if (int_rc NE 0)                                     /* BS10111 */
+     {                                                    /* BS10111 */
+       if (msg_len NE 0)                                  /* BS10111 */
+         say(msg_buff, 1, groplist->comp);                /* BS10111 */
+       else                                               /* BS10111 */
+       {                                                  /* BS10111 */
+         msg_buff[0] = NULL_CHAR;                         /* BS10111 */
+         sprintf(errmsg,                                  /* BS10111 */
+                "CTSARUH (%s) rc = %d",                   /* BS10111 */
+                CTSARUH_REQ_FREERUOB, int_rc);            /* BS10111 */
+         CTSAMSG_print(ERR_INTERNAL2,                     /* BS10111 */
+                       msgs, msg_buff, NULL,              /* BS10111 */
+                       component, func,                   /* BS10111 */
+                       errmsg, rc, __LINE__ );            /* BS10111 */
+         say(msg_buff, 1, groplist->comp);                /* BS10111 */
+       }                                                  /* BS10111 */
+     };                                                   /* BS10111 */
+
+     rc = ESA_FATAL;
+   }
+
+   ESA_DIAG_exit(groplist->comp, 1, func, rc);
+
+   ESA_DIAGR_terminate(handle);                           /* WS10082N */
+
+   exit_nodiag:
+
+   return rc;
+
+ }
+
+
+
+/****************************************************
+ * Procedure Name: get_token_addr
+ *
+ * Description   : Check entered header ptr, convert to ptr form
+ *
+ * Input         : ctsa_token
+ *
+ * Output        : groplist ptr
+ *
+ * Return Value  : ESA_OK, ESA_ERR
+ *
+ * Called by     : CTSCGRO
+ *
+ * Calls to      : OS_MVS_checksum
+ *
+ ***************************************************/
+
+ static ESA_RC get_token_addr(char        * token,
+                              OS_GRO_typ ** groplist)
+ {
+
+  /*
+   *   Variables
+   */
+
+   int                     l;
+   ESA_RC                  rc=ESA_OK;
+   int                     c_symb;
+   int                     chk_symb;
+   void                  * header_ptr;
+   int                     header_ptr_i;
+   char                    local_token[10];
+   OS_GRO_typ            * chk_ptr;
+
+   static char func[] = "get_token_addr";
+
+  /*
+   *   Initialize
+   */
+
+   l=strlen(token);      /* length of char ptr + control symbol */
+   if ( l LE 1 )         /* length must be GT 1                 */
+   {
+      rc = ESA_ERR;
+      goto exit;
+   }
+
+   strcpy(local_token,token);
+   c_symb=local_token[l-1];    /* control symbol */
+   local_token[l-1]=NULL_CHAR;
+
+  /*
+   *   Check valid/no ptr to header structure
+   */
+
+   rc = OS_MVS_checksum(local_token,&chk_symb);
+   if ( rc NE ESA_OK )
+   {
+      rc = ESA_ERR;
+      goto exit;
+   }
+
+  /*
+   *   Ptr to header structure err
+   */
+
+   if (c_symb NE chk_symb)
+   {
+      rc = ESA_ERR;
+      goto exit;
+   }
+
+  /*
+   *   Convert char ptr to header structure to ptr form
+   */
+
+   sscanf(local_token,"%x",&header_ptr_i);
+
+   header_ptr = (void *)header_ptr_i;
+   if ( header_ptr EQ NULL )
+   {
+       rc=ESA_ERR;
+       goto exit;
+   }
+
+   *groplist = (OS_GRO_ptr) header_ptr ;
+
+  /*
+   *    Eye catcher checking
+   */
+
+   chk_ptr = (OS_GRO_ptr) header_ptr ;
+   if ( memcmp(chk_ptr->eyecatcher,
+               GRO_EYECATCHER, 4) NE 0 )
+   {
+       rc=ESA_ERR;
+       goto exit;
+   }
+
+
+   exit:
+
+   return rc;
+
+ }
+
+
+/******************************************************************
+ * Procedure Name: Should_Line_Be_Ignored
+ ******************************************************************
+ * Description   : This routine decides whether the stem line passed
+ *                 to it should be ignored or not. The decision is
+ *                 based on an 'ignore' list which is also passed
+ *                 to the routine.
+ *
+ * Input         : stem line
+ *                 stem line length
+ *                 ignore list
+ *
+ * Output        : none
+ *
+ * Return Value  : TRUE (ignore) or FALSE (do not ignore)
+ ******************************************************************/
+static int Should_Line_Be_Ignored(
+                       char                            * stem_line,
+                       int                               stem_line_len,
+                       REXX@UTL_output_ignlist_rec_typ * ignore_list,
+                       ESA_DIAG_COMP_typ                 comp)
+{
+  static char func[] = "Should_Line_Be_Ignored";
+
+  int      Ignore_The_Line = FALSE;
+  int      i, j;
+  int      rcc = 0;
+
+  ESA_DIAG_enter(comp, 20, func);
+
+  /******************************************************************/
+  /*  The decision whether an input line should be ignored or not   */
+  /*  is done in this manner:                                       */
+  /*  1. Loop from one ignore list entry to the next until reaching */
+  /*     an entry with ignlen = 0.  Once we reached this entry, the */
+  /*     input line should not be ignored.                          */
+  /*  2. If ignlen is GT the size of the entire input line, go on   */
+  /*     to the next ignore list entry.                             */
+  /*  3. If an ignore list entry has ignfull=x'ff', check if every  */
+  /*     character of the input line matches this igntext character */
+  /*     If it does, the input line should be ignored.  If it does  */
+  /*     not, go on to the next ignore list entry.                  */
+  /*  4. The normal/standard check: Compare igntext for a length of */
+  /*     ignlen against the input line. If there is a match, the    */
+  /*     input line should be ignored. If there is no match, go on  */
+  /*     to the next ignore list entry.                             */
+  /*                                                                */
+  /******************************************************************/
+
+  ESA_DIAG_printf(comp, 20,
+                  "length = %d   line = |%s|",
+                  stem_line_len, stem_line);
+
+  for (i=0; ignore_list[i].ignlen NE 0; i++)
+  {                         /* loop until end of list - step 1 above */
+     if (ignore_list[i].ignlen GT stem_line_len) continue;
+                                                     /* step 2 above */
+     if (ignore_list[i].ignfull EQ 0xFF)             /* step 3 above */
+     {
+        for (j=0; j LT stem_line_len; j++)
+        {
+           if (ignore_list[i].igntext[0] NE stem_line[j])
+              break;
+        }
+        if (j GE stem_line_len) /* every stem_line character matched */
+        {
+           Ignore_The_Line = TRUE;
+           break;
+        }
+     }
+     else
+       if (strncmp(stem_line, ignore_list[i].igntext, /* step 4 above */
+                              ignore_list[i].ignlen) EQ 0)
+       {
+          Ignore_The_Line = TRUE;
+          break;
+       }
+  }
+
+  exit:
+  ESA_DIAG_printf(comp, 20, "The stem line %s be ignored",
+                  Ignore_The_Line ? "will" : "will not");
+
+  ESA_DIAG_exit(comp, 20, func, Ignore_The_Line);
+  return Ignore_The_Line;
+}
+
+
+
+/****************************************************
+ * Procedure Name: say
+ * Description   : say service
+ *
+ * Input         : 1.msg        -  ptr to msg
+ *               : 2.diag       -  TRUE - diags env. exists.
+ *               :                 FALSE - no diags env.
+ *
+ * Output        : none
+ * Return Value  : none
+ *
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+ static void say(char              * msg,
+                 int                 diag,
+                 ESA_DIAG_COMP_typ   comp)
+ {
+
+   static char func[] = "say";
+   static char cmd_name[] = "CTSASAY ";                   /* IS10094 */
+
+  /*
+   *   Variables
+   */
+
+   struct tso_buff_struct
+   {
+       int  len;
+       char cmd[256];
+   } tso_buff;
+   char tso_cmd[]="CMD     ";
+   int  tso_r15, tso_rc, tso_rs, tso_ab;
+   int  tso_dbg = 0;
+
+  /*
+   *   Initialize
+   */
+
+   if (diag)                                            /* SAS2IBMN */
+   {
+     ESA_DIAG_enter(comp, 1, func);
+     tso_dbg = ESA_DIAG_get_debug_level(comp);
+   }
+
+  /*
+   *   Issue message
+   */
+
+   sprintf(tso_buff.cmd,"%s%.*s",                         /* IS10094 */
+           cmd_name,                                      /* IS10094 */
+           sizeof(tso_buff.cmd)-strlen(cmd_name)-1, msg); /* IS10094 */
+   tso_buff.len = strlen(tso_buff.cmd);
+   tso_r15 = (*(ASM_RTN_TYP *)&OS_DYNAM_call)             /* SAS2IBMT */
+                          ("CTSATSO ", 1, tso_cmd, &tso_rc,
+                           &tso_rs, &tso_ab, &tso_dbg, &tso_buff);
+   if (diag)                                           /* SAS2IBMN */
+     ESA_DIAG_printf(comp, 1,
+                   "CTSATSO r15=%d, rc=%d, rs=%d, ab=%d",
+                   tso_r15, tso_rc, tso_rs, tso_ab  );
+
+  /*
+   *   Finish
+   */
+
+   if (diag)                                            /* SAS2IBMN */
+     ESA_DIAG_exit(comp, 1, func, ESA_OK );
+
+   return;
+
+ }
+
+
+
+/****************************************************
+ * Procedure Name: send_msg
+ * Description   : Send error msg
+ * Input         : 1.rc
+ *                 2.additional message
+ *                 4.msgs  - ptr to msgs header
+ *                 5.dest  - ptr to dest
+ * Output        : none
+ *
+ * called by     : create_rexx_var
+ *
+ * calls to      : ESA_DIAG_enter
+ *                 ESA_DIAG_exit
+ *
+ * Return Value  : none
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+static void   send_msg(ESA_RC                      rc,
+                       char                       *msg,  /* SAS2IBMN */
+                       ESA_DIAG_COMP_typ           comp,
+                       CTSAMSG_HANDLE_rec_ptr      msgs,
+                       CTSAMSG_DEST_TABLE_rec_ptr  dest)
+
+ {
+
+   static char func[] = "send_msg";
+   char       *msg_code;
+
+   /*
+    *    Variables
+    */
+
+    CTSAMSG_MSG_typ msg_buff;
+
+   /*
+    *    Start of code
+    */
+
+    ESA_DIAG_enter(comp, 1, func );
+
+    msg_code = get_msg_code( rc ) ;
+    msg_buff[0] = NULL_CHAR;
+    CTSAMSG_print(OS_CS_ENV_ERR, msgs, msg_buff, NULL,
+                  "CTSCGRO", rc, msg_code);
+    say(msg_buff, 1, comp);
+    if (msg NE NULL)       /* issue additional message               */
+      say(msg, 1, comp);
+
+    ESA_DIAG_exit(comp, 1, func , ESA_OK );
+
+    return ;
+
+ }
+
+
+
+/****************************************************
+ * Procedure Name: get_msg_code
+ * Description   : Translate return codes to string
+ * Input         : shvrc
+ * Output        :
+ * Return Value  : char *
+ ****************************************************/
+
+static char * get_msg_code(int rc )
+{
+
+   switch ( rc )
+   {
+     case shvtrunc             :   return "SHV_TRUNC_VALUE"        ;
+     case shvbadf              :   return "SHV_INVALID_FUNCTION"   ;
+     case shvbadv              :   return "SHV_INVALID_VALUE"      ;
+     case shvnewv              :   return "SHV_NO_VAR"             ;
+     case shvbadn              :   return "SHV_INVALID_VAR"        ;
+     case shvrcist             :   return "IRX_NOTENOUGH_STORAGE"  ;
+     case shvrcinv             :   return "IRX_INVALID_ENTRY_COND" ;
+     case IRXRC_NO_LE          :   return "IRXRC_NO_LE"            ;
+     case IRXRC_INVALID_PARMS  :   return "IRXRC_INVALID_PARMS"    ;
+     case FETCH_FAILED         :   return "FETCH_FAILED"           ;
+     /* BS10111
+     case UNKNOWN_PARM         :   return "UNKNOWN_PARM"           ;
+     case INSUFFICIENT_STORAGE :   return "INSUFFICIENT_STORAGE"   ; */
+     case IRXRC_VARIABLE_ERROR :   return "IRXRC_VARIABLE_ERROR"   ;
+     default                   :   return "UNDEFINED"              ;
+   }
+
+}
+
+/*                 WS10082  - start
+ *   Provide msgs (handle) and dest addresses to CTSAMSG.  *
+ *   These routines are called by CTSAMSG_print_direct     *
+ *   when called with handle=0 or dest=CTSAMSG_FIND_DEST   */
+CTSAMSG_HANDLE_rec_typ     * CS_get_ctsamsg_handle()
+{
+   return (msgs);
+}
+
+CTSAMSG_DEST_TABLE_rec_typ * CS_get_ctsamsg_dest()
+{
+   return (dest);
+}
+/*                  WS10082  - end                         */
