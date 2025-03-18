@@ -1,0 +1,4429 @@
+/**************************************************************
+*                                                             *
+* Title            : Get user information (RACF)              *
+*                                                             *
+* File Name        : ctsrgus.c                                *
+*                                                             *
+* Author           : Alexander Shvartsman                     *
+*                                                             *
+* Creation Date    : 29/03/94                                 *
+*                                                             *
+* Description      :                                          *
+*                                                             *
+* Assumptions and                                             *
+*   Considerations :                                          *
+*                                                             *
+**************************************************************/
+
+/**************************************************************
+* Mod.Id   Who      When     Description                      *
+* -------- -------- -------  -------------------------------- *
+* ASH01    Alex     26/12/94  Set passwd_life field in users  *
+*                             structure to PASS_LIFE_IGNORE   *
+* AS0602   Alex     06/02/95  Change field name REVOKE_STATUS *
+*                                          to   REVOKED       *
+* AS1902   Alex     19/02/95  Change debug component name for *
+*                             EXTRACTOR.                      *
+* DC1005   Doron    10/05/95  Set def_ug_action for returned  *
+*                             users to OLD_DEF_UG_ACT_IGNORED *
+* r0003    Doron    28/05/95  Use malloc for output line      *
+*                                                             *
+* AS0309   Alex     03/09/95  Add DEBUG prints                *
+*                                                             *
+* spr163   Alex     05/09/95  Support Download restart        *
+*                                                             *
+* spr...   Alex     05/09/95  Correct Support Download restart*
+* spr...   Alex     03/01/96  New emplamantation of restart   *
+* ps0004   Alex     09/10/96  Adjust to new common code       *
+* ps0008   Alex     10/10/96  New form of wild info(without *)*
+*                                                             *
+* BS2022   Alex     23/07/97  Added Revoke Flag examining     *
+* ps0174   Alex     05/08/97  Revoke Flag examining algorithm *
+*                             improvement                     *
+*                             compatability with old version  *
+*                             of Agent(INFO.INTERVAL=INTERVAL)*
+* ps0292   AS       23/07/98  Digital certificate support     *
+* BS2403   AlexS    18/10/99  Racf 2.8 Download of entire     *
+*                             database does not return all    *
+*                             users to ESS database           *
+* PS0436   ShmuelK  07/11/00  support for racf 2.10 irrmulti  *
+* BS2703   yonim    26/03/06 Support Multi subgroup keyword   *
+* BS2714   yonim    13/09/06 Update Issure format             *
+* BS2717   YoniMa   04/10/06 Add parm for addinfo allocation. *
+* WS10004  AvnerL   05/06/07 Extend ICHEINTY & add SUBGROUP3  *
+* BS10006  MeirS    28/08/07 REVOKE/RESUME for z/os 1.7       *
+* BS10008  avnerl   25/03/08 1 more parm to RACF_Extract      *
+* IS10076  NuritY   31/01/13 Support Custom Fields.           *
+* IS10100  NuritY   29/07/13 Support CTSA internal custom     *
+*                            fields (CTSACFs) and revoke      *
+*                            reason.                          *
+* WS10043  NuritY   06/01/14 Enhance locked accounts support  *
+*                            to display the revoke reason.    *
+* WS10053  SeligT   26/05/16 Support RACDCERT MAP Display     *
+* SAS2IBMT SeligT   30/06/16 SAS/C to IBM C Conversion Project*
+* SAS2IBMN NuritY   08/02/17 SAS/C to IBM C Conversion Project*
+* CIQ#6    SeligT   19/03/17 Account Aggr includes Conns      *
+* IS10160  NuritY   18/09/17 Add GROUPS alwyas to laddinfo    *
+*                            and copy to addinfo when needed. *
+* IS10161  MeirS    09/11/17 remove calling to CTSRVRS rtns   *
+* WS10070  KailasP  07/03/18 Support connection attributes    *
+* IS10179  SeligT   28/03/19 If IIQ schema (input addinfo)    *
+*                            does not contain any DCERT       *
+*                            keywords, bypass all digital     *
+*                            certificate processing           *
+* IS10181  SeligT   06/06/19 Display Message When ADDINFO     *
+*                            Value Is Too Large - No Change;  *
+*                            Recompile Because of Larger      *
+*                            RACF_OUTPUT_SIZE                 *
+* BS10101  AvnerL   15/07/19 S0C4 due to WS10070.             *
+* WS10081  ThomaS   27/06/21 MFA support                      *
+* IS10185  AvnerL   22/08/22 Recomp with CTSRRCF              *
+* WS10082  MauriC   24/11/22 Update per ADDINFO new structure *
+* WS10082K KailasP  08/05/23 Initialise variable to NULL      *
+* WS10082N NuritY   08/05/23 Update per ADDINFO new structure *
+**************************************************************/
+
+ /*
+  *   Standard include files
+  */
+
+ #include   <globs.h>
+ #include   STDIO
+ #include   STDLIB
+ #include   STRING
+ #include   TIME            /* BS2022 */
+ #include   CTYPE           /* BS2403 */
+
+ /*
+  *   ESA include files
+  */
+
+ #include   ESA_API
+ #include   ESA_DIAG
+ #include   ESA_CTSAMSG
+ #include   ESA_API_CODES
+
+ #include   MVS_COMP
+ #include   MVS_CODES                                     /* IS10076 */
+
+ #include   RACF_CODES
+ #include   RACF
+
+ /* WS10070 - start */
+ #define NO_OF_SYS_ACCESS  4
+ #define err_string        "Failed to locate %s attribute for group %s"
+ /* WS10070 - end */
+/*
+ *  A list of special keywords :
+ *
+ *  When extracting information from RACF data base
+ *  the values of the keywords below will be putted in the local
+ *  addinfo, and copied from one to USER_PARAMS structure and
+ *  general returned addinfo area
+ */
+
+ static char  *spec_keywords[]={"USERID","DFLTGRP","REVOKED",
+                    "SPECIAL","AUDITOR",
+                    "REVOKE_DATE",                /* ps0174 */
+                    "RESUME_DATE",                /* ps0174 */
+                    "INTERVAL",                   /* ps0174 */
+                    "GROUPS",                     /* IS10160 */
+                    "GROUPS.SPECIAL",             /* WS10070 */
+                    "GROUPS.AUDITOR",             /* WS10070 */
+                    "GROUPS.OPERATIONS",          /* WS10070 */
+                    "OPERATIONS",                 /* WS10070 */
+                    "ROAUDIT",                    /* WS10070 */
+                    DIG_CERT_INDEX_FIELD,         /* ps0292 */
+                    "DCERT.PROFILE",              /* ps0292 */
+                    "DCERT.CREATE_DATE",          /* ps0292 */
+                    "DCERT.OWNER",                /* ps0292 */
+                    "DCERT.TRUST",                /* ps0292 */
+                    "DCERT.APPLDATA",             /* ps0292 */
+                    DIG_CERT_DATA_FIELD,          /* ps0292 */
+                    "%%NMAPCT",                  /* WS10053 */
+                    "DCERTMAP.LABEL",            /* WS10053 */
+                    "DCERTMAP.TRUST",            /* WS10053 */
+                    "DCERTMAP.OWNER",            /* WS10053 */
+                    "DCERTMAP.FILTER",           /* WS10053 */
+                    "MFA.FACTORS",               /* WS10081 */
+                    "MFA.ACTIVE",                /* WS10081 */
+                    "MFA.TAGS",                  /* WS10081 */
+                                "" };
+ /* Del by ps0292 static short spec_keywords_number = 20 ;  */
+ /* BS2717   static short spec_keywords_number = 100 ;*/  /* ps0292 */
+ /************************ BS2717 ***********************************
+    spec_keywords_number is set now by parameter
+    LOCAL_ADDINFO_SPEC_KW# in RSSPARM.
+    If not set in RSSPARM its default value is 300.
+    Notice that it includes digital certificate pairs, in addition
+    to the other special keywords.
+
+    digital_keywords_number is used for allocating dgt_addinfo.
+    The value of this parameter is set as the number of fields that
+    were added in fix ps0292 without field DIG_CERT_INDEX_FIELD .
+    Whenever more digital_cert fields are added to code, this value
+    needs to be updated accordingly.
+  End of BS2717 note */
+/*
+ static short   digital_keywords_number = 6 ;         BS2717 */
+ static short   digital_keywords_number = 11;     /* WS10053 */
+ static int     dcert_present;                            /* IS10179 */
+
+ static char component[]="GTUSERS";
+
+ static char get_connection;  /* 2 b used in internal routines CIQ#6 */
+
+/*
+ *     Entry structure
+ */
+
+ #define USR_EYECATCHER         "USR "
+
+ typedef struct S_ENTRY    {
+    char   eyecatcher[4];              /* eyecatcher 'USR'          */
+    char   entry_name[RCF_USER_NAME_LEN+2] ;  /* + place for *,eol   */
+    char   entry_prefix[RCF_USER_NAME_LEN+2] ;/* + place for *,eol   */
+    char   wild_op_code[10];            /* locate/next (for wild)    */
+    short  wild_flag;                   /* prefix with(*)=1,else=0   */
+    short  entry_prefix_len ;           /* prefix len (for wild)     */
+    short  entry_ind ;                  /* index of prefix (for wild)*/
+    ADDINFO_rec_ptr   laddinfo ;        /* local addinfo             */
+    ADDINFO_rec_ptr   dgt_addinfo ;     /* local addinfo  ps0292     */
+    char   func_name[10];               /* program name              */
+ } ENTRY_typ , *ENTRY_ptr ;
+
+/*
+ *   Assembler user information extraction routine
+ */
+
+ /* SAS2IBMT typedef and prototype changed for IBM C
+ extern int ctsfrlu (char                     * option,
+                     char                     * entry_type,
+                     char                     * entry,
+                     int                      * generic_flag,
+                     RACF_OUTPUT_LINE_rec_typ * output,
+                     int                      * debug,
+                     int                      * rc_racf,
+                     int                      * reason_code,
+                     char                     * sep);                */
+ extern int ctsfrlu ();                                   /* SAS2IBMT */
+
+/*
+ *   Assembler routine. Extract digital certificate info
+ *   ps0292
+ */
+
+ /* SAS2IBMT typedef and prototype changed for IBM C
+ extern int ctsfdgt (char                     * option,
+                     char                     * entry_type,
+                     char                     * entry,
+                     int                      * generic_flag,
+                     char                     * volume,
+                     char                     * unit,
+                     RACF_OUTPUT_LINE_rec_typ * output,
+                     int                      * debug,
+                     int                      * rc_racf,
+                     int                      * reason_code,
+                     char                     * sep);                */
+ extern int ctsfdgt ();                                   /* SAS2IBMT */
+
+ static int debug=0;      /* debug level for extractor*/
+
+/*
+ *   Routine for mode=all
+ */
+
+ /* SAS2IBMT typedef and prototype changed for IBM C
+ static ESA_RC do_all(RACF_ACCESS_PROG       racfprg,                */
+ static ESA_RC do_all(ASM_RTN_TYP           *racfprg,     /* SAS2IBMT */
+                  RACF_OUTPUT_LINE_rec_ptr    output,
+                  ENTRY_typ                 * entry,
+                  short                       num_users_in,
+                  USER_PARAMS_rec_typ         user_params_in[1],
+                  short                       max_users,
+                  short                     * actual_num,
+                  HAVE_MORE_typ             * have_more,
+                  USER_PARAMS_rec_typ         user_params[1],
+                  ADDINFO_rec_ptr             addinfo[1],
+                  OBJ_EXISTS_typ              obj_exist[1],
+   /* IS10076     CTSAMSG_HANDLE_rec_typ     * msgs,      */
+   /* IS10076     CTSAMSG_DEST_TABLE_rec_typ * dest);     */
+   /* IS10076  */ ADMIN_PARAMS_rec_typ       * admin_params);
+
+/*
+ *   Routine for mode=many
+ */
+
+ /* SAS2IBMT typedef and prototype changed for IBM C
+ static ESA_RC do_many(RACF_ACCESS_PROG      racfprg,                */
+ static ESA_RC do_many(ASM_RTN_TYP          *racfprg,     /* SAS2IBMT */
+                 RACF_OUTPUT_LINE_rec_ptr     output,
+                 ENTRY_typ                  * entry,
+                 short                        max_users,
+                 short                      * actual_num,
+                 HAVE_MORE_typ              * have_more,
+                 short                        num_users_in,
+                 USER_PARAMS_rec_typ          user_params_in[1],
+                 USER_PARAMS_rec_typ          user_params[1],
+                 ADDINFO_rec_ptr              addinfo[1],
+                 OBJ_EXISTS_typ               obj_exist[1],
+  /* IS10076     CTSAMSG_HANDLE_rec_typ     * msgs,      */
+  /* IS10076     CTSAMSG_DEST_TABLE_rec_typ * dest);     */
+  /* IS10076  */ ADMIN_PARAMS_rec_typ       * admin_params);
+
+/*
+ *   Rotuine for mode=wild
+ */
+
+ /* SAS2IBMT typedef and prototype changed for IBM C
+ static ESA_RC do_wild(RACF_ACCESS_PROG      racfprg,                */
+ static ESA_RC do_wild(ASM_RTN_TYP          *racfprg,     /* SAS2IBMT */
+                 RACF_OUTPUT_LINE_rec_ptr     output,
+                 ENTRY_typ                  * entry,
+                 short                        max_users,
+                 short                      * actual_num,
+                 HAVE_MORE_typ              * have_more,
+                 short                        num_users_in,
+                 USER_PARAMS_rec_typ          user_params_in[1],
+                 USER_PARAMS_rec_typ          user_params[1],
+                 ADDINFO_rec_ptr              addinfo[1],
+                 OBJ_EXISTS_typ               obj_exist[1],
+  /* IS10076     CTSAMSG_HANDLE_rec_typ     * msgs,      */
+  /* IS10076     CTSAMSG_DEST_TABLE_rec_typ * dest);     */
+  /* IS10076  */ ADMIN_PARAMS_rec_typ       * admin_params);
+/*
+ *   Routine to get information from RACF database
+ */
+
+/* SAS2IBMT typedef and prototype changed for IBM C
+static ESA_RC do_it_get(RACF_ACCESS_PROG           racfprg,          */
+static ESA_RC do_it_get(ASM_RTN_TYP              * racfprg, /*SAS2IBMT*/
+                        char                       *opcode,
+                        RACF_OUTPUT_LINE_rec_ptr    output,
+                        ENTRY_typ                  *entry,
+                        RACF_FLAG_typ               locate_err_flag,
+                        CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                        CTSAMSG_HANDLE_rec_ptr      msgs);
+
+
+/*
+ *   Routine to put information in additional info
+ */
+
+ static ESA_RC do_it_put(int                         i,
+                         ENTRY_typ                  *entry,
+                         RACF_OUTPUT_LINE_rec_ptr    output,
+                         USER_PARAMS_rec_typ         user_params[1],
+                         ADDINFO_rec_ptr             addinfo[1],
+          /* IS10076     CTSAMSG_HANDLE_rec_typ     * msgs,      */
+          /* IS10076     CTSAMSG_DEST_TABLE_rec_typ * dest);     */
+          /* IS10076  */ ADMIN_PARAMS_rec_typ       * admin_params);
+/*
+ *   Check handle value
+ */
+
+ static ESA_RC check_handle(ENTRY_typ                  ** entry,
+                            void                       ** handle,
+                            CTSAMSG_DEST_TABLE_rec_typ  * dest,
+                            CTSAMSG_HANDLE_rec_typ      * msgs,
+                   ADMIN_PARAMS_rec_typ * admin_params); /* BS2717 */
+/*
+ *   Internal subroutines for wild request
+ */
+
+ static ESA_RC get_next_prefix(ENTRY_typ             *entry,
+                               USER_PARAMS_rec_typ   user_params_in[1],
+                               HAVE_MORE_typ         *have_more,
+                               short                 num_users_in,
+                               CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                               CTSAMSG_HANDLE_rec_ptr      msgs);
+
+ static ESA_RC get_wild_entry(ENTRY_typ         * entry,
+                              USER_PARAMS_rec_typ user_params_in[1],
+                              CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                              CTSAMSG_HANDLE_rec_ptr      msgs);
+
+ static void RevokeFlagExamining(ADDINFO_rec_ptr           addinfo,
+                 /* ps0174 */    ADDINFO_rec_ptr           laddinfo,
+                               USER_PARAMS_rec_typ       * user_params,
+                /* IS10100 */  int                       * rvkflg_set,
+                               CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                               CTSAMSG_HANDLE_rec_ptr      msgs);
+ /* ps0174 */
+ static void Update_ret_addinfo(ADDINFO_rec_ptr     addinfo,
+                                char               *revoke_date,
+                                char               *resume_date);
+
+ /* ps0174 */
+ static void Copy_to_ret_addinfo(ADDINFO_rec_ptr             addinfo,
+                                 ADDINFO_rec_ptr             laddinfo,
+                                 CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                   /* IS10160 */ CTSAMSG_HANDLE_rec_ptr      msgs);
+                   /* IS10160    CTSAMSG_HANDLE_rec_ptr      msgs,
+                                 int      GROUPS_inserted);  * CIQ#6 */
+
+ /* ps0292 */
+ static void Dig_cert_processing(ADDINFO_rec_ptr            addinfo,
+                                 ADDINFO_rec_ptr            laddinfo,
+                                 ADDINFO_rec_ptr            dgt_addinfo,
+                                 char                     * user,
+                                 RACF_OUTPUT_LINE_rec_ptr   output,
+                  /* IS10076     CTSAMSG_HANDLE_rec_typ     * msgs,*/
+                  /* IS10076     CTSAMSG_DEST_TABLE_rec_typ * dest);*/
+                  /* IS10076  */ ADMIN_PARAMS_rec_typ  * admin_params);
+
+ /* ps0292 */
+static ESA_RC Dig_cert_extract (RACF_OUTPUT_LINE_rec_ptr    output,
+                        char                       *dig_cert_profile,
+                        RACF_FLAG_typ               locate_err_flag,
+                        CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                        CTSAMSG_HANDLE_rec_ptr      msgs);
+
+ /* WS10053 */
+static ESA_RC Dig_nmap_extract (RACF_OUTPUT_LINE_rec_ptr    output,
+                        char                       *dig_cert_profile,
+                        RACF_FLAG_typ               locate_err_flag,
+                        CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                        CTSAMSG_HANDLE_rec_ptr      msgs);
+
+ /* ps0292 */
+static void   Dig_cert_put(int                         i,
+                           char                      * dgt_profile,
+                           ADDINFO_rec_ptr             addinfo,
+                           ADDINFO_rec_ptr             laddinfo,
+                           ADDINFO_rec_ptr             dgt_addinfo,
+                           char                      * user,
+                           RACF_OUTPUT_LINE_rec_ptr    output,
+            /* IS10076     CTSAMSG_HANDLE_rec_typ     * msgs,      */
+            /* IS10076     CTSAMSG_DEST_TABLE_rec_typ * dest);     */
+            /* IS10076  */ ADMIN_PARAMS_rec_typ       * admin_params);
+
+ /* WS10053 */
+static void   Dig_nmap_put(int                         i,
+                           char                      * dgt_profile,
+                           ADDINFO_rec_ptr             addinfo,
+                           ADDINFO_rec_ptr             laddinfo,
+                           ADDINFO_rec_ptr             dgt_addinfo,
+                           char                      * user,
+                           RACF_OUTPUT_LINE_rec_ptr    output,
+                           ADMIN_PARAMS_rec_typ    * admin_params);
+
+ /* ps0292 */
+ static void Dig_cert_put_field(ADDINFO_rec_ptr          addinfo,
+                             char                      * keyword,
+                             char                      * value,
+                             CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                             CTSAMSG_HANDLE_rec_ptr      msgs);
+
+ /* ps0292 */
+ static void Dig_cert_set_mandatory(ADDINFO_rec_ptr             addinfo,
+                                    CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                                    CTSAMSG_HANDLE_rec_ptr      msgs);
+
+ /*  IS10100 - start  */
+static  ESA_RC Handle_Revoke_Reason(ESA_DIAG_COMP_typ     comp,
+                                  char                   *cf_name,
+                                  ONE_FIELD_rec_ptr       lpair,
+                                  ADDINFO_rec_ptr         addinfo,
+                                  ADDINFO_rec_ptr         laddinfo,
+                                  void                   *uparms,
+                                  ADMIN_PARAMS_rec_typ   *admin_params,
+                                  int                     args_num,
+                                  va_list                 args_list);
+
+static RACF_CTSACF_PROC_rec_typ  CTSACF_procrtn_table[] = {
+    LOCKED_ACCOUNT,  Handle_Revoke_Reason,
+    NONE,            NULL
+  };
+ /*  IS10100 - end    */
+
+ /* WS10070 - start */
+static void Add_conn_attr(ONE_FIELD_rec_ptr           pair,
+                          ADDINFO_rec_ptr             laddinfo,
+                          ONE_FIELD_rec_ptr           grp_pair,
+                          CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                          CTSAMSG_HANDLE_rec_ptr      msgs);
+ /* WS10070 - end */
+
+/*Add structure with only keyword & value for local vars - WS10082A */
+typedef struct {
+   char       keyword [MAX_RSS_ADDINFO_KWD_LEN+1];
+   char       value   [ADDINFO_16K_VAL_LEN+1];
+} local_pair;
+/*********************** end of WS10082A ****************************/
+
+/****************************************************
+ * Procedure Name: CTSGetUsers
+ * Description   : Get one, two, many or all users
+ * Input         : mode         - ALL,
+ *                                MANY (or one),
+ *                                WILD (wildcard - currently
+ *                                unimplemented)
+ *                 max_users    - # of elements in user_params,
+ *                                objs_exist and addinfo arrays
+ *                 num_users_in - # of elements in user_params_in
+ *                 user_params_in- array of num_users_in, filled with
+ *                                users requested.
+ *                 admin_params -
+ *                 get_conn     - get connection - 'Y'/'N'  // CIQ#6 //
+ * Output        : actual_num   - # of users returned
+ *                 have_more    - HAVE_MORE if more users, else NO_MORE
+ *                 err          - error indication, message, etc.
+ *                 objs_exist   - array of max_users:
+ *                                OBJ_EXIST if user exists, else
+ *                                OBJ_NOT_EXIST.
+ *                 user_params  - array of max_users:
+ *                                callee fills with users returned
+ *  Input/Output : addinfo      - array of max_users pointers:
+ *                                add.info per user, Caller puts
+ *                                requested keywords, callee returns
+ *                                actual add.info.
+ *                 handle       - NULL on first call, filled by callee,
+ *                                used by callee to keep track.
+ *                                Freed by caller.
+ * Return Value  : ESA_RC
+ * Side Effects  : Function may allocate memory, return pointer in
+ *                 *handle; Caller MUST free when done.
+ * Comments      : Caller must reset I/O params to their initial values
+ *                 when using subsequent calls (if HAVE_MORE).
+ ****************************************************/
+
+ ESA_RC CTSGetUsers (GET_USER_MODE         mode,
+                     OE_typ                oe,
+                     short                 max_users,
+                     short               * actual_num,
+                     HAVE_MORE_typ       * have_more,
+                     void               ** handle,
+                     short                 num_users_in,
+                     USER_PARAMS_rec_typ   user_params_in[1],
+                     USER_PARAMS_rec_typ   user_params[1],
+                     ADDINFO_rec_ptr       addinfo[1],
+                     OBJ_EXISTS_typ        objs_exist[1],
+                     ADMIN_PARAMS_rec_typ * admin_params,
+                     ERR_STRUCT_rec_typ   * err,
+                     char                   get_conn)       /* CIQ#6 */
+{
+
+ static char func[]="CTSGetUsers";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                     rc = ESA_OK ;
+ RACF_OUTPUT_LINE_rec_typ   * output = NULL;    /* r0003 */
+ ENTRY_typ                  * entry = NULL ;
+ CTSAMSG_HANDLE_rec_typ     * msgs;
+ CTSAMSG_DEST_TABLE_rec_typ * dest;
+ int                          i_dump;
+ int                          i_dcrt;           /* ps0292 */
+ ONE_FIELD_rec_ptr            pair;                       /* IS10179 */
+
+/*
+ *  Initialize
+ */
+
+ ESA_DIAG_enter(ESA_COMP_GTUSERS, 1, func );
+
+ debug = ESA_DIAG_get_debug_level(PLT_COMP_RCFUSR_EXT);
+
+ msgs = admin_params->ctsamsg_handle;
+ dest = admin_params->ctsamsg_dest;
+ *have_more = NO_MORE ;
+ *actual_num = 0 ;
+ get_connection = get_conn;                                 /* CIQ#6 */
+
+ ESA_DIAG_printf(ESA_COMP_GTUSERS,1,
+                 "mode=%d handle=%X max_users=%d get_conn=%c",
+                 mode, *handle, max_users,
+                 get_connection);                           /* CIQ#6 */
+
+/*                                                           IS10179
+ *    Does ADDINFO contain any DCERT keywords?               IS10179
+ */                                                       /* IS10179 */
+                                                          /* IS10179 */
+ pair = ADDINFO_prefix_search("DCERT",                    /* IS10179 */
+                       RCF_ADDINFO_KWD_LEN,               /* IS10179 */
+                       TRUE,                              /* IS10179 */
+                       addinfo[0]->pair,                  /* IS10179 */
+                       addinfo[0]->num_pairs);            /* IS10179 */
+ if (pair EQ NULL) {                                      /* IS10179 */
+    dcert_present = 0;                                    /* IS10179 */
+ /* ADDINFO_insert(TYPE_1A,"NODCERT",KWD_FLAG_ON,addinfo,    IS10179 */
+ /*                RCF_ADDINFO_KWD_LEN,                      IS10179 */
+ /*                RCF_ADDINFO_VAL_LEN,UNIQUE);              IS10179 */
+ /* ADDINFO_insert(TYPE_1A,"NODCERTMAP",KWD_FLAG_ON,addinfo, IS10179 */
+ /*                RCF_ADDINFO_KWD_LEN,                      IS10179 */
+ /*                RCF_ADDINFO_VAL_LEN,UNIQUE);              IS10179 */
+    ESA_DIAG_printf(ESA_COMP_GTUSERS, 1,                  /* IS10179 */
+             "DCERT keywords not found in i/p addinfo");  /* IS10179 */
+    }                                                     /* IS10179 */
+ else                                                     /* IS10179 */
+    dcert_present = 1;                                    /* IS10179 */
+
+/*
+ *    Check if handle was passed, if no create it
+ */
+
+ if ( mode NE GET_FREE_HANDLE_USERS ) {
+    rc = check_handle( &entry, handle , dest , msgs,
+                       admin_params);                  /* BS2717 */
+    if ( rc NE ESA_OK )
+       goto exit ;
+ }
+
+/*
+ *  Allocate output line buffer
+ */
+
+ output = (RACF_OUTPUT_LINE_rec_typ *)malloc(          /* r0003 */
+                 sizeof(RACF_OUTPUT_LINE_rec_typ) );   /* r0003 */
+ if (output EQ NULL) {                                 /* r0003 */
+    CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,        /* r0003 */
+                 "OUTPUT BUFFER",                      /* r0003 */
+                 sizeof(RACF_OUTPUT_LINE_rec_typ) );   /* r0003 */
+    CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,     /* r0003 */
+                 component, func, "MALLOC OUTPUT",     /* r0003 */
+                 8, __LINE__);                         /* r0003 */
+    rc = ESA_FATAL;                                    /* r0003 */
+    goto exit ;                                        /* r0003 */
+ }                                                     /* r0003 */
+
+/*
+ *    Execute according to mode
+ */
+
+ switch (mode) {
+
+      case GET_FREE_HANDLE_USERS :
+
+         if ( *handle NE NULL ) {
+            entry=(ENTRY_typ *)(*handle);
+            if (entry->laddinfo NE NULL)
+               ADDINFO_free(&(entry->laddinfo));
+            if (entry->dgt_addinfo NE NULL)             /* ps0292 */
+               ADDINFO_free(&(entry->dgt_addinfo));     /* ps0292 */
+            free(*handle) ;
+            *handle=NULL ;
+            entry=NULL;
+         }
+         goto exit ;
+         break ;
+
+      case GET_ALL_USERS  :
+
+ /* SAS2IBMT typedef and prototype changed for IBM C
+         rc=do_all(&ctsfrlu, output, entry, num_users_in,            */
+         rc=do_all((ASM_RTN_TYP *) &ctsfrlu,              /* SAS2IBMT */
+                   output, entry, num_users_in,
+                   user_params_in, max_users, actual_num,
+                   have_more, user_params, addinfo, objs_exist,
+     /* IS10076    dest, msgs) ;   */
+     /* IS10076 */ admin_params);
+         break ;
+
+      case GET_MANY_USERS :
+
+ /* SAS2IBMT typedef and prototype changed for IBM C
+         rc=do_many(&ctsfrlu, output, entry, max_users, actual_num,  */
+         rc=do_many((ASM_RTN_TYP *) &ctsfrlu,             /* SAS2IBMT */
+                    output, entry, max_users, actual_num,
+                    have_more, num_users_in, user_params_in,
+     /* IS10076     user_params, addinfo, objs_exist, dest, msgs); */
+     /* IS10076 */  user_params, addinfo, objs_exist, admin_params);
+         break ;
+
+      case GET_WILD_USERS :
+
+ /* SAS2IBMT typedef and prototype changed for IBM C
+         rc=do_wild(&ctsfrlu, output, entry,max_users,actual_num,    */
+         rc=do_wild((ASM_RTN_TYP *) &ctsfrlu,             /* SAS2IBMT */
+                    output, entry,max_users,actual_num,
+                    have_more, num_users_in, user_params_in,
+     /* IS10076     user_params, addinfo, objs_exist, dest, msgs); */
+     /* IS10076 */  user_params, addinfo, objs_exist, admin_params);
+         break ;
+
+      case GET_SUBTREE_USERS :
+
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                       func, "Not supported mode", mode,__LINE__) ;
+         rc=ESA_NOT_SUPP;
+         goto exit ;
+
+      default       :
+
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                       func, "Invalid mode", mode,__LINE__) ;
+         rc=ESA_FATAL;
+         goto exit ;
+
+ }
+
+/*
+ *  Set Dig Cert Mandatory fields
+ */
+
+ /* IS10179 Adding another check to the following if statement
+ if ( (rc EQ ESA_OK) AND ((*actual_num) GT 0) ) {              */
+ if ( (rc EQ ESA_OK) AND ((*actual_num) GT 0)
+                                   AND (dcert_present) ) { /* IS10179 */
+    for (i_dcrt=0; i_dcrt LT *actual_num; i_dcrt++) {
+      if (   objs_exist[i_dcrt] EQ OBJ_EXIST  )
+         Dig_cert_set_mandatory(addinfo[i_dcrt], dest, msgs);
+    }
+ }
+
+/*
+ *  Print diagnostic information
+ */
+
+ ESA_DIAG_printf(ESA_COMP_GTUSERS,1,
+                 "Max_users=%d actual num=%d", max_users, *actual_num);
+
+ if ( ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 1 ) {
+    for (i_dump=0; i_dump LT *actual_num; i_dump++) {
+      ESA_DIAG_printf(ESA_COMP_GTUSERS,0,
+        "User=%s exist=%d DFLTGRP=%s rev_status=%d user_admin=%d",
+                      user_params[i_dump].user,
+                      objs_exist[i_dump],
+                      user_params[i_dump].def_group,
+                      user_params[i_dump].rev_status,
+                      user_params[i_dump].user_admin);
+      if ( ( objs_exist[i_dump] EQ OBJ_EXIST ) AND
+           ( ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 2 ) )
+         ADDINFO_dump(addinfo[i_dump],0);
+    }
+ }
+
+/*
+ *  Finish
+ */
+
+ exit : ;
+
+/*
+ *  Set flags and handle
+ */
+
+ if ( (rc NE ESA_OK) OR (*have_more EQ NO_MORE) ) {
+    if ( *handle NE NULL ) {
+       entry=(ENTRY_typ *)(*handle);
+       if (entry->laddinfo NE NULL)
+          ADDINFO_free(&(entry->laddinfo));
+       if (entry->dgt_addinfo NE NULL)              /* ps0292 */
+          ADDINFO_free(&(entry->dgt_addinfo));      /* ps0292 */
+       free((*handle)) ;
+       *handle=NULL ;
+       entry=NULL ;
+    }
+    *have_more = NO_MORE ;
+ }
+
+/*
+ *  Free output line area
+ */
+
+ if (output NE NULL)                                   /* r0003 */
+    free (output);                                     /* r0003 */
+
+/*
+ *  Return to caller
+ */
+
+ ESA_DIAG_printf(ESA_COMP_GTUSERS, 1,
+                 "Exiting with rc = %d actual num=%d have_more=%d",
+                 rc,*actual_num,*have_more);
+
+ ESA_DIAG_exit(ESA_COMP_GTUSERS, 1, func, rc);
+
+ return rc ;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : do_all                                    *
+ *                                                             *
+ * DESCRIPTION     : Handle mode=all                           *
+ *                                                             *
+ * INPUT           : 1. racfprg  - Addr of RACF access program *
+ *                   2. output   - Output area for RACF        *
+ *                                 extractor                   *
+ *                   3. entry    - Entry structure             *
+ *                   4. max_users-Max count of return area     *
+ *                   5. dest     - Message destination ptr     *
+ *                   6. msgs     - Message handle ptr          *
+ *                                                             *
+ *                                                             *
+ * OUTPUT          : 1. user_params-Output area                *
+ *                   2. addinfo    - Addinfo                   *
+ *                   3. obj_exist  - Obj exist vector          *
+ *                   4. have_more  - Have_more parameter       *
+ *                   5. actual_num - Actual num                *
+ *                                                             *
+ * RETURN VALUE    : ESA_ERR   - end of database               *
+ *                   ESA_FATAL - serious error                 *
+ *                                                             *
+ **************************************************************/
+
+/* SAS2IBMT typedef and prototype changed for IBM C
+ static ESA_RC do_all(RACF_ACCESS_PROG        racfprg,               */
+ static ESA_RC do_all(ASM_RTN_TYP           * racfprg,    /* SAS2IBMT */
+                 RACF_OUTPUT_LINE_rec_ptr     output,
+                 ENTRY_typ                  * entry,
+                 short                        num_users_in,
+                 USER_PARAMS_rec_typ          user_params_in[1],
+                 short                        max_users,
+                 short                      * actual_num,
+                 HAVE_MORE_typ              * have_more,
+                 USER_PARAMS_rec_typ          user_params[1],
+                 ADDINFO_rec_ptr              addinfo[1],
+                 OBJ_EXISTS_typ               obj_exist[1],
+  /* IS10076     CTSAMSG_HANDLE_rec_typ     * msgs,      */
+  /* IS10076     CTSAMSG_DEST_TABLE_rec_typ * dest);     */
+  /* IS10076  */ ADMIN_PARAMS_rec_typ       * admin_params)
+{
+
+ /*
+  *    Variables
+  */
+
+  ESA_RC rc_all = ESA_OK ;
+  int    i=0 ;
+  static char func[]="do_all";
+
+  CTSAMSG_HANDLE_rec_ptr        msgs;                     /* IS10076 */
+  CTSAMSG_DEST_TABLE_rec_ptr    dest;                     /* IS10076 */
+
+ /*
+  *    Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_GTUSERS, 3, func);
+
+  msgs = admin_params->ctsamsg_handle;                    /* IS10076 */
+  dest = admin_params->ctsamsg_dest;                      /* IS10076 */
+
+  *have_more = HAVE_MORE ;
+
+  /* spr163 */
+
+  ESA_DIAG_printf(ESA_COMP_GTUSERS, 3,
+                  "entry->entry_name=%d/%s num_users_in=%d" ,
+                  strlen(entry->entry_name),
+                  entry->entry_name, num_users_in );
+
+  /* spr ... */
+  if ( num_users_in GT 1 )
+     CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                   component,func,
+                   "Invalid num_users_in parameter",
+                   num_users_in, __LINE__);
+
+  /*
+   * GET_ALL - continue process checking
+   */
+
+  /*
+   *   Start. Old implementation of get_all restart
+   *
+   *     if ( ( entry->entry_name[0] EQ ' ' )         AND
+   *          ( strlen(user_params_in[0].user) GT 0 ) AND
+   *            user_params_in[0].user[0] NE '*'        )
+   *        strcpy( entry->entry_name, user_params_in[0].user );
+   *
+   *   End. Old implementation of get_all restart
+   *
+   */
+
+  /*
+   *   New implamantation of get_all restart
+   */
+
+   if ( entry->entry_name[0] EQ ' ' )
+     if ( num_users_in EQ 1 )
+        strcpy( entry->entry_name, user_params_in[0].user );
+
+ /*
+  *    Loop on output users
+  */
+
+  i=0;
+  while (i LT max_users) {
+
+      ESA_DIAG_printf(ESA_COMP_GTUSERS, 3,           /* AS0309 */
+                      "Extracting user no. %d", i);
+
+      rc_all = do_it_get(racfprg, RACF_OPERATION_NEXT,
+                         output, entry, RACF_NO, dest, msgs);
+      if (rc_all NE ESA_OK) {
+         *have_more = NO_MORE ;
+         if ( rc_all EQ ESA_ERR )       /* ESA_ERR = End of DB */
+            rc_all =  ESA_OK ;
+         break ;
+      }
+
+      rc_all = do_it_put(i, entry, output, user_params,
+           /* IS10076    addinfo, dest, msgs) ;    */
+           /* IS10076 */ addinfo, admin_params);
+      if ( rc_all EQ ESA_OK ) {
+         obj_exist[i] = OBJ_EXIST ;
+         (*actual_num)++ ;
+         i++;
+      }
+      else                        /* internal error */
+         rc_all = ESA_OK;
+
+  } /* for - loop on users    */
+
+ /*
+  *    Finish
+  */
+
+  ESA_DIAG_exit(ESA_COMP_GTUSERS, 3, func, rc_all);
+
+  return rc_all  ;
+
+ }
+
+ /**************************************************************
+ *                                                              *
+ * Subroutine name : do_many                                    *
+ *                                                              *
+ * DESCRIPTION     : Handle mode=many                           *
+ *                                                              *
+ * INPUT           : 1. racfprg       - Addr of RACF access     *
+ *                                      program                 *
+ *                   2. output        - Output area for RACF    *
+ *                                      extractor               *
+ *                   3. entry         - Entry structure         *
+ *                   4. max_users     - Max count of return area*
+ *                   5. num_users_in  - Count of requested users*
+ *                   6. user_params_in - List of requested users*
+ *                   7. dest           - Message destination ptr*
+ *                   8. msgs           - Message handle ptr     *
+ *                                                              *
+ *                                                              *
+ * OUTPUT          : 1. user_params    - Output area            *
+ *                   2. addinfo        - Addinfo                *
+ *                   3. obj_exist      - Obj exist vector       *
+ *                   4. have_more      - Have_more parameter    *
+ *                   5. actual_num     - Actual num             *
+ *                                                             *
+ * RETURN VALUE    : ESA_RC                                    *
+ *                                                             *
+ ***************************************************************/
+
+/* SAS2IBMT typedef and prototype changed for IBM C
+ static ESA_RC do_many(RACF_ACCESS_PROG        racfprg,              */
+ static ESA_RC do_many(ASM_RTN_TYP           * racfprg,   /* SAS2IBMT */
+                    RACF_OUTPUT_LINE_rec_typ * output,
+                  ENTRY_typ                  * entry,
+                  short                        max_users,
+                  short                      * actual_num,
+                  HAVE_MORE_typ              * have_more,
+                  short                        num_users_in,
+                  USER_PARAMS_rec_typ          user_params_in[1],
+                  USER_PARAMS_rec_typ          user_params[1],
+                  ADDINFO_rec_ptr              addinfo[1],
+                  OBJ_EXISTS_typ               obj_exist[1],
+   /* IS10076     CTSAMSG_HANDLE_rec_typ     * msgs,      */
+   /* IS10076     CTSAMSG_DEST_TABLE_rec_typ * dest);     */
+   /* IS10076  */ ADMIN_PARAMS_rec_typ       * admin_params)
+ {
+
+  /*
+   *    Variables
+   */
+
+   ESA_RC rc_many;
+   int i ;
+   static char func[]="do_many";
+
+   CTSAMSG_HANDLE_rec_ptr        msgs;                     /* IS10076 */
+   CTSAMSG_DEST_TABLE_rec_ptr    dest;                     /* IS10076 */
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GTUSERS, 3, func);
+
+   msgs = admin_params->ctsamsg_handle;                    /* IS10076 */
+   dest = admin_params->ctsamsg_dest;                      /* IS10076 */
+
+   *have_more = HAVE_MORE ;
+
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 1,
+                   "num_users_in=%d",num_users_in);
+
+  /*
+   *    Loop on input users
+   */
+
+   for (i=0; i LT num_users_in ; i++ ) {
+
+      strcpy(entry->entry_name,user_params_in[i].user) ;
+
+      /***  Set USER_PARAMS defaults ***/
+
+      user_params[i].user[0]       = NULL_CHAR;
+      user_params[i].passwd_life   = PASS_LIFE_IGNORED;
+      user_params[i].def_ug_action = OLD_DEF_UG_ACT_IGNORED;
+      user_params[i].def_group[0]  = NULL_CHAR;
+      user_params[i].parent_oe[0]  = NULL_CHAR;
+      user_params[i].rev_status    = USER_STAT_ACTIVE;
+      user_params[i].user_admin    = USER_ADM_NONE;
+
+      strcpy(user_params[i].user,entry->entry_name) ;
+      (*actual_num)++ ;
+
+      ESA_DIAG_printf(ESA_COMP_GTUSERS, 3,
+                     "user %d, entry=%s", i,entry->entry_name);
+
+      rc_many = do_it_get(racfprg, RACF_OPERATION_LOCATE ,
+                       output, entry, RACF_NO, dest, msgs);
+
+      /* WS10081 - start */
+      if (ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 10)
+      {
+        SNAP_AREA("output after do_it_get", output,
+        sizeof(RACF_OUTPUT_LINE_rec_typ));
+      }
+      /* WS10081 - end   */
+
+      if ( rc_many EQ ESA_OK ) {
+         rc_many = do_it_put(i, entry, output, user_params,
+            /* IS10076       addinfo,dest,msgs);        */
+            /* IS10076 */    addinfo, admin_params);
+         if ( rc_many EQ ESA_OK )
+            obj_exist[i] = OBJ_EXIST ;
+         else  {                             /* Internal error */
+            rc_many = ESA_OK;
+            obj_exist[i] = OBJ_NOT_EXIST;
+         }
+      }
+
+      else if ( rc_many EQ ESA_ERR ) {       /* User not defined */
+         obj_exist[i] = OBJ_NOT_EXIST ;
+         rc_many = ESA_OK ;
+      }
+      else break ;                           /* Fatal error */
+
+   } /* for - loop on users    */
+
+   *have_more = NO_MORE ;
+
+  /*
+   *    Finish
+   */
+
+   ESA_DIAG_exit(ESA_COMP_GTUSERS, 3, func, rc_many);
+
+   return rc_many ;
+
+ }
+
+ /****************************************************************
+ *                                                               *
+ * Subroutine name : do_wild                                     *
+ *                                                               *
+ * DESCRIPTION     : Treatment request wild                      *
+ *                                                               *
+ * INPUT           : 1. racfprg        - Addr of RACF access     *
+ *                                       program                 *
+ *                   2. output         - Output area for RACF    *
+ *                                       extractor               *
+ *                   3. entry          - Entry structure         *
+ *                   4. max_users      - Max count of return area*
+ *                   5. num_users_in   - Count of requested users*
+ *                   6. user_params_in - List of requested users *
+ *                   7. dest           - Message destination ptr *
+ *                   8. msgs           - Message handle ptr      *
+ *                                                               *
+ * OUTPUT          : 1. user_params    - Output area             *
+ *                   2. addinfo        - Addinfo                 *
+ *                   3. obj_exist      - Obj exist vector        *
+ *                   4. have_more      - Have_more parameter     *
+ *                   5. actual_num     - Actual num              *
+ *                                                               *
+ * RETURN VALUE    : ESA_RC                                      *
+ *                                                               *
+ ****************************************************************/
+
+/* SAS2IBMT typedef and prototype changed for IBM C
+ static ESA_RC do_wild(RACF_ACCESS_PROG       racfprg,               */
+ static ESA_RC do_wild(ASM_RTN_TYP          * racfprg,    /* SAS2IBMT */
+                  RACF_OUTPUT_LINE_rec_ptr    output,
+                  ENTRY_typ                 * entry,
+                  short                       max_users,
+                  short                     * actual_num,
+                  HAVE_MORE_typ             * have_more,
+                  short                       num_users_in,
+                  USER_PARAMS_rec_typ         user_params_in[1],
+                  USER_PARAMS_rec_typ         user_params[1],
+                  ADDINFO_rec_ptr             addinfo[1],
+                  OBJ_EXISTS_typ              obj_exist[1],
+   /* IS10076     CTSAMSG_HANDLE_rec_typ     * msgs,      */
+   /* IS10076     CTSAMSG_DEST_TABLE_rec_typ * dest);     */
+   /* IS10076  */ ADMIN_PARAMS_rec_typ       * admin_params)
+ {
+
+  /*
+   *   Varaiables
+   */
+
+   ESA_RC    rc_wild=ESA_OK;
+   char      op_code[10];
+   int       i ;
+   RACF_FLAG_typ  send_err_msg;
+   static char func[]="do_wild";
+
+   CTSAMSG_HANDLE_rec_ptr        msgs;                     /* IS10076 */
+   CTSAMSG_DEST_TABLE_rec_ptr    dest;                     /* IS10076 */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GTUSERS, 3, func);
+
+   msgs = admin_params->ctsamsg_handle;                    /* IS10076 */
+   dest = admin_params->ctsamsg_dest;                      /* IS10076 */
+
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 1,
+                   "num_users_in=%d",num_users_in);
+
+   if ( num_users_in EQ 0 )
+      goto exit_no_more ;
+  /*
+   *   Handle first time
+   */
+
+   if (  entry->wild_op_code[0] EQ BLANK ) {
+      rc_wild=get_wild_entry(entry, user_params_in,dest,msgs) ;
+      if (  rc_wild NE ESA_OK )
+         goto exit_no_more ;
+
+   }
+
+  /*
+   *    Operation code for get wild processin:
+   *    1.  Start of prefix processing   -  locate
+   *    2.  Continue                     -  next
+   */
+
+   strcpy(op_code, entry->wild_op_code);
+
+   *have_more = HAVE_MORE;
+
+   i=0 ;
+   do {
+
+        /*
+         *  Each prefix can be - entry name and prefix too.
+         *  before scanning data base need check if defined
+         *  user with requested prefix. During this checking
+         *  not need issue error messages ( user not defined to RACF).
+         *
+         *  For instance :  prefix = n67*
+         *  In RACF database defined user = n67, n67a, n67b.
+         *  So, first entry can be found with 'locate' operation
+         *  and other with 'next' operation.
+         */
+
+       if (( strcmp(op_code,RACF_OPERATION_LOCATE) EQ 0 ) AND
+           ( entry->wild_flag EQ 1 ) )
+            send_err_msg=RACF_NO ;
+       else
+            send_err_msg=RACF_YES;
+
+       rc_wild= do_it_get(racfprg, op_code , output, entry,
+                          send_err_msg, dest, msgs);
+
+       ESA_DIAG_printf(ESA_COMP_GTUSERS,3,
+                      "wild entry=%s op_code=%s wild_flag=%d rc=%d",
+                      entry->entry_name,op_code,
+                      entry->wild_flag, rc_wild );
+
+       if ( rc_wild EQ ESA_FATAL )
+            goto exit_no_more ;
+
+      /*
+       *  wild_flag=0 means : entry_wild prefix was witout
+       *  '*' symbol. Valid only LOCATE operation.
+       */
+
+       if ( entry->wild_flag EQ 0 ) {
+
+         /*
+          *   User ( not wild prefix ) not found
+          */
+
+          if (rc_wild NE ESA_OK ) {
+              (*actual_num)++ ;
+
+             /*
+              *  Set USER_PARAMS defaults in case that
+              *  do_it_get failed ( user not found )
+              *  See also do_it_put prog.
+              */
+
+              user_params[i].user[0]       = NULL_CHAR;
+              user_params[i].passwd_life   = PASS_LIFE_IGNORED;
+              user_params[i].def_ug_action = OLD_DEF_UG_ACT_IGNORED;
+              user_params[i].def_group[0]  = NULL_CHAR;
+              user_params[i].parent_oe[0]  = NULL_CHAR;
+              user_params[i].rev_status    = USER_STAT_ACTIVE;
+              user_params[i].user_admin    = USER_ADM_NONE;
+
+              strcpy(user_params[i].user,entry->entry_name );
+              obj_exist[i] = OBJ_NOT_EXIST ;
+              i++;
+          }
+
+         /*
+          *   User ( not wild prefix ) found
+          */
+
+          else {
+
+              rc_wild=do_it_put(i, entry, output, user_params,
+                  /* IS10076    addinfo, dest, msgs) ;     */
+                  /* IS10076 */ addinfo, admin_params);
+              if ( rc_wild NE ESA_OK )  /* Internal error */
+                {
+                 rc_wild=ESA_OK;
+                 obj_exist[i] = OBJ_NOT_EXIST ;
+                }
+              else
+                obj_exist[i] = OBJ_EXIST ;
+
+              (*actual_num)++ ;
+              ESA_DIAG_printf(ESA_COMP_GTUSERS, 3,
+                         "user %d,entry=%s", i,entry->entry_name);
+              i++ ;
+          }
+
+          rc_wild=get_next_prefix(entry, user_params_in,
+                                  have_more, num_users_in,
+                                  dest,msgs ) ;
+          if ( ( *have_more EQ NO_MORE )  OR
+               ( rc_wild NE ESA_OK     )   )
+             goto exit ;
+          strcpy(op_code, entry->wild_op_code);
+          continue ;
+
+       }     /* wild_flag=0 */
+
+       /*
+        *    If was op_code = 'locate' and return code NE 0
+        *    need try again with operation code 'next'
+        */
+
+       if ( (strcmp(op_code,RACF_OPERATION_LOCATE) EQ 0) AND
+            (rc_wild NE ESA_OK      ) ) {
+
+            /*
+             *    Unseccessful locate.
+             *    Change op_code to 'next' and try again
+             */
+
+              strcpy(op_code,RACF_OPERATION_NEXT);
+              strcpy( entry->wild_op_code,RACF_OPERATION_NEXT);
+
+              continue ;
+        }
+
+       /*
+        *    Uncoditionally after first access need change
+        *    op_code to 'next' for scan RACF data base
+        */
+
+        strcpy(op_code,RACF_OPERATION_NEXT);
+        strcpy( entry->wild_op_code,RACF_OPERATION_NEXT);
+
+        if (   rc_wild EQ ESA_OK )  {
+
+          /*
+           *    Check if current entry name has required prefix
+           */
+
+           ESA_DIAG_printf(ESA_COMP_GTUSERS,3,
+                      "wild entry=%s prefix=%s len=%d",
+                      entry->entry_name, entry->entry_prefix,
+                      entry->entry_prefix_len);
+
+           if ( memcmp( entry->entry_name, entry->entry_prefix,
+                       entry->entry_prefix_len) EQ 0 ) {
+
+              rc_wild=do_it_put(i, entry, output, user_params,
+                  /* IS10076    addinfo, dest, msgs) ;   */
+                  /* IS10076 */ addinfo, admin_params);
+              if ( rc_wild NE ESA_OK )  /* Internal error */
+                 rc_wild=ESA_OK;
+              else {
+                (*actual_num)++ ;
+                obj_exist[i] = OBJ_EXIST ;
+                ESA_DIAG_printf(ESA_COMP_GTUSERS, 3,
+                               "user %d,entry=%s", i,entry->entry_name);
+                i++;
+              }
+           }
+
+          /*
+           *   Current entry name not include required prefix ,
+           *   get next prefix
+           */
+
+           else {
+              rc_wild=get_next_prefix(entry, user_params_in,
+                                      have_more, num_users_in,
+                                      dest,msgs ) ;
+              if ( ( *have_more EQ NO_MORE )  OR
+                   ( rc_wild NE ESA_OK     )   )
+                 goto exit ;
+              strcpy(op_code, entry->wild_op_code);
+           }
+       }        /* rc_wild  EQ ESA_OK */
+
+      /*
+       *   Entry name not found anyway ( locate/next op_code )
+       *   get next prefix
+       */
+
+       else if ( rc_wild NE ESA_FATAL ) {
+          rc_wild = get_next_prefix(entry, user_params_in, have_more,
+                                    num_users_in,dest,msgs) ;
+          if ( ( *have_more EQ NO_MORE ) OR ( rc_wild NE ESA_OK ) )
+             goto exit ;
+          strcpy(op_code, entry->wild_op_code);
+       } /* rc_wild EQ ESA_ERR */
+
+       else {
+           *have_more = NO_MORE ;
+           goto exit_no_more ;   /* Serious error       */
+       }
+
+   } while (i LT max_users);     /* for - loop on users  */
+   goto exit ;
+
+  /*
+   *   Finish
+   */
+
+   exit_no_more : ;
+
+      *have_more = NO_MORE;
+
+   exit : ;
+
+   ESA_DIAG_exit(ESA_COMP_GTUSERS, 3, func, rc_wild);
+
+   return rc_wild ;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : check_handle                              *
+ *                                                             *
+ * DESCRIPTION     : Check handle parameter                    *
+ *                   1.If NULL allocate memory and create      *
+ *                     entry strycture                         *
+ *                   2.IF not equal NULL addr.entry=addr handle*
+ *                                                             *
+ * INPUT           : 1. handle    -  handle ptr                *
+ *                   2. dest      -  msg dest ptr              *
+ *                   3. msgs      -  msgs handle ptr           *
+ *                   4. mode      -  mode parameter            *
+ *                                                             *
+ * OUTPUT          : 1. entry     -  entry structure ptr       *
+ *                                                             *
+ * CALLED BY       : gtusers                                   *
+ *                                                             *
+ * CALLS TO        : none                                      *
+ *                                                             *
+ * RETURN VALUE    : ESA_OK    - ok                            *
+ *                   ESA_FATAL - malloc() failed               *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC check_handle(ENTRY_typ                  ** entry,
+                            void                       ** handle,
+                            CTSAMSG_DEST_TABLE_rec_typ  * dest,
+                            CTSAMSG_HANDLE_rec_typ      * msgs,
+                       ADMIN_PARAMS_rec_typ * admin_params) /* BS2717 */
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC rc_check = ESA_OK ;
+   int    size = 0;
+   static char func[]="check_handle";
+
+  /* BS2717 begin */
+  ESA_RC  rc_get_parm = ESA_OK ;
+  short   spec_keywords_number ;
+  short   spec_keywords_number_default = 300 ;
+  char    parm_get[5] = " ";
+  /* BS2717 end */
+
+  RACF_PARAMS_rec_typ         * params_ptr;               /* IS10100 */
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GTUSERS, 3, func);
+   params_ptr = admin_params->apiinit_handle;             /* IS10100 */
+
+  /*
+   *   First time, obtain handle
+   */
+
+   size = sizeof(ENTRY_typ) ;
+   if ( *handle EQ NULL )
+   {
+      *handle = malloc(size);
+      if ( *handle EQ NULL )
+      {
+         CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest, "USER_HANDLE",
+                       size);
+         rc_check = ESA_FATAL ;
+         goto exit ;
+      }
+      *entry = *handle;
+
+      /*
+       *   Initialize entry structure variables
+       */
+
+      memcpy( (*entry)->eyecatcher,  USR_EYECATCHER ,4 );
+
+      memset( (*entry)->entry_name, BLANK, RCF_USER_NAME_LEN);
+      (*entry)->entry_name[RCF_USER_NAME_LEN] = NULL_CHAR ;
+      memset( (*entry)->entry_prefix, BLANK, RCF_USER_NAME_LEN);
+      (*entry)->entry_prefix[RCF_USER_NAME_LEN] = NULL_CHAR ;
+      memset( (*entry)->wild_op_code, BLANK, RCF_USER_NAME_LEN);
+      (*entry)->wild_op_code[RCF_USER_NAME_LEN] = NULL_CHAR ;
+
+      (*entry)->entry_ind        = 0 ;
+      (*entry)->entry_prefix_len = 0 ;
+      (*entry)->wild_flag        = 0 ;
+      (*entry)->laddinfo         = NULL ;
+      (*entry)->dgt_addinfo      = NULL ;          /*WS10082K*/
+      strcpy( (*entry)->func_name ,component );
+
+      /* BS2717 begin */
+      rc_get_parm =
+         admin_params->cs_func.rssprm_get_opt_ptr(
+                                             admin_params->rss_name,
+                                             "LOCAL_ADDINFO_SPEC_KW#",
+                                             sizeof(parm_get),
+                                             parm_get,
+                                             OPT_TRUE,
+                                             OPT_TRUE) ;
+      if (rc_get_parm EQ ESA_OK)
+           spec_keywords_number = atoi(parm_get) ;
+      else
+           spec_keywords_number = spec_keywords_number_default ;
+
+      /* BS2717 end */
+
+      /* IS10100 - start */
+      if (params_ptr->p_u_ctsacfs NE NULL)
+        spec_keywords_number += params_ptr->p_u_ctsacfs->num_of_entries;
+      /* IS10100 - end   */
+
+      /*   Allocate Local addinfo */
+
+      rc_check= ADDINFO_alloc(component,
+                              spec_keywords_number,
+                              &((*entry)->laddinfo),
+                              dest, msgs);
+      if (rc_check NE ESA_OK)
+      {
+          free( *handle ) ;
+          *handle=NULL;
+          rc_check=ESA_FATAL ;
+          goto exit;
+      }
+
+      /*   Allocate Local addinfo for digital certificate fields */
+
+      if (dcert_present) {                                /* IS10179 */
+        rc_check= ADDINFO_alloc(component,                 /* ps0292 */
+                     /* BS2717  spec_keywords_number, */   /* ps0292 */
+                                digital_keywords_number,   /* BS2717 */
+                                &((*entry)->dgt_addinfo),  /* ps0292 */
+                                dest, msgs);               /* ps0292 */
+        if (rc_check NE ESA_OK)                            /* ps0292 */
+        {
+            ADDINFO_free(&((*entry)->laddinfo));           /* ps0292 */
+            free( *handle ) ;                              /* ps0292 */
+            *handle=NULL;                                  /* ps0292 */
+            rc_check=ESA_FATAL ;                           /* ps0292 */
+            goto exit;                                     /* ps0292 */
+        }                                                  /* ps0292 */
+      }                                                   /* IS10179 */
+
+   }
+
+  /*
+   *   NO first time, move handle address to entry address
+   */
+
+   else
+   {
+        *entry = *handle ;
+
+       /*
+        *    Eye catcher checking
+        */
+
+        if ( memcmp( (*entry)->eyecatcher,
+                     USR_EYECATCHER ,4 ) NE 0 )
+        {
+           CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                         component,func,
+                         "Invalid handle", 16,__LINE__);
+           rc_check=ESA_ERR;
+           goto exit ;
+        }
+   }
+
+  /*
+   *   Finish
+   */
+
+   exit :;
+
+   ESA_DIAG_exit(ESA_COMP_GTUSERS, 3, func, rc_check );
+
+   return rc_check ;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : do_it_get                                 *
+*                                                             *
+* DESCRIPTION     : Extract information from RACF database    *
+*                                                             *
+* INPUT           : 1. racfprg - Addr of racf-access program  *
+*                   2. opcode  - Operation code(locate/next)  *
+*                   3. output  - Output area for extractor    *
+*                   4. entry   - Entry name                   *
+*                   5. locate_err_flag                        *
+*                   6. dest    - Message destination ptr      *
+*                   7. msgs    - Message handle ptr           *
+*                                                             *
+*                                                             *
+* OUTPUT          : 1. output  - Output area for extractor    *
+*                                                             *
+* RETURN VALUE    : racf_extract rc                           *
+*                                                             *
+**************************************************************/
+
+/* SAS2IBMT typedef and prototype changed for IBM C
+static ESA_RC do_it_get(RACF_ACCESS_PROG           racfprg,          */
+static ESA_RC do_it_get(ASM_RTN_TYP              * racfprg, /*SAS2IBMT*/
+                        char                       *opcode,
+                        RACF_OUTPUT_LINE_rec_ptr    output,
+                        ENTRY_typ                  *entry,
+                        RACF_FLAG_typ               locate_err_flag,
+                        CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                        CTSAMSG_HANDLE_rec_ptr      msgs)
+
+{
+
+ /*
+  *   Variables
+  */
+
+  ESA_RC rc_doit = ESA_OK ;
+  char   racf_entry[RCF_USER_NAME_LEN+1];
+  static char func[]="do_it_get";
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_GTUSERS, 3, func);
+
+ /*
+  *   Get the info
+  */
+
+  strcpy(racf_entry, entry->entry_name) ;
+  output->max_len  = RACF_OUTPUT_SIZE;
+  output->used_len = 0 ;
+/* SAS2IBMT typedef and prototype changed for IBM C
+  rc_doit = RACF_extract((RACF_ACCESS_PROG_E) racfprg,      *BS10008**/
+  rc_doit = RACF_extract(racfprg,                         /* SAS2IBMT */
+                         opcode, RACF_USER_PROFILE,
+                         racf_entry, 0, component, output, debug,
+                         locate_err_flag,  dest, msgs ,0);/*BS10008*/
+
+  racf_entry[RCF_USER_NAME_LEN] = NULL_CHAR ;
+
+  ESA_DIAG_printf(ESA_COMP_GTUSERS, 3,           /* AS0309 */
+                  "Extracted user=%s", racf_entry);
+
+  strcpy( entry->entry_name,racf_entry) ;
+
+ /*
+  *   Finish
+  */
+
+  exit : ;
+
+  ESA_DIAG_exit(ESA_COMP_GTUSERS, 3, func, rc_doit);
+
+  return rc_doit ;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : do_it_put                                 *
+ *                                                             *
+ * DESCRIPTION     : Put information to addinfo                *
+ *                                                             *
+ * INPUT           : 1. i       - Index of current entry name  *
+ *                   2. output  - Output area for extractor    *
+ *                   3. dest    - Message destination ptr      *
+ *                   4. msgs    - Message handle ptr           *
+ *                                                             *
+ *                                                             *
+ * OUTPUT          : 1. user_params - User_params structure    *
+ *                   2. addinfo     - Addinfo                  *
+ *                                                             *
+ * RETURN VALUE    : addinfo_alloc rc (if failed), or:         *
+ *                   racf_extract rc                           *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC do_it_put(int                         i,
+                         ENTRY_typ                  *entry,
+                         RACF_OUTPUT_LINE_rec_ptr    output,
+                         USER_PARAMS_rec_typ         user_params[1],
+                         ADDINFO_rec_ptr             addinfo[1],
+          /* IS10076     CTSAMSG_HANDLE_rec_typ     * msgs,      */
+          /* IS10076     CTSAMSG_DEST_TABLE_rec_typ * dest);     */
+          /* IS10076  */ ADMIN_PARAMS_rec_typ       * admin_params)
+
+ {
+
+ /*
+  *   Variables
+  */
+
+  ESA_RC            rc_doit = ESA_OK ;
+  static char       msg_buf[100];
+  static char       func[]="do_it_put";
+  int               found_lowercase_symbol;    /* BS2403 */
+  char             *wptr;                      /* BS2403 */
+  ONE_FIELD_rec_ptr pair;
+  ONE_FIELD_rec_ptr start_pair;                           /* IS10100 */
+  int               srch_lim;                             /* IS10100 */
+  ESA_RC            rc = ESA_OK ;                         /* IS10100 */
+
+  CTSAMSG_HANDLE_rec_ptr        msgs;                     /* IS10076 */
+  CTSAMSG_DEST_TABLE_rec_ptr    dest;                     /* IS10076 */
+  RACF_PARAMS_rec_typ         * params_ptr;               /* IS10076 */
+  int       rvkflg_set;                                   /* IS10100 */
+  /* IS10160
+  int       GROUPS_inserted;   * ind we added GROUPS addinfo   CIQ#6 *
+  */
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_GTUSERS, 3, func );
+
+  msgs = admin_params->ctsamsg_handle;                    /* IS10076 */
+  dest = admin_params->ctsamsg_dest;                      /* IS10076 */
+  params_ptr = admin_params->apiinit_handle;              /* IS10076 */
+
+ /*
+  *   Load information to addinfo
+  */
+
+ /* If Custom Fields are not supported, but ESS/IIQ   */   /* IS10076 */
+ /* requested them, issue a message.                  */   /* IS10076 */
+  if (params_ptr->rssparm_CUSTOM_FIELDS_SUPPORT[0] EQ 'N') /* IS10076 */
+  {                                                        /* IS10076 */
+    /*  IS10100 - start  */
+    /*
+    pair = ADDINFO_prefix_search("CSDATA.",                 * IS10076 *
+                          RCF_ADDINFO_KWD_LEN,              * IS10076 *
+                          TRUE,                             * IS10076 *
+                          addinfo[i]->pair,                 * IS10076 *
+                          addinfo[i]->num_pairs );          * IS10076 *
+                                                            * IS10076 *
+    if (pair EQ NULL)                                       * IS10076 *
+                                                                      */
+    /* IS10100 - end   */
+
+    pair = ADDINFO_search("NOCSDATA",                      /* IS10076 */
+                            RCF_ADDINFO_KWD_LEN,           /* IS10076 */
+                            addinfo[i]->pair,              /* IS10076 */
+                            addinfo[i]->num_pairs );       /* IS10076 */
+
+    /*  IS10100 - start                                               */
+    if (pair EQ NULL)
+    {
+      start_pair = addinfo[i]->pair;
+      srch_lim = addinfo[i]->num_pairs;
+
+      while (srch_lim  GT  0)
+      {
+       pair = ADDINFO_prefix_search("CSDATA.", RCF_ADDINFO_KWD_LEN,
+                                    TRUE, start_pair, srch_lim);
+       if (pair EQ NULL)
+         break;
+
+       rc = RACF_IsIt_CTSACF_cf(ESA_COMP_GTUSERS, 'U', NULL,
+                                &pair->keyword[7],
+                                NULL, NULL, NULL,
+                                admin_params);   /* CTSACF field ? */
+       if (rc NE ESA_OK)        /* No - out */
+         break;
+
+       /* WS10082N
+       start_pair = pair + 1;    /@ prepare to look for next...       @/
+       srch_lim = addinfo[i]->num_pairs -
+                    (start_pair - addinfo[i]->pair);                  */
+       srch_lim = addinfo[i]->num_pairs - (pair->index+1); /*WS10082N*/
+       start_pair = get_orig_pair(pair); /* So that we ...   WS10082N */
+       start_pair++;                     /* ..can do ++      WS10082N */
+       pair = NULL;
+      }
+    }
+    /* IS10100 - end    */
+                                                           /* IS10076 */
+    if (pair NE NULL)                                      /* IS10076 */
+      CTSAMSG_print(ERR_NOT_SUPP_DUE_RSSP_NO, msgs, NULL,  /* IS10076 */
+                    dest, "CSDATA. and NOCSDATA keywords", /* IS10076 */
+                    "CUSTOM_FIELDS_SUPPORT", "N");         /* IS10076 */
+  }                                                        /* IS10076 */
+
+  ESA_DIAG_printf(ESA_COMP_GTUSERS, 6,                 /*WS10082K*/
+                  "laddinfo - %p, addinfo[%d] - %p",   /*WS10082K*/
+                  entry->laddinfo, i,  addinfo[i]);    /*WS10082K*/
+
+  ADDINFO_empty( entry->laddinfo );
+  ADDINFO_clear( addinfo[i] );
+  /*WS10082K*/
+  if (ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 9) {
+     ESA_DIAG_printf(ESA_COMP_GTUSERS, 0,
+                               "laddinfo after addinfo clear");
+     ADDINFO_dump( entry->laddinfo, 1);
+     ESA_DIAG_printf(ESA_COMP_GTUSERS, 0,
+                            "Addinfo[i] after addinfo clear");
+     ADDINFO_dump( addinfo[i], 1);
+  }
+  /*WS10082K*/
+
+  /* IS10160 - start */
+  /*
+   * Replace CIQ#6 code:
+   * CIQ#6 added the GROUPS keyword to the addinfo because the
+   * assmebler routine cannot handle the received groups name
+   * because it is in lowercase. But, we do not know if we have a
+   * "spare" entry in addinfo for this.
+   * So, with IS10160 we add the GROUPS keyword to the local addinfo
+   * as a special keyword. Later, we will copy the value to the
+   * appropriate keywords in addinfo.
+   *
+   * GROUPS is hanlded as a special keyword. But, as its type is
+   * 1B, we have to add it here, because RACF_output_to_addinfo
+   * adds the keywords as type 1A.
+   *
+   * This is always done, regardless of the get_conn value.
+   * Later we decide whether to copy the GROUPS value to the
+   * addinfo accordsing to the get_conn value.
+   *
+
+   *
+   ***  CIQ#6 Start                                                ***
+   *
+   *    If input parameter, get_conn, is 'Y' and an ADDINFO entry
+   *    exists for 'groups' but does not exist for 'GROUPS', issue
+   *    an ADDINFO_insert for 'GROUPS' and set the GROUPS_inserted
+   *    field to 'on'.
+   *
+
+  GROUPS_inserted = 0;
+
+  if ((get_connection EQ 'Y') AND
+      (ADDINFO_search("GROUPS", RCF_ADDINFO_KWD_LEN,       * 'GROUPS' *
+                      addinfo[i]->pair, * ADDINFO entry doesn't exist *
+                      addinfo[i]->num_pairs) EQ NULL) AND
+      (ADDINFO_search("groups", RCF_ADDINFO_KWD_LEN,         * groups *
+                      addinfo[i]->pair,    * ADDINFO entry does exist *
+                      addinfo[i]->num_pairs) NE NULL)) {
+             ADDINFO_insert(TYPE_1B, "GROUPS","", addinfo[i],
+                            entry->laddinfo,
+                            RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                            UNIQUE);
+             GROUPS_inserted = 1;
+             ESA_DIAG_printf(ESA_COMP_GTUSERS,1,
+                    "Just did insert to GROUPS 1B ADDINFO entry");
+  }
+   ***  CIQ#6 End                                                  ***
+  end of removed code    */
+  ADDINFO_insert(TYPE_1B, "GROUPS","",
+                 entry->laddinfo,
+                 RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                 UNIQUE);
+  /* IS10160 - end */
+  /* WS10070 - start */
+  ADDINFO_insert(TYPE_1B, "GROUPS.SPECIAL","",
+                 entry->laddinfo,
+                 RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                 UNIQUE);
+  ADDINFO_insert(TYPE_1B, "GROUPS.OPERATIONS","",
+                 entry->laddinfo,
+                 RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                 UNIQUE);
+  ADDINFO_insert(TYPE_1B, "GROUPS.AUDITOR","",
+                 entry->laddinfo,
+                 RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                 UNIQUE);
+  /* WS10070 - end */
+
+  /* WS10081 - start */
+  ADDINFO_insert(TYPE_1B, "MFA.FACTORS","",
+                 entry->laddinfo,
+                 RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                 UNIQUE);
+  ADDINFO_insert(TYPE_1B, "MFA.ACTIVE","",
+                 entry->laddinfo,
+                 RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                 UNIQUE);
+  ADDINFO_insert(TYPE_1B, "MFA.TAGS","",
+                 entry->laddinfo,
+                 RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                 UNIQUE);
+  /* WS10081 - end */
+
+  RACF_output_to_addinfo(output , addinfo[i] , entry->laddinfo,
+           /* IS10076      spec_keywords, dest, msgs );     */
+           /* IS10076 */   spec_keywords, params_ptr->p_user_CFields,
+    /* IS10076, IS10100 */ params_ptr->p_u_ctsacfs, admin_params);
+
+  if (ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 3) { /*ps0292*/
+     ESA_DIAG_printf(ESA_COMP_GTUSERS, 0, "Local Addinfo");  /*ps0292*/
+     ADDINFO_dump( entry->laddinfo, 1);  /*WS10082K*/        /*ps0292*/
+  }                                                          /*ps0292*/
+
+ /*
+  *  Set USER_PARAMS defaults
+  */
+
+  user_params[i].user[0]       = NULL_CHAR;
+  user_params[i].passwd_life   = PASS_LIFE_IGNORED;      /* ASH01  */
+  user_params[i].def_ug_action = OLD_DEF_UG_ACT_IGNORED; /* DC1005 */
+  user_params[i].def_group[0]  = NULL_CHAR;
+  user_params[i].parent_oe[0]  = NULL_CHAR;
+  user_params[i].rev_status    = USER_STAT_ACTIVE;
+  user_params[i].user_admin    = USER_ADM_NONE;
+
+ /*
+  *   Handle special keyword - Userid
+  */
+
+  pair = ADDINFO_search("USERID", RCF_ADDINFO_KWD_LEN,
+                        entry->laddinfo->pair,
+                        entry->laddinfo->num_pairs);
+  if (pair NE NULL) {
+     strcpy(user_params[i].user,pair->value) ;
+
+     ESA_DIAG_printf(ESA_COMP_GTUSERS, 3,           /* AS0309 */
+                     "Put UserID=%s", pair->value);
+
+     /*
+      * BS2403
+      * Check UserID. If lowecased, ignore it
+      */
+
+     found_lowercase_symbol = FALSE;                        /* BS2403 */
+     for (wptr=&user_params[i].user[0]; *wptr; wptr++) {/* BS2403 */
+       if ( islower(*wptr) ) {                              /* BS2403 */
+         found_lowercase_symbol = TRUE;                     /* BS2403 */
+         break;                                             /* BS2403 */
+       }                                                    /* BS2403 */
+     }                                                      /* BS2403 */
+     if (found_lowercase_symbol) {                          /* BS2403 */
+       if ( (strcmp(user_params[i].user, "irrcerta") NE 0)  /* BS2403 */
+                            AND                             /* BS2403 */
+            (strcmp(user_params[i].user, "irrsitec") NE 0)  /* BS2403 */
+                            AND                             /* PS0436 */
+            (strcmp(user_params[i].user, "irrmulti") NE 0)) /* PS0436 */
+       {                                                    /* BS2403 */
+        sprintf(msg_buf,                                    /* BS2403 */
+         "User=%s Ignored. Contains lowercase characters",  /* BS2403 */
+         user_params[i].user) ;                             /* BS2403 */
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,      /* BS2403 */
+                      component, func,                      /* BS2403 */
+                      msg_buf, 0,__LINE__);                 /* BS2403 */
+       }                                                    /* BS2403 */
+        rc_doit = ESA_ERR;                                  /* BS2403 */
+        goto exit;                                          /* BS2403 */
+     }                                                      /* BS2403 */
+  }
+  else {
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                   func, "USERID field not found", 0, __LINE__);
+     rc_doit = ESA_ERR;
+     goto exit;
+  }
+
+ /*
+  *   Handle special keyword - DFLTGRP
+  */
+
+  pair = ADDINFO_search("DFLTGRP", RCF_ADDINFO_KWD_LEN,
+                         entry->laddinfo->pair,
+                         entry->laddinfo->num_pairs);
+  if (pair NE NULL)
+     strcpy(user_params[i].def_group,pair->value) ;
+  else {
+     sprintf(msg_buf,"DFLTGRP field not found. USER=%s",
+             user_params[i].user) ;
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component, func,
+                   msg_buf, 0,__LINE__);
+     rc_doit = ESA_ERR;
+     goto exit;
+  }
+
+ /*
+  *   Handle special keyword - REVOKED
+  */
+
+  pair = ADDINFO_search("REVOKED", RCF_ADDINFO_KWD_LEN,
+                        entry->laddinfo->pair,
+                        entry->laddinfo->num_pairs );
+  if (pair NE NULL) {
+    if ( strcmp(pair->value,KWD_FLAG_ON) EQ 0 )
+         user_params[i].rev_status = USER_STAT_REVOKED;
+    else user_params[i].rev_status = USER_STAT_ACTIVE;
+  }
+  else {
+     sprintf(msg_buf,"REVOKED field not found. User=%s",
+             user_params[i].user) ;
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component, func,
+                   msg_buf, 0,__LINE__);
+     rc_doit = ESA_ERR;
+     goto exit;
+  }
+
+ /*
+  *   Handle special keyword - ADMIN
+  */
+
+  pair = ADDINFO_search("SPECIAL", RCF_ADDINFO_KWD_LEN,
+                        entry->laddinfo->pair,
+                        entry->laddinfo->num_pairs );
+  if (pair NE NULL) {
+     if ( strcmp(pair->value,KWD_FLAG_ON) EQ 0 )
+        user_params[i].user_admin = USER_ADM_ADMIN;
+  }
+  else {
+     sprintf(msg_buf,"SPECIAL field not not found. User=%s",
+             user_params[i].user) ;
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component, func,
+                   msg_buf, 0,__LINE__);
+     rc_doit = ESA_ERR;
+     goto exit;
+  }
+
+  pair = ADDINFO_search("AUDITOR", RCF_ADDINFO_KWD_LEN,
+                        entry->laddinfo->pair,
+                        entry->laddinfo->num_pairs );
+  if (pair NE NULL) {
+     if ( strcmp(pair->value,KWD_FLAG_ON) EQ 0 ) {
+        if ( user_params[i].user_admin EQ USER_ADM_NONE )
+           user_params[i].user_admin = USER_ADM_AUDIT;
+        else user_params[i].user_admin = USER_ADM_ALL;
+     }
+  }
+  else {
+     sprintf(msg_buf,"AUDITOR field not not found. User=%s",
+             user_params[i].user) ;
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component, func,
+                   msg_buf, 0,__LINE__);
+     rc_doit = ESA_ERR;
+     goto exit;
+  }
+
+  RevokeFlagExamining(addinfo[i],                   /* BS2022 */
+                      entry->laddinfo,              /* ps0174 */
+                      &user_params[i],              /* BS2022 */
+                      &rvkflg_set,                  /* IS10100  */
+                      dest, msgs );                 /* BS2022 */
+
+  RACF_Handle_CTSACF_Features(ESA_COMP_GTUSERS,      /* IS10100 */
+                              'U',                   /* IS10100 */
+                              CTSACF_procrtn_table,  /* IS10100 */
+                              addinfo[i],            /* IS10100 */
+                              entry->laddinfo,       /* IS10100 */
+                              &user_params[i],       /* Is10100 */
+                              admin_params,          /* IS10100 */
+                              1, rvkflg_set);        /* IS10100 */
+
+  Copy_to_ret_addinfo(addinfo[i],                   /* ps0174 */
+                      entry->laddinfo,              /* ps0174 */
+                      dest, msgs);                  /* IS10160 */
+       /* IS10160     dest, msgs,                    * ps0174 *
+                      GROUPS_inserted);              * CIQ#6  *   */
+
+  if (dcert_present)                                      /* IS10179 */
+     Dig_cert_processing(addinfo[i],                   /* ps0292 */
+                         entry->laddinfo,              /* ps0292 */
+                         entry->dgt_addinfo,           /* ps0292 */
+                         user_params[i].user,          /* ps0292 */
+                         output,                       /* ps0292 */
+          /* IS10076     dest, msgs );                  * ps0292 */
+                         admin_params);                /* IS10076 */
+ /*
+  *   Finish
+  */
+
+  exit : ;
+  /*WS10082K*/
+  if (ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 3) {
+     ESA_DIAG_printf(ESA_COMP_GTUSERS, 0,
+                               "laddinfo after copy ret");
+     ADDINFO_dump( entry->laddinfo, 1);
+     ESA_DIAG_printf(ESA_COMP_GTUSERS, 0,
+                            "Addinfo[i] after copy ret");
+     ADDINFO_dump( addinfo[i], 1);
+  }
+  /*WS10082K*/
+
+  ESA_DIAG_exit(ESA_COMP_GTUSERS, 3, func, rc_doit);
+
+  return rc_doit ;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : get_wild_entry                            *
+ *                                                             *
+ * DESCRIPTION     : create entry for wild request with        *
+ *                   prefix                                    *
+ *                                                             *
+ * INPUT           : entry struc                               *
+ *                   user_params_in - list of prefix           *
+ *                   dest           - dest ptr                 *
+ *                   msgs           - msgs ptr                 *
+ *                                                             *
+ * OUTPUT          : entry name , prefix name                  *
+ *                                                             *
+ * RETURN VALUE    : ESA_ERR - Prefix is without the '*'       *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC get_wild_entry(ENTRY_typ             *entry,
+                              USER_PARAMS_rec_typ   user_params_in[1],
+                              CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                              CTSAMSG_HANDLE_rec_ptr      msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC    rc = ESA_OK ;
+   char    * char_ptr ;
+   short     i ;
+   short     len;
+   static    char func[]="get_wild_entry";
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GTUSERS, 3, func );
+
+   i = entry->entry_ind ;
+
+   /***  Get current entry_prefix_name  ***/
+
+   strcpy( entry->entry_name,user_params_in[i].user);   /* prefix */
+   strcpy( entry->entry_prefix,user_params_in[i].user); /* prefix */
+   strcpy( entry->wild_op_code,RACF_OPERATION_LOCATE);
+
+   ESA_DIAG_printf(ESA_COMP_GTUSERS,3,
+                   "wild entry=%s", entry->entry_name);
+
+   strcat( entry->entry_name,  "*" );       /* ps0008 */
+   strcat( entry->entry_prefix,"*" );       /* ps0008 */
+
+   len = strlen(entry->entry_name);
+
+   char_ptr=strchr( entry->entry_name,'*') ;
+
+   /***  Symbol '*' found  ***/
+
+   if ( char_ptr NE NULL ) {
+      entry->wild_flag=1;
+      *char_ptr=NULL_CHAR ;    /* Erase '*' symbol */
+      entry->entry_prefix_len = strlen( entry->entry_prefix)-1 ;
+
+      /***  '*' must be last symbol in prefix name  ***/
+
+      if ( len NE ( strlen(entry->entry_name) + 1 ) ) {
+        CTSAMSG_print(RACF_INVALID_WILD,   msgs, NULL,
+                      dest, entry->entry_name);
+        rc=ESA_ERR ;
+      }
+   }
+   else  /***  Symbol '*' not found   ***/
+      entry->wild_flag=0;
+
+  /*
+   *          Finish
+   */
+
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 3,
+                   "entry_prefix=%s  len=%d wild_flag=%d rc=%d",
+                    entry->entry_prefix, entry->entry_prefix_len,
+                    entry->wild_flag, rc );
+
+   ESA_DIAG_exit(ESA_COMP_GTUSERS, 3, func, rc);
+
+   return rc ;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : get_next_prefix                           *
+ *                                                             *
+ * DESCRIPTION     : create next entry for wild request        *
+ *                                                             *
+ * INPUT           : 1.entry          - Entry structure        *
+ *                   2.user_params_in - List of prefix         *
+ *                   3.num_users_in   - Count of users prefix  *
+ *                   4.dest           - dest ptr               *
+ *                   5.msgs           - msgs ptr               *
+ *                                                             *
+ * OUTPUT          : 1.have_more      - Have more parameter    *
+ *                                                             *
+ * RETURN VALUE    : HAVE_MORE , NO_MORE                       *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC get_next_prefix(ENTRY_typ           * entry,
+                               USER_PARAMS_rec_typ   user_params_in[1],
+                               HAVE_MORE_typ       * have_more,
+                               short                 num_users_in,
+                               CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                               CTSAMSG_HANDLE_rec_ptr      msgs)
+
+ {
+
+   ESA_RC rc=ESA_OK ;
+   static char func[]="get_next_prefix";
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GTUSERS, 3, func );
+
+   /***  Advance to next prefix  ***/
+
+   (entry->entry_ind)++;
+
+   ESA_DIAG_printf(ESA_COMP_GTUSERS,3,
+                   "wild index=%d num_users_in=%d",
+                   entry->entry_ind,num_users_in);
+
+   if (entry->entry_ind GE num_users_in)
+      *have_more=NO_MORE;
+   else
+      rc = get_wild_entry(entry, user_params_in,dest,msgs) ;
+
+  /*
+   *          Finish
+   */
+
+   ESA_DIAG_exit(ESA_COMP_GTUSERS, 3, func, rc );
+
+   return rc ;
+
+ }
+
+ /* BS2022 */
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : RevokeFlagExamining                       *
+ *                                                             *
+ * DESCRIPTION     : Revoke status examining according revoke, *
+ *                   resume dates existings                    *
+ *                                                             *
+ * INPUT           : 1.addinfo        - ptr to addinfo         *
+ *                   2.dest           - dest ptr               *
+ *                   2.msgs           - msgs ptr               *
+ *                                                             *
+ * OUTPUT          : none                                      *
+ *                                                             *
+ * RETURN VALUE    : none                                      *
+ *                                                             *
+ **************************************************************/
+
+ static void RevokeFlagExamining(ADDINFO_rec_ptr           addinfo,
+                 /* ps0174 */    ADDINFO_rec_ptr           laddinfo,
+                               USER_PARAMS_rec_typ       * user_params,
+                 /* IS10100 */ int                       * rvkflg_set,
+                               CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                               CTSAMSG_HANDLE_rec_ptr      msgs)
+ {
+
+   static char func[]="RevokeFlagExamining";
+   time_t            now;
+   struct            tm *tm_ptr;
+   char              date_str[80] = "";
+   ONE_FIELD_rec_ptr tmp_pair;
+   /* WS10082N
+   ONE_FIELD_rec_typ revoke_date_pair={TYPE_1A,0,"",0,""};         */
+   int    revoke_date_vallen = 0;                         /* WS10082N */
+   char   revoke_date_value[MAX_RSS_ADDINFO_VAL_LEN+1] = "";/*WS10082N*/
+   /* WS10082N
+   ONE_FIELD_rec_typ resume_date_pair={TYPE_1A,0,"",0,""};           */
+   int    resume_date_vallen = 0;                         /* WS10082N */
+   char   resume_date_value[MAX_RSS_ADDINFO_VAL_LEN+1] = "";/*WS10082N*/
+ /*resume_date_pair deals with dates so no risk of GT 1024 WS10082A*/
+   int               revoke_date;
+   int               resume_date;
+   int               today;
+   /* WS10082N RACF_FLAG_typ       at_least_Z17; /@ BS10006   @/  */
+   ESA_RC                       rc;           /* BS10006   */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GTUSERS, 4, func );
+   *rvkflg_set = FALSE;                               /* IS10100 */
+
+  /*
+   * Obtain current time
+   */
+
+   time(&now);
+   tm_ptr=localtime(&now);
+   strftime( date_str, sizeof(date_str), "%Y%m%d",tm_ptr);
+
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 3,
+                   "Entering:Current date is=%s Revoke Status=%d",
+                   date_str, user_params->rev_status);
+
+   /*** Get REVOKE_DATE  ***/
+   /* No need to handle long pair because it holds a date   WS10082N */
+
+   tmp_pair = ADDINFO_search("REVOKE_DATE", RCF_ADDINFO_KWD_LEN,
+           /* ps0174 */       laddinfo->pair,
+           /* ps0174 */       laddinfo->num_pairs);
+
+   if (tmp_pair)
+   {
+     /* WS10082N memcpy( (char *)&revoke_date_pair, (char *)tmp_pair,
+                         sizeof(ONE_FIELD_rec_typ) );  */
+     revoke_date_vallen = tmp_pair->vallen;            /* WS10082N */
+     strcpy(revoke_date_value, tmp_pair->value);      /* WS10082N */
+   }                                                       /*WS10082*/
+
+   /*** Get RESUME_DATE  ***/
+   /* No need to handle long pair because it holds a date   WS10082N */
+
+   tmp_pair = ADDINFO_search("RESUME_DATE", RCF_ADDINFO_KWD_LEN,
+          /* ps0174 */       laddinfo->pair,
+          /* ps0174 */       laddinfo->num_pairs);
+   if (tmp_pair)
+   {
+     /* WS10082N memcpy( (char *)&resume_date_pair, (char *)tmp_pair,
+                sizeof(ONE_FIELD_rec_typ) );        */
+     resume_date_vallen = tmp_pair->vallen;           /* WS10082N */
+     strcpy(resume_date_value, tmp_pair->value);      /* WS10082N */
+   }                                                         /*WS10082*/
+
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                   "Current=%s REVOKE_DATE=%s RESUME_DATE=%s",
+                   date_str,
+                   revoke_date_value, resume_date_value); /* WS10082N */
+      /* WS10082N  revoke_date_pair.value, resume_date_pair.value);  */
+
+   /* WS10082N if ( (revoke_date_pair.vallen EQ 0 ) AND
+        (resume_date_pair.vallen EQ 0 )                          */
+   if ( (revoke_date_vallen EQ 0 ) AND
+        (resume_date_vallen EQ 0 )   )
+     goto exit;
+
+   /* WS10082N revoke_date = atoi(revoke_date_pair.value);   */
+   /* WS10082N resume_date = atoi(resume_date_pair.value);   */
+   revoke_date = atoi(revoke_date_value);                 /* WS10082N */
+   resume_date = atoi(resume_date_value);                 /* WS10082N */
+   today       = atoi(date_str);
+
+  /*  BS10006 Retrieve RACF version ==> start         */
+  /*  IS10161 start - remove RACF version retrieving
+   rc = RACF_version_at_least(RACFZ17,
+                             &at_least_Z17);
+   if (rc NE ESA_OK)
+      IS10161 end                                     */
+  /* WS10082N     at_least_Z17 = RACF_YES;   */
+  /*  BS10006 Retrieve RACF version ==> end */
+  /*
+   *  Revoke Status Examining
+   */
+
+   /* BS10006 - add conditions                     ==> start        */
+
+   /* The following code intends to cover RACF's ICHEINTY macro bug */
+   /* when this macro returns the REVOKE flag as was before         */
+   /* REVOKE or RESUME date takes effect. It actually simulates     */
+   /* the results that RACF shows by LISTUSER command               */
+   /*
+   if ( (revoke_date LT resume_date)  AND               BS10006
+        (resume_date LE today      )    ) {             BS10006     */
+   if ( (revoke_date LT resume_date OR             /*   BS10006     */
+         revoke_date GT today      ) AND           /*   BS10006     */
+        (resume_date LE today        AND           /*   BS10006     */
+         resume_date_vallen GT 0 ) ) {        /* BS10006 +  WS10082N */
+         /* WS10082N resume_date_pair.vallen GT 0 ) ) { /*BS10006@/ */
+   /* BS10006 - add conditions                     ==> end          */
+      user_params->rev_status = USER_STAT_ACTIVE;
+      *rvkflg_set = TRUE;                                /* IS10100 */
+   /* BS10006 - clear RESUME_DATE only for z/os < 1.7               */
+   /* WS10082N
+      if (at_least_Z17 EQ RACF_NO)                 /@   BS10006     @/
+        ADDINFO_updval("", RCF_ADDINFO_VAL_LEN, &resume_date_pair ); */
+   }
+   /* BS10006 - add conditions                     ==> start
+   else if ( (resume_date LT revoke_date)  AND
+             (revoke_date LE today      )    ) {                    */
+   else if ( (resume_date LE revoke_date OR        /*   BS10006     */
+              resume_date GT today      ) AND      /*   BS10006     */
+             (revoke_date LE today        AND      /*   BS10006     */
+              revoke_date_vallen GT 0 ) ) {   /* BS10006 + WS10082N */
+              /*WS10082N revoke_date_pair.vallen GT 0 ) ) {/@BS10006@/*/
+   /* BS10006 - add conditions                     ==> end          */
+      user_params->rev_status = USER_STAT_REVOKED;
+      *rvkflg_set = TRUE;                                /* IS10100 */
+   /* BS10006 - clear RESUME_DATE only for z/os < 1.7               */
+   /* WS10082N
+      if (at_least_Z17 EQ RACF_NO)                 /@   BS10006     @/
+        ADDINFO_updval("", RCF_ADDINFO_VAL_LEN, &revoke_date_pair ); */
+   }
+
+   Update_ret_addinfo(addinfo,                  /* ps0174 */
+                      revoke_date_value,   /* ps0174 */   /* WS10082N */
+                      resume_date_value);  /* ps0174 */   /* WS10082N */
+         /* WS10082N  revoke_date_pair.value,   /@ ps0174 @/  */
+         /* WS10082N  resume_date_pair.value);  /@ ps0174 @/  */
+
+  /*
+   *   Finish
+   */
+
+  exit :;
+
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 3,
+                   "Exiting:Current date is=%s Revoke Status=%d",
+                   date_str, user_params->rev_status);
+
+   ESA_DIAG_exit(ESA_COMP_GTUSERS, 4, func, ESA_OK);
+
+ }
+
+ /* ps0174 */
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : Update_ret_addinfo                        *
+ *                                                             *
+ * DESCRIPTION     : Update retuned addinfo area after         *
+ *                   Revoke status examining processing        *
+ *                                                             *
+ * INPUT           : 1.addinfo       - ptr to addinfo          *
+ *                   2.revoke_date   - revoke date             *
+ *                   3.resume_date   - resume date             *
+ *                                                             *
+ * OUTPUT          : none                                      *
+ *                                                             *
+ * RETURN VALUE    : none                                      *
+ *                                                             *
+ **************************************************************/
+
+ static void Update_ret_addinfo(ADDINFO_rec_ptr     addinfo,
+                                char               *revoke_date,
+                                char               *resume_date)
+ {
+
+   static char func[]="Update_ret_addinfo";
+   ONE_FIELD_rec_ptr tmp_pair;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GTUSERS, 4, func );
+
+   /***  RESUME_DATE processing ***/
+
+   tmp_pair = ADDINFO_search("RESUME_DATE", RCF_ADDINFO_KWD_LEN,
+                             addinfo->pair,
+                             addinfo->num_pairs);
+   if (tmp_pair NE NULL) {
+      ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                      "Updated RESUME_DATE:old=%s new=%s",
+                      tmp_pair->value, resume_date);
+      ADDINFO_updval(resume_date, RCF_ADDINFO_VAL_LEN, tmp_pair );
+   }
+
+   /***  REVOKE_DATE processing ***/
+
+   tmp_pair = ADDINFO_search("REVOKE_DATE", RCF_ADDINFO_KWD_LEN,
+                             addinfo->pair,
+                             addinfo->num_pairs);
+   if (tmp_pair NE NULL) {
+      ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                      "Updated REVOKE_DATE:old=%s new=%s",
+                      tmp_pair->value, revoke_date);
+      ADDINFO_updval(revoke_date, RCF_ADDINFO_VAL_LEN, tmp_pair );
+   }
+
+   ESA_DIAG_exit(ESA_COMP_GTUSERS, 4, func, ESA_OK);
+
+ }
+
+ /* ps0174 */
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : Copy_to_ret_addinfo                       *
+ *                                                             *
+ * DESCRIPTION     : Copy information from local to returned   *
+ *                   addinfo for keeping compatability         *
+ *                   with old versions of SA=Agent             *
+ *                                                             *
+ * INPUT           : 1.addinfo       - ptr to addinfo          *
+ *                 : 2.laddinfo      - ptr to local addinfo    *
+ *                                                             *
+ * OUTPUT          : none                                      *
+ *                                                             *
+ * RETURN VALUE    : none                                      *
+ *                                                             *
+ **************************************************************/
+
+ static void Copy_to_ret_addinfo(ADDINFO_rec_ptr             addinfo,
+                                 ADDINFO_rec_ptr             laddinfo,
+                                 CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                /* IS10160 */    CTSAMSG_HANDLE_rec_ptr      msgs)
+                /* IS10160       CTSAMSG_HANDLE_rec_ptr      msgs,
+                                 int    GROUPS_inserted)     * CIQ#6 *
+                                                                     */
+ {
+
+   static char func[]="Copy_to_ret_addinfo";
+   ONE_FIELD_rec_ptr pair;
+   ONE_FIELD_rec_ptr lpair;
+   /* WS10070 - start */
+   ONE_FIELD_rec_ptr tpair, opair;
+   char *fields[NO_OF_SYS_ACCESS] = {"SPECIAL","OPERATIONS",
+                                     "AUDITOR","ROAUDIT"};
+   /* WS10081 - start */
+   RACF_MFA_TRANMAP  MAP;
+   ONE_FIELD_rec_ptr fpair   = NULL;
+   ONE_FIELD_rec_ptr upair   = NULL;
+   ONE_FIELD_rec_ptr apair   = NULL;
+   ONE_FIELD_rec_ptr ipair   = NULL;
+   ONE_FIELD_rec_ptr tipair  = NULL;
+   char              *factor = NULL;
+   char              *active = NULL;
+   char              *tag    = NULL;
+   char              *tnext  = NULL;
+   char              *pcol   = NULL;
+   char              *psub   = NULL;
+   char              *ptag_name  = NULL;
+   char              *ptag_value = NULL;
+   char              avalue[2] = { NULL_CHAR };
+   char              *tvalue = NULL;
+   /* int               with_quotes = TRUE;   */
+   int               tags_len = 0;
+   int               tn_len  = 0;
+   int               fl      = 0;
+   int               al      = 0;
+   int               tnl     = 0;
+   int               tl      = 0;
+   short             tvl     = 0;
+   char    sublistsep[2]   = {ADDINFO_LIST_SUBFIELD, NULL_CHAR};
+   char       listsep[2]   = {ADDINFO_LIST_ENTRY,    NULL_CHAR};
+   int     factor_tags_len   = 0;
+   /* WS10082N short   factor_tags_len2  = 0;   */
+   int     l1 = 0;
+   int     j  = 0;
+   int     pairs_left  = 0;
+   int     num_factors = 0;
+   int     num_actives = 0;
+   int     num_tags    = 0;
+   char   *p1  = NULL;
+   char   *ptr = NULL;
+   char   *user_factor_name_ptr = NULL;
+   char   keyword[MAX_RSS_ADDINFO_KWD_LEN + 1]  = { NULL_CHAR };
+   char   keyword1[MAX_RSS_ADDINFO_KWD_LEN + 1] = { NULL_CHAR };
+   char   keywordb[MAX_RSS_ADDINFO_KWD_LEN + 1] = { NULL_CHAR };
+   char   user_factor_name[35 + 1]              = { NULL_CHAR };
+   char   IBM_factor_name[20 + 1]               = { NULL_CHAR };
+   char   TAG_name[20 + 1]                      = { NULL_CHAR };
+   char   TAG_value[11024 + 1]                  = { NULL_CHAR };
+   /* WS10081 - end   */
+   int i;
+   /* WS10070 - end */
+   ESA_RC            rc = ESA_OK;                           /* CIQ#6 */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GTUSERS, 4, func );
+
+   /* WS10081 - start */
+   if (ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 4) {
+      ESA_DIAG_printf(ESA_COMP_GTUSERS, 0, "laddinfo");
+      ADDINFO_dump( laddinfo, 1);
+   /* WS10081 - end   */
+   }
+  /*  IS10160 - start */
+  /*
+   *  Replace CIQ#6 code with code handling the inserted GROUPS
+   *  entry in laddinfo (instead of addinfo).
+
+   ***  CIQ#6 Start                                                ***
+   *
+   *   If GROUPS_inserted is 'on' (in other words, if we made the
+   *   previous change, i.e., we added a 'GROUPS' ADDINFO entry),
+   *   we will now delete the 'groups' ADDINFO entry and we will
+   *   rename the 'GROUPS' ADDINFO keyword to 'groups'.
+   *
+
+   if (GROUPS_inserted EQ 1) {
+      rc = ADDINFO_delete(addinfo, "groups");
+      if (rc NE ESA_OK) {
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component, func,
+                       "Unable to delete groups entry", 4, __LINE__);
+         goto exit;
+      }
+      pair = ADDINFO_search("GROUPS", RCF_ADDINFO_KWD_LEN,
+                             addinfo->pair,
+                             addinfo->num_pairs);
+      if (pair EQ NULL) {
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component, func,
+                       "Unable to locate GROUPS field", 4, __LINE__);
+         goto exit;
+      }
+      else {
+         strcpy (pair->keyword, "groups");
+         ESA_DIAG_printf(ESA_COMP_GTUSERS,1,
+                         "Just renamed GROUPS ADDINFO entry to groups");
+      }
+   }  * GROUPS_inserted is 'on' *
+
+   *
+   *   If GROUPS_inserted is 'off' (in other words, if we did not make
+   *   the previous change) and if the 'GROUPS' ADDINFO entry exists,
+   *   we do the following:
+   *   - if the get_conn input parameter was set to 'N', we clear
+   *     the 'GROUPS' ADDINFO value.
+   *   - if the get_conn input parameter was set to 'Y' and the
+   *     'groups' ADDINFO entry exists, we copy the value from
+   *     the 'GROUPS' ADDINFO entry to the 'groups' ADDINFO entry
+   *
+   else {  * if (GROUPS_inserted EQ 0) *
+      pair = ADDINFO_search("GROUPS", RCF_ADDINFO_KWD_LEN,
+                             addinfo->pair,
+                             addinfo->num_pairs);
+      if (pair NE NULL) {       * 'GROUPS' ADDINFO entry exists *
+         if (get_connection EQ 'N') ADDINFO_clear_value(pair);
+         if (get_connection EQ 'Y') {
+            lpair = ADDINFO_search("groups", RCF_ADDINFO_KWD_LEN,
+                                   addinfo->pair,
+                                   addinfo->num_pairs);
+            if (lpair NE NULL) {    * 'groups' ADDINFO entry exists *
+               ADDINFO_updval(pair->value,
+                              RCF_ADDINFO_VAL_LEN, lpair );
+               ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                               "Updated groups field = %s = %#X",
+                               lpair->value, lpair->value);
+            }  * 'GROUPS' and 'groups' exist *
+         }  * get_conn was set to 'Y' *
+      }  * 'GROUPS' ADDINFO entry exists *
+   }  * GROUPS_inserted is off *
+
+   ***  CIQ#6 End                                                  ***
+   end of CIQ#6 removed code                                         */
+
+   /*
+    *  When Get_connection is Y:
+    *  - If "GROUPS" does not exist in laddinfo -> error.
+    *  - When "groups" exists, copy its value from GROUPS
+    *    in laddinfo.
+    *  - When "GROUPS" exists, copy its value from GROUPS
+    *    in laddinfo.
+    *
+    *  When Get_connection is N, nothing to do.
+    *
+    */
+   /*  WS10070
+    *          When get_connection is P:
+    *          Populate connection information along with
+    *          attribute info SPECIAL, OPERATIONS and AUDITOR
+    *
+    */
+
+   if (  get_connection EQ 'Y'
+      OR get_connection EQ 'P' )                 /* WS10070 */
+   {
+     pair = ADDINFO_search("GROUPS", RCF_ADDINFO_KWD_LEN,
+                           laddinfo->pair,
+                           laddinfo->num_pairs);
+     if (pair NE NULL)     /* "GROUPS" exists in laddinfo ? */
+     {
+       lpair = ADDINFO_search("groups", RCF_ADDINFO_KWD_LEN,
+                              addinfo->pair,
+                              addinfo->num_pairs);
+       if (lpair NE NULL)       /* "groups" exist ?   */
+       {
+         /* WS10070 - start */
+         if(get_connection EQ 'P')
+         {
+            Add_conn_attr(lpair,laddinfo, pair, dest, msgs);
+         }
+         else /* WS10070 - end */
+            ADDINFO_updval(pair->value, /* fill "groups" in addinfo */
+                        RCF_ADDINFO_VAL_LEN, lpair );
+
+         ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                         "Updated groups field = %s = %#X",
+                         lpair->value, lpair->value);
+       }
+
+       lpair = ADDINFO_search("GROUPS", RCF_ADDINFO_KWD_LEN,
+                               addinfo->pair,
+                               addinfo->num_pairs);
+
+       if (lpair NE NULL)     /* "GROUPS" exists in addinfo ? */
+       {
+         /* WS10070 - start Add connection attributes */
+         if(get_connection EQ 'P')
+         {
+            Add_conn_attr(lpair,laddinfo, pair, dest, msgs);
+         }
+         else /* WS10070 - end */
+            ADDINFO_updval(pair->value,  /* fill "GROUPS" in addinfo */
+                           RCF_ADDINFO_VAL_LEN, lpair );
+         ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                         "Updated GROUPS field = %s = %#X",
+                         lpair->value, lpair->value);
+       }
+     } /* "GROUPS" exists in laddinfo */
+     else  /* "GROUPS" not found in laddinfo - error */
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component, func,
+                     "Unable to locate GROUPS field", 4, __LINE__);
+   }   /*   get_connection = 'Y' */
+   /* IS10160 - end */
+
+   /* WS10070 - start                                           *
+    * Populate SYSTEM_ACCESS along with USER_ADMIN & OPERATIONS *
+    * if exists in schema for backward compatibility            */
+
+   pair = ADDINFO_search("SYSTEM_ACCESS", RCF_ADDINFO_KWD_LEN,
+                          addinfo->pair,
+                          addinfo->num_pairs);
+   if ( pair NE NULL )
+   {
+      for ( i = 0; i LT NO_OF_SYS_ACCESS ; i++ )
+      { /*Look for SPECIAL, OPERATIONS, AUDITOR, ROAUDIT */
+         tpair = ADDINFO_search(fields[i], RCF_ADDINFO_KWD_LEN,
+                                laddinfo->pair,
+                                laddinfo->num_pairs);
+         if (tpair NE NULL)
+         {
+            if (strcmp(tpair->value,"Y") EQ 0)
+            {
+                ADDINFO_addval(fields[i], RCF_ADDINFO_KWD_LEN,
+                              ADDINFO_LIST_ENTRY, pair,
+                              dest, msgs);
+            }
+         }
+      }
+
+      ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                     "Updated SYSTEM_ACCESS :%s",
+                      pair->value);
+   }
+
+   tpair = ADDINFO_search("OPERATIONS", RCF_ADDINFO_KWD_LEN,
+                          laddinfo->pair, laddinfo->num_pairs);
+   if ( tpair NE NULL )
+   {
+        opair = ADDINFO_search("OPERATIONS", RCF_ADDINFO_KWD_LEN,
+                               addinfo->pair, addinfo->num_pairs);
+        if ( opair NE NULL )
+        {
+           ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                           "Updated OPERATIONS: old=%s new=%s",
+                           opair->value, tpair->value);
+           ADDINFO_updval(tpair->value, RCF_ADDINFO_VAL_LEN,
+                          opair);
+        }
+   }
+   /* WS10070 - end */
+
+   /***  INTERVAL field processing ***/
+
+   lpair = ADDINFO_search("INTERVAL", RCF_ADDINFO_KWD_LEN,
+                          laddinfo->pair,
+                          laddinfo->num_pairs);
+   if (lpair EQ NULL) {
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                   component, func,
+                   "Unable to locate INTERVAL field",
+                   4, __LINE__);
+     goto exit;
+   }
+
+   /***   Copy value to INTERVAL field */
+
+   pair = ADDINFO_search("INTERVAL", RCF_ADDINFO_KWD_LEN,
+                          addinfo->pair,
+                          addinfo->num_pairs);
+   if (pair NE NULL) {
+      ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                      "Updated INTERVAL:old=%s new=%s",
+                      pair->value, lpair->value);
+      ADDINFO_updval(lpair->value,
+                     RCF_ADDINFO_VAL_LEN, pair );
+   }
+
+   /***   Copy value to INFO.INTERVAL field */
+
+   pair = ADDINFO_search("INFO.INTERVAL", RCF_ADDINFO_KWD_LEN,
+                          addinfo->pair,
+                          addinfo->num_pairs);
+   if (pair NE NULL) {
+      ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                      "Updated INFO.INTERVAL:old=%s new=%s",
+                      pair->value, lpair->value);
+      ADDINFO_updval(lpair->value,
+                     RCF_ADDINFO_VAL_LEN, pair );
+   }
+
+   /* start  WS10081 */
+   /* check if any MFA. attribute requested. */
+   pair = ADDINFO_prefix_search("MFA.", RCF_ADDINFO_KWD_LEN,
+                                 TRUE,    /* include NULL value */
+                                 addinfo->pair, addinfo->num_pairs);
+   if ( pair NE NULL)
+    ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                    "MFA. entries found in addinfo\n");
+   else goto skip_mfa;
+
+   if (ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 1)
+   {
+    pairs_left = 0;
+    pair = ADDINFO_prefix_search("MFA.", RCF_ADDINFO_KWD_LEN,
+                                  TRUE,    /* include NULL value */
+                                  addinfo->pair, addinfo->num_pairs);
+    ESA_DIAG_printf(ESA_COMP_GTUSERS,0,
+                    "Recieved MFA. attributes:\n");
+    while (pair NE NULL)
+    {
+     ESA_DIAG_printf(ESA_COMP_GTUSERS,0,
+                    "keyword = <%s>\n "
+                    "value   = <%s>\n ",
+                    pair->keyword,
+                    pair->value);
+     pairs_left = addinfo->num_pairs - (pair - addinfo->pair) - 1;
+     if (pairs_left EQ 0) break;
+     pair = ADDINFO_prefix_search("MFA.", RCF_ADDINFO_KWD_LEN,
+                                  TRUE,   /* find also empty */
+                                  ppair(pair), pairs_left); /*WS10082N*/
+                    /* WS10082    pair+1, pairs_left);         */
+    }
+   }
+   /* Build the MAP 3-D array                */
+   rc =  RACF_Build_MAP (ESA_COMP_GTUSERS,
+                    MAP,
+                    addinfo,
+                    dest,
+                    msgs);
+   if (rc NE ESA_OK)
+   {
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+            dest, component, func,
+            "RACF_Build_MAP failed",
+            rc, __LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+   }
+
+   /* if MFA.ENABLE requested, fill according to MFA.PWFALLBACK having
+      any value or not                                               */
+
+   pair = ADDINFO_search("MFA.ENABLE", RCF_ADDINFO_KWD_LEN,
+                          addinfo->pair,
+                          addinfo->num_pairs);
+   if (pair NE NULL)
+   {
+    lpair = ADDINFO_search("MFA.PWFALLBACK", RCF_ADDINFO_KWD_LEN,
+                          addinfo->pair,
+                          addinfo->num_pairs);
+    if (lpair NE NULL)
+    {
+      if (lpair->value[0] NE NULL_CHAR)
+         ADDINFO_updval("Y", RCF_ADDINFO_VAL_LEN, pair);
+      else
+         ADDINFO_updval("N", RCF_ADDINFO_VAL_LEN, pair);
+    }
+   }
+
+   /* handle the factors */
+   fpair = ADDINFO_search("MFA.FACTORS", RCF_ADDINFO_KWD_LEN,
+                          laddinfo->pair,
+                          laddinfo->num_pairs);
+   upair = ADDINFO_search("MFA.FACTORS", RCF_ADDINFO_KWD_LEN,
+                          addinfo->pair,
+                          addinfo->num_pairs);
+   if ( (fpair NE NULL) AND (upair NE NULL) )
+   {
+    ptr = fpair->value;
+    num_factors = 0;
+    if (ptr[0] NE NULL_CHAR)
+    while (ptr NE NULL)
+    {
+      ptr = strchr(ptr+1, ADDINFO_LIST_ENTRY);
+      num_factors++;
+    }
+
+    if (num_factors GT 0)
+    {
+     ipair = ADDINFO_search("MFA.ACTIVE", RCF_ADDINFO_KWD_LEN,
+                       addinfo->pair,
+                       addinfo->num_pairs);
+     apair = ADDINFO_search("MFA.ACTIVE", RCF_ADDINFO_KWD_LEN,
+                       laddinfo->pair,
+                       laddinfo->num_pairs);
+     if (apair NE NULL)
+     {
+      ESA_DIAG_printf(ESA_COMP_GTUSERS,4,
+             "apair->vallen = %d,  value = %s",
+              apair->vallen, apair->value);
+      if (ipair NE NULL)
+       ADDINFO_updval(apair->value, RCF_ADDINFO_VAL_LEN,ipair);
+     }
+
+     tipair = ADDINFO_search("MFA.TAGS", RCF_ADDINFO_KWD_LEN,
+                       addinfo->pair,
+                       addinfo->num_pairs);
+     tpair = ADDINFO_search("MFA.TAGS", RCF_ADDINFO_KWD_LEN,
+                       laddinfo->pair,
+                       laddinfo->num_pairs);
+      ESA_DIAG_printf(ESA_COMP_GTUSERS,4,
+             "tipair = %p(%d),  tpair = %p(%d)",
+              tipair, tipair->vallen, tpair, tpair->vallen);
+     if ( (tipair NE NULL) AND (tpair NE NULL) )
+     {
+       /* can't use ADDINFO_updval because it expects a string */
+       /* WS10082N RACF_output_to_addinfo in CTSREXT builds TAGS as
+                   a multi-valued pair. Such pair cannot be non-string
+                   because any x'01' or x'02' in the data will be
+                   treated as list/sublist separator and will cause
+                   incorrect values separation. Therefore, we will
+                   treat TAGS as a string until proven otherwise.    */
+       /* WS10082N memcpy(tipair->value,tpair->value,tpair->vallen); */
+       /* WS10082N tipair->vallen = tpair->vallen;                  */
+       ADDINFO_updval(tpair->value,                       /* WS10082N */
+                      RCF_ADDINFO_VAL_LEN,                /* WS10082N */
+                      tipair);                            /* WS10082N */
+     }
+     factor = fpair->value;
+     active = apair->value;
+     tag    = tpair->value;
+     tags_len= tpair->vallen;
+     if ( (tpair NE NULL) AND (tags_len GT 0) )
+     {
+      if (ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 4)
+      {
+        SNAP_AREA("TAGs returned by RACF:", tag, tags_len )
+      }
+     }
+
+     /* for each factor returned find the corresponding attributes
+        in the addinfo from IIQ/IDN:
+        MFA.<factor-name>.ACTIVE
+        MFA.<factor-name>.TAG.<tag-name>
+        and locate the corresponding value returned in the multi-value
+        special laddinfo attributes:
+        MFA.ACTIVE
+        MFA.TAGS
+        The retuned values need some conversion/extraction before they
+        can be set in corresponding keyword value in addinfo.
+     */
+     for (i = 1; i LE num_factors; i++)
+     {
+       IBM_factor_name[0] = NULL_CHAR;
+       user_factor_name[0] = NULL_CHAR;
+       ptr = strchr(factor, ADDINFO_LIST_ENTRY);
+       if (ptr NE NULL)
+         fl = ptr - factor;
+       else
+         fl = strlen(factor);
+       strncat(IBM_factor_name,factor,fl);
+       factor = ptr + 1;
+       ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+              "Handling Factor returned by RACF = <%s>\n",
+                    IBM_factor_name);
+
+       /*  translate from IBM name to user name */
+       user_factor_name_ptr = RACF_Trans_Factor_IBM2Usr(
+                                                ESA_COMP_GTUSERS,
+                                                MAP,
+                                                IBM_factor_name,
+                                                dest,
+                                                msgs);
+
+       /*  add to MFA.FACTORS                   */
+       ADDINFO_addval(user_factor_name_ptr, RCF_ADDINFO_VAL_LEN,
+                     ADDINFO_LIST_ENTRY, upair,
+                     dest, msgs);
+
+       /* Retrieve the active value of this factor */
+
+       if (apair NE NULL)   /* apair is returned by RACF */
+       {
+        ptr = strchr(active, ADDINFO_LIST_ENTRY);
+        if (ptr NE NULL)
+         al = ptr - active;
+        else
+         al = strlen(active);
+
+        if (  (al EQ 16) AND
+              (strncmp(active,"FFFFFFFFFFFFFFFF",16) EQ 0) )
+           strcpy(avalue,"N");
+        else
+           strcpy(avalue,"Y");
+
+        active += al + 1;
+       }
+
+       /* construct MFA.<factor-name>.ACTIVE  */
+       strcpy(keyword,"MFA.");
+       strcat(keyword,user_factor_name_ptr);
+
+       strcpy(keywordb,keyword);
+       strcat(keyword,".ACTIVE");
+       /* search MFA.<factor-name>.ACTIVE  */
+       pair = ADDINFO_search(keyword, RCF_ADDINFO_KWD_LEN,
+                          addinfo->pair,
+                          addinfo->num_pairs);
+       ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                    "keyword <%s> : %s",
+                    keyword,
+                    pair NE NULL ? "Found"
+                                 : "Not found");
+       if (pair NE NULL)
+       {
+         ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                    "returning keyword <%s> : value <%s>",
+                    keyword,
+                    avalue);
+         ADDINFO_updval(avalue, RCF_ADDINFO_VAL_LEN, pair);
+       }
+       /* construct all MFA.<factor-name>.TAG.<tag-name> of the factor.
+          We need to extract the tag-name and value from MFA.TAGS
+          If the tag value includes blanks, the name:value pair is
+          enclosed with double quotes.
+       */
+
+       if ( (tpair NE NULL) AND (tags_len GT 0) ) /*tpair is returned
+                                                    by RACF */
+       {
+        while ( (tag LT (tpair->value + tags_len) ) AND
+                (*tag NE ADDINFO_LIST_ENTRY)  )
+        {
+         ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+             "Start while: tag = %s, tpair->value = %s, tags_len = %d",
+                           tag ,     tpair->value,      tags_len);
+         tnext = strchr(tag, ADDINFO_LIST_ENTRY);
+         if (tnext NE NULL)
+          tl = tnext - tag;
+         else
+         {
+          tl = strlen(tag);
+          tnext = tag + tl;
+         }
+
+         if (tl EQ strlen("NOTAGS")  AND
+              strncmp("NOTAGS", tag, tl) EQ 0 )
+              break;
+         pcol = strchr(tag,':');
+         if ( (pcol EQ NULL) OR (pcol GT tnext) )
+         {
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                 dest, component, func,
+                 ": not found in tag",
+                 rc, __LINE__);
+          rc = ESA_FATAL;
+          goto exit;
+         }
+
+         tnl = pcol - tag;
+         ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                    "TAG name length = %d",tnl);
+         ptag_name = tag;
+         memcpy(TAG_name, ptag_name, tnl);
+         TAG_name[tnl] = NULL_CHAR;
+         ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                    "TAG name = %s",TAG_name);
+         ptag_value = pcol + 1;
+         /* ADDINFO_LIST_SUBFIELD separates tags of a factor */
+         psub = strchr(tag,ADDINFO_LIST_SUBFIELD);
+         if ( (psub NE NULL) AND (psub LT tnext) )
+          tvl = psub - ptag_value;
+         else  /* this is the last tag of this factor */
+          tvl = tnext - ptag_value;
+         ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                    "TAG value length = %d",tvl);
+         memcpy(TAG_value, ptag_value, tvl);
+         TAG_value[tvl] = NULL_CHAR;
+         ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                    "TAG value = %s",TAG_value);
+         /* MFA.<factor-name> already in keywordb */
+         strcpy(keyword1,keywordb);
+         strcat(keyword1,".TAG.");
+         strcat(keyword1,TAG_name);
+         /* search MFA.<factor-name>.TAG.<tag-name>  */
+         pair = ADDINFO_search(keyword1, RCF_ADDINFO_KWD_LEN,
+                            addinfo->pair,
+                            addinfo->num_pairs);
+         ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                      "keyword <%s> : %s",
+                      keyword1,
+                      pair NE NULL ? "Found"
+                                  : "Not found");
+         if (pair NE NULL)
+         {
+           ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                      "returning keyword <%s> : value <%s>",
+                      keyword1,
+                      TAG_value);
+           ADDINFO_updval(TAG_value, RCF_ADDINFO_VAL_LEN, pair);
+         }
+         tag = ptag_value + tvl;
+         if (*tag EQ ADDINFO_LIST_SUBFIELD)
+          tag++;   /* next tag for this factor */
+        }  /* end of while */
+        tag = tnext + 1; /* for next factor */
+       }  /* end of: if (tpair NE NULL)  ....               */
+     }  /* end of: for (i = 1; i LE num_factors; i++)       */
+    }  /* end of: if (num_factors GT 0)                     */
+   }  /* finished with factors. end of: if (fpair NE NULL)  */
+   if (ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 1)
+   {
+    pairs_left = 0;
+    pair = ADDINFO_prefix_search("MFA.", RCF_ADDINFO_KWD_LEN,
+                                  TRUE,    /* include NULL value */
+                                  addinfo->pair, addinfo->num_pairs);
+    ESA_DIAG_printf(ESA_COMP_GTUSERS,0,
+                    "Returning MFA. attributes:\n");
+    while (pair NE NULL)
+    {
+     ESA_DIAG_printf(ESA_COMP_GTUSERS,0,
+                    "keyword = <%s>\n"
+                    "value   = <%s>\n",
+                    pair->keyword,
+                    pair->value);
+     /* WS10082
+     pairs_left = addinfo->num_pairs - (pair - addinfo->pair) - 1; */
+     pairs_left = addinfo->num_pairs - (pair->index + 1);  /*WS10082N*/
+     if (pairs_left EQ 0) break;
+     pair = ADDINFO_prefix_search("MFA.", RCF_ADDINFO_KWD_LEN,
+                                  TRUE,   /* find also empty */
+                                  ppair(pair), pairs_left); /*WS10082*/
+                     /* WS10082   pair+1, pairs_left);         */
+    }
+   }
+   skip_mfa:
+   /* end    WS10081 */
+   exit :;
+
+   ESA_DIAG_exit(ESA_COMP_GTUSERS, 4, func, ESA_OK);
+
+ }
+
+ /* WS10070 - start */
+ /****************************************************************
+ * Subroutine name : Add_conn_attr                               *
+ *                                                               *
+ * Description     : Populate connection information along with  *
+ *                   ATTRIBUTES in a format,                     *
+ *                   GROUP_ID1,S,A,O;GROUP_ID2,A,O               *
+ *                   where                                       *
+ *                   ; - list delimiter ADDINFO_LIST_ENTRY       *
+ *                   , - sublist delimiter ADDINFO_LIST_SUBFIELD *
+ *                   S, A & O represents SPECIAL, AUDITOR, &     *
+ *                   OPERATIONS                                  *
+ *                                                               *
+ * Input                                                         *
+ *                 : 1.laddinfo      - ptr to local addinfo      *
+ *                 : 2.lpair         - groups from local addinfo *
+ *                                                               *
+ * Output                                                        *
+ *                 : 1. pair  - populated with groups along with *
+ *                   permissions in addinfo.                     *
+ *                                                               *
+ * Return Value    : none                                        *
+ *****************************************************************/
+ static void Add_conn_attr(ONE_FIELD_rec_ptr          pair,
+                           ADDINFO_rec_ptr            laddinfo,
+                           ONE_FIELD_rec_ptr          lpair,
+                           CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                           CTSAMSG_HANDLE_rec_ptr      msgs)
+ {
+   static char func[]="Add_conn_attr";
+   ONE_FIELD_rec_ptr spair,opair,apair;
+   char *s_gPtr, *s_sPtr, *s_oPtr, *s_aPtr;
+   char sToken[2], oToken[2], aToken[2];
+   char errmsg[64]=NULL_STRING;
+   UG_typ gToken;
+   int i = 0;
+   ESA_RC rc = ESA_OK;
+
+   ESA_DIAG_enter(ESA_COMP_GTUSERS, 4, func );
+
+   spair = ADDINFO_search("GROUPS.SPECIAL", RCF_ADDINFO_KWD_LEN,
+                         laddinfo->pair,
+                         laddinfo->num_pairs);
+
+   if ( spair EQ NULL)
+   {
+      sprintf(errmsg,"Unable to locate GROUPS.SPECIAL attribute");
+      goto exit;
+   }
+
+   opair = ADDINFO_search("GROUPS.OPERATIONS", RCF_ADDINFO_KWD_LEN,
+                         laddinfo->pair,
+                         laddinfo->num_pairs);
+
+   if ( opair EQ NULL)
+   {
+      sprintf(errmsg,"Unable to locate GROUPS.OPERATIONS attribute");
+      goto exit;
+   }
+
+   apair = ADDINFO_search("GROUPS.AUDITOR", RCF_ADDINFO_KWD_LEN,
+                         laddinfo->pair,
+                         laddinfo->num_pairs);
+
+   if ( apair EQ NULL)
+   {
+      sprintf(errmsg,"Unable to locate GROUPS.AUDITOR attribute");
+      goto exit;
+   }
+
+   /* BS10101 - limit the length of diags string printed as it might
+    * extend the 16K addinfo length and causes S0C4. This might occur
+    * also when diags are off as we use the interface which passes the
+    * parameters in any event.                                       */
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 5,
+    /*  "list of\ngrps - %s,\nsp - %s,\nop - %s,\nap - %s", BS10101*/
+    "list of\ngrps - %.400s,\nsp - %.99s,\nop - %.99s,\nap - %.99s",
+     lpair->value, spair->value, opair->value, apair->value);
+
+   s_gPtr = NULL;
+   s_sPtr = NULL;
+   s_oPtr = NULL;
+   s_aPtr = NULL;
+
+   /* Get group name and append S, O, A for SPECIAL  *
+    * OPERATIONS, and AUDITOR                        */
+   do
+   {
+      rc = ADDINFO_list_getnextvalue(lpair, ADDINFO_LIST_ENTRY,
+                                     gToken, &s_gPtr);
+
+      if( rc NE ESA_OK )
+      { /* If we are at the end of list then we must stop *
+         * This is the condition to end the loop but we   *
+         * still want to set condition in while           */
+         break;
+      }
+
+      if( *gToken EQ NULL_CHAR )
+      {
+         sprintf(errmsg,"Failed to locate group");
+         goto exit;
+      }
+
+      /* We do not want to check the rc of the next 3 calls    *
+       * to ADDINFO_list_getnextvalue since we are not using   *
+       * it to end the loop.                                   */
+
+      ADDINFO_list_getnextvalue(spair, ADDINFO_LIST_ENTRY,
+                                sToken, &s_sPtr);
+
+      if( *sToken EQ NULL_CHAR )
+      { /* If we are getting groups then we must get other values */
+         sprintf(errmsg, err_string , "SPECIAL", gToken);
+         ESA_DIAG_printf(ESA_COMP_GTUSERS, 3, "%s",errmsg); /* WS10082K*/
+         goto exit;
+      }
+
+      ADDINFO_list_getnextvalue(opair, ADDINFO_LIST_ENTRY,
+                                oToken, &s_oPtr);
+
+      if( *oToken EQ NULL_CHAR )
+      {
+         sprintf(errmsg, err_string , "OPERATIONS", gToken);
+         ESA_DIAG_printf(ESA_COMP_GTUSERS, 3, "%s",errmsg); /* WS10082K*/
+         goto exit;
+      }
+
+      ADDINFO_list_getnextvalue(apair, ADDINFO_LIST_ENTRY,
+                                aToken, &s_aPtr);
+
+      if( *aToken EQ NULL_CHAR )
+      {
+         sprintf(errmsg, err_string , "AUDITOR", gToken);
+         ESA_DIAG_printf(ESA_COMP_GTUSERS, 3, "%s",errmsg); /* WS10082K*/
+         goto exit;
+      }
+
+      ESA_DIAG_printf(ESA_COMP_GTUSERS, 9,
+                    "gToken - %s,sToken-%s,oToken-%s,aToken-%s",
+                    gToken,sToken,oToken,aToken);
+
+      ADDINFO_addval(gToken, RCF_ADDINFO_VAL_LEN,
+                     ADDINFO_LIST_ENTRY, pair,
+                     dest, msgs);
+
+      if ( *sToken EQ 'Y' )
+      {
+         ADDINFO_addval("S", RCF_ADDINFO_VAL_LEN,
+                        ADDINFO_LIST_SUBFIELD, pair,
+                        dest, msgs);
+      }
+
+      if ( *oToken EQ 'Y' )
+      {
+         ADDINFO_addval( "O", RCF_ADDINFO_VAL_LEN,
+                        ADDINFO_LIST_SUBFIELD, pair,
+                        dest, msgs);
+      }
+
+      if ( *aToken EQ 'Y' )
+      {
+         ADDINFO_addval( "A", RCF_ADDINFO_VAL_LEN,
+                        ADDINFO_LIST_SUBFIELD, pair,
+                        dest, msgs);
+      }
+
+   } while ( rc EQ ESA_OK );  /* This condition is "dummy" because the
+                                 decision on loop end is done at the
+                                 beginning of the loop, when we reach
+                                 the end of the groups value.         */
+
+   exit :
+   if ( *errmsg NE NULL_CHAR )
+   {
+      CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                    func, errmsg, 4, __LINE__);
+   }
+
+   ESA_DIAG_exit(ESA_COMP_GTUSERS, 4, func, ESA_OK);
+
+ }
+ /* WS10070 - end */
+
+ /* ps0292 */
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : Dig_cert_processing                       *
+ *                                                             *
+ * DESCRIPTION     : Digital certificate fields processing     *
+ *                                                             *
+ * INPUT           : 1.addinfo       - ptr to addinfo          *
+ *                 : 2.laddinfo      - ptr to local addinfo    *
+ *                                                             *
+ * OUTPUT          : none                                      *
+ *                                                             *
+ * RETURN VALUE    : none                                      *
+ *                                                             *
+ **************************************************************/
+
+ static void Dig_cert_processing(ADDINFO_rec_ptr            addinfo,
+                                 ADDINFO_rec_ptr            laddinfo,
+                                 ADDINFO_rec_ptr            dgt_addinfo,
+                                 char                      *user,
+                                 RACF_OUTPUT_LINE_rec_ptr   output,
+                  /* IS10076     CTSAMSG_HANDLE_rec_typ     * msgs, */
+                  /* IS10076     CTSAMSG_DEST_TABLE_rec_typ * dest);*/
+                  /* IS10076  */ ADMIN_PARAMS_rec_typ  * admin_params)
+ {
+
+   static char func[]="Dig_cert_processing";
+   ESA_RC            rc;
+   int               ind_max;
+   int               i;
+   char              idx_ptn[] = DIG_CERT_PROFILE_PRFX;
+   char              idx_nmap_ptn[] = "DCERTMAP.NMAPNAME.";
+                                                       /* WS10053 */
+   char              idx_fld[80] = "";
+   static char       msg_buf[100];
+   ONE_FIELD_rec_ptr dpair;
+   ONE_FIELD_rec_ptr lpair;
+
+   CTSAMSG_HANDLE_rec_ptr        msgs;                     /* IS10076 */
+   CTSAMSG_DEST_TABLE_rec_ptr    dest;                     /* IS10076 */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GTUSERS, 4, func );
+
+   msgs = admin_params->ctsamsg_handle;                    /* IS10076 */
+   dest = admin_params->ctsamsg_dest;                      /* IS10076 */
+
+   /***  %%CERTCT field processing ***/
+
+   lpair = ADDINFO_search(DIG_CERT_INDEX_FIELD,
+                          RCF_ADDINFO_KWD_LEN,
+                          laddinfo->pair,
+                          laddinfo->num_pairs);
+   if (lpair EQ NULL)       /* The field does not exist */
+   {
+     Dig_cert_put_field(addinfo, "NODCERT", KWD_FLAG_ON, dest, msgs);
+     goto nmap;  /* WS10053 */
+   }
+
+   ind_max = atoi(lpair->value);
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 4, "cert: %s/%s/%d",
+                   lpair->keyword, lpair->value, ind_max);
+
+   if (ind_max EQ 0)
+   {
+     Dig_cert_put_field(addinfo, "NODCERT", KWD_FLAG_ON, dest, msgs);
+     goto nmap;  /* WS10053 */  /* There is no dig cert info */
+   }
+
+   Dig_cert_put_field(addinfo, "NODCERT", KWD_FLAG_OFF, dest, msgs);
+   /* Get Dig Cert Info */
+
+   for (i=1; i LE ind_max; i++)
+   {
+      sprintf(idx_fld, "%s%d", idx_ptn, i);
+
+      dpair = ADDINFO_search(idx_fld, RCF_ADDINFO_KWD_LEN,
+                          laddinfo->pair,
+                          laddinfo->num_pairs);
+      if (dpair EQ NULL)       /* The field does not exist */
+      {
+          sprintf(msg_buf,"%s field not found. USER=%s",
+                  idx_fld, user);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                        component, func,
+                        msg_buf, 0,__LINE__);
+          goto nmap;  /* WS10053 */
+      }
+
+      /* Extract Digital certificate info */
+
+      ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                      "dig cert: dpair value/i/ind max=%s/%d/%d",
+                      dpair->value, i, ind_max);      /* WS10053 */
+
+      rc = Dig_cert_extract(output,dpair->value,RACF_YES,dest,msgs);
+
+      if (rc NE ESA_OK)
+        goto nmap;  /* WS10053 */
+
+      Dig_cert_put(i, dpair->value, addinfo, laddinfo, dgt_addinfo,
+    /* IS10076     user, output, dest, msgs);     */
+    /* IS10076 */  user, output, admin_params);
+
+   }
+
+      /* The following was added to support digital         WS10053 */
+      /* certificate mapping information.  Here are the     WS10053 */
+      /* details:                                           WS10053 */
+      /* 1) We extract the value of %%NMAPCT in order to    WS10053 */
+      /*    set the loop count, ind_max.                    WS10053 */
+      /* 2) Each time in the loop, we extract the next      WS10053 */
+      /*    DCERTMAP.NMAPNAME.n field value.  This field    WS10053 */
+      /*    will be used to extract all of the required     WS10053 */
+      /*    FLTRxxxx fields (by calling CTSFDGT). These     WS10053 */
+      /*    4 fields will be extracted:                     WS10053 */
+      /*    -> DCERTMAP.LABEL                               WS10053 */
+      /*    -> DCERTMAP.TRUST                               WS10053 */
+      /*    -> DCERTMAP.OWNER                               WS10053 */
+      /*    -> DCERTMAP.FILTER                              WS10053 */
+      /* 3) Once extracted, these fields will be written    WS10053 */
+      /*    to the global ADDINFO table.                    WS10053 */
+
+   /* WS10053 begin */
+   /***  %%NMAPCT field processing ***/
+   nmap :;
+
+   lpair = ADDINFO_search("%%NMAPCT",
+                          RCF_ADDINFO_KWD_LEN,
+                          laddinfo->pair,
+                          laddinfo->num_pairs);
+   if (lpair EQ NULL)       /* The field does not exist */
+   {
+     Dig_cert_put_field(addinfo, "NODCERTMAP", KWD_FLAG_ON, dest, msgs);
+     goto exit;
+   }
+
+   ind_max = atoi(lpair->value);
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 4, "nmap: %s/%s/%d",
+                   lpair->keyword, lpair->value, ind_max);
+
+   if (ind_max EQ 0)
+   {
+     Dig_cert_put_field(addinfo, "NODCERTMAP", KWD_FLAG_ON, dest, msgs);
+     goto exit;   /* There is no dig cert mapping info */
+   }
+
+   Dig_cert_put_field(addinfo, "NODCERTMAP", KWD_FLAG_OFF, dest, msgs);
+   /* Get Dig Cert Mapping Info */
+
+   for (i=1; i LE ind_max; i++)
+   {
+      sprintf(idx_fld, "%s%d", idx_nmap_ptn, i);
+
+      dpair = ADDINFO_search(idx_fld, RCF_ADDINFO_KWD_LEN,
+                          laddinfo->pair,
+                          laddinfo->num_pairs);
+      if (dpair EQ NULL)       /* The field does not exist */
+      {
+          sprintf(msg_buf,"%s field not found. USER=%s",
+                  idx_fld, user);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                        component, func,
+                        msg_buf, 0,__LINE__);
+          goto exit;
+      }
+
+      /* Extract Digital certificate mapping info */
+
+      ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                      "nmap: dpair value/i/ind max=%s/%d/%d",
+                      dpair->value, i, ind_max);
+      rc = Dig_nmap_extract(output,dpair->value,RACF_YES,dest,msgs);
+
+      if (rc NE ESA_OK)
+        goto exit;
+
+      Dig_nmap_put(i, dpair->value, addinfo, laddinfo, dgt_addinfo,
+                   user, output, admin_params);
+   }
+   /* WS10053 end */
+
+   exit :;
+
+   ESA_DIAG_exit(ESA_COMP_GTUSERS, 4, func, ESA_OK);
+
+ }
+
+ /* ps0292 */
+/**************************************************************
+*                                                             *
+* Subroutine name : Dig_cert_extract                          *
+*                                                             *
+* DESCRIPTION     : Extract Digital certificate info          *
+*                                                             *
+* INPUT           : 1. output  - Output area for extractor    *
+*                   2. entry   - Entry name                   *
+*                   3. locate_err_flag                        *
+*                   4. dest    - Message destination ptr      *
+*                   5. msgs    - Message handle ptr           *
+*                                                             *
+*                                                             *
+* OUTPUT          : 1. output  - Output area for extractor    *
+*                                                             *
+* RETURN VALUE    : racf_extract rc                           *
+*                                                             *
+**************************************************************/
+
+static ESA_RC Dig_cert_extract (RACF_OUTPUT_LINE_rec_ptr    output,
+                        char                       *dig_cert_profile,
+                        RACF_FLAG_typ               locate_err_flag,
+                        CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                        CTSAMSG_HANDLE_rec_ptr      msgs)
+{
+
+ /*
+  *   Variables
+  */
+
+  ESA_RC rc_doit = ESA_OK ;
+  char   *volume = "", *unit = "";
+  int    len;
+  static char func[]="Dig_cert_extract";
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_GTUSERS, 3, func);
+
+  /*   Get the info */
+
+  output->max_len  = RACF_OUTPUT_SIZE;
+  output->used_len = 0 ;
+  len = strlen(dig_cert_profile);
+ /* SAS2IBMT typedef and prototype changed for IBM C
+  rc_doit = RACF_extract_res(&ctsfdgt,                               */
+  rc_doit = RACF_extract_res((ASM_RTN_TYP *) &ctsfdgt,    /* SAS2IBMT */
+                             RACF_OPERATION_LOCATE, "DIGTCERT",
+                             dig_cert_profile, len,
+                             volume, unit, component, output, debug,
+                             locate_err_flag, dest, msgs );
+ /*
+  *   Finish
+  */
+
+  exit : ;
+
+  ESA_DIAG_exit(ESA_COMP_GTUSERS, 3, func, rc_doit);
+
+  return rc_doit ;
+
+ }
+
+ /* WS10053 begin */
+/**************************************************************
+*                                                             *
+* Subroutine name : Dig_nmap_extract                          *
+*                                                             *
+* DESCRIPTION     : Extract Digital certificate mapping info  *
+*                                                             *
+* INPUT           : 1. output  - Output area for extractor    *
+*                   2. entry   - Entry name                   *
+*                   3. locate_err_flag                        *
+*                   4. dest    - Message destination ptr      *
+*                   5. msgs    - Message handle ptr           *
+*                                                             *
+*                                                             *
+* OUTPUT          : 1. output  - Output area for extractor    *
+*                                                             *
+* RETURN VALUE    : racf_extract rc                           *
+*                                                             *
+**************************************************************/
+
+static ESA_RC Dig_nmap_extract (RACF_OUTPUT_LINE_rec_ptr    output,
+                        char                       *dig_cert_profile,
+                        RACF_FLAG_typ               locate_err_flag,
+                        CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                        CTSAMSG_HANDLE_rec_ptr      msgs)
+{
+
+ /*
+  *   Variables
+  */
+
+  ESA_RC rc_doit = ESA_OK ;
+  char   *volume = "", *unit = "";
+  int    len;
+  static char func[]="Dig_nmap_extract";
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_GTUSERS, 3, func);
+
+  /*   Get the info */
+
+  output->max_len  = RACF_OUTPUT_SIZE;
+  output->used_len = 0 ;
+  len = strlen(dig_cert_profile);
+ /* SAS2IBMT typedef and prototype changed for IBM C
+  rc_doit = RACF_extract_res(&ctsfdgt,                               */
+  rc_doit = RACF_extract_res((ASM_RTN_TYP *) &ctsfdgt,    /* SAS2IBMT */
+                             RACF_OPERATION_LOCATE, "DIGTNMAP",
+                             dig_cert_profile, len,
+                             volume, unit, component, output, debug,
+                             locate_err_flag, dest, msgs );
+ /*
+  *   Finish
+  */
+
+  exit : ;
+
+  ESA_DIAG_exit(ESA_COMP_GTUSERS, 3, func, rc_doit);
+
+  return rc_doit ;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : Dig_nmap_put                              *
+ *                                                             *
+ * DESCRIPTION     : Put Digital Certificate mapping info      *
+ *                                                             *
+ * INPUT           : 1.addinfo       - ptr to addinfo          *
+ *                 : 2.laddinfo      - ptr to local addinfo    *
+ *                 : 3.dgt_addinfo   - ptr to local addinfo    *
+ *                 : 4.dgt_profile   - dig cert profile        *
+ *                                                             *
+ * OUTPUT          : none                                      *
+ *                                                             *
+ * RETURN VALUE    : none                                      *
+ *                                                             *
+ **************************************************************/
+
+ static void Dig_nmap_put(int                         i,
+                          char                      * dgt_profile_p,
+                          ADDINFO_rec_ptr             addinfo,
+                          ADDINFO_rec_ptr             laddinfo,
+                          ADDINFO_rec_ptr             dgt_addinfo,
+                          char                      * user,
+                          RACF_OUTPUT_LINE_rec_ptr    output,
+                          ADMIN_PARAMS_rec_typ       * admin_params)
+ {
+
+   static char func[]="Dig_nmap_put";
+   char              msg_buf[500];
+   char             *wptr;
+   ONE_FIELD_rec_ptr dpair;
+   /*WS10082A ONE_FIELD_rec_typ wpair; */
+   local_pair wpair;                                     /*WS10082A*/
+
+   CTSAMSG_HANDLE_rec_ptr        msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr    dest;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GTUSERS, 4, func );
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+  /*
+   *   Load information to addinfo
+   */
+
+   ADDINFO_empty( dgt_addinfo );        /* Clear local addinfo */
+   RACF_output_to_addinfo(output, addinfo, dgt_addinfo,
+                          spec_keywords, NULL, NULL, admin_params);
+
+   if (ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 4) {
+      ESA_DIAG_printf(ESA_COMP_GTUSERS, 0, "DGT MAP Addinfo");
+      ADDINFO_dump( dgt_addinfo, 0);
+   }
+
+   /** Separate DCERTMAP.FILTER into DCERTMAP.ISSUER_NAME
+                and DCERTMAP.SUBJECT_NAME - split by cent sign **/
+
+   dpair = ADDINFO_search("DCERTMAP.FILTER",
+                          RCF_ADDINFO_KWD_LEN,
+                          dgt_addinfo->pair,
+                          dgt_addinfo->num_pairs);
+
+   if (dpair EQ NULL) {
+       sprintf(msg_buf, "FILTER field not found.User=%s", user);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, msg_buf, 8,__LINE__) ;
+       goto exit;
+   }
+
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 4, "NMAP filter / i = %s / %d",
+                      dpair->value, i);
+
+   /* Obtain and put DCERTMAP.SUBJECT_NAME */
+
+   wptr = strchr(dpair->value, '½');
+   if ( NOT wptr ) {
+       sprintf(msg_buf,
+               "User=%s.Filter=%s is corrupted",
+               user, dpair->value);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, msg_buf, 8,__LINE__) ;
+       goto exit;
+   }
+
+   wptr++; /* Skip cent sign */
+   strcpy(wpair.value, wptr);
+
+   sprintf(wpair.keyword, "%s%d", "DCERTMAP.SUBJECT_NAME.", i);
+
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 4, "SUBJECT: kwd / val = %s / %s",
+                      wpair.keyword, wpair.value);
+
+   Dig_cert_put_field(addinfo, wpair.keyword, wpair.value, dest, msgs);
+
+   /* Obtain and put DCERTMAP.ISSUER_NAME */
+
+   wptr = strtok(dpair->value, "½");  /* Extract ISSUER_NAME */
+   if ( NOT wptr ) {
+       sprintf(msg_buf,
+               "User=%s.Filter=%s is corrupted",
+               user, dpair->value);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, msg_buf, 8,__LINE__) ;
+       goto exit;
+   }
+
+   sprintf(wpair.keyword, "%s%d", "DCERTMAP.ISSUER_NAME.", i);
+
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 4, "ISSUER: kwd / val = %s / %s",
+                      wpair.keyword, wptr);
+
+   Dig_cert_put_field(addinfo, wpair.keyword, wptr, dest, msgs);
+
+
+   /* Deal with DCERTMAP.LABEL */
+   dpair = ADDINFO_search("DCERTMAP.LABEL",
+                          RCF_ADDINFO_KWD_LEN,
+                          dgt_addinfo->pair,
+                          dgt_addinfo->num_pairs);
+
+   if (dpair NE NULL) {
+     sprintf(wpair.keyword, "%s%d", "DCERTMAP.LABEL.", i);
+     Dig_cert_put_field(addinfo, wpair.keyword, dpair->value,
+                        dest, msgs);
+     ESA_DIAG_printf(ESA_COMP_GTUSERS, 4, "NMAP label = %s / %s",
+                      wpair.keyword, dpair->value);
+   }
+   else {
+       sprintf(msg_buf,
+               "DCERTMAP.LABEL field not found.User=%s", user);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, msg_buf, 8,__LINE__) ;
+       Dig_cert_put_field(addinfo, wpair.keyword, KWD_FLAG_OFF,
+                          dest, msgs);
+   }
+
+
+   /* Deal with DCERTMAP.TRUST */
+   dpair = ADDINFO_search("DCERTMAP.TRUST",
+                          RCF_ADDINFO_KWD_LEN,
+                          dgt_addinfo->pair,
+                          dgt_addinfo->num_pairs);
+
+   if (dpair NE NULL) {
+     sprintf(wpair.keyword, "%s%d", "DCERTMAP.TRUST.", i);
+     Dig_cert_put_field(addinfo, wpair.keyword, dpair->value,
+                        dest, msgs);
+     ESA_DIAG_printf(ESA_COMP_GTUSERS, 4, "NMAP trust = %s / %s",
+                      wpair.keyword, dpair->value);
+   }
+   else {
+       sprintf(msg_buf,
+               "DCERTMAP.TRUST field not found.User=%s", user);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, msg_buf, 8,__LINE__) ;
+       Dig_cert_put_field(addinfo, wpair.keyword, KWD_FLAG_OFF,
+                          dest, msgs);
+   }
+
+
+   /* Deal with DCERTMAP.OWNER */
+   dpair = ADDINFO_search("DCERTMAP.OWNER",
+                          RCF_ADDINFO_KWD_LEN,
+                          dgt_addinfo->pair,
+                          dgt_addinfo->num_pairs);
+
+   if (dpair NE NULL) {
+     sprintf(wpair.keyword, "%s%d", "DCERTMAP.OWNER.", i);
+     Dig_cert_put_field(addinfo, wpair.keyword, dpair->value,
+                        dest, msgs);
+     ESA_DIAG_printf(ESA_COMP_GTUSERS, 4, "NMAP owner = %s / %s",
+                      wpair.keyword, dpair->value);
+   }
+   else {
+       sprintf(msg_buf,
+               "DCERTMAP.OWNER field not found.User=%s", user);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, msg_buf, 8,__LINE__) ;
+       Dig_cert_put_field(addinfo, wpair.keyword, KWD_FLAG_OFF,
+                          dest, msgs);
+   }
+
+
+   exit :;
+
+   ESA_DIAG_exit(ESA_COMP_GTUSERS, 4, func, ESA_OK);
+
+ }
+ /* WS10053 end */
+
+ /* ps0292 */
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : Dig_cert_put                              *
+ *                                                             *
+ * DESCRIPTION     : Put Digital Certificate info              *
+ *                                                             *
+ * INPUT           : 1.addinfo       - ptr to addinfo          *
+ *                 : 2.laddinfo      - ptr to local addinfo    *
+ *                 : 3.dgt_addinfo   - ptr to local addinfo    *
+ *                 : 4.dgt_profile   - dig cert profile        *
+ *                                                             *
+ * OUTPUT          : none                                      *
+ *                                                             *
+ * RETURN VALUE    : none                                      *
+ *                                                             *
+ **************************************************************/
+
+ static void Dig_cert_put(int                         i,
+                          char                      * dgt_profile_p,
+                          ADDINFO_rec_ptr             addinfo,
+                          ADDINFO_rec_ptr             laddinfo,
+                          ADDINFO_rec_ptr             dgt_addinfo,
+                          char                      * user,
+                          RACF_OUTPUT_LINE_rec_ptr    output,
+           /* IS10076     CTSAMSG_HANDLE_rec_typ     * msgs,      */
+           /* IS10076     CTSAMSG_DEST_TABLE_rec_typ * dest);     */
+           /* IS10076  */ ADMIN_PARAMS_rec_typ       * admin_params)
+ {
+
+   static char func[]="Dig_cert_put";
+   ESA_RC            rc;
+   char              dgt_profile[500];
+   char              msg_buf[500];
+   int               length;
+   char             *asn1buf;
+   char             *wptr;
+   char              racf_separator = 0x4A;
+   ONE_FIELD_rec_ptr dpair;
+   /* replace with local dummy pair with keywor & value only. WS10082A*
+   ONE_FIELD_rec_typ wpair;
+   ONE_FIELD_rec_typ serial_number;
+   ONE_FIELD_rec_typ serial_number_dot;               end of WS10082A*/
+   local_pair        wpair;                                /*WS10082A*/
+   local_pair        serial_number;                        /*WS10082A*/
+   local_pair        serial_number_dot;                    /*WS10082A*/
+   /* Next 4 vars are not GT 1024.                           WS10082A*/
+   ONE_FIELD_rec_typ issuer_name;
+   ONE_FIELD_rec_typ valid_date;
+   ONE_FIELD_rec_typ expired_date;
+   ONE_FIELD_rec_typ subject_name;
+
+   CTSAMSG_HANDLE_rec_ptr        msgs;                     /* IS10076 */
+   CTSAMSG_DEST_TABLE_rec_ptr    dest;                     /* IS10076 */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GTUSERS, 4, func );
+
+   msgs = admin_params->ctsamsg_handle;                    /* IS10076 */
+   dest = admin_params->ctsamsg_dest;                      /* IS10076 */
+
+  /*
+   *   Load information to addinfo
+   */
+
+   strcpy(dgt_profile, dgt_profile_p);  /* Keep profile name   */
+   ADDINFO_empty( dgt_addinfo );        /* Clear local addinfo */
+   RACF_output_to_addinfo(output, addinfo, dgt_addinfo,
+            /* IS10076    spec_keywords, dest, msgs );    */
+     /* IS10100   * IS10076 *  spec_keywords, NULL, admin_params);  */
+            /* IS10100 */ spec_keywords, NULL, NULL, admin_params);
+
+   if (ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 4) {
+      ESA_DIAG_printf(ESA_COMP_GTUSERS, 0, "DGT Addinfo");
+      ADDINFO_dump( dgt_addinfo, 0);
+   }
+
+   /***  CERTDATA field processing ***/
+
+   dpair = ADDINFO_search(DIG_CERT_DATA_FIELD,
+                          RCF_ADDINFO_KWD_LEN,
+                          dgt_addinfo->pair,
+                          dgt_addinfo->num_pairs);
+
+   if (dpair EQ NULL) { /* The field does not exist */
+     sprintf(msg_buf, "Field %s not found. User=%s",
+             DIG_CERT_DATA_FIELD, user);
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                   func, msg_buf, 8,__LINE__) ;
+     goto exit;
+   }
+   if (dpair->vallen EQ 0) {
+     sprintf(msg_buf, "Field %s not found. User=%s",
+             DIG_CERT_DATA_FIELD, user);
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                   func, msg_buf, 8,__LINE__) ;
+     goto exit;
+   }
+
+   length = dpair->vallen;
+   asn1buf= dpair->value;
+
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                   "CERTDATA and length=%s / %d", asn1buf, length);
+
+   rc = RACF_getdig_info(asn1buf,
+                         length,
+                         serial_number.value,
+                         issuer_name.value,
+                         valid_date.value,
+                         expired_date.value,
+                         subject_name.value,
+                         dest, msgs);
+
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 4, "RACF_getdig_info:rc=%d", rc);
+   if (rc NE ESA_OK)
+     goto exit;
+
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 3,
+                   "serial_number=%s", serial_number.value);
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 3,
+                   "issuer_name=%s", issuer_name.value);
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 3,
+                   "valid_date=%s", valid_date.value);
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 3,
+                   "expired_date=%s", expired_date.value);
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 3,
+                   "subject_name=%s", subject_name.value);
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 3,
+                   "dgt_profile=%s", dgt_profile);
+
+   /** Parsing tests **/
+
+   /** Serial Number checking **/
+
+   strcpy(serial_number_dot.value, serial_number.value);
+   strcat(serial_number_dot.value, ".");
+   if (memcmp(dgt_profile, serial_number_dot.value,
+       strlen(serial_number_dot.value) ) NE 0 ) {
+       sprintf(msg_buf,
+               "User=%s.Profile=%s Invalid Serial Number=%s",
+               user, dgt_profile, serial_number.value);
+     /*
+      *CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+      *              func, msg_buf, 8,__LINE__) ;
+      */
+      /* The message abive - is only Warning. goto exit; */
+   }
+
+   /** APPLDATA field checking **/
+
+   dpair = ADDINFO_search("DCERT.APPLDATA",
+                          RCF_ADDINFO_KWD_LEN,
+                          dgt_addinfo->pair,
+                          dgt_addinfo->num_pairs);
+
+   if (dpair EQ NULL) {
+       sprintf(msg_buf, "APPLDATA field not found.User=%s", user);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, msg_buf, 8,__LINE__) ;
+       goto exit;
+   }
+
+   if ( strcmp(dpair->value, user) NE 0) {
+       sprintf(msg_buf,
+               "User=%s.Mismatch APPLDATA. Expected=%s obtained=%s",
+               user, dpair->value);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, msg_buf, 8,__LINE__) ;
+       /* goto exit; */
+   }
+
+   /* Obtain and put to ADDINFO issuer name from RACF profile */
+
+   wptr = strchr(dgt_profile, '.');
+   if ( NOT wptr ) {
+       sprintf(msg_buf,
+               "User=%s.Profile name=%s is corrupted",
+               user, dgt_profile);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, msg_buf, 8,__LINE__) ;
+       goto exit;
+   }
+
+   wptr++; /* Skip dot*/
+   strcpy(wpair.value, wptr);
+
+   /* Convert X'4A' to X'40' (Blank) */
+
+   for (wptr=wpair.value; *wptr; wptr++) {
+     if ( (*wptr) EQ racf_separator )
+        *wptr = ' ';
+   }
+
+   sprintf(wpair.keyword, "%s%d", "DCERT.ISSUER_NAME.", i);
+   /* BS2714 begin */
+/*Dig_cert_put_field(addinfo, wpair.keyword, wpair.value, dest, msgs);*/
+   Dig_cert_put_field(addinfo, wpair.keyword, issuer_name.value,
+                      dest, msgs);
+   /* BS2714 end */
+
+   /* Put to ADDINFO serial number */
+
+   sprintf(wpair.keyword, "%s%d", "DCERT.SERIAL_NUMBER.", i);
+   wptr = strtok(dgt_profile, ".");  /* Extract serial number */
+   if ( NOT wptr ) {
+       sprintf(msg_buf,
+               "User=%s.Profile name=%s is corrupted",
+               user, dgt_profile);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, msg_buf, 8,__LINE__) ;
+       goto exit;
+   }
+
+   Dig_cert_put_field(addinfo, wpair.keyword, wptr, dest, msgs);
+
+   /* Put to ADDINFO validity date */
+
+   if (strlen(valid_date.value) GT 0) {
+     sprintf(wpair.keyword, "%s%d", "DCERT.VALID_NOT_BEFORE.", i);
+     Dig_cert_put_field(addinfo,wpair.keyword,valid_date.value,
+                        dest, msgs);
+   }
+   else {
+       sprintf(msg_buf,
+               "Validity Period not found. User=%s", user);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, msg_buf, 8,__LINE__) ;
+       /* goto exit; */
+   }
+
+   /* Put to ADDINFO validity date */
+
+   if (strlen(expired_date.value) GT 0) {
+     sprintf(wpair.keyword, "%s%d", "DCERT.VALID_NOT_AFTER.", i);
+     Dig_cert_put_field(addinfo,wpair.keyword,expired_date.value,
+                        dest, msgs);
+   }
+   else {
+       sprintf(msg_buf,
+               "Validity period not found.User=%s", user);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, msg_buf, 8,__LINE__) ;
+       /* goto exit; */
+   }
+
+   /* Put to ADDINFO subject name */
+
+   sprintf(wpair.keyword, "%s%d", "DCERT.SUBJECT_NAME.", i);
+   Dig_cert_put_field(addinfo,wpair.keyword,subject_name.value,
+                      dest, msgs);
+
+   /* Put to ADDINFO general flag */
+
+   sprintf(wpair.keyword, "%s%d", "DCERT.SERIAL.", i);
+   Dig_cert_put_field(addinfo, wpair.keyword, KWD_FLAG_ON, dest, msgs);
+
+   /* Put to ADDINFO TRUST flag */
+   dpair = ADDINFO_search("DCERT.TRUST",
+                          RCF_ADDINFO_KWD_LEN,
+                          dgt_addinfo->pair,
+                          dgt_addinfo->num_pairs);
+
+   if (dpair NE NULL) {
+     sprintf(wpair.keyword, "%s%d", "DCERT.TRUST.", i);
+     Dig_cert_put_field(addinfo, wpair.keyword, dpair->value,
+                        dest, msgs);
+   }
+   else {
+       sprintf(msg_buf,
+               "TRUST field not found.User=%s", user);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, msg_buf, 8,__LINE__) ;
+       Dig_cert_put_field(addinfo, wpair.keyword, KWD_FLAG_OFF,
+                          dest, msgs);
+       /* goto exit; */
+   }
+
+   /* Put to ADDINFO OWNER field */
+   dpair = ADDINFO_search("DCERT.OWNER",
+                          RCF_ADDINFO_KWD_LEN,
+                          dgt_addinfo->pair,
+                          dgt_addinfo->num_pairs);
+
+   if (dpair NE NULL) {
+     sprintf(wpair.keyword, "%s%d", "DCERT.OWNER.", i);
+     Dig_cert_put_field(addinfo, wpair.keyword, dpair->value,
+                        dest, msgs);
+   }
+   else {
+       sprintf(msg_buf,
+               "OWNER field not found.User=%s", user);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, msg_buf, 8,__LINE__) ;
+       /* goto exit; */
+   }
+
+   /* Put to ADDINFO CREATE_DATE field */
+   dpair = ADDINFO_search("DCERT.CREATE_DATE",
+                          RCF_ADDINFO_KWD_LEN,
+                          dgt_addinfo->pair,
+                          dgt_addinfo->num_pairs);
+
+   if (dpair NE NULL) {
+     sprintf(wpair.keyword, "%s%d", "DCERT.CREATE_DATE.", i);
+     Dig_cert_put_field(addinfo, wpair.keyword, dpair->value,
+                        dest, msgs);
+   }
+   else {
+       sprintf(msg_buf,
+               "CREATE_DATE field not found.User=%s", user);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, msg_buf, 8,__LINE__) ;
+       /* goto exit; */
+   }
+
+   exit :;
+
+   ESA_DIAG_exit(ESA_COMP_GTUSERS, 4, func, ESA_OK);
+
+ }
+
+ /* ps0292 */
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : Dig_cert_put_field                        *
+ *                                                             *
+ * DESCRIPTION     : Put dcert related fields into addinfo     *
+ *                                                             *
+ * INPUT           : 1.addinfo       - ptr to addinfo          *
+ *                 : 2.keyword       - keyword                 *
+ *                 : 3.value         - value                   *
+ *                                                             *
+ * OUTPUT          : none                                      *
+ *                                                             *
+ * RETURN VALUE    : none                                      *
+ *                                                             *
+ **************************************************************/
+
+ static void Dig_cert_put_field(ADDINFO_rec_ptr          addinfo,
+                             char                      * keyword,
+                             char                      * value,
+                             CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                             CTSAMSG_HANDLE_rec_ptr      msgs)
+ {
+
+   static char func[]="Dig_cert_put_field";
+   ESA_RC            rc = ESA_OK;
+   ONE_FIELD_rec_ptr pair;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GTUSERS, 4, func );
+
+   pair = ADDINFO_search(keyword,
+                         RCF_ADDINFO_KWD_LEN,
+                         addinfo->pair,
+                         addinfo->num_pairs);
+   if (pair) { /* Field exists */
+     ADDINFO_updval(value, RCF_ADDINFO_VAL_LEN, pair );
+     ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+                     "keyword=%s value=%s",
+                      keyword,  value);
+   }
+
+   ESA_DIAG_exit(ESA_COMP_GTUSERS, 4, func, rc);
+
+ }
+
+ /* ps0292 */
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : Dig_cert_set_mandatory                    *
+ *                                                             *
+ * DESCRIPTION     : Set dig set mandatory flag fields         *
+ *                                                             *
+ * INPUT           : 1.addinfo       - ptr to addinfo          *
+ *                                                             *
+ * OUTPUT          : none                                      *
+ *                                                             *
+ * RETURN VALUE    : none                                      *
+ *                                                             *
+ **************************************************************/
+
+ static void Dig_cert_set_mandatory(ADDINFO_rec_ptr             addinfo,
+                                    CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                                    CTSAMSG_HANDLE_rec_ptr      msgs)
+ {
+
+   static char func[]="Dig_cert_set_mandatory";
+   ESA_RC            rc = ESA_OK;
+   int               i=0;
+   ONE_FIELD_rec_ptr pair = NULL;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GTUSERS, 4, func );
+
+   while (pair=ADDINFO_get_next(addinfo,pair)) {
+     i++;
+     ESA_DIAG_printf(ESA_COMP_GTUSERS, 5,
+                  "pair no. %3d: kwd=%s(%3d) val=%s(%3d)",
+                  i, pair->keyword, pair->keylen, pair->value,
+                  pair->vallen) ;
+
+     /* The Main DCERT field */
+
+     if ( (strcmp(pair->keyword, "NODCERT") EQ 0) AND
+          (pair->vallen EQ 0)                       )
+        Dig_cert_put_field(addinfo, "NODCERT", KWD_FLAG_ON, dest, msgs);
+
+     /* The Main DCERT.SERIAL. field */
+
+     if ( (memcmp(pair->keyword, "DCERT.SERIAL.", 13) EQ 0) AND
+          (pair->vallen EQ 0)                                 )
+        Dig_cert_put_field(addinfo,
+                           pair->keyword, KWD_FLAG_OFF, dest, msgs);
+
+     /* The Main DCERT.TRUST. field */
+
+     if ( (memcmp(pair->keyword, "DCERT.TRUST.", 12) EQ 0) AND
+          (pair->vallen EQ 0)                                 )
+        Dig_cert_put_field(addinfo,
+                           pair->keyword, KWD_FLAG_OFF, dest, msgs);
+
+   }
+
+   ESA_DIAG_exit(ESA_COMP_GTUSERS, 4, func, rc);
+
+ }
+
+/* IS10100 - start  */
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : Handle_Revoke_Reason                       *
+*                                                             *
+* DESCRIPTION    : Called at te end of the GetUser process    *
+*                  to handle the revoke reaosn (along with    *
+*                  other CTSACF features).                    *
+*                  - If the user is not revoked but has a     *
+*                    revoke reason, remove it.                *
+*                  - If reason is ? or empty and              *
+*                    rvkflg_set_arg is TRUE, the user is      *
+*                    revoked becasue of date so set reason    *
+*                    = 'D'.                                   *
+*                  - Otherwise, do not change the reason.     *
+*                  - return the revoke reason name in         *
+*                    RACF_REVOKE_REASON field.                *
+*                  - Set values fo RU_LOCKED and U_SUSPENDED. *
+*                                                             *
+* INPUT          : cf_name     - CTSACF custom field name.    *
+*                : in_pair     - CTSACF custom field pair in  *
+*                                uaddinfo if user has data    *
+*                                for the field, or NULL if    *
+*                                no data.                     *
+*                : addinfo     - addinfo containing user      *
+*                                information.                 *
+*                : laddinfo    - addinfo with additional      *
+*                                information. (special        *
+*                                keywords and CTSACF data).   *
+*                : user_params - user params.                 *
+*                : args_num    - 1                            *
+*                : args_list     rvkflg_set_arg - TRUE when   *
+*                                    the user is revoked      *
+*                :                   because of date.         *
+*                                                             *
+* OUTPUT         : RU_LOCKED and RU_SUSPENDED are updated in  *
+*                  addinfo according to revoke reason.        *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+**************************************************************/
+static  ESA_RC Handle_Revoke_Reason(ESA_DIAG_COMP_typ     comp,
+                                  char                   *cf_name,
+                                  ONE_FIELD_rec_ptr       in_pair,
+                                  ADDINFO_rec_ptr         addinfo,
+                                  ADDINFO_rec_ptr         laddinfo,
+                                  void                   *uparms,
+                                  ADMIN_PARAMS_rec_typ   *admin_params,
+                                  int                     args_num,
+                                  va_list                 args_list)
+{
+
+  char     func[] = "Handle_Revoke_Reason";
+  ESA_RC   rc;
+  USER_PARAMS_rec_typ    *user_params;
+  char      csfield_full_name[16];
+  ONE_FIELD_rec_ptr     pair;
+  ONE_FIELD_rec_ptr     locked_pair;
+  ONE_FIELD_rec_ptr     suspended_pair;
+  ONE_FIELD_rec_ptr     reason_pair;                     /* WS10043 */
+  char                  reason_name[15];                 /* SAS2IBMN */
+  char              is_locked[2] = "N";
+  char              is_suspended[2] = "N";
+  int               rvkflg_set_arg;
+
+  CTSAMSG_HANDLE_rec_ptr        msgs;
+  CTSAMSG_DEST_TABLE_rec_ptr    dest;
+
+  /*
+   *  Initialization
+   */
+  ESA_DIAG_enter(ESA_COMP_GTUSERS, 1, func);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  if (uparms EQ NULL  OR args_num EQ 0)
+    goto exit;
+
+  user_params = (USER_PARAMS_rec_typ *)uparms;
+  pair = in_pair;
+  rvkflg_set_arg = va_arg(args_list, int);
+
+  /*
+   *  If the user is not revoked, remove the revoke reason,
+   *  if exists.
+   */
+  if (user_params->rev_status EQ USER_STAT_ACTIVE)
+  {
+    if (pair NE NULL)
+    {
+      rc = RACF_Update_Revoke_Reason(comp, user_params->user,
+                                     'U', 'S', NULL_CHAR,
+                                     cf_name, admin_params);
+      if (rc EQ ESA_OK)
+        pair = NULL;
+    }
+  }
+  else
+  /*
+   *  If the user is revoked:
+   *  - If reason is ? or empty and rvkflg_set_arg is TRUE, the
+   *    user is revoked becasue of date, set reason = 'D'.
+   *  - Otherwise, do not change the reason.
+   *  - Set values fo RU_LOCKED and U_SUSPENDED.
+   */
+    if (user_params->rev_status EQ USER_STAT_REVOKED)
+    {
+      if ( ( (pair NE NULL   AND
+              pair->vallen EQ 1 AND
+              pair->value[0] EQ '?')  OR
+             (pair EQ NULL) )   AND
+             (rvkflg_set_arg EQ TRUE) )
+      {
+        rc = RACF_Update_Revoke_Reason(comp, user_params->user,
+                                  'U', 'V', 'D',
+                                  cf_name, admin_params);
+
+        /*  If the revoke reason was added/changed successfully, */
+        /*  update the local addinfo accordingly.                */
+        if (rc EQ ESA_OK)
+        {
+          strcpy(csfield_full_name, "CSDATA.");
+          strcat(csfield_full_name, cf_name);
+
+          if (pair EQ NULL)
+          {
+            ADDINFO_insert(TYPE_1A,
+                           csfield_full_name,
+                           "D",
+                           laddinfo,
+                           RCF_ADDINFO_KWD_LEN,
+                           RCF_ADDINFO_VAL_LEN,
+                           UNIQUE);
+            pair = ADDINFO_search(csfield_full_name,
+                            RCF_ADDINFO_KWD_LEN,
+                            laddinfo->pair,
+                            laddinfo->num_pairs );
+          }
+          else
+            ADDINFO_updval("D", RCF_ADDINFO_VAL_LEN, pair);
+        }
+      }
+    }
+
+  /*
+   *  Set RU_LOCKED and RU_SUSPENDED values.
+   *
+   *  If we have a value for the field, set according to value.
+   *  If there's  no value, set N in both RU_LOCKED and RU_SUSPENDED.
+   */
+  if (pair NE NULL)
+  {
+    /* WS10043 - start */
+    reason_pair = ADDINFO_search("RACF_REVOKE_REASON",
+                        RCF_ADDINFO_KWD_LEN,
+                        addinfo->pair,
+                        addinfo->num_pairs );
+    if (reason_pair NE NULL)
+      /* SAS2IBMN - start */
+      /*
+      ADDINFO_updval(RACF_Revoke_Reason_Code2Name(pair->value[0]),
+                     RCF_ADDINFO_VAL_LEN, reason_pair);
+      */
+      {
+        RACF_Revoke_Reason_Code2Name(pair->value[0], reason_name);
+        ADDINFO_updval(reason_name, RCF_ADDINFO_VAL_LEN, reason_pair);
+      }
+      /* SAS2IBMN - end   */
+    /* WS10043 - end */
+    if (pair->value[0] EQ 'P')
+    {
+      is_locked[0] = 'Y';
+      is_suspended[0] = 'N';
+    }
+    else
+    {
+      is_locked[0] = 'N';
+      is_suspended[0] = 'Y';
+    }
+  }
+  else
+  {
+    is_locked[0] = 'N';
+    is_suspended[0] = 'N';
+  }
+
+  is_locked[1] = NULL_CHAR;
+  is_suspended[1] = NULL_CHAR;
+
+  /*  Set RU_LOCKED value */
+  locked_pair = ADDINFO_search("RU_LOCKED",
+                        RCF_ADDINFO_KWD_LEN,
+                        addinfo->pair,
+                        addinfo->num_pairs );
+  if (locked_pair NE NULL)
+    ADDINFO_updval(is_locked, RCF_ADDINFO_VAL_LEN, locked_pair);
+
+  /*  Set RU_SUSPENDED value */
+  suspended_pair = ADDINFO_search("RU_SUSPENDED",
+                        RCF_ADDINFO_KWD_LEN,
+                        addinfo->pair,
+                        addinfo->num_pairs );
+  if (suspended_pair NE NULL)
+    ADDINFO_updval(is_suspended, RCF_ADDINFO_VAL_LEN,
+                   suspended_pair);
+
+  /*
+   *  Termination
+   */
+ exit:;
+  ESA_DIAG_exit(ESA_COMP_GTUSERS, 1, func, ESA_OK);
+
+  return ESA_OK;
+}
+/* IS10100 - end    */

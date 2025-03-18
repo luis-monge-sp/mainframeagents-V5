@@ -1,0 +1,840 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Isuuing TSS  commands                    *
+ *                                                             *
+ * File Name        : ctstcmr (resource )                      *
+ *                                                             *
+ * Author           : Alexander Shvartsman                     *
+ *                                                             *
+ * Creation Date    : 16/06/96                                 *
+ *                                                             *
+ * Description      : TSS  issuing command                     *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * ps0319   Alex     15/10/98 Invalid Sequence Of Login/Logout *
+ * IS10077  NuritY   20/08/12 incorrect handling of resource   *
+ *                            names between signle quotes.     *
+ * IS10092  NuritY   10/06/13 Copy from 3.2 for IS10077.       *
+ * BS10109  NuritY   15/09/20 Abend S0C4 when length of line   *
+ *                            returned from TSS > 133.         *
+ * WS10082  AvnerL   12/11/23 Remove API_ADDINFO               *
+ ***************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDIO
+ #include   STDLIB
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_CTSAMSG
+ #include ESA_API
+ #include ESA_API_CODES
+ #include API_AUTH
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_COMP
+ #include MVS_OS_MVS
+ /*WS10082A #include API_ADDINFO --- not used */
+
+ /*
+  *   TSS include files
+  */
+
+ #include TSS
+ #include TSS_XRES
+ #include TSS_CODES
+
+/* IS10077 - start */
+static char * my_res_strtok(char         *  sptr,
+                            char         *  charset,
+                            void         ** handle,
+                            char         *  result);
+
+static void Convert_resname(char    * res_type,
+                            char    * res_name,
+                            char    * conv_res_name);
+/* IS10077 - end */
+
+ /*************************************************
+  *       GET RESOURCE RELATED PROGRAMS           *
+  *************************************************/
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_get_whoowns_res                        *
+ *                                                             *
+ * DESCRIPTION    : Issue TSS commands and save output         *
+ *                                                             *
+ * INPUT          : comp        - diag component               *
+ *                  res_in      - resource description         *
+ *                  get_handle  - get res handle               *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_get_whoowns_res(ESA_DIAG_COMP_typ            comp,
+                          TSS_CMD_MODE_typ               mode,
+                          RES_PARAMS_rec_typ           * res_in,
+                          TSS_GET_RES_HANDLE_typ       * get_handle,
+                          TSS_SAVE_ACL_MODE_typ          acl_save_mode,
+                          ADMIN_PARAMS_rec_typ         * admin_params,
+                          ERR_STRUCT_rec_typ           * err)
+ {
+
+  /*
+   *    Local Variables
+   */
+
+   static char func[]="TSS_get_whoowns_res";
+
+   static char   *main_cmd = " WHOOWNS %s(%s) ";
+   TSS_LIST_HANDLE_rec_typ      handle;
+   CTSAMSG_HANDLE_rec_typ     * msgs;
+   CTSAMSG_DEST_TABLE_rec_typ * dest;
+   TSS_TRAP_RES_BUF_typ       * tmp = NULL;
+   ESA_RC                       rc  = ESA_OK;
+   ESA_RC                       rc_cmd = ESA_OK,
+                                rc_p = ESA_OK,
+                                rc_f = ESA_OK;
+   int                          i_trap = 0;
+   int                          logout_done = 0;
+   int                          i;
+   TSS_CMD_BUF_rec_typ          ret_buf;
+   TSS_CMD_BUF_rec_typ          cmd = { 0, 0, "" };
+   char                         cmd_handle[TSS_CMD_HANDLE_LEN];
+   char                         tmp_handle[TSS_CMD_HANDLE_LEN];
+   char                        *token;
+   void                        *my_res_strtok_handle;      /* IS10077 */
+   char                    result[MAX_TSS_RES_NAME_LEN+1]; /* IS10077 */
+
+ /***********************************************************
+  *   DEPTCTSA    OWNS   DATASET  CTSA                      *
+  *   CTSU010     OWNS   DATASET  CTSU010.                  *
+  *   CTSU010     OWNS   DATASET  CTSU010A.                 *
+  ***********************************************************/
+
+  static char     ace_acid[TSS_USER_NAME_LEN  + 1]  = "";
+  static char     owner_acid[TSS_USER_NAME_LEN  + 1];
+  static char     owns    [TSS_USER_NAME_LEN    + 1];
+  static char     res_name[MAX_TSS_RES_NAME_LEN + 1];
+  static char     res_name_conv[MAX_TSS_RES_NAME_LEN + 1]; /* IS10077 */
+  /* IS10077 static char   res_type[TSS_USER_NAME_LEN    + 1];    */
+  static char     res_type[MAX_TSS_RES_TYPE_LEN + 1];      /* IS10077 */
+  static TSS_OUTP_typ    resown_d[] = {
+                     { sizeof(owner_acid),  owner_acid },
+                     { sizeof(owns),        owns       },
+                     { sizeof(res_type),    res_type   },
+                     { sizeof(res_name),    res_name   },
+                     { 0,                   NULL     } };
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 3, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   ESA_DIAG_printf(comp, 3, "Resource %s %s",
+                   res_in->restype, res_in->resource);
+   rc = CTSCRSS_set_authority( &logout_done,
+                               SET_TO_STARTED_TASK_AUTH,
+                               admin_params, err );
+   if ( rc NE ESA_OK )
+       goto exit;
+
+   sprintf(cmd.buffer, main_cmd,
+           TSS_convert_restype(res_in->restype),
+           res_in->resource);
+
+   cmd.max_len = strlen(cmd.buffer);
+   cmd.use_len = strlen(cmd.buffer);
+
+  /*
+   *   Send cmd to TSS
+   */
+
+   rc_cmd = TSS_send_cmd(comp, mode,
+                              /* TSS_CMD_QUIET_MODE,    */
+                              /* TSS_CMD_DEFAULT_MODE,  */
+                         &cmd, cmd_handle, FALSE, dest, msgs);
+   if ( rc_cmd NE ESA_OK )
+      goto exit;
+
+  /*
+   * Calculate number of output lines
+   */
+
+   memcpy(tmp_handle, cmd_handle, sizeof(cmd_handle) );
+   rc_p = TSS_get_output(comp, tmp_handle, &ret_buf, dest, msgs);
+   if ( rc_p EQ ESA_FATAL)
+       goto exit;
+
+   while (rc_p NE ESA_EOF)
+   {
+        i_trap++;
+        rc_p = TSS_get_output(comp, tmp_handle, &ret_buf, dest, msgs);
+        if ( rc_p EQ ESA_FATAL)
+            goto exit;
+   }
+
+   rc_p = ESA_OK;
+
+   ESA_DIAG_printf(comp,6, "Detected %d output lines", i_trap );
+
+  /*
+   *  Create trap command handle
+   */
+
+   i_trap += 2;
+
+   if ( get_handle->trap_buffer EQ NULL)
+   {
+     rc = TSS_alloc_res_trap_buffer (comp, i_trap, &tmp, dest, msgs );
+     if ( rc NE ESA_OK )
+        goto exit;
+   }
+   else
+   {
+      tmp = get_handle->trap_buffer;
+      rc = TSS_realloc_res_trap_buffer(comp, &(tmp->res_info),
+                                       i_trap, dest, msgs);
+      if ( rc NE ESA_OK )
+        goto exit;
+   }
+
+   rc_p = TSS_get_output(comp, cmd_handle, &ret_buf, dest, msgs);
+   if ( rc_p EQ ESA_FATAL )
+       goto exit;
+
+   while (rc_p NE ESA_EOF)
+   {
+     if ( rc_p EQ ESA_OK)
+     {
+       owner_acid[0] = NULL_CHAR;
+       owns      [0] = NULL_CHAR;
+       res_type  [0] = NULL_CHAR;
+       res_name  [0] = NULL_CHAR;
+
+       handle.start_line_ptr   = ret_buf.buffer;
+       handle.current_line_ptr = ret_buf.buffer;
+
+       ESA_DIAG_printf (comp, 10, "Obtained data=%s",ret_buf.buffer);
+
+/*  IS10077 - start */
+/*     token = strtok(ret_buf.buffer, " \n");                        */
+       token = my_res_strtok(ret_buf.buffer, " \n",
+                             &my_res_strtok_handle, result);
+/*  IS10077 - end */
+       i = 0;
+       while (token AND resown_d[i].data)
+       {
+         ESA_DIAG_printf (comp, 10,
+                          "var=%d/%s max_var_len=%d",
+            /* IS10077 */ strlen(result), result, resown_d[i].data_len);
+ /* IS10077               strlen(token), token , resown_d[i].data_len);
+ */
+
+         rc=TSS_check_param_overflow(comp, NULL, NULL, NULL,
+                       /* IS10077     strlen(token),                  */
+                                      strlen(result),      /* IS10077 */
+                                      resown_d[i].data_len,
+                                      dest,msgs);
+         if (rc NE ESA_OK)
+            goto exit;
+         else
+/*  IS10077 strcpy(resown_d[i].data, token);                      */
+            strcpy(resown_d[i].data, result);          /* IS10077 */
+
+        /*
+         *  Get next var
+         */
+
+/*  IS10077 - start */
+/*       token = strtok(NULL, " \n");                          */
+         token = my_res_strtok(NULL, " \n",
+                               &my_res_strtok_handle, result);
+/*  IS10077 - end */
+         i++;
+       }
+
+       ESA_DIAG_printf (comp, 5, "Obtained parameters: %s %s %s %s",
+                        owner_acid, owns, res_type, res_name);
+
+       res_name_conv[0] = NULL_CHAR;
+       Convert_resname(res_type, res_name, res_name_conv); /* IS10077 */
+
+       ESA_DIAG_printf (comp, 5, "Converted resource name: %s -> %s",
+                        res_name, res_name_conv);         /* IS10077 */
+
+       if (res_name_conv[0] EQ NULL_CHAR)    /* IS10077 */
+         strcpy(res_name_conv, res_name);    /* IS10077 */
+
+       rc = TSS_save_res_info(comp, tmp, owner_acid, ace_acid,
+              /* IS10077    owns, res_type, res_name, acl_save_mode,*/
+                            owns, res_type, res_name_conv, /* IS10077 */
+                            acl_save_mode,                 /* IS10077 */
+                            TSS_ACL_ITEM_SOURCE_UNKNOWN, dest, msgs );
+       if ( rc EQ ESA_OK )
+          strcpy(tmp->res_type, res_type);
+       else
+         if ( rc EQ ESA_SKIP )
+           rc = ESA_OK;
+         else
+           goto exit;
+
+     }   /* rc = ESA_OK after get_output */
+     else
+       if ( rc_p EQ ESA_FATAL)
+         goto exit;
+
+       rc_p = TSS_get_output(comp, cmd_handle, &ret_buf, dest, msgs);
+   }
+
+   rc_p = ESA_OK;
+
+  /*
+   *    Finish
+   */
+
+  exit:;
+
+   rc_f = TSS_free_output(comp, cmd_handle, dest, msgs);
+
+   if ( ( rc_cmd NE ESA_OK ) OR
+        ( rc_p   NE ESA_OK ) OR
+        ( rc_f   NE ESA_OK )  )
+     rc = ESA_FATAL;
+
+  if (logout_done)
+    CTSCRSS_set_authority( &logout_done,
+                           RETURN_FROM_STARTED_TASK_AUTH,
+                           admin_params, err );
+
+  get_handle->trap_buffer = tmp;
+
+  ESA_DIAG_exit(comp, 3, func, rc);
+
+  return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_get_whohas_res                         *
+ *                                                             *
+ * INPUT          : comp        - diag component               *
+ *                  res_in      - resource description         *
+ *                  get_handle  - get res handle               *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_get_whohas_res(ESA_DIAG_COMP_typ             comp,
+                          TSS_CMD_MODE_typ               mode,
+                          RES_PARAMS_rec_typ           * res_in,
+                          TSS_GET_RES_HANDLE_typ       * get_handle,
+                          TSS_SAVE_ACL_MODE_typ          acl_save_mode,
+                          ADMIN_PARAMS_rec_typ         * admin_params,
+                          ERR_STRUCT_rec_typ           * err)
+ {
+
+
+  /*
+   *    Local Variables
+   */
+
+   static char func[]="TSS_get_whohas_res";
+
+   static char   *main_cmd = " WHOHAS %s(%s) ";
+   char                       * wptr;
+   TSS_LIST_HANDLE_rec_typ      handle;
+   CTSAMSG_HANDLE_rec_typ     * msgs;
+   CTSAMSG_DEST_TABLE_rec_typ * dest;
+   TSS_TRAP_RES_BUF_typ       * tmp = NULL;
+   TSS_ACL_ITEM_SOURCE_typ      acl_source;
+   ESA_RC                  rc  = ESA_OK;
+   ESA_RC                  rc1 = ESA_OK;
+   ESA_RC                  rc2 = ESA_OK;
+   ESA_RC                  rc_cmd = ESA_OK,
+                           rc_p = ESA_OK,
+                           rc_f = ESA_OK;
+   int                     i_trap = 0;
+   int                     logout_done = 0;
+   TSS_CMD_BUF_rec_typ     ret_buf;
+   TSS_CMD_BUF_rec_typ     cmd = { 0, 0, "" };
+   char                    cmd_handle[TSS_CMD_HANDLE_LEN];
+   char                    tmp_handle[TSS_CMD_HANDLE_LEN];
+   /* BS10109 * char      tmp_line[MAX_TSS_API_ST_TRAP];  * IS10077 */
+   char                    tmp_line[MAX_TSS_API_ST];    /* BS10109 */
+   char                   *token;
+   void                   *my_res_strtok_handle;           /* IS10077 */
+   char                    result[MAX_TSS_RES_NAME_LEN+1]; /* IS10077 */
+
+ /***********************************************************
+  * DATASET  = CTSA         OWNER(DEPTCTSA)                 *
+  *  XAUTH  = CTSA.V201.CLIST                 ACID(*ALL*)   *
+  *  ACCESS = READ                                          *
+  *  XAUTH  = CTSA.V201.CLIST UNTIL(11/11/97) ACID(*ALL*)   *
+  *  ACCESS = READ                                          *
+  *  ADMIN  = CTSA.V201.CLIST                 ACID(*ALL*)   *
+  *  ACCESS = READ                                          *
+  ***********************************************************/
+
+  static char            ace_acid[TSS_USER_NAME_LEN  + 1] = "";
+  static char            owner_acid[TSS_USER_NAME_LEN  + 1] = "";
+  static char            owns    [TSS_USER_NAME_LEN    + 1] = "OWNS";
+  static char            res_type[TSS_USER_NAME_LEN    + 1] = "";
+
+  static char            xauthr_name[MAX_TSS_RES_NAME_LEN + 1];
+  static char           *xauthr_k[]={"XAUTH", "=", NULL};
+  static TSS_OUTP_typ    xauthr_d[] = {
+                     { sizeof(xauthr_name), xauthr_name },
+                     { 0,                   NULL      } };
+
+  TSS_LIST_LINE(xauthr, LIST_ACCESSORID, CURRENT_LINE);
+
+  static char           *xadmin_k[]={"ADMIN", "=", NULL};
+  static TSS_OUTP_typ    xadmin_d[] = {
+                     { sizeof(xauthr_name), xauthr_name },
+                     { 0,                   NULL      } };
+
+  TSS_LIST_LINE(xadmin, LIST_ACCESSORID, CURRENT_LINE);
+
+  static TSS_OUTPUT_typ  line_desc[] = {
+        { &xauthr,     NULL   },
+        { &xadmin,     NULL   },
+        { NULL,        NULL   } };
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 6, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   ESA_DIAG_printf(comp, 3, "Resource %s %s",
+                   res_in->restype, res_in->resource);
+
+   rc = CTSCRSS_set_authority( &logout_done,
+                               SET_TO_STARTED_TASK_AUTH,
+                               admin_params, err );
+   if ( rc NE ESA_OK )
+       goto exit;
+
+   sprintf(cmd.buffer, main_cmd,
+           TSS_convert_restype(res_in->restype), res_in->resource);
+
+   cmd.max_len = strlen(cmd.buffer);
+   cmd.use_len = strlen(cmd.buffer);
+
+  /*
+   *   Send cmd to TSS
+   */
+
+   rc_cmd = TSS_send_cmd(comp, mode,
+                               /* TSS_CMD_QUIET_MODE,   */
+                               /* TSS_CMD_DEFAULT_MODE, */
+                         &cmd, cmd_handle, FALSE, dest, msgs);
+   if ( rc_cmd NE ESA_OK )
+      goto exit;
+
+  /*
+   * Calculate number of output lines
+   */
+
+   memcpy(tmp_handle, cmd_handle, sizeof(cmd_handle) );
+   rc_p = TSS_get_output(comp, tmp_handle, &ret_buf, dest, msgs);
+   if ( rc_p EQ ESA_FATAL)
+       goto exit;
+
+   while (rc_p NE ESA_EOF)
+   {
+        i_trap++;
+        rc_p = TSS_get_output(comp, tmp_handle, &ret_buf, dest, msgs);
+        if ( rc_p EQ ESA_FATAL)
+            goto exit;
+   }
+
+   rc_p = ESA_OK;
+
+   ESA_DIAG_printf(comp,6, "Detected %d output lines", i_trap );
+
+  /*
+   *  Create trap command handle
+   */
+
+   i_trap += 2;
+
+   if ( get_handle->trap_buffer EQ NULL)
+   {
+     rc = TSS_alloc_res_trap_buffer (comp, i_trap, &tmp, dest, msgs );
+     if ( rc NE ESA_OK )
+        goto exit;
+   }
+   else
+   {
+      tmp = get_handle->trap_buffer;
+      rc = TSS_realloc_res_trap_buffer(comp, &(tmp->res_info),
+                                       i_trap, dest, msgs);
+      if ( rc NE ESA_OK )
+        goto exit;
+   }
+
+   rc_p = TSS_get_output(comp, cmd_handle, &ret_buf, dest, msgs);
+   if ( rc_p EQ ESA_FATAL )
+       goto exit;
+
+   while (rc_p NE ESA_EOF)
+   {
+     if ( rc_p EQ ESA_OK)
+     {
+       ace_acid[0]    = NULL_CHAR;
+       xauthr_name[0] = NULL_CHAR;
+
+       handle.start_line_ptr   = ret_buf.buffer;
+       handle.current_line_ptr = ret_buf.buffer;
+       strcpy(tmp_line, handle.start_line_ptr);    /* IS10077 */
+       ESA_DIAG_printf (comp, 10, "Obtained data=%s",ret_buf.buffer);
+
+       acl_source = TSS_ACL_ITEM_FROM_XAUTH;
+       rc1 = TSS_identify_rec(comp, &handle, &line_desc[0],dest,msgs);
+
+       if ( rc1 NE ESA_OK )
+       {
+            acl_source = TSS_ACL_ITEM_FROM_ADMIN;
+            rc2 = TSS_identify_rec(comp, &handle, &line_desc[1],
+                                   dest,msgs);
+       }
+       else
+            rc2 = ESA_OK;
+
+       if ( (rc1 EQ ESA_OK) OR (rc2 EQ ESA_OK) )       /*Record found*/
+       {
+         /*  IS10077 - start */
+
+         /*  set the start point to the line copy, and look end of
+          *  the end of the resource name.
+          */
+     /*  token = handle.current_line_ptr;
+         ESA_DIAG_printf (comp, 10,
+                     "var=%d/%s max_var_len=%d",
+                     strlen(token), token , sizeof(xauthr_name) );
+
+
+         rc=TSS_check_param_overflow(comp, NULL, NULL, NULL,
+                                     strlen(token),
+                                     sizeof(xauthr_name),
+                                     dest,msgs);                */
+
+         my_res_strtok_handle = handle.current_line_ptr -
+                                handle.start_line_ptr +
+                                tmp_line;
+
+         token = my_res_strtok(NULL, " \n",
+                               &my_res_strtok_handle, result);
+
+         ESA_DIAG_printf (comp, 10,
+                     "var=%d/%s max_var_len=%d",
+                     strlen(result), result,
+                     sizeof(xauthr_name) );
+
+         rc=TSS_check_param_overflow(comp, NULL, NULL, NULL,
+                                     strlen(result),
+                                     sizeof(xauthr_name),
+                                     dest,msgs);
+         /*  IS10077 - end */
+
+         if (rc NE ESA_OK)
+            goto exit;
+         else
+  /* IS10077 strcpy(xauthr_name , token);   */
+            strcpy(xauthr_name , result);    /* IS10077 */
+
+         ESA_DIAG_printf (comp, 5, "res name=%s", xauthr_name);
+
+        /*
+         *  Obtain ace acid
+         */
+
+ /* IS10077 token = strtok(NULL, " \n");  */
+         token = my_res_strtok(NULL, " \n",               /* IS10077 */
+                         &my_res_strtok_handle, result);  /* IS10077 */
+
+ /* IS10077 ESA_DIAG_printf (comp, 5, "search acid: token=%x", token);*/
+         ESA_DIAG_printf (comp, 5,
+                         "search acid: token=%x", result); /* IS10077 */
+
+         while ( token )
+         {
+         /* IS10077
+           ESA_DIAG_printf (comp, 5, "search acid: token=%s", token);
+           wptr = strstr(token, "ACID(" );                           */
+           ESA_DIAG_printf (comp, 5,
+                         "search acid: token=%s", result); /* IS10077 */
+           wptr = strstr(result, "ACID(" );                /* IS10077 */
+           if ( wptr )
+           {
+             strcpy(ace_acid, wptr + 5);
+             TSS_strip_val(ace_acid, ')' ,TSS_STRIP_BOTH);
+             TSS_strip_val(ace_acid, '*' ,TSS_STRIP_BOTH); /* *ALL* */
+           }
+ /* IS10077 token = strtok(NULL, " \n");           */
+           token = my_res_strtok(NULL, " \n",             /* IS10077 */
+                         &my_res_strtok_handle, result);  /* IS10077 */
+         }
+
+         ESA_DIAG_printf (comp, 5,
+                          "Obtained parameters: %s %s %s %s %s",
+                          owner_acid, owns, res_type,
+                          xauthr_name, ace_acid);
+
+         rc = TSS_save_res_info(comp, tmp, owner_acid, ace_acid,
+                                owns, res_type, xauthr_name,
+                                acl_save_mode, acl_source, dest, msgs );
+         if ( rc EQ ESA_OK )
+            strcpy(tmp->res_type, res_type);
+         else if ( rc EQ ESA_SKIP )
+            rc = ESA_OK;
+         else
+            goto exit;
+       }   /* record identified */
+     }   /* rc = ESA_OK after get_output */
+     else
+       if ( rc_p EQ ESA_FATAL)
+         goto exit;
+
+      rc_p = TSS_get_output(comp, cmd_handle, &ret_buf, dest, msgs);
+   }
+
+   rc_p = ESA_OK;
+
+  /*
+   *    Finish
+   */
+
+  exit:;
+
+   rc_f = TSS_free_output(comp, cmd_handle, dest, msgs);
+
+   if ( ( rc_cmd NE ESA_OK ) OR
+        ( rc_p   NE ESA_OK ) OR
+        ( rc_f   NE ESA_OK )  )
+     rc = ESA_FATAL;
+
+   if (logout_done)   /* ps0319 */
+     CTSCRSS_set_authority( &logout_done,
+                            RETURN_FROM_STARTED_TASK_AUTH,
+                            admin_params, err );
+
+   get_handle->trap_buffer = tmp;
+
+   ESA_DIAG_exit(comp, 6, func, rc);
+
+   return rc;
+
+ }
+
+/* IS10077 - start */
+/**************************************************************
+*                                                             *
+* Subroutine name : my_res_strtok                             *
+*                                                             *
+* DESCRIPTION     : Find a token using charset as delimiters. *
+*                   If the token starts with a quote, look    *
+*                   for the ending quote and only then look   *
+*                   for a delimiter using charset.            *
+*                                                             *
+* INPUT           : sptr        - ptr to string               *
+*                   charset     - ptr to char set             *
+*                   handle      - ptr to handle               *
+*                                                             *
+* OUTPUT          : result contains the token as a string.    *
+*                                                             *
+* RETURN VALUE    : ptr to current token in sptr.             *
+*                                                             *
+* NOTES           : the token returned as return value does   *
+*                   not always terminate with a string        *
+*                   terminator.                               *
+*                                                             *
+**************************************************************/
+
+static char * my_res_strtok(char         *  sptr,
+                            char         *  charset,
+                            void         ** handle,
+                            char         *  result)
+{
+
+    char   *rptr;                   /* Return ptr          */
+    int     k;                      /* Work var            */
+    char   *wcs;                    /* work charset        */
+    char    qcs[2] = {QUOTE_CHAR, NULL_CHAR}; /*charset for quotes. */
+    int     qcs_used = 0;
+    char   *temp_sptr;
+    int     len;
+
+    *result = NULL_CHAR;            /* Clear result field  */
+
+    if ( !sptr )                    /* Get ptr from handle */
+      sptr = (char *)(*handle);
+
+    if ( !sptr )                    /* End-of-string */
+    {
+      rptr = sptr;
+      goto exit;
+    }
+
+    k = strspn(sptr, charset);      /* Skip delimiters until start */
+                                    /* of next word.               */
+    sptr += k;
+    if (strlen(sptr) == 0)          /* No more data.               */
+    {
+      strcpy(result, "");
+      rptr = NULL;
+      *handle = rptr;
+      goto exit;
+    }
+
+    temp_sptr = sptr;
+
+    do
+    {
+      if (temp_sptr[0] == QUOTE_CHAR) /* If string starts with quote  */
+      {
+        wcs = qcs;                    /* Use quotes delimiter.        */
+        qcs_used = 1;
+        temp_sptr++;                  /* skip starting quote and look */
+                                      /* for ending quote.            */
+      }
+      else
+      {
+        wcs = charset;                /* Use input delimiters.        */
+        qcs_used = 0;
+      }
+
+      rptr  = strpbrk(temp_sptr, wcs);   /* Search for end-of-item  */
+                                      /* starting from second char    */
+                                      /* becasue we know the first    */
+                                      /*  char is OK.                 */
+
+      if (!rptr)       /* No characters from charset appear in string */
+      {
+        if (qcs_used)                 /* If ending quote is missing, */
+        {
+          rptr = strpbrk(sptr, charset);   /* search for end-of-item */
+                                            /* using input charset   */
+          qcs_used = 0;
+        }
+      }
+      else                        /* end of string was found          */
+        if (qcs_used)             /* if quoted string...              */
+          rptr++;                 /* ...rptr should point after the   */
+                                  /* ...last quote because the last   */
+                                  /* ...quote is part of the token.   */
+
+      temp_sptr = rptr;           /* prepare next start point.        */
+
+    } while (qcs_used);
+
+    if (!rptr)       /* No characters from charset appear in string */
+    {
+      strcpy(result, sptr);         /* Copy until end-of-string     */
+      *handle = rptr;
+      rptr    = sptr;
+      goto exit;
+    }
+    else             /* token delimiter was found.          */
+    {
+      len = rptr - sptr;              /* End-of-item found   */
+      memcpy( result, sptr, len );    /* Copy item to result */
+      *(result + len) = NULL_CHAR;
+
+      *handle = rptr;           /* Keep ptr for the next call.     */
+      rptr    = sptr;           /* Start ptr to string */
+    }
+
+   exit :;
+     return rptr;
+
+}     /* my_res_strtok */
+
+/**************************************************************
+*                                                             *
+* Subroutine name : Convert_resname                           *
+*                                                             *
+* DESCRIPTION     : For DSN/DATASET resource type, when the   *
+*                   resource name is enclosed between quotes  *
+*                   remove the blank before the last quote,   *
+*                   if exists.                                *
+*                                                             *
+* INPUT           : res_type    - resource type.              *
+*                   res_name    - resource_name               *
+*                                                             *
+* OUTPUT          : Converted resource name.                  *
+*                                                             *
+* RETURN VALUE    : None.                                     *
+*                                                             *
+* NOTES           : We need to perform this transalation      *
+*                   because the dataset name returned by the  *
+*                   WHOOWNS contains the ending blank and     *
+*                   cannot be further used in other commands. *
+*                                                             *
+**************************************************************/
+
+static void Convert_resname(char    * res_type,
+                            char    * res_name,
+                            char    * conv_res_name)
+{
+
+   int     res_name_len;
+
+   strcpy(conv_res_name, res_name);
+   res_name_len = strlen(res_name);
+
+   if ( (strcmp(res_type, "DSN") EQ 0  OR
+         strcmp(res_type, "DSNAME") EQ 0  OR
+         strcmp(res_type, "DATASET") EQ 0)  AND
+         res_name_len GT 3  AND
+        (res_name[0] EQ QUOTE_CHAR     AND
+         res_name[res_name_len-1] EQ QUOTE_CHAR  AND
+         res_name[res_name_len-2] EQ BLANK) )
+   {
+            conv_res_name[res_name_len-2] = QUOTE_CHAR;
+            conv_res_name[res_name_len-1] = NULL_CHAR;
+   }
+
+   return ;
+
+}    /* Convert_resname */
+/* IS10077 - end */

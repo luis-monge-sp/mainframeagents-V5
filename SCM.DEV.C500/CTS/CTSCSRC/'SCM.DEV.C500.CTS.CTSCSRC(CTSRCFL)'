@@ -1,0 +1,3206 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Custom Field blocks handling.            *
+ *                                                             *
+ * File Name        : ctsrcfl.c                                *
+ *                                                             *
+ * Author           : Nurit Yahalom                            *
+ *                                                             *
+ * Creation Date    : 10/01/13                                 *
+ *                                                             *
+ * Description      : Provide routines to create and free      *
+ *                  : the custom field tables.                 *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * IS10076  NuritY   10/01/13  Initial version.                *
+ * IS10100  NuritY   29/07/13  Support CTSA internal custom    *
+ *                             fields (CTSACFs)                *
+ * IS10109  NuritY   26/12/13  Correct a bug in custom fields  *
+ *                             error handing.                  *
+ * SAS2IBMA AvnerL   20/07/16  SAS/C to IBM/C                  *
+ * SAS2IBMT SeligT   09/10/16  SAS/C to IBM C Conversion Project*
+ * SAS2IBMN NuritY   05/02/17  SAS/C to IBM C Conversion Project*
+ * IS10182  AvnerL   17/07/19  S0C4/S0C1 due to DIAG vsprintf  *
+ * WS10082  MauriC   07/11/22  Recompile for new ADDINFO macros*
+ * WS10082N NuritY   26/11/23  Fix storage leak.               *
+ * BS10139  LuisM    04/09/24  Only process USER and GROUP flds*
+ ***************************************************************/
+
+ #include <globs.h>
+
+ #include ESA_API
+ #include ESA_DIAG
+
+ #include RACF
+ #include RACF_CODES
+
+ #include   ESA_API_CODES
+ #include   STDIO
+ #include   STDLIB
+ #include   STRING
+
+ #define ALLOC_RACF_OUTPUT(ob)                                     \
+                                                                   \
+  /*                                                               \
+   *  Allocate RACF extract output buffer.             IS10182     \
+   */                                                              \
+  (ob) = (RACF_CFIELD_OUTPUT_rec_typ *)malloc(                     \
+                  RACF_CFIELD_OUTPUT_BUF_LEN );                    \
+  ESA_DIAG_printf(comp, 3, "RACF extract area address = %8X",      \
+                  (ob));                                           \
+  if ((ob) EQ NULL)                                                \
+  {                                                                \
+    /* SAS2IBMN                                                    \
+    admin_params->cs_func.MSG_printf_ptr(ERR_MALLOC,  */           \
+    CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,     /* SAS2IBMN */ \
+                 "OUTPUT BUFFER",                                  \
+                 RACF_CFIELD_OUTPUT_BUF_LEN );                     \
+    *msg_issued = TRUE;                                            \
+    rc = ESA_FATAL;                                                \
+  }
+                                                                   \
+  #define LOOK_FOR_ATTR(typ, ind, ent)                             \
+                                                                   \
+   /*                                                              \
+    *   Look for the corresponding attributes table.               \
+    */                                                             \
+   (ind) = 0;                                                      \
+   (ent) = NULL;                                                   \
+                                                                   \
+   while (RACF_ctsacf_attr_blks[(ind)].type[0] NE NULL_CHAR)       \
+   {                                                               \
+     if (strcmp(RACF_ctsacf_attr_blks[(ind)].type, (typ)) EQ 0)    \
+     {                                                             \
+       (ent) = &RACF_ctsacf_attr_blks[(ind)];                      \
+       break;                                                      \
+     }                                                             \
+     (ind)++;                                                      \
+   }
+
+ typedef struct {       /* Custom Field attributes table   */
+    char                  kwd[MAX_RSS_ADDINFO_KWD_LEN+1];
+    int                   kwd_number;
+  } CFIELD_KEYWORD_table_rec, *CFIELD_KEYWORD_table_ptr;
+
+ typedef struct {                  /* Custm Field syntax rules table  */
+    char                  data_rule[9];
+  } CFIELD_data_rule_rec, *CFIELD_data_rule_ptr;
+
+/* IS10100 - start   */
+
+ /*
+  *  Issue ACTIVE / NOT ACTIVE messages for CTSACF features.
+  */
+static void Issue_CTSACF_ACTYN_msgs(RACF_CTSACF_block_typ *p_ctsacfs,
+                                    char                 *type,
+                                    ADMIN_PARAMS_rec_typ *admin_params);
+ /*
+  *   Prototype for Custom Field attribute processing routine.
+  */
+ typedef ESA_RC CF_Process_Field_typ(ESA_DIAG_COMP_typ   comp,
+                             char                   *cf_name,
+                             void                   *entry,
+                             int                     keyword_id,
+                             char                   *keyword,
+                             void                   *value,
+                             int                     value_length,
+                             int                    *msg_issued,
+                             ADMIN_PARAMS_rec_typ   *admin_params);
+
+ typedef CF_Process_Field_typ *CF_Process_Field_ptr;
+
+ /*
+  *   Create the site Custom Field blocks.
+  */
+ static ESA_RC Create_CField_Blocks(ESA_DIAG_COMP_typ      comp,
+                        RACF_CUSTOM_FIELDS_block_ptr *p_user_CFields,
+                        RACF_CUSTOM_FIELDS_block_ptr *p_group_CFields,
+                        RACF_CTSACF_block_ptr         user_ctsacfs,
+                        RACF_CTSACF_block_ptr         group_ctsacfs,
+                        int                          *msg_issued,
+                        ADMIN_PARAMS_rec_typ         *admin_params);
+
+ /*
+  *   Create the CTSA Custom Field blocks.
+  */
+ static ESA_RC Build_CTSACF_Blocks(ESA_DIAG_COMP_typ      comp,
+                        RACF_CTSACF_block_ptr        *p_user_ctsacfs,
+                        RACF_CTSACF_block_ptr        *p_group_ctsacfs,
+                        RACF_FLAG_typ                 activate,
+                        int                          *msg_issued,
+                        ADMIN_PARAMS_rec_typ         *admin_params);
+
+ /*
+  *   Build a CTSA Custom Fields block, initialize and fill it.
+  */
+ static ESA_RC Create_CTSACF_Block(ESA_DIAG_COMP_typ      comp,
+                        char                         *type,
+                        RACF_CTSACF_ATTR_blk_typ     *attrblk,
+                        RACF_CTSACF_block_ptr        *p_ctsacfs,
+                        RACF_FLAG_typ                 activate,
+                        int                          *msg_issued,
+                        ADMIN_PARAMS_rec_typ         *admin_params);
+
+ /*
+  *   Init a CTSA Custom Field entry.
+  */
+ static void   Init_CTSACF_Entry(ESA_DIAG_COMP_typ      comp,
+                        RACF_CTSACF_ATTR_rec_typ     *attr,
+                        RACF_CTSACF_rec_typ          *entry,
+                        int                          *msg_issued,
+                        ADMIN_PARAMS_rec_typ         *admin_params);
+
+ /*
+  *   Activate a CTSA Custom Field entry.
+  */
+ static ESA_RC Activate_CTSACF_Entry(ESA_DIAG_COMP_typ      comp,
+                        char                         *type,
+                        RACF_CTSACF_rec_typ          *entry,
+                        RACF_CTSACF_ATTR_rec_typ     *attr_tab,
+                        RACF_CFIELD_OUTPUT_rec_typ   *cf_data,
+                        int                           do_extract,
+                        int                          *msg_issued,
+                        ADMIN_PARAMS_rec_typ         *admin_params);
+
+ /*
+  *   Common function to Analyze the Customn Field definitions.
+  */
+ static ESA_RC Analyze_CF_Definition(ESA_DIAG_COMP_typ comp,
+                        char                         *cf_name,
+                        void                         *entry,
+                        RACF_CFIELD_OUTPUT_rec_typ   *cf_data,
+                        CF_Process_Field_ptr          proc_rtn,
+                        int                          *msg_issued,
+                        ADMIN_PARAMS_rec_typ         *admin_params);
+
+ /*
+  *   Put CField attributes in CField entry
+  *
+  *   Function characterstics should match CF_Process_Field_typ
+  *   prototype.
+  */
+ static  ESA_RC Process_CField_Definition(ESA_DIAG_COMP_typ comp,
+                             char                   *cf_name,
+                             void                   *entry,
+                             int                     keyword_id,
+                             char                   *keyword,
+                             void                   *value,
+                             int                     value_length,
+                             int                    *msg_issued,
+                             ADMIN_PARAMS_rec_typ   *admin_params);
+
+ /*
+  *   Validate CTSACF is defined with required attributes.
+  *
+  *   Function characterstics should match CF_Process_Field_typ
+  *   prototype.
+  */
+ static  ESA_RC Validate_CTSACF_Definition(ESA_DIAG_COMP_typ comp,
+                             char                   *cf_name,
+                             void                   *attr,
+                             int                     keyword_id,
+                             char                   *keyword,
+                             void                   *value,
+                             int                     value_length,
+                             int                    *msg_issued,
+                             ADMIN_PARAMS_rec_typ   *admin_params);
+/* IS10100 - end     */
+
+ /*
+  *   Create a Custom Field entry.
+  */
+ static ESA_RC Create_CField_entry(ESA_DIAG_COMP_typ    comp,
+                            char                        *cf_name,
+                            RACF_CFIELD_OUTPUT_rec_typ  *cf_data,
+                            RACF_CUSTOM_FIELD_rec_typ   *entry,
+                            int                         *msg_issued,
+                            ADMIN_PARAMS_rec_typ        *admin_params);
+
+ /*
+  *   Allocate a Custom Fields block
+  */
+ static ESA_RC Allocate_CFields_Block(ESA_DIAG_COMP_typ    comp,
+                            RACF_CUSTOM_FIELDS_block_ptr *block,
+                            int                 *msg_issued,
+                            ADMIN_PARAMS_rec_typ *admin_params);
+
+ /*
+  *   Add Custom Field entry to the block.
+  */
+ static ESA_RC Add_CField_to_block(ESA_DIAG_COMP_typ    comp,
+                           RACF_CUSTOM_FIELD_rec_typ  cf_entry,
+                           RACF_CUSTOM_FIELDS_block_ptr *curr_block_ptr,
+                           int                           max_entries,
+                           int                          *msg_issued,
+                           ADMIN_PARAMS_rec_typ         *admin_params);
+
+ /*
+  *   Free unused blocks / part of blocks.
+  */
+ static ESA_RC Free_Unused_CField_Block(ESA_DIAG_COMP_typ    comp,
+                          RACF_CUSTOM_FIELDS_block_ptr *first_block,
+                          RACF_CUSTOM_FIELDS_block_ptr *curr_block,
+                          int                           max_entries,
+                          int                          *msg_issued,
+                          ADMIN_PARAMS_rec_typ         *admin_params );
+
+ /*
+  *   Assembler custom fields information extraction routine
+  */
+ /* SAS2IBMT typedef and prototype changed for IBM C
+ extern int ctsfrcf (char                     * na1_c,
+                     char                     * na2_c,
+                     char                     * entry,
+                     int                      * na1_i,
+                     RACF_OUTPUT_LINE_rec_typ * output,
+                     int                      * debug,
+                     int                      * rc_racf,
+                     int                      * reason_code,
+                     char                     * na3_c,
+                     int                      * na2_i);              */
+ extern int ctsfrcf ();                                   /* SAS2IBMT */
+
+ /* IS10100 - move the structures above outside the functions
+              and make them static.                            */
+
+ /*
+  *  Custom Fields attributes table.
+  *
+  *   This list should be synchronized with the list of fields
+  *   in CTSFAGR invocation in CTSFRCF
+  */
+  static CFIELD_KEYWORD_table_rec kwd_tab[] = {
+    {"TYPE"               ,1  },
+    {"MAXLENGTH"          ,2  },
+    {"MAXVALUE"           ,3  },
+    {"MINVALUE"           ,4  },
+    {"FIRST"              ,5  },
+    {"OTHER"              ,6  },
+    {"MIXED"              ,7  },
+    {"LISTHEAD"           ,8  },
+    {""                   ,0  }    };
+
+ /*
+  *  Custom Fields "first" and "other" allowed values.
+  *
+  *   This list was created according to the list of values in
+  *   "OSSecurity Server RACF Macros and Interfaces" Appendix D
+  */
+  static CFIELD_data_rule_rec   data_rules[] = {
+               "ALPHA",
+               "ALPHANUM",
+               "ANY",
+               "NONATABC",
+               "NONATNUM",
+               "NUMERIC"     };
+
+ /* IS10100 - end    */
+
+/*  IS10100 - start  */
+/********************************************************************
+ *
+ * Procedure Name : RACF_Init_Custom_Fields
+ *
+ * Description    : Initialize the site custom field blocks and/or
+ *                  CTSA custom field blocks.
+ *
+ * Input          : admin
+ *
+ * Output         : msg_issued - on error, contains an indicatiom if
+ *                               an error message was issued or not.
+ *
+ * Input/Output   : p_user_CFields - area for address of user Custom
+ *                                   Fields block.
+ *                : p_group_CFields - area for address of group Custom
+ *                                    Fields block.
+ *                : p_user_ctsacfs - area for address of user CTSA
+ *                                   custom field blocks.
+ *                : p_group_CFields - area for address of user CTSA
+ *                                    custom field blocks.
+ *                  Note: NULL in any of the above parameters indicates
+ *                        this table is not required.
+ *
+ * Return Value   : ESA_RC:
+ *                  - ESA_OK - OK
+ *                  - ESA_SKIP - one or more custom field failed, but
+ *                              the tables were created.
+ *                  - ESA_ERR - Custom Fields initialization failed.
+ *                              No tables were created.
+ *                  - ESA_FATAL - Severe error.
+ *
+ *
+ * Side Effects   :
+ *
+ ********************************************************************/
+
+ ESA_RC RACF_Init_Custom_Fields(ESA_DIAG_COMP_typ      comp,
+                        RACF_CUSTOM_FIELDS_block_ptr *p_user_CFields,
+                        RACF_CUSTOM_FIELDS_block_ptr *p_group_CFields,
+                        RACF_CTSACF_block_ptr        *p_user_ctsacfs,
+                        RACF_CTSACF_block_ptr        *p_group_ctsacfs,
+                        int                          *msg_issued,
+                        ADMIN_PARAMS_rec_typ         *admin_params)
+{
+
+  char          func[] = "RACF_Init_Custom_Fields";
+  ESA_RC        rc = ESA_OK ;
+  ESA_RC        ctsacf_rc = ESA_OK ;
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+
+  RACF_CUSTOM_FIELDS_block_ptr  p_u_sitecfs = NULL;
+  RACF_CUSTOM_FIELDS_block_ptr *pp_u_sitecfs = NULL;
+
+  RACF_CUSTOM_FIELDS_block_ptr  p_g_sitecfs = NULL;
+  RACF_CUSTOM_FIELDS_block_ptr *pp_g_sitecfs = NULL;
+
+  RACF_CTSACF_block_typ        *p_u_ctsacfs = NULL;
+  RACF_CTSACF_block_ptr        *pp_u_ctsacfs = NULL;
+
+  RACF_CTSACF_block_typ        *p_g_ctsacfs = NULL;
+  RACF_CTSACF_block_ptr        *pp_g_ctsacfs = NULL;
+
+  RACF_FLAG_typ   act;
+
+  /*
+   *  Initialization
+   */
+  /* IS10182 admin_params->cs_func.DIAG_enter_ptr(comp, 1, func);*/
+  ESA_DIAG_enter(comp, 1, func);                        /*IS10182*/
+  *msg_issued = FALSE;
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5, */
+  ESA_DIAG_printf(comp, 5,                                   /*IS10182*/
+                "input: site-u/g = %8X/%8X    ctsa-u/g = %8X/%8X",
+                 p_user_CFields, p_group_CFields,
+                 p_user_ctsacfs, p_group_ctsacfs);
+
+  if (p_user_ctsacfs NE NULL)
+    pp_u_ctsacfs = &p_u_ctsacfs;
+  else
+    pp_u_ctsacfs = NULL;
+
+  if (p_group_ctsacfs NE NULL)
+    pp_g_ctsacfs = &p_g_ctsacfs;
+  else
+    pp_g_ctsacfs = NULL;
+
+  if (p_user_CFields NE NULL)
+    pp_u_sitecfs = &p_u_sitecfs;
+  else
+    pp_u_sitecfs = NULL;
+
+  if (p_group_CFields NE NULL)
+    pp_g_sitecfs = &p_g_sitecfs;
+  else
+    pp_g_sitecfs = NULL;
+
+  /*
+   *  Create the CTSA custom field blocks, if requied.
+   *
+   *  if site custom fields are not required, activate the
+   *  CTSA custom fields.
+   *  Otherwise, it will be done as part of the site custom fields
+   *  processing which retrieves all the custom fields defined to
+   *  RACF.
+   */
+
+  if (pp_u_ctsacfs NE NULL  OR
+      pp_g_ctsacfs NE NULL)      /* if CTSA cfields are required...   */
+  {                              /*           -- AND --               */
+    if (pp_u_sitecfs EQ NULL   AND
+        pp_g_sitecfs EQ NULL)    /* site cfields are not req'd...     */
+          act = RACF_YES;        /* .. init and activate ctsa cfields */
+    else                         /* else                              */
+          act = RACF_NO;         /* .. do not activate ctsa cfields   */
+                                 /* because it willbe done later.     */
+
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5, */
+    ESA_DIAG_printf(comp, 5,                              /*IS10182*/
+                  "Call Build_CTSACF_Blocks: u=%8X  g=%8X  act=%d",
+                    pp_u_ctsacfs, pp_g_ctsacfs, act);
+
+    ctsacf_rc = Build_CTSACF_Blocks(comp, pp_u_ctsacfs, pp_g_ctsacfs,
+                                    act, msg_issued, admin_params);
+
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5, */
+    ESA_DIAG_printf(comp, 5,                                /*IS10182*/
+                      "Build_CTSACF_Blocks: rc = %d", rc);
+
+  }
+
+  /*
+   *  Create site custom field blocks, if required.
+   *
+   *  If both CTSA and site custom fields are requied, this process
+   *  will also activate the CTSA custom fields.
+   */
+  if ( ( pp_u_sitecfs NE NULL OR
+         pp_g_sitecfs NE NULL )  AND
+       ctsacf_rc LT ESA_FATAL )
+  {
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5, */
+    ESA_DIAG_printf(comp, 5,                               /*IS10182*/
+              "Call Create_CField_Blocks: site:%8X/%8X  ctsa:%8X/%8X",
+                    pp_u_sitecfs, pp_g_sitecfs,
+                    p_u_ctsacfs, p_g_ctsacfs);
+
+    rc = Create_CField_Blocks(comp,
+                              pp_u_sitecfs, pp_g_sitecfs,
+                              p_u_ctsacfs, p_g_ctsacfs,
+                              msg_issued, admin_params);
+
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+    ESA_DIAG_printf(comp, 5,                               /*IS10182*/
+                  "Create_CField_Blocks: rc = %d", rc);
+
+  }
+
+  if (rc LE ESA_SKIP)
+  {
+    /* Issue a message for each CTSACF feature                */
+    if (p_user_ctsacfs NE NULL)
+    {
+      Issue_CTSACF_ACTYN_msgs(p_u_ctsacfs, "USER", admin_params);
+      *p_user_ctsacfs = p_u_ctsacfs;   /* return block address */
+    }
+
+    if (p_group_ctsacfs NE NULL)
+    {
+      Issue_CTSACF_ACTYN_msgs(p_g_ctsacfs, "GROUP", admin_params);
+      *p_group_ctsacfs = p_g_ctsacfs;   /* return block address */
+    }
+
+    /*  Issue a message for site-cf blocks.                         */
+    if (p_user_CFields NE NULL  OR
+        p_group_CFields NE NULL)
+    {
+      if (rc EQ ESA_OK)
+      {
+        if (p_u_sitecfs EQ NULL  AND
+            p_g_sitecfs EQ NULL)
+          /* SAS2IBMN
+          admin_params->cs_func.MSG_printf_ptr(RACF_NO_CFIELDS);  */
+          CTSAMSG_print(RACF_NO_CFIELDS,                 /* SAS2IBMN */
+                        msgs, NULL, dest);               /* SAS2IBMN */
+        else
+          /* SAS2IBMN
+          admin_params->cs_func.MSG_printf_ptr(RACF_CFIELDS_LOADED);*/
+          CTSAMSG_print(RACF_CFIELDS_LOADED,             /* SAS2IBMN */
+                        msgs, NULL, dest);               /* SAS2IBMN */
+      }
+      else
+        /* SAS2IBMN
+        admin_params->cs_func.MSG_printf_ptr(RACF_CFIELDS_LOAD_ERR); */
+        CTSAMSG_print(RACF_CFIELDS_LOAD_ERR,             /* SAS2IBMN */
+                        msgs, NULL, dest);               /* SAS2IBMN */
+
+      if (p_user_CFields NE NULL)
+        *p_user_CFields = p_u_sitecfs;   /* return block address */
+
+      if (p_group_CFields NE NULL)
+        *p_group_CFields = p_g_sitecfs;   /* return block address */
+    }
+  }
+
+  rc = MAX(rc, ctsacf_rc);             /*  Set Max rc.            */
+
+  /*  If creation failed, free the blocks.                        */
+  if (rc GT ESA_SKIP)
+  {
+    /*  If CTSACF blocks were requested, issue a message.           */
+    if (pp_u_ctsacfs NE NULL  OR
+        pp_g_ctsacfs NE NULL)
+      /* SAS2IBMN
+      admin_params->cs_func.MSG_printf_ptr(RACF_CTSACF_LOAD_FAILED); */
+      CTSAMSG_print(RACF_CTSACF_LOAD_FAILED,             /* SAS2IBMN */
+                    msgs, NULL, dest);                   /* SAS2IBMN */
+
+    /*  If site custom fields blocks were requestedm issue a message  */
+    if (pp_u_sitecfs NE NULL  OR
+        pp_g_sitecfs NE NULL)
+      /* SAS2IBMN
+      admin_params->cs_func.MSG_printf_ptr(RACF_CFIELDS_LOAD_FAILED); */
+      CTSAMSG_print(RACF_CFIELDS_LOAD_FAILED ,           /* SAS2IBMN */
+                    msgs, NULL, dest);                   /* SAS2IBMN */
+
+    RACF_Free_CField_Blocks(comp, p_u_sitecfs, admin_params);
+    RACF_Free_CField_Blocks(comp, p_g_sitecfs, admin_params);
+
+    RACF_Free_CTSACF_Block(comp, p_u_ctsacfs, admin_params);
+    RACF_Free_CTSACF_Block(comp, p_g_ctsacfs, admin_params);
+  }
+
+  /*
+   *   If all OK, return block addresses to the caller.
+   */
+ exit:
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+  ESA_DIAG_printf(comp, 5,                             /*IS10182*/
+                "output: site-u/g = %8X/%8X    ctsa-u/g = %8X/%8X",
+                 p_u_sitecfs, p_g_sitecfs,
+                 p_u_ctsacfs, p_g_ctsacfs);
+
+  /*IS10182 admin_params->cs_func.DIAG_exit_ptr(comp, 1, func, rc);*/
+  ESA_DIAG_exit(comp, 1, func, rc);                      /*IS10182*/
+  return rc;
+
+}  /* RACF_Init_Custom_Fields */
+
+/********************************************************************
+ *                                                                  *
+ * Procedure Name : Issue_CTSACF_ACTYN_msgs                         *
+ *                                                                  *
+ * Description    : Issue a message for each CTSACF feature that    *
+ *                  was activated successfully.                     *
+ *                                                                  *
+ * Input          : p_ctsacf - -> CTSACF block.                     *
+ *                : type     - USER / GROUP                         *
+ *                                                                  *
+ * Output         :                                                 *
+ *                                                                  *
+ * Return Value   : None.                                           *
+ *                                                                  *
+ * Side Effects   :                                                 *
+ *                                                                  *
+ ********************************************************************/
+static void Issue_CTSACF_ACTYN_msgs(RACF_CTSACF_block_typ *p_ctsacfs,
+                                    char                 *type,
+                                    ADMIN_PARAMS_rec_typ *admin_params)
+{
+  int             i;
+  RACF_CTSACF_rec_typ  *entry;
+  char            cf_name[22];
+  int             cfname_plen;
+
+  CTSAMSG_HANDLE_rec_typ     * msgs;                    /* SAS2IBMN */
+  CTSAMSG_DEST_TABLE_rec_typ * dest;                    /* SAS2IBMN */
+
+  msgs = admin_params->ctsamsg_handle;                  /* SAS2IBMN */
+  dest = admin_params->ctsamsg_dest;                    /* SAS2IBMN */
+
+  strcpy(cf_name, type);
+  strcat(cf_name, ".CSDATA.");
+  cfname_plen = strlen(cf_name);
+
+  if (p_ctsacfs NE NULL)
+  {
+    for (i = 0; i LT p_ctsacfs->num_of_entries; i++)
+    {
+      entry = &p_ctsacfs->entries[i];
+      strcpy(&cf_name[cfname_plen], entry->CF_name);
+      switch (entry->act)
+      {
+        case ACT_YES:
+          /* SAS2IBMN
+          admin_params->cs_func.MSG_printf_ptr(RACF_CTSACF_INIT_OK, */
+          CTSAMSG_print(RACF_CTSACF_INIT_OK,              /* SAS2IBMN */
+                msgs, NULL, dest,                         /* SAS2IBMN */
+                RACF_CTSACF_feature_names[(int)entry->CF_Feature],
+                cf_name);
+          break;
+        case ACT_NO:
+          /* SAS2IBMN
+          admin_params->cs_func.MSG_printf_ptr(RACF_CTSACF_NO_CF,   */
+          CTSAMSG_print(RACF_CTSACF_NO_CF,                /* SAS2IBMN */
+                msgs, NULL, dest,                         /* SAS2IBMN */
+                RACF_CTSACF_feature_names[(int)entry->CF_Feature],
+                cf_name);
+          break;
+        case ACT_ERROR:
+          /* SAS2IBMN
+          admin_params->cs_func.MSG_printf_ptr(RACF_CTSACF_INIT_FAILED,
+          */
+          CTSAMSG_print(RACF_CTSACF_INIT_FAILED,          /* SAS2IBMN */
+                msgs, NULL, dest,                         /* SAS2IBMN */
+                RACF_CTSACF_feature_names[(int)entry->CF_Feature],
+                cf_name);
+          break;
+        default:
+          break;
+      }
+    }
+  }
+}  /*  Issue_CTSACF_ACTYN_msgs  */
+/*  IS10100 - end    */
+
+/********************************************************************
+ *
+ * Procedure Name : Create_CField_Blocks
+ *
+ * Description    : Retrieve Custom Fields information and create
+ *                  the user and/or group custom field blocks.
+ *
+ * Input          : user_ctsacfs -> user CTSA internal custom fields
+ *                                  table.
+ *                : group_ctsacfs -> group CTSA internal custom fields
+ *                                   table.
+ *                : admin
+ *
+ * Output         : msg_issued - on error, contains an indicatiom if
+ *                               an error message was issued or not.
+ *
+ * Input/Output   : p_user_CFields - area for address of user Custom
+ *                                   Fields block or NULL if user Custom
+ *                                   Fields block is not required.
+ *                : p_group_CFields - area for address of group Custom
+ *                                    Fields block or NULL if group
+ *                                    Custom Fields block is not
+ *                                    required.
+ *
+ * Return Value   : ESA_RC
+ *
+ * Side Effects   :
+ *
+ * Comments       : If NULL is passed for p_user_CFields or
+ *                  p_group_CFields it indicates that the corresponding
+ *                  table is not required.
+ *
+ ********************************************************************/
+
+/* IS10100 ESA_RC RACF_Create_CField_Blocks(ESA_DIAG_COMP_typ comp, */
+static ESA_RC Create_CField_Blocks(ESA_DIAG_COMP_typ      comp,
+                        RACF_CUSTOM_FIELDS_block_ptr *p_user_CFields,
+                        RACF_CUSTOM_FIELDS_block_ptr *p_group_CFields,
+        /* IS10100 */   RACF_CTSACF_block_typ        *user_ctsacfs,
+        /* IS10100 */   RACF_CTSACF_block_typ        *group_ctsacfs,
+                        int                          *msg_issued,
+                        ADMIN_PARAMS_rec_typ         *admin_params)
+{
+
+ #define PUT_NOCSDATA(blk)                                         \
+                                                                   \
+   /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 3,*/      \
+   ESA_DIAG_printf(comp, 3, "Put the NOCSDATA entry"); /*IS10182*/ \
+                                                                   \
+  (blk)->fields[0] = nocsdata_entry; /* put the NOCSDATA entry */  \
+  (blk)->used_fields_count++;      /* Increment the use count */
+
+
+ /* IS10100 #define PROC_ENTRY(blk_ptr)                       */   \
+ #define PROC_ENTRY(ctsacfs, blk_ptr, type)        /* IS10100 */   \
+                                                                   \
+   /* IS10100 - start */                                           \
+   cfs = FALSE;                                                    \
+   if ((ctsacfs) NE NULL)                                          \
+   {                                                               \
+     /* Look for the field ni the ctsacf block        */           \
+     cfe_rc = RACF_IsIt_CTSACF_cf(comp, NULL_CHAR, (ctsacfs),      \
+                                  &cf_name[strlen((type))+8],      \
+                                  &ctsacf_ent, NULL, NULL,         \
+                                  admin_params);                   \
+     if (cfe_rc  EQ  ESA_OK )                                      \
+     {                                                             \
+       cfs = TRUE;                                                 \
+       cfe_rc = Activate_CTSACF_Entry(comp, (type),                \
+                                      ctsacf_ent,                  \
+                                      NULL, output, FALSE,         \
+                                      msg_issued, admin_params);   \
+     }                                                             \
+   }                                                               \
+                                                                   \
+   if (NOT cfs)                                                    \
+   {                                                               \
+   /* IS10100 - end   */                                           \
+     /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 3, */   \
+     ESA_DIAG_printf(comp, 3,                  /*IS10182*/         \
+                   "Create CField entry for %s",                   \
+                   cf_name);                                       \
+                                                                   \
+     cfe_rc = Create_CField_entry(comp, cf_name, output, &entry,   \
+                                  msg_issued, admin_params);       \
+                                                                   \
+     if (cfe_rc EQ ESA_OK)                                         \
+     {                                                             \
+       /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 3,*/  \
+       ESA_DIAG_printf(comp, 3,                     /*IS10182 */   \
+                      "Add entry for %s to CFields block",         \
+                       cf_name);                                   \
+                                                                   \
+       cfe_rc = Add_CField_to_block(comp, entry, (blk_ptr),        \
+                                    max_entries, msg_issued,       \
+                                    admin_params);                 \
+     }                                                             \
+   }
+
+
+ /* IS10100  char          func[] = "RACF_Create_CField_Blocks";  */
+  char          func[] = "Create_CField_Blocks";       /* IS10100 */
+  ESA_RC        rc = ESA_OK ;
+  ESA_RC        cfe_rc = ESA_OK ;
+  ESA_RC        max_cfe_rc = ESA_OK ;                  /* IS10100 */
+  char          cf_name[256];
+  char          na_c = ' ';
+  int           na_i = 0;
+  int           max_entries = 0;
+  int           debug;
+  int           cfs;              /* TRUE / FALSE          IS10100 */
+
+  RACF_CFIELD_OUTPUT_rec_typ * output = NULL;
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+
+  RACF_CUSTOM_FIELD_rec_typ    entry;
+  RACF_CUSTOM_FIELD_rec_typ    nocsdata_entry = {
+  /*SAS2IBMA "NOCSDATA",'F',"NOCSDATA",NULL,NULL,NULL,"","",NULL};*/
+      "NOCSDATA", 'F', "NOCSDATA", NULL_CHAR  ,         /*SAS2IBMA*/
+      NULL_CHAR , NULL_CHAR , "", "", NULL_CHAR };      /*SAS2IBMA*/
+  RACF_CTSACF_rec_ptr          ctsacf_ent;              /* IS10100 */
+
+  /*
+   *   Blocks pointers and counters.
+   */
+  RACF_CUSTOM_FIELDS_block_ptr  curr_ublock_ptr = NULL;
+  RACF_CUSTOM_FIELDS_block_ptr  curr_gblock_ptr = NULL;
+
+  RACF_CUSTOM_FIELDS_block_ptr  first_ublock_ptr = NULL;
+  RACF_CUSTOM_FIELDS_block_ptr  first_gblock_ptr = NULL;
+
+  /*
+   *  Initialization
+   */
+  /*IS10182 admin_params->cs_func.DIAG_enter_ptr(comp, 1, func);*/
+  ESA_DIAG_enter(comp, 1, func);                            /*IS10182*/
+  *msg_issued = FALSE;
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  if (p_user_CFields EQ NULL  AND
+      p_group_CFields EQ NULL)
+        goto exit;
+
+  cf_name[0] = 0X00;         /* no name                          */
+
+  /*
+   *  Allocate RACF extract output buffer.
+   */
+  /* IS10100 - start
+  output = (RACF_CFIELD_OUTPUT_rec_typ *)malloc(
+                  RACF_CFIELD_OUTPUT_BUF_LEN );
+  admin_params->cs_func.DIAG_printf_ptr(comp, 3,
+                    "RACF extract area address = %8X",
+                    output);
+  if (output EQ NULL)
+  {
+    admin_params->cs_func.MSG_printf_ptr(ERR_MALLOC,
+                 "OUTPUT BUFFER",
+                 RACF_CFIELD_OUTPUT_BUF_LEN );
+    *msg_issued = TRUE;
+    rc = ESA_FATAL;
+    goto exit ;
+  }
+  */
+  ALLOC_RACF_OUTPUT(output)
+  if (rc NE ESA_OK)
+    goto exit;
+  /* IS10100 - end  */
+
+  /*
+   *   Allocate User Custom Fields block.
+   */
+  if (p_user_CFields NE NULL)
+  {
+    rc = Allocate_CFields_Block(comp, &first_ublock_ptr, msg_issued,
+                                admin_params);
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 3,*/
+    ESA_DIAG_printf(comp, 3,                       /*IS10182 */
+                      "First user cfield block = %8X",
+                      first_ublock_ptr);
+    if (rc EQ ESA_OK)
+    {
+      PUT_NOCSDATA(first_ublock_ptr)    /* Put the NOCSDATA entry.   */
+      curr_ublock_ptr = first_ublock_ptr;   /* set first as current.*/
+    }
+    else
+    {
+      if (NOT *msg_issued)
+      {
+        /* SAS2IBMN
+        admin_params->cs_func.MSG_printf_ptr(ERR_MALLOC,  */
+        CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,      /* SAS2IBMN */
+                  "USER CFIELD BLOCK", RACF_CUSTOM_FIELDS_BLOCK_LEN);
+        *msg_issued = TRUE;
+      }
+      rc = ESA_FATAL;
+      goto exit ;
+    }
+  }
+
+  /*
+   *   Allocate Group Custom Fields block.
+   */
+  if (p_group_CFields NE NULL)
+  {
+    rc = Allocate_CFields_Block(comp, &first_gblock_ptr, msg_issued,
+                                admin_params);
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 3,*/
+    ESA_DIAG_printf(comp, 3,                      /*IS10182*/
+                      "First group cfield block = %8X",
+                      first_gblock_ptr);
+    if (rc EQ ESA_OK)
+    {
+      PUT_NOCSDATA(first_gblock_ptr)    /* Put the NOCSDATA entry.   */
+      curr_gblock_ptr = first_gblock_ptr;   /* set first as current.*/
+    }
+    else
+    {
+      if (NOT *msg_issued)
+      {
+        /* SAS2IBMN
+        admin_params->cs_func.MSG_printf_ptr(ERR_MALLOC,  */
+        CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,      /* SAS2IBMN */
+                  "GROUP CFIELD BLOCK", RACF_CUSTOM_FIELDS_BLOCK_LEN);
+        *msg_issued = TRUE;
+      }
+      rc = ESA_FATAL;
+      goto exit ;
+    }
+  }
+  else
+    if (group_ctsacfs EQ NULL)                            /* IS10100 */
+      strcpy(cf_name, "USER.CSDATA");     /* extract user fields only */
+
+  max_entries = (RACF_CUSTOM_FIELDS_BLOCK_LEN -
+                  ((int)(curr_ublock_ptr->fields) -
+                  (int)curr_ublock_ptr) ) /
+                 sizeof(RACF_CUSTOM_FIELD_rec_typ);
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 3,*/
+  ESA_DIAG_printf(comp, 3,                      /*IS10182*/
+                    "Max entries = %d", max_entries);
+
+  /*
+   *  Extract Custom Field information from RACF and put into blocks.
+   *
+   *  The fields are extracted in a sorted order - first the group
+   *  fields are received and then the user fields. There's no
+   *  indication when the group fields end and the user fields start.
+   *
+   *  when the group block is created, we provide an empty "start"
+   *  name, requesting to recieve the fields from the beginning. We
+   *  receive all group fields first, followed by the user fields.
+   *  When the first user field is received, if the user block is not
+   *  created, we fake an end-of-data return code in order to stop
+   *  stop the retrieve process.
+   *
+   *  when only user block is created, we provide "CSDATA.USER" as
+   *  the "start" name in order to retrieve the user fields only.
+   */
+  /*IS10182debug=admin_params->cs_func.DIAG_get_debug_level_ptr(comp);*/
+  debug = ESA_DIAG_get_debug_level(comp);               /*IS10182*/
+
+  do
+  {
+    output->max_len = RACF_CFIELD_OUTPUT_BUF_LEN -
+                       ( (int)&(output->buffer) - (int)output );
+    output->used_len = 0 ;
+
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 3, */
+    ESA_DIAG_printf(comp, 3,                           /*IS10182*/
+                    "Extract next CField");
+
+ /* SAS2IBMT typedef and prototype changed for IBM C
+    rc = RACF_extract((RACF_ACCESS_PROG_E)&ctsfrcf,                  */
+    rc = RACF_extract((ASM_RTN_TYP *) &ctsfrcf,           /* SAS2IBMT */
+                      RACF_OPERATION_NEXT,               /* IS10100 */
+                      &na_c, cf_name, na_i, &na_c,
+                      (RACF_OUTPUT_LINE_rec_typ *)output, debug,
+                      RACF_YES, dest, msgs, na_i);
+
+    /* IS10100 admin_params->cs_func.DIAG_printf_ptr(comp, 3,
+                    "CField = %s", cf_name);                      */
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp,3,*IS10100*/
+    ESA_DIAG_printf(comp, 3,         /*IS10182       * IS10100 */
+               "EXTRACT (NEXT): rc = %d  CField = %s",   /* IS10100 */
+               rc, cf_name);                             /* IS10100 */
+
+
+    if (rc EQ ESA_OK)
+    {
+      cfs = FALSE;                                    /* IS10100 */
+      if (strncmp(cf_name, "USER.CSDATA.", 12) EQ 0)
+      {
+        /* IS10100  if (first_ublock_ptr NE NULL)                */
+        if (first_ublock_ptr NE NULL  OR              /* IS10100 */
+            user_ctsacfs NE NULL)                     /* IS10100 */
+        {
+          /* IS10100 - start                                     */
+          /*  PROC_ENTRY(&curr_ublock_ptr)                       */
+          PROC_ENTRY(user_ctsacfs, &curr_ublock_ptr, "USER")
+          /* IS10100 - end                                       */
+        }
+        else
+        /* IS10100  - start
+          rc = ESA_ERR;   * fake 'end-of-data' because there's no *
+                          * need to retrieve the user fields.     */
+        {
+          rc = ESA_OK;   /* Leave the loop because there's no     */
+          break;         /* need to retrieve the user fields.     */
+        }
+        /* IS10100 - end */
+      }
+      else
+        if (strncmp(cf_name, "GROUP.CSDATA.", 13) EQ 0)
+        {
+          /* IS10100 if (first_gblock_ptr NE NULL)               */
+          if (first_gblock_ptr NE NULL  OR            /* IS10100 */
+              group_ctsacfs NE NULL)                  /* IS10100 */
+          {
+            /* IS10100 - start                                     */
+            /*   PROC_ENTRY(&curr_gblock_ptr)                      */
+            PROC_ENTRY(group_ctsacfs, &curr_gblock_ptr, "GROUP")
+            /* IS10100 - end                                       */
+          }
+        }
+      /*  BS10139 Remove the code below because we
+                  only process custom fields for USER and GROUP
+        else
+        {
+          /@IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 0,@/
+          ESA_DIAG_printf(comp, 0,                 /@IS10182@/
+                    "** ERROR **  CField name invalid. Name = %s",
+                    cf_name);
+          /@ IS10100 rc = ESA_FATAL;                                @/
+          /@ IS10100 break;                                         @/
+          cfe_rc = ESA_SKIP;                             /@ IS10100 @/
+        }
+        End of removed code          BS10139     */
+
+      /*  For CTSACF fields, if the field was skipped,      IS10100 */
+      /*  entry is marked with ERROR so there's no need     IS10100 */
+      /*  for the rc.                                       IS10100 */
+      /*  For site custom fields, we need an indication     IS10100 */
+      /*  that a field was skipped.                         IS10100 */
+      if (cfs)
+      {                                                  /* IS10109 */
+        if (cfe_rc EQ ESA_SKIP)                          /* IS10100 */
+          cfe_rc = ESA_OK;                               /* IS10100 */
+      }                                                  /* IS10109 */
+      else                                               /* IS10100 */
+      {                                                  /* IS10100 */
+        if (cfe_rc EQ ESA_SKIP)                          /* IS10100 */
+          /* SAS2IBMN
+          admin_params->cs_func.MSG_printf_ptr(           * IS10100 *
+                                           RACF_CUSTOM_FIELD_IGNORED,*/
+          CTSAMSG_print(RACF_CUSTOM_FIELD_IGNORED,       /* SAS2IBMN */
+                     msgs, NULL, dest,                   /* SAS2IBMN */
+                     cf_name);                           /* IS10100 */
+      }                                                  /* IS10100 */
+
+      max_cfe_rc = MAX(max_cfe_rc, cfe_rc);              /* IS10100 */
+    }
+    else
+      if (rc EQ ESA_ERR)           /* If no more fields..   IS10100 */
+      {                                                  /* IS10100 */
+        rc = ESA_OK;               /* ...reset rc...        IS10100 */
+        break;                     /*   ... and leave loop. IS10100 */
+      }                                                  /* IS10100 */
+      else
+        if (rc EQ ESA_FATAL)     /* If extract failed...             */
+        {                                                 /* IS10100 */
+     /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp,0,/*IS10100*/
+          ESA_DIAG_printf(comp, 0,          /*IS10182  * IS10100 */
+                  "EXTRACT (NEXT): rc = %d  CField = %s", /* IS10100 */
+                   rc, cf_name);                          /* IS10100 */
+          *msg_issued = TRUE;     /* ...RACF_Extract issued a msg    */
+          rc = ESA_ERR;                                   /* IS10100 */
+        }                                                 /* IS10100 */
+
+  /* IS10100 } while (rc EQ ESA_OK AND cfe_rc EQ ESA_OK);            */
+  } while (rc EQ ESA_OK AND cfe_rc LT ESA_ERR);           /* IS10100 */
+
+  /*
+   *   Handle return codes after loop
+   */
+  /*IS10100 if (rc EQ ESA_ERR) /* no more entries - finish last block */
+  if (rc EQ ESA_OK  AND  max_cfe_rc LE ESA_SKIP)          /* IS10100  */
+  {
+    /* IS10100 rc = ESA_OK;  */
+
+    if (first_ublock_ptr NE NULL)
+    {
+      /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 3,  */
+      ESA_DIAG_printf(comp, 3,                     /*IS10182*/
+                    "Free unused user blocks");
+
+      rc = Free_Unused_CField_Block(comp, &first_ublock_ptr,
+                                    &curr_ublock_ptr, max_entries,
+                                    msg_issued, admin_params);
+    }
+
+    if (rc EQ ESA_OK   AND
+        first_gblock_ptr NE NULL)
+    {
+      /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 3, */
+      ESA_DIAG_printf(comp, 3,                         /*IS10182*/
+                    "Free unused group blocks");
+      rc = Free_Unused_CField_Block(comp, &first_gblock_ptr,
+                                    &curr_gblock_ptr, max_entries,
+                                    msg_issued, admin_params);
+    }
+
+    if (rc EQ ESA_OK)
+    {
+      /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 3, */
+      ESA_DIAG_printf(comp, 3,                          /*IS10182*/
+              "Return to caller:  User = %8X  Group = %8X",
+              first_ublock_ptr, first_gblock_ptr);
+
+      if (p_user_CFields NE NULL)
+        *p_user_CFields = first_ublock_ptr;
+
+      if (p_group_CFields NE NULL)
+        *p_group_CFields = first_gblock_ptr;
+
+    }
+  }
+
+  rc = MAX(rc, max_cfe_rc);    /* Prepare to return max rc. IS10100  */
+
+  /* if (rc NE ESA_OK OR cfe_rc NE ESA_OK)                  IS10100  */
+  if (rc GT ESA_SKIP)                                    /* IS10100 */
+  {
+    RACF_Free_CField_Blocks(comp, first_ublock_ptr, admin_params);
+    RACF_Free_CField_Blocks(comp, first_gblock_ptr, admin_params);
+  }
+
+ exit:
+
+  if (output NE NULL)                                     /* WS10082N */
+    free(output);                                         /* WS10082N */
+
+  /*IS10182 admin_params->cs_func.DIAG_exit_ptr(comp, 1, func, rc);*/
+  ESA_DIAG_exit(comp, 1, func, rc);             /*IS10182 */
+
+  return rc;
+} /* Create_CField_Blocks */
+
+/********************************************************************
+ *
+ * Procedure Name : Create_CField_Entry
+ *
+ * Description    : Create the Custom Field entry.
+ *
+ * Input          : cf_name - Custom Field name
+ *                : cf_data - Custom Field attributes received
+ *                            from RACF.
+ *                : admin
+ *
+ * Output         : entry -> entry to fill.
+ *                : msg_issued - on error, contains an indicatiom if
+ *                               an error message was issued or not.
+ *
+ * Input/Output   :
+ *
+ * Return Value   : ESA_RC
+ *
+ * Side Effects   :
+ *
+ * Comments       : This function was re-written for IS10100:
+ *                  The code for analyzing the custom field definition
+ *                  and putting the data in the entry was split into
+ *                  two routines:
+ *                  - Analyze_CF_Definition - which analyzes the RACF
+ *                    output and verifies each attribute.
+ *                  - Process_CField_Definition - called to put each
+ *                    cusomt field attribute in entry.
+ *
+ ********************************************************************/
+
+ static ESA_RC Create_CField_entry(ESA_DIAG_COMP_typ    comp,
+                            char                        *cf_name,
+                            RACF_CFIELD_OUTPUT_rec_typ  *cf_data,
+                            RACF_CUSTOM_FIELD_rec_typ   *entry,
+                            int                         *msg_issued,
+                            ADMIN_PARAMS_rec_typ        *admin_params)
+{
+
+  char          func[] = "Create_CField_entry";
+
+  CTSAMSG_HANDLE_rec_typ      *msgs;
+  CTSAMSG_DEST_TABLE_rec_typ  *dest;
+
+  ESA_RC   rc = ESA_FATAL;
+  char   * cf_kwd_name;
+  const RACF_CUSTOM_FIELD_rec_typ null_entry = {0};
+
+
+  /*
+   *   Initialization
+   */
+  /*IS10182 admin_params->cs_func.DIAG_enter_ptr(comp, 1, func);*/
+  ESA_DIAG_enter(comp, 1, func);                           /*IS10182*/
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  *entry = null_entry;
+
+  /*
+   *    Put name in entry (skip USER/GROUP and put CSDATA.name)
+   *
+   *    The name received is constructed of 3 parts:
+   *    - Custom Field type (USER / GROUP)
+   *    - CSDATA
+   *    - field name.
+   *
+   *    We save CSDATA.name as the field name.
+   */
+  cf_kwd_name = strchr(cf_name, '.');
+  if (cf_kwd_name NE NULL AND strlen(cf_kwd_name) > 1) /* Validate */
+    strcpy(entry->name, cf_kwd_name+1);               /* Save     */
+  else
+  {
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 0,*/
+    ESA_DIAG_printf(comp, 0,                       /*IS10182*/
+                  "** ERROR **   Invalid CField name.  Name = %s",
+                  cf_name);
+    /* IS10100 rc = ESA_FATAL;   */
+    rc = ESA_SKIP;                                     /* IS10100 */
+    goto exit;
+  }
+
+  /*
+   *    Process entry keywords.
+   */
+  rc = Analyze_CF_Definition(comp, cf_name, entry, cf_data,
+                              Process_CField_Definition,
+                              msg_issued, admin_params);
+
+ exit:
+  /*IS10182 admin_params->cs_func.DIAG_exit_ptr( */
+  ESA_DIAG_exit(                                 /*IS10182*/
+                  comp, 1, func, rc);
+  return rc;
+
+}   /* Create_CField_entry */
+
+
+/********************************************************************
+ *
+ * Procedure Name : Add_CField_to_block
+ *
+ * Description    : Add an entry to the block. If the block was not
+ *                  allocated yet, or if the block is exhausted,
+ *                  allocate a new block and update the current
+ *                  block address and the frist block address, if
+ *                  needed.
+ *
+ * Input          : entry.
+ *                   -> first block address.
+ *
+ * Output         : None.
+ *
+ * Input/Output   :  -> first block address.
+ *                   -> current block address.
+ *
+ * Return Value   : return code.
+ *
+ * Side Effects   :
+ *
+ * Comments       :
+ *
+ ********************************************************************/
+
+ static ESA_RC Add_CField_to_block(ESA_DIAG_COMP_typ    comp,
+                           RACF_CUSTOM_FIELD_rec_typ     cf_entry,
+                           RACF_CUSTOM_FIELDS_block_ptr *curr_block_ptr,
+                           int                           max_entries,
+                           int                          *msg_issued,
+                           ADMIN_PARAMS_rec_typ         *admin_params)
+{
+
+  char          func[] = "Add_CField_to_block";
+
+  CTSAMSG_HANDLE_rec_typ      *msgs;
+  CTSAMSG_DEST_TABLE_rec_typ  *dest;
+
+  RACF_CUSTOM_FIELDS_block_typ  * block = *curr_block_ptr;
+  ESA_RC                     rc;
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  /*IS10182 admin_params->cs_func.DIAG_enter_ptr(comp, 1, func);*/
+  ESA_DIAG_enter(comp, 1, func);                        /*IS10182*/
+
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,  */
+  ESA_DIAG_printf(comp, 5,                               /*IS10182*/
+                    "current block = %8X   entries = %d / %d",
+                    block, block->used_fields_count, max_entries);
+  /*
+   *   Check if there is enough space for the entry in the current
+   *   block.
+   *   If not, allocate a new block, chain it to current and change
+   *   the current to be the new block.
+   */
+  if (block->used_fields_count EQ max_entries)
+  {
+    rc = Allocate_CFields_Block(comp, &block, msg_issued,
+                                admin_params);
+    if (rc EQ ESA_OK)
+    {
+      (*curr_block_ptr)->next_block = (void *)block; /* curr -> new */
+      *curr_block_ptr = block;                /* set new as current. */
+      /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+      ESA_DIAG_printf(comp, 5,                           /*IS10182*/
+                    "new block = %8X   entries = %d / %d",
+                    block, max_entries, block->used_fields_count);
+    }
+    else
+    {
+      if (NOT *msg_issued)
+      {
+        /* SAS2IBMN
+        admin_params->cs_func.MSG_printf_ptr (
+            ERR_MALLOC, "CFIELD BLOCK", RACF_CUSTOM_FIELDS_BLOCK_LEN);
+        */
+        CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,      /* SAS2IBMN */
+                     "CFIELD BLOCK",                     /* SAS2IBMN */
+                     RACF_CUSTOM_FIELDS_BLOCK_LEN);      /* SAS2IBMN */
+        *msg_issued = TRUE;
+      }
+      rc = ESA_FATAL;
+      goto exit ;
+    }
+  }
+
+  /*
+   *   Copy to the frist free entry in block
+   *   ..If the block is empty, copy to the frist entry (index 0).
+   *   ..else, copy to the first free entry (the used count is used
+   *     as the index to this entry).
+   */
+  block->fields[block->used_fields_count] = cf_entry;
+  block->used_fields_count++;            /* Increment the use count */
+
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5, */
+  ESA_DIAG_printf(comp, 5,                          /*IS10182*/
+                    "entry added to block %8X.   used entries = %d",
+                    block, block->used_fields_count);
+  rc = ESA_OK;
+
+ exit:
+  /*IS10182 admin_params->cs_func.DIAG_exit_ptr( */
+  ESA_DIAG_exit(                                   /*IS10182*/
+                  comp, 1, func, rc);
+  return rc;
+
+}  /* Add_CField_to_block */
+
+/********************************************************************
+ *
+ * Procedure Name : Allocate_CFields_Block
+ *
+ * Description    : Allocate and initialize a new Custmo Fields
+ *                  block.
+ *
+ * Input          : Nne.
+ *
+ * Output         : None.
+ *
+ * Input/Output   :
+ *
+ * Return Value   : Custom Fields block address or NULL
+ *
+ * Side Effects   :
+ *
+ * Comments       :
+ *
+ ********************************************************************/
+
+ static ESA_RC Allocate_CFields_Block(ESA_DIAG_COMP_typ  comp,
+                           RACF_CUSTOM_FIELDS_block_ptr *block,
+                           int                          *msg_issued,
+                           ADMIN_PARAMS_rec_typ         *admin_params)
+{
+
+  char          func[] = "Allocate_CFields_Block";
+
+  ESA_RC rc;
+  RACF_CUSTOM_FIELDS_block_typ * new_blk;
+
+  /*IS10182* admin_params->cs_func.DIAG_enter_ptr(comp, 1, func);*/
+  ESA_DIAG_enter(comp, 1, func);                        /*IS10182*/
+
+  new_blk = (RACF_CUSTOM_FIELDS_block_typ *)malloc(
+                                      RACF_CUSTOM_FIELDS_BLOCK_LEN);
+  if (new_blk NE NULL)
+  {
+    strcpy(new_blk->cfb_eyec, "CFB");     /* initialize...       */
+    new_blk->next_block = NULL;           /*   ...the new...     */
+    new_blk->used_fields_count = 0;       /*        ...block.    */
+    rc = ESA_OK;
+  }
+  else
+   rc = ESA_FATAL;
+
+  *block = new_blk;
+
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+  ESA_DIAG_printf(comp, 5,                         /*IS10182*/
+                    "Allocated block:  address = %8X   length = %d",
+                    new_blk, RACF_CUSTOM_FIELDS_BLOCK_LEN);
+
+  /*IS10182 admin_params->cs_func.DIAG_exit_ptr(comp, 1, func, rc);*/
+  ESA_DIAG_exit(comp, 1, func, rc);                     /*IS10182*/
+
+  return rc;
+
+}  /* Allocate_CFields_Block */
+
+/********************************************************************
+ *
+ * Procedure Name : Free_Unused_CField_Block
+ *
+ * Description    : Free unused part of CField block. If the whole
+ *                  block was not used, free it and adjust the
+ *                  first or next pointers.
+ *
+ * Input          : Nne.
+ *
+ * Output         : None.
+ *
+ * Input/Output   :
+ *
+ * Return Value   : return code.
+ *
+ * Side Effects   :
+ *
+ * Comments       :
+ *
+ ********************************************************************/
+
+ static ESA_RC Free_Unused_CField_Block(ESA_DIAG_COMP_typ  comp,
+                          RACF_CUSTOM_FIELDS_block_ptr *first_block,
+                          RACF_CUSTOM_FIELDS_block_ptr *curr_block,
+                          int                           max_entries,
+                          int                          *msg_issued,
+                          ADMIN_PARAMS_rec_typ         *admin_params )
+{
+
+  char          func[] = "Free_Unused_CField_Block";
+  ESA_RC                   rc = ESA_OK;
+  RACF_CUSTOM_FIELDS_block_ptr  new_curr = NULL;
+  RACF_CUSTOM_FIELDS_block_ptr  curr = *curr_block;
+  RACF_CUSTOM_FIELDS_block_ptr  first = *first_block;
+  RACF_CUSTOM_FIELDS_block_ptr  pre_last;
+  size_t                   new_size;
+  CTSAMSG_HANDLE_rec_typ     * msgs;                 /* IS10100 */
+  CTSAMSG_DEST_TABLE_rec_typ * dest;                 /* IS10100 */
+
+  /*IS10182 admin_params->cs_func.DIAG_enter_ptr(comp, 1, func);*/
+  ESA_DIAG_enter(comp, 1, func);                       /*IS10182*/
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr( */
+  ESA_DIAG_printf(                                      /*IS10182*/
+                comp, 5,
+                "First = %8X    Current = %8X",first, curr);
+
+  msgs = admin_params->ctsamsg_handle;               /* IS10100 */
+  dest = admin_params->ctsamsg_dest;                 /* Is10100 */
+
+  if (curr NE NULL)             /*  if current is not NULL - process */
+  {
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr( */
+    ESA_DIAG_printf(                                    /*IS10182*/
+                  comp, 5,
+                  "used entries = %d  Max entries = %d",
+                  curr->used_fields_count, max_entries);
+
+    /*  If current block is empty, free it.                         */
+    /*  The block is considerred empty when :                       */
+    /*  - no used entries                                           */
+    /*      -- OR --                                                */
+    /*  - there is only 1 block and it contains 1 entry (NOCSDATA). */
+    if (curr->used_fields_count EQ 0  OR
+        (curr EQ first  AND  curr->used_fields_count EQ 1) )
+    {
+      free(curr);                     /* ..no - free the block       */
+      /*IS10182 admin_params->cs_func.DIAG_printf_ptr( */
+      ESA_DIAG_printf(                                   /*IS10182*/
+                comp, 5,
+                "Current empty - freed");
+    }
+    else                              /* ..yes - realloc if needed   */
+    {
+
+      if (curr->used_fields_count LT max_entries)
+      {
+        new_size = (int)(curr->fields) - (int)curr +
+                   ( (int)(curr->used_fields_count) *
+                    sizeof(RACF_CUSTOM_FIELD_rec_typ) ) ;
+        new_curr = (RACF_CUSTOM_FIELDS_block_typ *)realloc(curr,
+                                                           new_size);
+        /*IS10182 admin_params->cs_func.DIAG_printf_ptr( */
+        ESA_DIAG_printf(                             /*IS10182*/
+                comp, 5,
+                "Current reallocated: New address = %8X   Size = %d",
+                new_curr, new_size);
+        if (new_curr EQ NULL)           /* if realloc failed...       */
+        {
+          new_curr = curr;              /*  ...continue with current. */
+          /*IS10182 admin_params->cs_func.DIAG_printf_ptr( */
+          ESA_DIAG_printf(                               /*IS10182*/
+                comp, 0,
+                "** ERROR **  CField block reallocation failed");
+        }
+      }
+      else
+        new_curr = curr;                /* realloc not needed.        */
+    }
+
+    /*
+     *  Update blocks chain
+     */
+    if (new_curr NE curr)           /* if current changed - update    */
+    {
+      *curr_block = new_curr;       /*  Update current.               */
+
+      if (curr EQ first)            /* If current is first...         */
+        *first_block = new_curr;    /*  ...update first.              */
+      else                          /* otherwise, update chain.       */
+      {
+        rc = ESA_FATAL;             /* when no block points to curr.  */
+        for (pre_last = first;
+             pre_last->next_block NE NULL;
+             pre_last = pre_last->next_block)
+        {
+          /*IS10182 admin_params->cs_func.DIAG_printf_ptr(*/
+          ESA_DIAG_printf( /*IS10182*/
+                comp, 5,
+                "block = %8X   next = %8X",
+                pre_last, pre_last->next_block);
+
+          if (pre_last->next_block EQ curr)   /* if block points...   */
+          {                                   /*      ...to current   */
+            /*IS10182 admin_params->cs_func.DIAG_printf_ptr( */
+            ESA_DIAG_printf(                              /*IS10182*/
+                  comp, 5,
+                  "Change 'next' in %8X from %8X to %8X",
+                  pre_last, pre_last->next_block, new_curr);
+            pre_last->next_block = new_curr; /* point to new current.*/
+            rc = ESA_OK;
+            break;
+          }
+        }
+
+        if (rc NE ESA_OK)
+        {
+          /*IS10182 admin_params->cs_func.DIAG_printf_ptr(*/
+          ESA_DIAG_printf(                                /*IS10182*/
+                comp, 0,
+                "CField blocks chain error: F=%8X PL=%8X C=%8X NC=%8X",
+                first, pre_last, curr, new_curr);
+          CTSAMSG_print(ERR_INTERNAL3, msgs, NULL, dest,  /* IS10100 */
+                 comp, func, rc,                          /* IS10100 */
+                 "CField blocks chain error");            /* IS10100 */
+          *msg_issued = TRUE;                             /* IS10100 */
+        }
+      }
+    }
+  }
+
+  /*IS10182 admin_params->cs_func.DIAG_exit_ptr(comp, 1, func, rc);*/
+  ESA_DIAG_exit(comp, 1, func, rc);                        /*IS10182*/
+
+  return rc;
+
+}   /* Free_Unused_CField_Block */
+
+/********************************************************************
+ *
+ * Procedure Name : Free_CField_Blocks
+ *
+ * Description    : Free all CField blocks starting from the first
+ *                  block received as parameter.
+ *
+ * Input          : first block address.
+ *
+ * Output         : None.
+ *
+ * Input/Output   :
+ *
+ * Return Value   : None.
+ *
+ * Side Effects   :
+ *
+ * Comments       :
+ *
+ ********************************************************************/
+
+ void  RACF_Free_CField_Blocks(ESA_DIAG_COMP_typ        comp,
+                          RACF_CUSTOM_FIELDS_block_ptr  first_block,
+                          ADMIN_PARAMS_rec_typ         *admin_params)
+{
+
+  char          func[] = "RACF_Free_CFields_Blocks";
+  RACF_CUSTOM_FIELDS_block_ptr next;
+  RACF_CUSTOM_FIELDS_block_ptr block = first_block;
+
+  /*IS10182 admin_params->cs_func.DIAG_enter_ptr(comp, 1, func); */
+  ESA_DIAG_enter(comp, 1, func);                         /*IS10182*/
+
+  while (block NE NULL)
+  {
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5, */
+    ESA_DIAG_printf(comp, 5,                      /*IS10182*/
+                  "Free block at %8X", block);
+    next = block->next_block;
+    free (block);
+    block = next;
+  }
+
+  /*IS10182 admin_params->cs_func.DIAG_exit_ptr(comp, 1, */
+  ESA_DIAG_exit(comp, 1,                    /*IS10182*/
+                                      func, ESA_RC_VOID);
+
+}  /* Free_CField_Blocks */
+
+/********************************************************************
+ *
+ * Procedure Name : RACF_Search_CField_Block
+ *
+ * Description    : Look for a specific field in the CFields block.
+ *
+ * Input          : first_block - -> first CFB.
+ *                : cf_name- Custom field name to look for.
+ *
+ * Output         : None.
+ *
+ * Input/Output   :
+ *
+ * Return Value   : CField entry in CFB or NULL if not found.
+ *
+ * Side Effects   :
+ *
+ * Comments       :
+ *
+ ********************************************************************/
+
+RACF_CUSTOM_FIELD_rec_typ * RACF_Search_CField_Block(
+                             ESA_DIAG_COMP_typ            comp,
+                             RACF_CUSTOM_FIELDS_block_ptr first_block,
+                             char                        *cf_name,
+                             ADMIN_PARAMS_rec_typ        *admin_params)
+{
+
+  char          func[] = "RACF_Search_CField_Block";
+  RACF_CUSTOM_FIELDS_block_ptr block = first_block;
+  RACF_CUSTOM_FIELD_rec_typ   *cf_entry = NULL;
+  int                          i;
+
+  /*
+   *   Initialization
+   */
+  /*IS10182 admin_params->cs_func.DIAG_enter_ptr(comp, 1, func);*/
+  ESA_DIAG_enter(comp, 1, func);                      /*IS10182*/
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5, */
+  ESA_DIAG_printf(comp, 5,                          /*IS10182*/
+                  "Look for %s in %8X", cf_name, block);
+
+  /*
+   *   Search
+   */
+  while (block NE NULL)
+  {
+    for (i=0; i LT block->used_fields_count; i++)
+    {
+      if (strcmp(block->fields[i].name, cf_name) EQ 0)
+      {
+        cf_entry = &block->fields[i];
+        break;
+      }
+    }
+
+    if (cf_entry NE NULL)
+      break;
+
+    block = block->next_block;
+  }
+
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5, */
+  ESA_DIAG_printf(comp, 5,                 /*IS10182*/
+                  "%s entry = %8X", cf_name, cf_entry);
+
+  /*IS10182 admin_params->cs_func.DIAG_exit_ptr(comp, 1, */
+  ESA_DIAG_exit(comp, 1,                     /*IS10182*/
+                                      func, ESA_RC_VOID);
+
+  return cf_entry;
+}  /* RACF_Search_CField_Block*/
+
+/* IS10100 - start  */
+/********************************************************************
+ *
+ * Procedure Name : Build_CTSACF_Blocks
+ *
+ * Description    : Build the CTSA internal Custom Field blocks
+ *                  and fill them.
+ *
+ * Input          : activate - 1 - After creatng and initializing the
+ *                                 blocks, activate the feature whose
+ *                                 Custom Fields are defined in RACF.
+ *                             0 - Create and initialiaze the blocks.
+ *                : admin
+ *
+ * Output         : msg_issued - on error, contains an indicatiom if
+ *                               an error message was issued or not.
+ *
+ * Input/Output   : p_user_ctsacfs - area for address of user Custom
+ *                                   Fields block or NULL if user Custom
+ *                                   Fields block is not required.
+ *                : p_group_ctsacfs - area for address of group Custom
+ *                                    Fields block or NULL if group
+ *                                    Custom Fields block is not
+ *                                    required.
+ *
+ * Return Value   : ESA_RC:
+ *                  - ESA_OK - OK
+ *                  - ESA_ERR - Custom Fields initialization failed.
+ *                              No tables were created.
+ *                  - ESA_FATAL - Severe error.
+ *
+ *
+ * Side Effects   :
+ *
+ ********************************************************************/
+
+ static ESA_RC Build_CTSACF_Blocks(ESA_DIAG_COMP_typ      comp,
+                        RACF_CTSACF_block_ptr        *p_user_ctsacfs,
+                        RACF_CTSACF_block_ptr        *p_group_ctsacfs,
+                        RACF_FLAG_typ                 activate,
+                        int                          *msg_issued,
+                        ADMIN_PARAMS_rec_typ         *admin_params)
+{
+
+  char          func[] = "Build_CTSACF_Blocks";
+  ESA_RC        rc = ESA_OK ;
+
+  RACF_CTSACF_ATTR_blk_typ   *attrs;
+  int    i;
+
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+
+  /*
+   *   Blocks pointers and counters.
+   */
+  RACF_CTSACF_block_ptr       p_u_block = NULL;
+  RACF_CTSACF_block_ptr       p_g_block = NULL;
+
+  /*
+   *  Initialization
+   */
+  /*IS10182 admin_params->cs_func.DIAG_enter_ptr(comp, 1, func);*/
+  ESA_DIAG_enter(comp, 1, func);                   /*IS10182*/
+  *msg_issued = FALSE;
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+  ESA_DIAG_printf(comp, 5,                  /*IS10182*/
+          "Build_CTSACF_Blocks input:  ublk = %8X   gblk = %8X",
+          p_user_ctsacfs, p_group_ctsacfs);
+
+  if (p_user_ctsacfs EQ NULL  AND
+      p_group_ctsacfs EQ NULL)
+        goto exit;
+
+  /*
+   *  Create and fill the user CTSA internal custom fields.
+   */
+  if (p_user_ctsacfs NE NULL)
+  {
+    LOOK_FOR_ATTR ("USER", i, attrs)
+    if (attrs NE NULL  AND
+        attrs->attr_num GT 0)
+      rc = Create_CTSACF_Block(comp, "USER", attrs,
+                               &p_u_block, activate, msg_issued,
+                               admin_params);
+
+      /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+      ESA_DIAG_printf(comp, 5,                         /*IS10182*/
+          "Create_CTSACF_Block for USER returned: rc = %d  block = %8X",
+          rc, p_u_block);
+  }
+
+  /*
+   *  Create and fill the group CTSA internal custom fields.
+   */
+  if (p_group_ctsacfs NE NULL   AND
+      rc EQ ESA_OK)
+  {
+    LOOK_FOR_ATTR ("GROUP", i, attrs)
+    if (attrs NE NULL  AND
+        attrs->attr_num GT 0)
+      rc = Create_CTSACF_Block(comp, "GROUP", attrs,
+                               &p_g_block, activate, msg_issued,
+                               admin_params);
+
+      /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+      ESA_DIAG_printf(comp, 5,                            /*IS10182*/
+         "Create_CTSACF_Block for GROUP returned: rc = %d  block = %8X",
+         rc, p_g_block);
+  }
+
+  if (rc EQ ESA_OK)
+  {
+    if (p_user_ctsacfs NE NULL)
+      *p_user_ctsacfs = p_u_block;
+
+    if (p_group_ctsacfs NE NULL)
+      *p_group_ctsacfs = p_g_block;
+  }
+  else
+  {
+    if (p_u_block NE NULL)
+      RACF_Free_CTSACF_Block(comp, p_u_block, admin_params);
+
+    if (p_g_block NE NULL)
+      RACF_Free_CTSACF_Block(comp, p_g_block, admin_params);
+  }
+
+ /*
+  *   Return
+  */
+ exit:
+  /*IS10182 admin_params->cs_func.DIAG_exit_ptr(comp, 1, func, rc);*/
+  ESA_DIAG_exit(comp, 1, func, rc);                        /*IS10182*/
+  return rc;
+
+}  /*  Build_CTSACF_Blocks  */
+
+/********************************************************************
+ *
+ * Procedure Name : Create_CTSACF_Block
+ *
+ * Description    : Create a CTSA internal Custom Field block and
+ *                  fill it.
+ *
+ * Input          : type         - "USER" / "GROUP".
+ *                : ctsacfs_attr - pointer to the CTSA custom fields
+ *                                 attributes block entry.
+ *                : activate - 1 - After creatng and initializing the
+ *                                 blocks, activate the feature whose
+ *                                 Custom Fields are defined in RACF.
+ *                             0 - Create and initialiaze the blocks.
+ *                : admin_params
+ *
+ * Output         : msg_issued - on error, contains an indicatiom if
+ *                               an error message was issued or not.
+ *
+ * Input/Output   : p_ctsacfs - area for address of the CTSA Custom
+ *                              fields block.
+ *
+ * Return Value   : ESA_RC:
+ *                  - ESA_OK - OK
+ *                  - ESA_ERR - Custom Fields initialization failed.
+ *                              No tables were created.
+ *                  - ESA_FATAL - Severe error.
+ *
+ * Side Effects   :
+ *
+ ********************************************************************/
+
+ static ESA_RC Create_CTSACF_Block(ESA_DIAG_COMP_typ      comp,
+                        char                         *type,
+                        RACF_CTSACF_ATTR_blk_typ     *attrs_blk,
+                        RACF_CTSACF_block_ptr        *p_ctsacfs,
+                        RACF_FLAG_typ                 activate,
+                        int                          *msg_issued,
+                        ADMIN_PARAMS_rec_typ         *admin_params)
+ {
+
+  char          func[] = "Create_CTSACF_Block";
+
+  ESA_RC                  rc = ESA_OK;
+  ESA_RC                  max_rc = ESA_OK;
+  RACF_CTSACF_block_typ  *blk;
+  int                     blk_len;
+  int                     i;
+  char                    msg[40];
+  RACF_CFIELD_OUTPUT_rec_typ *output = NULL;
+
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+
+  /*
+   *  Initialization
+   */
+  /*IS10182 admin_params->cs_func.DIAG_enter_ptr(comp, 1, func); */
+  ESA_DIAG_enter(comp, 1, func);                         /*IS10182*/
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  if (attrs_blk EQ NULL  OR
+      p_ctsacfs EQ NULL)
+  {
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 0,*/
+    ESA_DIAG_printf(comp, 0,                          /*IS10182*/
+               "No attr_blk / p_ctsacfs");
+    rc = ESA_FATAL;
+    goto exit;
+  }
+
+  /*
+   *  Calculate Block length = (entry_length * #_of_entries) +
+   *                            block_header_length
+   */
+  if (attrs_blk->attr_num EQ 0)  /* If empty block, nothing to do.   */
+    goto exit;
+
+  blk_len = (sizeof(RACF_CTSACF_rec_typ) * attrs_blk->attr_num) +
+            sizeof(RACF_CTSACF_block_typ);
+
+  /*
+   *   Allocate the  block
+   */
+  blk = (RACF_CTSACF_block_typ *)malloc(blk_len);
+
+  if (blk NE NULL)
+  {
+    strcpy(blk->ctsacf_eyec, "CTSACFB");       /* Initialize...       */
+    blk->num_of_entries = attrs_blk->attr_num; /*    ... the block.   */
+    rc = ESA_OK;
+  }
+  else
+  {
+    sprintf(msg, "%s CTSACF BLOCK", type);
+    /* SAS2IBMN
+    admin_params->cs_func.MSG_printf_ptr(ERR_MALLOC, msg, blk_len); */
+    CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,          /* SAS2IBMN */
+                  msg, blk_len);                         /* SAS2IBMN */
+    *msg_issued = TRUE;
+    rc = ESA_FATAL;
+    goto cleanup;
+  }
+
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+  ESA_DIAG_printf(comp, 5,                             /*IS10182*/
+               "%s block:  address = %8X  length = %d  entriee=%d",
+               type, blk, blk_len, attrs_blk->attr_num);
+
+  /*
+   *  Initialize the entries
+   */
+  for (i = 0; i LT attrs_blk->attr_num; i++)
+  {
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+    ESA_DIAG_printf(comp, 5,                           /*IS10182*/
+                    "Init %s(%d): field=%s/%s  feature=%d",
+                    type, i, attrs_blk->attr_tab[i].CF_def_name,
+                    attrs_blk->attr_tab[i].rssparm_name,
+                    attrs_blk->attr_tab[i].CF_Feature);
+    Init_CTSACF_Entry(comp, &attrs_blk->attr_tab[i],
+                      &blk->entries[i],
+                      msg_issued, admin_params);
+  }
+
+  /*
+   *  Activate the entries
+   */
+  if (activate EQ RACF_YES)
+  {
+    /*
+     *  Allocate RACF extract output buffer.
+     */
+    ALLOC_RACF_OUTPUT(output)
+    if (rc NE ESA_OK)
+      goto cleanup;
+
+    max_rc = rc;
+    for (i = 0; i LT attrs_blk->attr_num AND max_rc LT ESA_ERR; i++)
+    {
+      /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+      ESA_DIAG_printf(comp, 5,                           /*IS10182*/
+                    "Act %s(%d): field=%s  feature=%d",
+                    type, i, blk->entries[i].CF_name,
+                    blk->entries[i].CF_Feature);
+      rc = Activate_CTSACF_Entry(comp, type, &blk->entries[i],
+                                 &attrs_blk->attr_tab[i], output,
+                                 TRUE, msg_issued, admin_params);
+      max_rc = MAX(max_rc, rc);
+    }
+
+    rc = max_rc;
+
+  }
+
+ /*
+  *  Cleanup
+  */
+ cleanup:
+  if (rc LT ESA_ERR)
+  {
+    *p_ctsacfs = blk;
+    rc = ESA_OK;
+  }
+  else
+  {
+    if (blk NE NULL)
+      free (blk);
+  }
+
+ /*
+  *  Return
+  */
+ exit:
+  if (output NE NULL)                                     /* WS10082N */
+    free(output);                                         /* WS10082N */
+
+  /*IS10182 admin_params->cs_func.DIAG_exit_ptr(comp, 1, func, rc);*/
+  ESA_DIAG_exit(comp, 1, func, rc);                     /*IS10182*/
+
+  return rc;
+
+}  /*  Create_CTSACF_Block  */
+
+/********************************************************************
+ *
+ * Procedure Name : Init_CTSACF_Entry
+ *
+ * Description    : Initialize a CTSACF entry:
+ *                  - Retrieve the RSSPARM.
+ *                  - Fill the entry.
+ *
+ * Input          : attr - CTSA custom field attributes entry.
+ *                : admin_params
+ *
+ * Output         : msg_issued - on error, contains an indicatiom if
+ *                               an error message was issued or not.
+ *
+ * Input/Output   : entry - CTSAACF entry to initialize.
+ *
+ * Return Value   : None
+ *
+ * Side Effects   :
+ *
+ ********************************************************************/
+
+ static void   Init_CTSACF_Entry(ESA_DIAG_COMP_typ      comp,
+                        RACF_CTSACF_ATTR_rec_typ     *attr,
+                        RACF_CTSACF_rec_typ          *entry,
+                        int                          *msg_issued,
+                        ADMIN_PARAMS_rec_typ         *admin_params)
+ {
+  char          func[] = "Init_CTSACF_Entry";
+
+  ESA_RC                 rc = ESA_OK;
+  char                   cf_name[9];
+
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+
+  /*
+   *  Initialization
+   */
+  /*IS10182 admin_params->cs_func.DIAG_enter_ptr(comp, 1, func);*/
+  ESA_DIAG_enter(comp, 1, func);                       /*IS10182*/
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  /*
+   *  If RSSPARM parameter exists in entry, retrieve its value.
+   *  If parameter does not exist, or exists without value, use
+   *  the default name.
+   */
+  if (attr->rssparm_name NE NULL)
+  {
+    rc = admin_params->cs_func.rssprm_get_opt_ptr(
+                    admin_params->rss_name,
+                    attr->rssparm_name,
+                    8,
+                    cf_name,
+                    OPT_TRUE,
+                    OPT_FALSE) ;
+    if (rc EQ ESA_OK)
+      strcpy(entry->CF_name, cf_name);
+    else
+      strcpy(entry->CF_name, attr->CF_def_name);
+  }
+  else
+    strcpy(entry->CF_name, attr->CF_def_name);
+
+  /*
+   *  Initialize all other fields.
+   */
+  entry->CF_Feature = attr->CF_Feature;
+  entry->act = ACT_NO;
+
+  /*
+   *  Return
+   */
+  /*IS10182admin_params->cs_func.DIAG_exit_ptr(comp,1,func,ESA_OK);*/
+  ESA_DIAG_exit(comp, 1, func, ESA_OK);                   /*IS10182*/
+  return;
+
+ }  /*  Init_CTSACF_Entry  */
+
+/********************************************************************
+ *
+ * Procedure Name : Activate_CTSACF_Entry
+ *
+ * Description    : Activate a CTSACF entry:
+ *                  - If extract=N, retrieve the custom field
+ *                    attributes.
+ *                  - Call Analyze_CF_definition to analyze and
+ *                    verify the custom field attributes.
+ *                  - If all OK, set TRUE in act field in the entry.
+ *
+ * Input          : attr - CTSA custom field attributes entry or
+ *                         NULL if entry not located yet.
+ *                : cf_data - RACF_Extract output area.
+ *                : do_extract :
+ *                   TRUE - extract the custom field definition.
+ *                   FALSE - do not extract the custom field
+ *                           definition. It is supplied in cf_data.
+ *                : admin_params
+ *
+ * Output         : entry -> entry to activate.
+ *                : msg_issued - on error, contains an indicatiom if
+ *                               an error message was issued or not.
+ *
+ * Input/Output   : entry - CTSAACF entry to initialize.
+ *
+ * Return Value   : ESA_RC
+ *
+ * Side Effects   :
+ *
+ ********************************************************************/
+
+ static ESA_RC Activate_CTSACF_Entry(ESA_DIAG_COMP_typ      comp,
+                        char                         *type,
+                        RACF_CTSACF_rec_typ          *entry,
+                        RACF_CTSACF_ATTR_rec_typ     *attr_ent,
+                        RACF_CFIELD_OUTPUT_rec_typ   *cf_data,
+                        int                           extract,
+                        int                          *msg_issued,
+                        ADMIN_PARAMS_rec_typ         *admin_params)
+ {
+
+  char          func[] = "Activate_CTSACF_Entry";
+
+  ESA_RC        rc = ESA_OK;
+  char          cf_name[256];  /* Full custom field name */
+  int           debug;
+  int           i;
+  char          na_c = ' ';
+  int           na_i = 0;
+  RACF_CTSACF_ATTR_rec_typ   *attr;
+  RACF_CTSACF_ATTR_blk_typ   *attrblk_ent;
+  int          cf_exists;
+
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+
+  /*
+   *  Initialization
+   */
+  /*IS10182 admin_params->cs_func.DIAG_enter_ptr(comp, 1, func);*/
+  ESA_DIAG_enter(comp, 1, func);                  /*IS10182*/
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  strcpy(cf_name, type);
+  strcat(cf_name, ".CSDATA.");
+  strcat(cf_name, entry->CF_name);
+
+  /*
+   *  If extract requested, retrieve the custom field definition
+   *  into the pre-allocaetd area pointed by cf_data.
+   */
+  if (extract)
+  {
+    cf_data->max_len = RACF_CFIELD_OUTPUT_BUF_LEN -
+                       ( (int)&(cf_data->buffer) - (int)cf_data );
+    cf_data->used_len = 0 ;
+  /*IS10182debug=admin_params->cs_func.DIAG_get_debug_level_ptr(comp);*/
+    debug = ESA_DIAG_get_debug_level(comp);             /*IS10182*/
+
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 3, */
+    ESA_DIAG_printf(comp, 3,                         /*IS10182*/
+                    "Extract CTSA Custom Field %s", cf_name);
+
+ /* SAS2IBMT typedef and prototype changed for IBM C
+    rc = RACF_extract((RACF_ACCESS_PROG_E)&ctsfrcf,                  */
+    rc = RACF_extract((ASM_RTN_TYP *) &ctsfrcf,           /* SAS2IBMT */
+                      RACF_OPERATION_LOCATE,
+                      &na_c, cf_name, na_i, &na_c,
+                      (RACF_OUTPUT_LINE_rec_typ *)cf_data, debug,
+                      RACF_NO, dest, msgs, na_i);
+
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 3,  */
+    ESA_DIAG_printf(comp, 3,                         /*IS10182*/
+               "Extract (LOCATE): rc = %d  CTSACF = %s",
+               rc, cf_name);
+
+    if (rc EQ ESA_OK)
+      cf_exists = TRUE;
+    else
+    {
+      cf_exists = FALSE;
+
+      if (rc EQ ESA_ERR)         /* If not found...                   */
+        rc = ESA_OK;             /*   ...this is OK but noting to do. */
+      else
+      {
+        rc = ESA_SKIP;
+        *msg_issued = TRUE;      /* ...RACF_Extract issued a msg    */
+      }
+    }
+  }
+  else
+    cf_exists = TRUE;
+
+  /*
+   *    Locate the corresponding entry in attributes table.
+   */
+  if (NOT cf_exists)
+    goto exit;
+
+  if (attr_ent NE NULL)
+    attr = attr_ent;
+  else
+  {
+    attr = NULL;
+    LOOK_FOR_ATTR (type, i, attrblk_ent)  /* Look for attrs table */
+
+    if (attrblk_ent NE NULL)
+    {
+      for (i = 0; i LT attrblk_ent->attr_num; i++)
+      {
+        if (attrblk_ent->attr_tab[i].CF_Feature EQ entry->CF_Feature)
+        {
+          attr = &attrblk_ent->attr_tab[i];
+          break;
+        }
+      }
+    }
+
+    if (attr EQ NULL)   /* Fatal error - feature entry w/o attr    */
+    {
+      /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 0,*/
+      ESA_DIAG_printf(comp, 0,                   /*IS10182*/
+                   "** ERROR ** ATTR entry for %s was not found",
+                   cf_name);
+
+      rc = ESA_FATAL;
+      goto exit;
+    }
+  }
+
+  /*
+   *    Process entry keywords.
+   */
+  rc = Analyze_CF_Definition(comp, cf_name, attr, cf_data,
+                              Validate_CTSACF_Definition,
+                              msg_issued, admin_params);
+
+  /*
+   *  Issue message,  and return
+   */
+ exit:
+
+  if (cf_exists  AND  rc EQ ESA_OK)
+    entry->act = ACT_YES;
+  else
+    if (rc EQ ESA_SKIP)
+      entry->act = ACT_ERROR;
+
+  /*IS10182 admin_params->cs_func.DIAG_exit_ptr(comp, 1, func, rc);*/
+  ESA_DIAG_exit(comp, 1, func, rc);                   /*IS10182*/
+  return rc;
+
+}  /*  Activate_CTSACF_Entry  */
+
+/********************************************************************
+ *
+ * Procedure Name : Analyze_CF_Definition
+ *
+ * Description    : Scan the custo field definition attributes
+ *                  received from RACF. For ech attribute:
+ *                  - Do the required verifications.
+ *                  - Call the process routine to handle it.
+ *
+ * Input          : cf_data - Custom Field attributes received
+ *                            from RACF.
+ *                : prc_rtn -> process routine to be called to
+ *                             handle each attribute.
+ *                : admin
+ *
+ * Output         : entry -> entry to fill.
+ *                : msg_issued - on error, contains an indicatiom if
+ *                               an error message was issued or not.
+ *
+ * Input/Output   :
+ *
+ * Return Value   : ESA_RC
+ *
+ * Side Effects   :
+ *
+ * Comments       :
+ *
+ ********************************************************************/
+
+ static ESA_RC Analyze_CF_Definition(ESA_DIAG_COMP_typ comp,
+                        char                         *cf_name,
+                        void                         *entry,
+                        RACF_CFIELD_OUTPUT_rec_typ   *cf_data,
+                        CF_Process_Field_ptr          proc_rtn,
+                        int                          *msg_issued,
+                        ADMIN_PARAMS_rec_typ         *admin_params)
+{
+  char          func[] = "Analyze_CF_Definition";
+
+  CTSAMSG_HANDLE_rec_typ      *msgs;
+  CTSAMSG_DEST_TABLE_rec_typ  *dest;
+
+  int      i;
+  int      kwd_num;
+  ESA_RC   rc = ESA_OK;
+  ESA_RC   max_rc = ESA_OK;
+  void   * p_val;
+  int      mixed;
+
+
+  char  def_value[5] = {0xFF, 0xFF, 0xFF, 0xFF, '\0'};
+
+  char   * curr_data_ptr;
+  char   * end_of_data;
+
+  ONE_RACF_FIELD_rec_typ keyword = { 0 } ;
+  ONE_RACF_FIELD_rec_typ value   = { 0 } ;
+  ONE_RACF_FIELD_rec_typ pass    = { 0 } ;
+
+
+  int drt_count = sizeof(data_rules) / sizeof(data_rules[0]);
+
+  /*
+   *   Initialization
+   */
+  /*IS10182 admin_params->cs_func.DIAG_enter_ptr(comp, 1, func); */
+  ESA_DIAG_enter(comp, 1, func);                        /*IS10182*/
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  /*
+   *    Initialize data pointers
+   */
+  curr_data_ptr = cf_data->buffer;            /* -> buffer start */
+  end_of_data = curr_data_ptr + cf_data->used_len;  /* -> buffer end  */
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5, */
+  ESA_DIAG_printf(comp, 5,                                /*IS10182*/
+                  "Data buffer=%8Xx    Used length=%d",
+                  curr_data_ptr, cf_data->used_len) ;
+
+  /*
+   *    Process keywords.
+   */
+  while ( curr_data_ptr LT end_of_data  AND
+          rc LT ESA_ERR)
+  {
+    rc = ESA_OK;
+
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5, */
+    ESA_DIAG_printf(comp, 5,                         /*IS10182*/
+                    "curr_data_ptr=%8X    end_of_data=%8X",
+                    curr_data_ptr, end_of_data);
+
+    /*
+     *   Get the next keyword and value from the buffer.
+     */
+    curr_data_ptr = RACF_get_field(curr_data_ptr, &keyword, FALSE);
+
+    if (curr_data_ptr LT end_of_data)
+      curr_data_ptr = RACF_get_field(curr_data_ptr, &value, FALSE);
+    else
+    {
+      rc = ESA_FATAL;
+      break;
+    }
+
+    if (curr_data_ptr LT end_of_data)
+      curr_data_ptr = RACF_get_field(curr_data_ptr, &pass, FALSE);
+    else
+    {
+      rc = ESA_FATAL;
+      break;
+    }
+
+    /*
+     *   If keyword or value is missing - error
+     */
+    if (keyword.length EQ 0  OR  value.length EQ 0)
+    {
+      rc = ESA_ERR;
+      break;
+    }
+
+    /*
+     *   Find the keyword in the keywords table.
+     */
+    kwd_num = 0;
+    for (i=0; kwd_tab[i].kwd[0] NE NULL_CHAR; i++)
+    {
+     if (strcmp(keyword.value, kwd_tab[i].kwd) EQ 0)
+     {
+       kwd_num = kwd_tab[i].kwd_number;
+       break;
+     }
+    }
+
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+    ESA_DIAG_printf(comp, 5,                        /*IS10182*/
+         "name=%s  keyword=(%d)%s   value=(%d)%s (%2X)  kwd-num=%d",
+         cf_name, keyword.length, keyword.value,
+         value.length, value.value, value.value[0],
+         kwd_num);
+
+    /*
+     *   Analyze the keyword and value
+     */
+    if (kwd_num NE 0)
+    {
+      p_val = NULL;
+
+      switch (kwd_num)
+      {
+        case 1:                                   /* TYPE           */
+          if (value.value[0] LE RACF_CFEILD_type_tab_count)
+            p_val = (void *)value.value;
+          else
+            rc = ESA_SKIP;
+          break;
+        case 2:                                   /* MAXLENGTH      */
+          p_val = (void *)value.value;
+          break;
+        case 3:                                   /* MAXVALUE       */
+          if (strncmp(value.value, def_value, 4) NE 0)
+            p_val = (void *)value.value;
+          break;
+        case 4:                                   /* MINVALUE       */
+          if (strncmp(value.value, def_value, 4) NE 0)
+            p_val = (void *)value.value;
+          break;
+        case 5:                                   /* FIRST          */
+          if (value.value[0] LE drt_count)
+            p_val = (void *)value.value;
+          else
+            rc = ESA_SKIP;
+          break;
+        case 6:                                   /* OTHER          */
+          if (value.value[0] LE drt_count)
+            p_val = (void *)value.value;
+          else
+            rc = ESA_SKIP;
+          break;
+        case 7:                                   /* MIXED          */
+          if (value.value[0] EQ 0X80)
+            mixed = TRUE;
+          else
+            mixed = FALSE;
+          p_val = (void *)&mixed;
+          break;
+        case 8:                                   /* LISTHEAD       */
+            p_val = (void *)value.value;
+          break;
+        default:                                  /* Ignore keyword */
+          break;
+      }
+
+      /*
+       *  If the value is valid, call the process routine to
+       *  handle it.
+       *  The routine is responsible to issue its error messages
+       *  to PRTDBG.
+       */
+      if (rc EQ ESA_OK  AND
+          p_val NE NULL)
+      {
+        /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+        ESA_DIAG_printf(comp, 5,                      /*IS10182*/
+              "process %s: keyword=%s  num=%d  value=(%d)%s (%2X)",
+              cf_name, keyword.value, kwd_num,
+              value.length, (char *)p_val, ((char *)p_val)[0]);
+        rc = (proc_rtn)(comp, cf_name, entry, kwd_num,
+                        keyword.value, p_val, value.length,
+                        msg_issued, admin_params);
+      }
+      else    /* When keyword is skipped, write a message to PRTDBG */
+        if (rc EQ ESA_SKIP)
+          /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 0,*/
+          ESA_DIAG_printf(comp, 0,                     /*IS10182*/
+             "** ERROR ** name=%s  keyword=(%d)%s   value=(%d)%s (%2X) ",
+             cf_name, keyword.length, keyword.value,
+             value.length, value.value, value.value[0]);
+
+      max_rc = MAX(rc, max_rc);
+
+    }
+  }
+
+  /*
+   *  When analyze error, write a message to PRTDBG
+   */
+  max_rc = MAX(rc, max_rc);
+
+  if (max_rc GE ESA_ERR)
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 0,*/
+    ESA_DIAG_printf(comp, 0,                          /*IS10182*/
+        "** ERROR ** Buffer error. name=%s   buffer=%8X / %8X / %8X",
+        cf_name, cf_data->buffer, end_of_data, curr_data_ptr);
+
+  /*
+   *  Termination
+   */
+ exit:;
+  /*IS10182 admin_params->cs_func.DIAG_exit_ptr(comp, 1, func,max_rc);*/
+  ESA_DIAG_exit(comp, 1, func, max_rc);                /*IS10182*/
+  return max_rc;
+
+}   /* Analyze_CF_Definition */
+
+
+/********************************************************************
+ *
+ * Procedure Name : Process_CField_Definition
+ *
+ * Description    : Put the Custom Field definition attributes
+ *                  in the entry.
+ *
+ * Input          : Keyword_id - keyword internal id.
+ *                : value      -> value.
+ *                : value_length = length of value.
+ *                : admin
+ *
+ * Output         : entry -> entry to fill.
+ *                : msg_issued - on error, contains an indicatiom if
+ *                               an error message was issued or not.
+ *
+ * Input/Output   :
+ *
+ * Return Value   : ESA_OK
+ *
+ * Side Effects   :
+ *
+ * Comments       :
+ *
+ ********************************************************************/
+
+static  ESA_RC Process_CField_Definition(ESA_DIAG_COMP_typ comp,
+                             char                   *cf_name,
+                             void                   *entry,
+                             int                     keyword_id,
+                             char                   *keyword,
+                             void                   *value,
+                             int                     value_length,
+                             int                    *msg_issued,
+                             ADMIN_PARAMS_rec_typ   *admin_params)
+{
+  char          func[] = "Process_CField_Definition";
+
+  char   *p_char;
+  int    *p_int;
+  RACF_CUSTOM_FIELD_rec_typ  *p_ent;
+
+  CTSAMSG_HANDLE_rec_typ      *msgs;
+  CTSAMSG_DEST_TABLE_rec_typ  *dest;
+
+  /*
+   *   Initialization
+   */
+  /*IS10182 admin_params->cs_func.DIAG_enter_ptr(comp, 1, func);*/
+  ESA_DIAG_enter(comp, 1, func);                   /*IS10182*/
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  p_ent = (RACF_CUSTOM_FIELD_rec_typ *)entry;
+  p_char = (char *)value;
+  p_int = (int *)value;
+
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5, */
+  ESA_DIAG_printf(comp, 5,                           /*IS10182*/
+                "ent(%s): keyword=%d/%s,  value=(%d)%s (%2X)",
+                 p_ent->name, keyword_id, keyword,
+                 value_length, p_char, p_char[0]);
+  /*
+   *   Process the keyword - put the value in the CField entry
+   */
+  switch (keyword_id)
+  {
+    case 1:                                   /* TYPE           */
+      p_ent->type = RACF_CFEILD_type_tab[p_char[0] - 1];
+      break;
+    case 2:                                   /* MAXLENGTH      */
+      p_ent->max_length = *p_int;
+      break;
+    case 3:                                   /* MAXVALUE       */
+      p_ent->max_value = *p_int;
+      break;
+    case 4:                                   /* MINVALUE       */
+      p_ent->min_value = *p_int;
+      break;
+    case 5:                                   /* FIRST          */
+      strcpy(p_ent->first, data_rules[p_char[0]-1].data_rule)        ;
+      break;
+    case 6:                                   /* OTHER          */
+      strcpy(p_ent->other, data_rules[p_char[0]-1].data_rule)        ;
+      break;
+    case 7:                                   /* MIXED          */
+      if (*p_int EQ TRUE)
+        p_ent->mixed = 'Y';
+      else
+        p_ent->mixed = 'N';
+      break;
+    case 8:                                   /* LISTHEAD       */
+      if (value_length GT sizeof(p_ent->label)) /*  too long ?  */
+      {
+        strncpy(p_ent->label, p_char, sizeof(p_ent->label)-1);
+        p_ent->label[sizeof(p_ent->label)-1] = '\0';
+      }
+      else
+        strcpy(p_ent->label, p_char);
+      break;
+    default:                                  /* Ignore keyword */
+      break;
+  }
+
+  /*IS10182 admin_params->cs_func.DIAG_exit_ptr(comp, 1, func,ESA_OK);*/
+  ESA_DIAG_exit(comp, 1, func, ESA_OK);                 /*IS10182*/
+
+  return ESA_OK;
+
+}   /*  Process_CField_Definition  */
+
+/********************************************************************
+ *
+ * Procedure Name : Validate_CTSACF_Definition
+ *
+ * Description    : Validate the custom field definitions against
+ *                  the required attributes.
+ *
+ * Input          : Keyword_id - keyword internal id.
+ *                : value      -> value.
+ *                : value_length = length of value.
+ *                : admin
+ *
+ * Output         : entry -> entry with required attributes.
+ *                : msg_issued - on error, contains an indicatiom if
+ *                               an error message was issued or not.
+ *
+ * Input/Output   :
+ *
+ * Return Value   : ESA_RC
+ *
+ * Side Effects   :
+ *
+ * Comments       :
+ *
+ ********************************************************************/
+
+static  ESA_RC Validate_CTSACF_Definition(ESA_DIAG_COMP_typ comp,
+                             char                   *cf_name,
+                             void                   *attr,
+                             int                     keyword_id,
+                             char                   *keyword,
+                             void                   *value,
+                             int                     value_length,
+                             int                    *msg_issued,
+                             ADMIN_PARAMS_rec_typ   *admin_params)
+{
+  char          func[] = "Validate_CTSACF_Definition";
+
+  ESA_RC rc = ESA_OK;
+  char   *p_char;
+  int    *p_int;
+  RACF_CTSACF_ATTR_rec_typ  *p_attr;
+  char   err_val[10];
+  char   err_req[10];
+
+  CTSAMSG_HANDLE_rec_typ      *msgs;
+  CTSAMSG_DEST_TABLE_rec_typ  *dest;
+
+  /*
+   *   Initialization
+   */
+  /*IS10182 admin_params->cs_func.DIAG_enter_ptr(comp, 1, func);*/
+  ESA_DIAG_enter(comp, 1, func);                        /*IS10182*/
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  p_attr = (RACF_CTSACF_ATTR_rec_typ *)attr;
+  p_char = (char *)value;
+  p_int = (int *)value;
+  err_val[0] = NULL_CHAR;
+  err_req[0] = NULL_CHAR;
+
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5, */
+  ESA_DIAG_printf(comp, 5,                               /*IS10182*/
+                "attr(%s):  keyword=%d/%s,  value=(%d)%s (%2X)",
+                 p_attr->CF_def_name, keyword_id, keyword,
+                 value_length, p_char, p_char[0]);
+  /*
+   *   Process the keyword - put the value in the CField entry
+   */
+  switch (keyword_id)
+  {
+    case 1:                                   /* TYPE           */
+      if (RACF_CFEILD_type_tab[p_char[0] - 1] NE p_attr->CF_type)
+      {
+        err_val[0] = RACF_CFEILD_type_tab[p_char[0] - 1];
+        err_val[1] = NULL_CHAR;
+        err_req[0] = p_attr->CF_type;
+        err_req[1] = NULL_CHAR;
+        rc = ESA_SKIP;
+      }
+      break;
+    case 2:                                   /* MAXLENGTH      */
+      if (*p_int NE p_attr->CF_maxlen)
+      {
+        sprintf(err_val, "%d", *p_int);
+        sprintf(err_req, "%d", p_attr->CF_maxlen);
+        rc = ESA_SKIP;
+      }
+      break;
+    case 3:                                   /* MAXVALUE       */
+      if (*p_int NE p_attr->CF_maxval)
+      {
+        sprintf(err_val, "%d", *p_int);
+        sprintf(err_req, "%d", p_attr->CF_maxval);
+        rc = ESA_SKIP;
+      }
+      break;
+    case 4:                                   /* MINVALUE       */
+      if (*p_int NE p_attr->CF_minval)
+      {
+        sprintf(err_val, "%d", *p_int);
+        sprintf(err_req, "%d", p_attr->CF_minval);
+        rc = ESA_SKIP;
+      }
+      break;
+    case 5:                                   /* FIRST          */
+      if (*p_char NE p_attr->CF_first)
+      {
+        sprintf(err_val, "%.1x", *p_char);
+        sprintf(err_req, "%.1x", p_attr->CF_first);
+        rc = ESA_SKIP;
+      }
+      break;
+    case 6:                                   /* OTHER          */
+      if (*p_char NE p_attr->CF_other)
+      {
+        sprintf(err_val, "%.1x", *p_char);
+        sprintf(err_req, "%.1x", p_attr->CF_other);
+        rc = ESA_SKIP;
+      }
+      break;
+    case 7:                                   /* MIXED          */
+      if (*p_int NE p_attr->CF_mixed)
+      {
+        sprintf(err_val, "%d", *p_int);
+        sprintf(err_req, "%d", p_attr->CF_mixed);
+        rc = ESA_SKIP;
+      }
+      break;
+    case 8:                                   /* LISTHEAD       */
+      break;
+    default:                                  /* Ignore keyword */
+      break;
+  }
+
+  if (rc EQ ESA_SKIP)
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 0,*/
+    ESA_DIAG_printf(comp, 0,                            /*IS10182*/
+      "** ERROR: feature=%s  cfname=%s  keyword=%s  val=%s  req_val=%s",
+         RACF_CTSACF_feature_names[(int)p_attr->CF_Feature],
+         cf_name, keyword, err_val, err_req);
+
+  /*IS10182 admin_params->cs_func.DIAG_exit_ptr(comp, 1, func, rc);*/
+  ESA_DIAG_exit(comp, 1, func, rc);                     /*IS10182*/
+
+  return rc;
+
+}   /*  Validate_CTSACF_Definition  */
+
+/********************************************************************
+ *
+ * Procedure Name : RACF_Free_CTSACF_Block
+ *
+ * Description    : Free the CTSA custom field block.
+ *
+ * Input          : first block address.
+ *
+ * Output         : None.
+ *
+ * Input/Output   :
+ *
+ * Return Value   : None.
+ *
+ * Side Effects   :
+ *
+ * Comments       :
+ *
+ ********************************************************************/
+
+ void  RACF_Free_CTSACF_Block(ESA_DIAG_COMP_typ        comp,
+                          RACF_CTSACF_block_ptr        p_block,
+                          ADMIN_PARAMS_rec_typ        *admin_params)
+{
+
+  char          func[] = "RACF_Free_CTSACF_Block";
+
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+
+  /*IS10182 admin_params->cs_func.DIAG_enter_ptr(comp, 1, func);*/
+  ESA_DIAG_enter(comp, 1, func);                      /*IS10182*/
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  if (p_block NE NULL)
+  {
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,  */
+    ESA_DIAG_printf(comp, 5,                            /*IS10182*/
+                  "Free block at %8X", p_block);
+    free (p_block);
+  }
+
+/*IS10182admin_params->cs_func.DIAG_exit_ptr(comp,1,func,ESA_RC_VOID);*/
+  ESA_DIAG_exit(comp, 1, func, ESA_RC_VOID);                /*IS10182*/
+
+}  /* RACF_Free_CTSACF_Block */
+
+/********************************************************************
+ *
+ * Procedure Name : RACF_IsAct_CTSACF_Feature
+ *
+ * Description    : Check if a CTSACF-feature is active.
+ *
+ * Input          : type - U / G
+ *                : feature - feature number to look for.
+ *
+ * Output         : is_act -  active, inactive or in-error.
+ *
+ * Input/Output   :
+ *
+ * Return Value   : ESA_OK - found.
+ *                : ESA_ERR - not found.
+ *
+ * Side Effects   :
+ *
+ * Comments       :
+ *
+ ********************************************************************/
+
+ ESA_RC RACF_IsAct_CTSACF_Feature(ESA_DIAG_COMP_typ    comp,
+                              char                     type,
+                              RACF_CTSACF_FEATURE_typ  feature,
+                              RACF_CTSACF_ACT_typ     *is_act,
+                              char                    *cf_name,
+                              ADMIN_PARAMS_rec_typ    *admin_params)
+{
+
+  char          func[] = "RACF_IsAct_CTSACF_Feature";
+
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+
+  ESA_RC         rc = ESA_ERR;
+  RACF_PARAMS_rec_typ  * params_ptr = NULL;
+  RACF_CTSACF_block_ptr  p_block = NULL;
+  int            i;
+
+  /*
+   *   Initialization
+   */
+  /*IS10182 admin_params->cs_func.DIAG_enter_ptr(comp, 1, func);*/
+  ESA_DIAG_enter(comp, 1, func);                      /*IS10182*/
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+  ESA_DIAG_printf(comp, 5,                               /*IS10182*/
+               "input:  type=%.1S  feature=%d",
+               &type, feature);
+
+  /*
+   *   Look for feature in table.
+   */
+  params_ptr = admin_params->apiinit_handle;
+  if (params_ptr NE NULL)
+  {
+    switch (type)
+    {
+      case 'U':
+       p_block = params_ptr->p_u_ctsacfs;
+       break;
+      case 'G':
+       p_block = params_ptr->p_g_ctsacfs;
+       break;
+     }
+  }
+
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5, */
+  ESA_DIAG_printf(comp, 5,                           /*IS10182*/
+               "p_block = %8X", p_block);
+  if (p_block NE NULL)
+  {
+    for (i=0; i LT p_block->num_of_entries; i++)
+    {
+      /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+      ESA_DIAG_printf(comp, 5,                        /*IS10182*/
+               "p_block[%d] = %d / %s / %d",
+               i, p_block->entries[i].CF_Feature,
+               p_block->entries[i].CF_name,
+               p_block->entries[i].act);
+
+      if (p_block->entries[i].CF_Feature EQ feature)
+      {
+        rc = ESA_OK;
+        *is_act = p_block->entries[i].act;
+        strcpy(cf_name, p_block->entries[i].CF_name);
+        break;
+      }
+    }
+  }
+
+  /*
+   *  Termination
+   */
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+  ESA_DIAG_printf(comp, 5,                          /*IS10182*/
+               "output:  type=%.1S feature=%d   rc=%d    act=%d",
+               &type, feature, rc,
+               (rc EQ ESA_OK ? *is_act : 0));
+
+  /*IS10182 admin_params->cs_func.DIAG_exit_ptr(comp, 1, func, rc);*/
+  ESA_DIAG_exit(comp, 1, func, rc);                      /*IS10182*/
+
+
+  return rc;
+}  /* RACF_IsAct_CTSACF_Feature */
+
+/********************************************************************
+ *
+ * Procedure Name : RACF_IsIt_CTSACF_cf
+ *
+ * Description    : Check if the custom field is internal (CTSACF)
+ *
+ *                  The caller can provide the CTSACF block address
+ *                  or the type.  If block address is provided, it
+ *                  be used. otherwise, this routine will find the
+ *                  block according to the type.
+ *
+ *                  The caller can provide all or part of the output
+ *                  parameters and get data accordingly. If a
+ *                  parameter is omitted, NULL shuld be passed.
+ *
+ * Input          : type - U / G / NULL
+ *                : ctsacf_block - block address / NULL
+ *
+ * Output         : p_entry - address of entry on CTSACF block.
+ *                : feature - feature number.
+ *                : act_type -  active, inactive or in-error.
+ *
+ * Input/Output   :
+ *
+ * Return Value   : ESA_OK - found.
+ *                : ESA_ERR - not found.
+ *
+ * Side Effects   :
+ *
+ * Comments       :
+ *
+ ********************************************************************/
+
+ ESA_RC RACF_IsIt_CTSACF_cf(ESA_DIAG_COMP_typ        comp,
+                            char                     type,
+                            RACF_CTSACF_block_ptr    ctsacf_block,
+                            char                    *cf_name,
+                            RACF_CTSACF_rec_ptr     *p_entry,
+                            RACF_CTSACF_FEATURE_typ *feature,
+                            RACF_CTSACF_ACT_typ     *is_act,
+                            ADMIN_PARAMS_rec_typ    *admin_params)
+{
+
+  char          func[] = "RACF_IsIt_CTSACF_cf";
+
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+
+  ESA_RC         rc = ESA_ERR;
+  RACF_PARAMS_rec_typ  * params_ptr = NULL;
+  RACF_CTSACF_block_ptr  p_block = NULL;
+  int            i;
+  char         char_is_act[2] = "?";
+  char         char_feature[2] = "?";
+  char         char_p_entry[9] = "????????";
+
+  /*
+   *   Initialization
+   */
+  /*IS10182 admin_params->cs_func.DIAG_enter_ptr(comp, 1, func);*/
+  ESA_DIAG_enter(comp, 1, func);                      /*IS10182*/
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+  ESA_DIAG_printf(comp, 5,                             /*IS10182*/
+               "input:  type=%.1S  block=%8X   cfname=%s",
+               &type, ctsacf_block, cf_name);
+
+  p_block = ctsacf_block;
+
+  /*
+   *   If block address not provided, take block address according
+   *   to type.
+   */
+  if (p_block EQ NULL)
+  {
+    params_ptr = admin_params->apiinit_handle;
+    if (params_ptr NE NULL)
+    {
+      switch (type)
+      {
+        case 'U':
+         p_block = params_ptr->p_u_ctsacfs;
+         break;
+        case 'G':
+         p_block = params_ptr->p_g_ctsacfs;
+         break;
+      }
+    }
+  }
+
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+  ESA_DIAG_printf(comp, 5,                          /*IS10182*/
+               "p_block = %8X", p_block);
+  if (p_block NE NULL)
+  {
+    for (i=0; i LT p_block->num_of_entries; i++)
+    {
+      /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+      ESA_DIAG_printf(comp, 5,                        /*IS10182*/
+               "p_block[%d] = %d / %s / %d",
+               i, p_block->entries[i].CF_Feature,
+               p_block->entries[i].CF_name,
+               p_block->entries[i].act);
+
+      if (strcmp(p_block->entries[i].CF_name, cf_name) EQ 0)
+      {
+        rc = ESA_OK;
+        if (is_act NE NULL)
+        {
+          *is_act = p_block->entries[i].act;
+          sprintf(char_is_act, "%d", *is_act);
+        }
+        if (feature NE NULL)
+        {
+          *feature = p_block->entries[i].CF_Feature;
+          sprintf(char_feature, "%d", *feature);
+        }
+        if (p_entry NE NULL)
+        {
+          *p_entry = &p_block->entries[i];
+          sprintf(char_p_entry, "%8X", *p_entry);
+        }
+        break;
+      }
+    }
+  }
+
+  /*
+   *  Termination
+   */
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+  ESA_DIAG_printf(comp, 5,                          /*IS10182*/
+       "output for %.1S/%8X/%s - rc=%d  feature=%s  act=%s  p_entry=%s",
+               &type, p_block, cf_name, rc, char_feature, char_is_act,
+               char_p_entry);
+
+  /*IS10182 admin_params->cs_func.DIAG_exit_ptr(comp, 1, func, rc);*/
+  ESA_DIAG_exit(comp, 1, func, rc);                  /*IS10182*/
+
+
+  return rc;
+}  /* RACF_IsIt_CTSACF_cf */
+
+/********************************************************************
+ *
+ * Procedure Name : RACF_Handle_CTSACF_Features
+ *
+ * Description    : Call the feature handling routines received from
+ *                  the caller when the feature is active.
+ *
+ * Input          : type - U(ser) / G(roup)
+ *                : rtn_table - routines, table.
+ *                : addinfo - general addinfo.
+ *                : ctsacf_addinfo - addinfo containing CTSACF fields.
+ *                : entity_params - user_params, groyp_params, etc,
+ *                                  depending on the caller.
+ *                : args_num - number of arguments in variable parameter
+ *                             list (...)
+ *
+ * Output         :
+ *
+ * Input/Output   :
+ *
+ * Return Value   : highest return code from the called routines.
+ *
+ * Side Effects   :
+ *
+ * Comments       :
+ *
+ ********************************************************************/
+
+ ESA_RC RACF_Handle_CTSACF_Features(ESA_DIAG_COMP_typ   comp,
+                              char                      type,
+                              RACF_CTSACF_PROC_rec_typ *rtn_tab,
+                              ADDINFO_rec_ptr           addinfo,
+                              ADDINFO_rec_ptr           ctsacf_addinfo,
+                              void                     *entity_params,
+                              ADMIN_PARAMS_rec_typ     *admin_params,
+                              int                      args_num,
+                              ...                                   )
+{
+
+  char          func[] = "RACF_Handle_CTSACF_Features";
+
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+
+  va_list        args_list;
+
+  ESA_RC         rc = ESA_OK;
+  ESA_RC         max_rc = ESA_OK;
+  int            i;
+  RACF_CTSACF_PROC_ptr  procrtn;
+  RACF_CTSACF_ACT_typ  is_act;
+  char                 cf_name[9];
+  char                 full_cf_name[16];
+  ONE_FIELD_rec_ptr    lpair;
+
+  /*
+   *   Initialization
+   */
+  /*IS10182 admin_params->cs_func.DIAG_enter_ptr(comp, 1, func);*/
+  ESA_DIAG_enter(comp, 1, func);                     /*IS10182*/
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  va_start(args_list, args_num);
+
+  /*
+   *   Loop on rtn_tab and process each entry
+   */
+  if (rtn_tab EQ NULL)
+    goto exit;
+
+  for (i = 0; ; i++)
+  {
+    if (rtn_tab[i].CF_Feature EQ NONE)   /* when end of table...     */
+      break;                             /* ... out.                 */
+
+    if (rtn_tab[i].proc_rtn EQ NULL)   /* when no routine address... */
+      continue;                        /*  ...skip.                  */
+
+    /*  check if feature is active   */
+    rc = RACF_IsAct_CTSACF_Feature(comp, type, rtn_tab[i].CF_Feature,
+                                   &is_act, cf_name, admin_params);
+
+    if (rc EQ ESA_OK  AND  is_act EQ ACT_YES)
+    {
+      strcpy(full_cf_name, "CSDATA.");
+      strcat(full_cf_name, cf_name);
+
+      if (ctsacf_addinfo NE NULL)
+      {
+        /*  Look for field in ctsacf_addinfo */
+        lpair = ADDINFO_search(full_cf_name,
+                               RCF_ADDINFO_KWD_LEN,
+                               ctsacf_addinfo->pair,
+                               ctsacf_addinfo->num_pairs );
+
+        if (lpair NE NULL  AND
+            lpair->vallen GT 0)
+          /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+          ESA_DIAG_printf(comp, 5,                      /*IS10182*/
+             "Call process routine for feature %d, ctsacf=%s/%.*s(%d)",
+             rtn_tab[i].CF_Feature, full_cf_name,
+             lpair->vallen, lpair->value, lpair->vallen);
+        else
+        {
+          /* If the user does not have a vleu for the ctsacf field, */
+          /* pass NULL in pair.                                     */
+          /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+          ESA_DIAG_printf(comp, 5,                     /*IS10182*/
+                     "Call process routine for feature %d, no cf",
+                     rtn_tab[i].CF_Feature);
+          lpair = NULL;
+        }
+      }
+      else
+      {
+        /* If ctsacf_addinfo not supplied, pass NULL in pair.     */
+        /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+        ESA_DIAG_printf(comp, 5,                      /*IS10182*/
+               "Call process routine for feature %d, cf value unknown",
+               rtn_tab[i].CF_Feature);
+        lpair = NULL;
+      }
+
+      procrtn = rtn_tab[i].proc_rtn;
+
+      rc = (*procrtn)(comp, cf_name, lpair, addinfo, ctsacf_addinfo,
+                      entity_params, admin_params, args_num, args_list);
+
+      /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+      ESA_DIAG_printf(comp, 5,                         /*IS10182*/
+                 "Process routine for feature %d returned rc = %d",
+                 rtn_tab[i].CF_Feature, rc);
+    }
+
+    if (rc GT max_rc)
+      max_rc = rc;
+  }
+
+  rc = max_rc;
+
+  /*
+   *  Termination
+   */
+ exit:;
+
+  va_end(args_list);
+
+  /*IS10182 admin_params->cs_func.DIAG_exit_ptr(comp, 1, func, rc);*/
+  ESA_DIAG_exit(comp, 1, func, rc);                /*IS10182*/
+
+
+  return rc;
+}  /* RACF_Handle_CTSACF_Features */
+
+
+/* IS10100 - end    */
+

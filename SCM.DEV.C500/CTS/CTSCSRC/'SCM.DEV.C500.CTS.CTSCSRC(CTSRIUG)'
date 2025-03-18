@@ -1,0 +1,399 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Add a group (RACF)                       *
+ *                                                             *
+ * File Name        : ctsriug.c                                *
+ *                                                             *
+ * Author           : Doron Cohen                              *
+ *                                                             *
+ * Creation Date    : 14/03/94                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ *                   dd/mm/yy                                  *
+ *                                                             *
+ * as1506   A.Shv    15/06/95 call to new racf check program   *
+ * as0906   A.Shv    09/06/96 Change kdt-table. call to racfcmd*
+ *                            send command without ADDINFO     *
+ * BSAR2029 Alex     04/06/97 Add ug   name checking           *
+ * ps0163   Alex     29/07/97 RACF security server support     *
+ * ps0391   AlexS    11/11/99 RACF 2.8 support                 *
+ * ws2427  ShmuelK   10/01/02 RACF z/os 1.2 Universal Groups   *
+ * is0328   yonatan  01/12/05 update parent group              *
+ * WS10024  AvnerL   29/07/09 Support AUTOGID for OMVS.        *
+ * WS10025  BarakH   04/10/09 Support SHARED  for OMVS.        *
+ * BS10018  BarakH   25/10/09 Fix a bug introduced in IS0328   *
+ * IS10076  NuritY   31/01/13 Support Custom Fields.           *
+ * IS10100A NuritY   14/10/13 Support RACF command limitations.*
+ * SAS2IBMT SeligT   30/06/16 SAS/C to IBM C Conversion Project*
+ * IS10174  NuritY   31/12/17 Dynamic EXECOUT support.         *
+ * WS10082  MauriC   07/11/22 Recompile for new ADDINFO macros *
+ **************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_API
+
+ #include MVS_CODES                          /* BSAR2029 */
+ #include MVS_OS_CLI
+
+ #include API_ADDINFO
+ #include RACF
+
+
+ static char component[] = "CTSRIUG";                     /* IS10076 */
+
+ /*
+  *     RKT for addug
+  *         (Reserved Keywords Table)
+  */
+
+ static ADDINFO_RKTE_rec_typ rkt[] = {
+    "SUPGROUP",
+    ""         /* a null string indicate end-of-rkt */
+  };
+
+ /*
+  *     MKT for ADDGRP
+  *         (Mandatory Keywords Table)
+  */
+
+ static ADDINFO_MKTE_rec_typ mkt[] = {
+        "" };      /* a null string indicate end-of-mkt */
+
+ /*
+  *     KDT for ADDGRP  COMMAND
+  *         (Keyword Decscription Table)
+  */
+
+ /*  IS10076 - the static KDT is not used any more.
+  *            A dynamic KDT created at API INIT time is used instead
+ static ADDINFO_KDTE_rec_typ kdt[] =      {
+
+   *                                                            *
+   * keyword             type   negative       value delimiters *
+   *                             value                          *
+   * =================== ====== ============== ================ *
+
+   {"DATA"               ,KDT_KEY ,""          ,"('",  "') " },
+   {"OWNER"              ,KDT_KEY ,""          ,"(" ,  ") "  },
+   {"SUPGROUP"           ,KDT_KEY ,""          ,"(" ,  ") "  },
+   {"TERMUACC"           ,KDT_FLG ,"NOTERMUACC",""  ,  " "   },
+    * ws2427 *
+   {"UNIVERSAL"          ,KDT_FLG ,""          ,""  ,  " "   },
+   {"MODEL"              ,KDT_KEY ,""          ,"(" ,  ") "  },
+   {"OIDCARD"            ,KDT_FLG ,"NOOIDCARD" ,""  ,  " "   },
+   {"NODFP"              ,KDT_IGN ,""          ,""  ,  ""    },
+   {"DFP.DATAAPPL"       ,KDT_KEY ,""          ,"(" ,  ") "  },
+   {"DFP.DATACLAS"       ,KDT_KEY ,""          ,"(" ,  ") "  },
+   {"DFP.MGMTCLAS"       ,KDT_KEY ,""          ,"(" ,  ") "  },
+   {"DFP.STORCLAS"       ,KDT_KEY ,""          ,"(" ,  ") "  },
+   {"NOOMVS"             ,KDT_IGN ,""          ,""  ,  ""    },
+   {"OMVS.GID"           ,KDT_KEY ,""          ,"(" ,  ") "  },
+   {"OMVS.AUTOGID"       ,KDT_FLG ,""      ,"(" ,  ") "  }, *WS10024*
+   {"OMVS.SHARED"        ,KDT_FLG ,""      ,"(" , ") "   }, *WS10025*
+
+    * ps0163 *
+   {"NOOVM"              ,KDT_IGN ,""          ,""  ,  ""    },
+   {"OVM.GID"            ,KDT_KEY ,""          ,"(" ,  ") "  },
+
+    * ps0391 *
+   {"NOTME"              ,KDT_IGN ,""          ,""  ,  ""    },
+   {"TME.ROLES"          ,KDT_KEY ,""          ,"(" ,  ") "  },
+
+   {""                   ,KDT_KEY ,""          ,""  ,  ""    }  };
+ */
+
+ static ADDINFO_KDTE_rec_ptr    kdt;               /* IS10076  */
+
+ /*
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : addug                                      *
+ *                                                             *
+ * DESCRIPTION    : Create a user group                        *
+ *                                                             *
+ * INPUT          : ug, addinfo, admin                         *
+ *                                                             *
+ * OUTPUT         : err                                        *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC CTSAddUG (UG_PARAMS_rec_typ    * ug_params,
+                  ADDINFO_rec_typ      * addinfo,
+                  ADMIN_PARAMS_rec_typ * admin_params,
+                  ERR_STRUCT_rec_typ   * err)
+ {
+
+   static char                func[]="CTSAddUG";
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                     rc;
+   int                        grp_added = 0;
+   char                       cmd[MAX_API_ST];
+   ESA_RC                     chk_rc;
+   ADDINFO_rec_ptr            laddinfo = NULL;
+   /* IS10100A ADDINFO_rec_ptr   addinfo_vec[2] = { NULL, NULL };  */
+   ONE_FIELD_rec_ptr          pair;                 /* IS10076 */
+
+   static char                spec_symb[]=" ,();'";  /* BSAR2029 */
+   char                      *spcsmb;                /* BSAR2029 */
+
+   CTSAMSG_HANDLE_rec_ptr     msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr dest;
+   RACF_PARAMS_rec_typ      * params_ptr = NULL;   /* IS10076  */
+   char               supgrp_val[10];  /* new supgroup        IS0328 */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_ADDUG, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+   params_ptr = admin_params->apiinit_handle;             /* IS10076 */
+
+  /* IS10076 - start  */
+   if ( ESA_DIAG_get_debug_level(ESA_COMP_ADDUG) GE 1 )
+     ADDINFO_dump(addinfo, 1);
+
+  /*
+   *   Check that the dynamic KDT exists
+   */
+   if (params_ptr->ig_kdt.p_kdt NE NULL)
+   {
+     kdt = params_ptr->ig_kdt.p_kdt;
+     ESA_DIAG_printf(ESA_COMP_UPDUSER, 1,
+                  "kdt = %.8X", kdt);
+   }
+   else
+   {
+     CTSAMSG_print(WARN_INT1, msgs, NULL, dest, component, func,
+                   "Insert Group: Dynamic KDT was not found",
+                   ESA_FATAL,__LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+   }
+  /* IS10076 - end    */
+
+  /*
+   *   Check that Reserved Keywords were not used
+   */
+
+   if (ADDINFO_rkt_check(func,1,&addinfo,rkt, dest,
+                         msgs) NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*                                                       BSAR2029
+   *   Verify ug name                                      BSAR2029
+   */
+
+   spcsmb = strpbrk( ug_params->group, spec_symb);      /* BSAR2029 */
+   if ( spcsmb NE NULL ) {                              /* BSAR2029 */
+     CTSAMSG_print(ERR_INVALID_NAME, msgs, NULL, dest,  /* BSAR2029 */
+                   "GROUP", ug_params->group);          /* BSAR2029 */
+     rc = ESA_FATAL;                                    /* BSAR2029 */
+     goto exit;                                         /* BSAR2029 */
+   }                                                    /* BSAR2029 */
+
+  /*
+   *   Verify That the group does not exist
+   */
+
+   ESA_DIAG_printf(ESA_COMP_ADDUG, 1,
+                  "Checking group %s existance", ug_params->group);
+   chk_rc = RACF_chk_group(ug_params->group, OBJ_NOT_EXIST,
+                           TRUE, dest, msgs);
+   if ( chk_rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   /*  IS10076 - start   */
+   /****************************************************************
+   *                                                               *
+   *   If CSDATA/NOCSDATA are provided but CUSRTOM_FIELDS_SUPPORT  *
+   *   is N, issue a message.                                      *
+   *                                                               *
+   ****************************************************************/
+   if (params_ptr->rssparm_CUSTOM_FIELDS_SUPPORT[0] EQ 'N')
+   {
+     pair = ADDINFO_prefix_search("CSDATA.",
+                           RCF_ADDINFO_KWD_LEN,
+                           TRUE,
+                           addinfo->pair,
+                           addinfo->num_pairs );
+
+     if (pair EQ NULL)
+       pair = ADDINFO_search("NOCSDATA",
+                             RCF_ADDINFO_KWD_LEN,
+                             addinfo->pair,
+                             addinfo->num_pairs );
+
+     if (pair NE NULL)
+       CTSAMSG_print(ERR_NOT_SUPP_DUE_RSSP_NO, msgs, NULL,
+                     dest, "CSDATA. and NOCSDATA keywords",
+                     "CUSTOM_FIELDS_SUPPORT", "N");
+   }
+   /*  IS10076 - end     */
+
+  /*
+   *   Obtain a local addinfo buffer
+   */
+
+   if (ADDINFO_alloc(func, 5, &laddinfo, dest, msgs) NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   /* IS10100A
+   addinfo_vec[0] = laddinfo;
+   addinfo_vec[1] = addinfo;       */
+
+  /*
+   *   Add SUPGROUP to local addinfo
+   */
+
+   ESA_DIAG_printf(ESA_COMP_ADDUG, 1,
+                   "Inserting paramters to local addinfo");
+   ADDINFO_insert(TYPE_1A, "SUPGROUP", ug_params->parent_group,
+                  laddinfo, RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                  UNIQUE);
+
+  /*
+   *   Build and issue ADDGROUP command
+   */
+
+   /* IS10100A - start */
+   /*
+   sprintf(cmd,"ADDGROUP %s ",ug_params->group);
+   ESA_DIAG_printf(ESA_COMP_ADDUG, 1,
+                   "Command header prepared (%s)", cmd);
+   rc = racfcmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+                cmd, MAX_OK_RC_0,
+                2, addinfo_vec, mkt, kdt, dest, msgs,
+                CMDOUT_YES, RACF_NO);                       */
+
+   rc = RACF_do_AddAlt_cmd(ESA_COMP_ADDUG, 'G',
+                          ug_params->group, "ADD",
+                          addinfo, laddinfo, mkt, kdt,
+                          CMDOUT_YES, RACF_NO, MAX_OK_RC_0,
+                          admin_params);
+   /* IS10100A - end  */
+
+  /*
+   *   Verify That the group exists
+   */
+
+   ESA_DIAG_printf(ESA_COMP_ADDUG, 1,
+                  "Checking group %s existance", ug_params->group);
+   chk_rc = RACF_chk_group(ug_params->group, OBJ_EXIST,
+                           FALSE, dest, msgs);
+   if ( chk_rc EQ ESA_OK )
+       grp_added = 1;
+
+   /********************* is0328 (support SUPGROUP) start **********/
+   /* BS10018 - Fix a problem with original code in is0328         */
+   /* BS10018 - Add Group Transaction return success although      */
+   /* RACF ADDGROUP command failed when using SUPGROUP             */
+   /*                                                              */
+   /* Changes performed:                                           */
+   /* 1. Moved the code from the "exit:" section                   */
+   /* 2. Added condition:                                          */
+   /*  "if ( ( rc EQ ESA_OK ) AND grp_added )"                     */
+   /*  So the code SUPGROUP code will only be executed if the      */
+   /*  group was added successfully.                               */
+   /* 3.Use chk_rc instead of rc so the USA-API will return success*/
+   /*   regardless if the SUPGROUP interception is added,          */
+   /*   and will fail if the ADDGROUP command fails                */
+   /****************************************************************/
+
+   if ( ( rc EQ ESA_OK ) AND grp_added )         /*BS10018 SAS2IBMT*/
+   {                                             /*BS10018 SAS2IBMT*/
+     strncpy(supgrp_val,ug_params->parent_group,8);
+     supgrp_val[8] = NULL_CHAR;
+
+     /* Updating the new supgroup's SUBGROUP, by writing event
+        to the queue                                           */
+     if (strcmp(supgrp_val,"") NE 0)
+     {
+        chk_rc = (admin_params->cs_func.intercept_set_ptr)
+                      (INTERCEPT_SPECIFIC,
+                       INTERCEPT_GROUP,
+                       NULL,
+                       NULL,
+                       supgrp_val);
+         if (chk_rc NE ESA_OK )
+          ESA_DIAG_printf(ESA_COMP_ADDUG, 10,
+           "Failed to write event for new supgroup %s",supgrp_val);
+         else
+          ESA_DIAG_printf(ESA_COMP_ADDUG, 10,
+           "Write event for new supgroup %s",supgrp_val);
+     }
+   }                                             /*BS10018 SAS2IBMT*/
+   /************** is0328 (support SUPGROUP) end *********/
+  /*
+   *   Finish
+   */
+
+   exit: ;
+
+  /*
+   *   If Add process failed,
+   *   Here we perform cleanup, and delete this poor group
+   */
+
+   if ( ( rc NE ESA_OK ) AND grp_added ) {
+
+     /*
+      *   Build and issue DELGROUP command
+      */
+
+      sprintf(cmd,"DELGROUP %s ",ug_params->group);
+      ESA_DIAG_printf(ESA_COMP_ADDUSER, 1,
+                      "Command header prepared (%s)", cmd);
+
+      racfcmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+              cmd, MAX_OK_RC_0,
+              0, NULL, mkt, kdt, admin_params,           /* IS10174 */
+              CMDOUT_YES, RACF_YES);
+   /* IS10174 0, NULL, mkt, kdt, dest, msgs,   */
+   }
+
+
+
+   ADDINFO_free(&laddinfo);
+
+   ESA_DIAG_exit(ESA_COMP_ADDUG, 1, func, rc);
+   return rc;
+
+ }

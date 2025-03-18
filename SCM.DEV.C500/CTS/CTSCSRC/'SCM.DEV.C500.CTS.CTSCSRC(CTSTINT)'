@@ -1,0 +1,1580 @@
+/**************************************************************
+*                                                             *
+* Title            : TSS interception function                *
+*                                                             *
+* File Name        : ctstint.c                                *
+*                                                             *
+* Author           : Doron Cohen                              *
+*                                                             *
+* Creation Date    : 20/05/97                                 *
+*                                                             *
+**************************************************************/
+
+/**************************************************************
+* Mod.Id   Who      When     Description                      *
+* -------- -------- -------- -------------------------------- *
+* ps0089   Doron    20/05/97 Initial                          *
+* ps0295   Guy      13/08/98 Changes for common code 3.0.0 GA *
+* bs2426   AlexS    11/07/00 Sending add connection events    *
+* bs2429   Yoni     21/08/00 Sending upd connection events    *
+* bs2438   Yoni     20/11/00 improve performance of bs2429    *
+* bs2489   Yoni     12/11/01 Do not send connections in add   *
+*                            user (will be sent by exit)      *
+* ws2505   BellaP   08/04/03 Filter out certain events from   *
+*                            Online Interceptor accodence to  *
+*                           new optional param-s from RSSPARM,*
+*                           also for deleting entity.         *
+* bs2618   AmirH    18/11/03 Send connections after           *
+*                            profile/group rename event       *
+* IS0358   YoniMa   17/08/06 memory leak.(BS2698)             *
+* IS10018  AvnerL   15/06/08 Onli intercepts ESS ChPass-bs2707*
+* IS10020  AvnerL   22/06/08 notify new conns 4 create using. *
+* IS10032  AvnerL   13/08/09 chg parm to ONLI_MAX_TSS_EVENTS  *
+* SAS2IBMT SeligT   09/10/16 SAS/C to IBM C Conversion Project*
+* WS10064  MeirS    21/01/18 Password Phrase Support          *
+* IS10171  SeligT   15/04/18 ignore multi conns.              *
+                             This was copied from change      *
+                             IS10165 from V3 and was tagged   *
+                             IS10165 here.                    *
+* IS10183  ThomaS   13/05/21 Don't print password in clear    *
+**************************************************************/
+
+#include <globs.h>
+
+#include STRING
+#include STDIO
+#include STDLIB
+#include CTYPE
+
+#include ESA_API
+#include ESA_DIAG
+#include ESA_API_CODES
+#include ESA_INIT
+
+#include MVS_CODES
+#include MVS_INTERCEPTOR
+#include MVS_ONLINE_INTERCEPTOR
+#include MVS_COMP                                          /*IS0358*/
+
+#include TSS
+#include API_AUTH     /* bs2426 */
+
+/*
+ *   Events cache table definitions
+ */
+
+/*IS10032 #define PARAM_MAX_EVENT_RECS "ONLI_MAX_EVENTS" */
+#define PARAM_MAX_EVENT_RECS           "ONLI_MAX_TSS_EVENTS" /*IS10032*/
+#define PARAM_EXPIRE_INTERVAL          "ONLI_EXPIRE_INTERVAL"
+#define PARAM_DELAY_INTERVAL           "ONLI_DELAY_INTERVAL"
+
+#define INTERCEPT_ITEM_ACTIVE          'A'
+#define INTERCEPT_ITEM_REMOVED         'R'
+#define INTERCEPT_GET_TIME             "GETT"
+#define INTERCEPT_DIFF_TIME            "DIFF"
+
+/*
+ *   Interceptor timestamp prototype
+ */
+
+typedef  struct _INTERCEPT_TIME_S {
+    int    p_time;
+    int    p_date;
+} INTERCEPT_TIMES_rec_typ, * INTERCEPT_TIMES_rec_ptr;
+
+/*
+ *  Assembler routine get current time, calculate diff time
+ */
+
+/* SAS2IBMT
+extern ctsatim( int                      * debugl,
+                char                     * mode,
+                ... );  // Other parameters depends of mode */
+extern ctsatim();                                         /* SAS2IBMT */
+
+/*
+ *   Events table prototype
+ */
+
+typedef  struct _INTERCEPT_TABLE {
+  INTERCEPT_TIMES_rec_typ  timestamp;    /* timestamp      */
+  char                     object[9];    /* ACID           */
+  char                     admin[9];     /* administrator  */
+  char                     action;       /* action         */
+  char                     item_status;  /* active/removed */
+} INTERCEPT_TABLE_rec_typ, * INTERCEPT_TABLE_rec_ptr;
+
+typedef  struct _INTERCEPT_HANDLE{
+  int                        allocated_entries;
+  int                        used_entries;
+  INTERCEPT_TABLE_rec_typ  * ctstint_table;
+  int                        expire_interval;
+  int                        max_delay_interval;
+} INTERCEPT_HANDLE_rec_typ, *INTERCEPT_HANDLE_rec_ptr;
+
+static char internal2_msg_buf[200];
+
+static char comp[]= "CTSTINT";
+
+/* bs2426 */
+ static ESA_RC TSS_notify_acid_connections(char * acid,   /* BS2618 */
+                  OBJECT_TYPE_typ                 obj_type,
+                  ACTION_typ                      action,
+                  int                             msg_flag,
+                  INTERCEPT_RSS_PARAMS_rec_typ  * rss_parm,
+                  ADMIN_PARAMS_rec_typ          * admin_params);
+/*
+static ESA_RC TSS_notify_group_connections(char * group_acid,  *BS2618*
+                  ACTION_typ                      action,
+                  int                             msg_flag,
+                  INTERCEPT_RSS_PARAMS_rec_typ  * rss_parm,
+                  ADMIN_PARAMS_rec_typ          * admin_params);
+*/
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : CTSTINT_create_filter_table                *
+ *                                                             *
+ * DESCRIPTION    : Allocate Interceptor table                 *
+ *                                                             *
+ * INPUT          : max_entries   - max tbl entries            *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : tbl_handle    - table handle               *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK, ESA_FATAL - err               *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC CTSTINT_create_filter_table(
+                        int                          max_tbl_entries,
+                        int                          expire_interval,
+                        int                          max_delay_interval,
+                        INTERCEPT_HANDLE_rec_typ  ** tbl_handle,
+                        CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                        CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   ESA_RC                       rc = ESA_OK;
+   static char                  func[]="CTSTINT_create_filter_table";
+   INTERCEPT_HANDLE_rec_typ   * tmp_tbl_handle;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, 3, func);
+
+  /*
+   *  Allocate tbl handle structure
+   */
+
+   tmp_tbl_handle = (INTERCEPT_HANDLE_rec_typ *)malloc(
+                                sizeof(INTERCEPT_HANDLE_rec_typ));
+   if (tmp_tbl_handle EQ NULL ) {
+       CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                     "tbl handle", sizeof(INTERCEPT_HANDLE_rec_typ));
+       rc = ESA_FATAL;
+       goto exit;
+   }
+
+   ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,                  /*IS0358*/
+        "malloc (%d) bytes at address (%x) (%d,%s)",
+         sizeof(INTERCEPT_HANDLE_rec_typ),tmp_tbl_handle,
+         __LINE__, __FILE__ );
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,3,
+                   "tbl handle ptr=%x", tmp_tbl_handle);
+
+  /*
+   *  Allocate items buffer
+   */
+
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,3,
+                   "tbl buffer entries=%d", max_tbl_entries);
+
+   tmp_tbl_handle->ctstint_table = (INTERCEPT_TABLE_rec_typ  *)malloc(
+                               sizeof(INTERCEPT_TABLE_rec_typ ) *
+                               max_tbl_entries);
+
+   if (tmp_tbl_handle->ctstint_table  EQ NULL ) {
+       CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                  "item buffer",
+                  sizeof(INTERCEPT_TABLE_rec_typ ) *
+                  max_tbl_entries);
+       rc = ESA_FATAL;
+       ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,             /*IS0358*/
+        "Free address (%x) (%d,%s)",
+        tmp_tbl_handle, __LINE__, __FILE__ );
+       free(tmp_tbl_handle);
+       goto exit;
+   }
+
+   ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,                  /*IS0358*/
+    "malloc (%d) bytes at address (%x) (%d,%s)",
+    sizeof(INTERCEPT_TABLE_rec_typ )*max_tbl_entries,
+    tmp_tbl_handle->ctstint_table, __LINE__, __FILE__ );
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,3,
+                   "allocated cmd buffer ptr=%x",
+                   tmp_tbl_handle->ctstint_table);
+
+   tmp_tbl_handle->allocated_entries =  max_tbl_entries;
+   tmp_tbl_handle->used_entries       = 0;
+   tmp_tbl_handle->expire_interval    = expire_interval * 100;
+   tmp_tbl_handle->max_delay_interval = max_delay_interval * 100;
+
+   *tbl_handle = tmp_tbl_handle;
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, 3, func, rc);
+
+   return rc;
+
+}     /*  CTSTINT_create_filter_table */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : CTSTINT_free_filter_table                  *
+ *                                                             *
+ * DESCRIPTION    : Free interceptor table                     *
+ *                                                             *
+ * INPUT          : tbl_handle    -  table handle              *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ static void CTSTINT_free_filter_table
+                              (INTERCEPT_HANDLE_rec_typ  ** tbl_handle,
+                               CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                               CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   static char                 func[]="CTSTINT_free_filter_table";
+   INTERCEPT_HANDLE_rec_typ  * tmp_tbl_handle = *tbl_handle;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, 3, func);
+
+  /*
+   *  Free table buffer
+   */
+
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,5, "tbl buffer ptr=%x",
+                   tmp_tbl_handle->ctstint_table);
+
+   if (tmp_tbl_handle->ctstint_table NE NULL )
+    {
+       ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,          /*IS0358*/
+        "Free address (%x) (%d,%s)",
+        tmp_tbl_handle->ctstint_table, __LINE__, __FILE__ );
+       free(tmp_tbl_handle->ctstint_table);
+    }
+
+  /*
+   *  Free table handle
+   */
+
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,5,
+                   "tbl handle ptr=%x", tmp_tbl_handle);
+   ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,                  /*IS0358*/
+    "Free address (%x) (%d,%s)",
+    tmp_tbl_handle, __LINE__, __FILE__ );
+
+   free(tmp_tbl_handle);
+   *tbl_handle = NULL;
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, 3, func, ESA_OK);
+
+}     /*  CTSTINT_free_filter_table */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : CTSTINT_compress_records                   *
+ *                                                             *
+ * DESCRIPTION    : Compress events records                    *
+ *                                                             *
+ * INPUT          : handle        - intercept handle           *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ static void CTSTINT_compress_records
+                           (INTERCEPT_HANDLE_rec_typ   * tbl_handle)
+ {
+
+   int                          i, j, removed = FALSE;
+   static char                  func[]="CTSTINT_compress_records";
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, 3, func);
+
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 2,
+                   "Before compress :tbl_handle->used=%d",
+                   tbl_handle->used_entries);
+
+   /*** Locate first entry to compress ***/
+
+   for (j=0; j LT tbl_handle->used_entries; j++) {
+     if (tbl_handle->ctstint_table[j].item_status EQ
+                                     INTERCEPT_ITEM_REMOVED) {
+        removed = TRUE;
+        break;
+     }
+   }
+
+   if ( NOT removed)
+      goto exit;
+
+   /*** Compress remaining entries ***/
+
+   for (i=j+1; i LT tbl_handle->used_entries; i++) {
+
+       if ( tbl_handle->ctstint_table[i].item_status EQ
+                                     INTERCEPT_ITEM_ACTIVE ) {
+          memcpy( (char *)&tbl_handle->ctstint_table[j],
+                  (char *)&tbl_handle->ctstint_table[i],
+                  sizeof(INTERCEPT_TABLE_rec_typ ) );
+         j++;
+       }
+   }
+
+   tbl_handle->used_entries = j;
+
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 2,
+                   "After compress :tbl_handle->used=%d",
+                   tbl_handle->used_entries);
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, 3, func, ESA_OK);
+
+}     /* CTSTINT_compress_records  */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : CTSTINT_clear_expired_records              *
+ *                                                             *
+ * DESCRIPTION    : Clear expired items at current time        *
+ *                                                             *
+ * INPUT          : handle        - intercept handle           *
+ *                  interval      - time expired interval
+ *                  timestamp     - timestamp                  *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ static void CTSTINT_clear_expired_records(
+                             INTERCEPT_HANDLE_rec_typ   * tbl_handle,
+                             CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                             CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   static char               func[]="CTSTINT_clear_expired_records";
+   int                       i,k;
+   int                       difft;
+   int                       debugl = 0;
+   char                      mode[20];
+   INTERCEPT_TIMES_rec_typ   current_timestamp;
+   int                       exp_interval = tbl_handle->expire_interval;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, 3, func);
+
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 2,
+                   "tbl_handle->used=%d expiration interval=%d",
+                   tbl_handle->used_entries, exp_interval);
+
+   if ( ESA_DIAG_get_debug_level(ESA_COMP_RSS_INTERCEPT ) GT 0)
+     debugl = 1;
+
+   /* Get current date, time */
+
+   strcpy ( mode, INTERCEPT_GET_TIME);
+   /* SAS2IBMT
+   ctsatim( &debugl, mode, &current_timestamp);                      */
+   (*(ASM_RTN_TYP *)&ctsatim)                             /* SAS2IBMT */
+          ( &debugl, mode, &current_timestamp);
+
+   strcpy ( mode, INTERCEPT_DIFF_TIME);
+
+   /* Release expired records */
+
+   for (i=0; i LT tbl_handle->used_entries; i++) {
+
+       if (tbl_handle->ctstint_table[i].item_status NE
+                                      INTERCEPT_ITEM_REMOVED) {
+
+          /* SAS2IBMT
+          ctsatim( &debugl, mode, &current_timestamp,                */
+          (*(ASM_RTN_TYP *)&ctsatim)                      /* SAS2IBMT */
+                 ( &debugl, mode, &current_timestamp,
+                   &tbl_handle->ctstint_table[i].timestamp,
+                   &difft);
+
+          ESA_DIAG_printf( ESA_COMP_RSS_INTERCEPT, 2,
+                           "difft=%d", difft);
+
+          if ( difft LT 0 ) {
+              sprintf(internal2_msg_buf , "%d. %s/%s/%c Difft=%d", i,
+                       tbl_handle->ctstint_table[i].object,
+                       tbl_handle->ctstint_table[i].admin,
+                       tbl_handle->ctstint_table[i].action,
+                       difft);
+
+               CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                      comp,func, internal2_msg_buf,
+                      4,__LINE__);
+              continue;
+          }/* difft < 0 */
+
+          if ( difft GE exp_interval) {
+             tbl_handle->ctstint_table[i].item_status =
+                                           INTERCEPT_ITEM_REMOVED;
+             ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 3,
+                       "Released rec %d. %s/%s/%c", i,
+                       tbl_handle->ctstint_table[i].object,
+                       tbl_handle->ctstint_table[i].admin,
+                       tbl_handle->ctstint_table[i].action);
+          }/* difft > limit */
+
+       }/* item is not deleted */
+
+   } /* for */
+
+   /* Clear trailing records - Update number of used records */
+
+   k = tbl_handle->used_entries;
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 2,
+                   "1.tbl_handle->used=%d", tbl_handle->used_entries);
+
+   for (i=k; i GT 0; i--) {
+     if (tbl_handle->ctstint_table[i-1].item_status EQ
+                                      INTERCEPT_ITEM_REMOVED)
+        k--;
+     else
+        break;
+   }
+
+   tbl_handle->used_entries = k;
+
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 2,
+                   "2.tbl_handle->used=%d", tbl_handle->used_entries);
+
+   exit:;
+
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, 3, func, ESA_OK);
+
+}     /*  CTSTINT_clear_expired_records  */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : CTSTINT_insert                             *
+ *                                                             *
+ * DESCRIPTION    : Insert record in the queue                 *
+ *                                                             *
+ * INPUT          : handle        - intercept handle           *
+ *                  timestamp     - timestamp                  *
+ *                  object        - object ID                  *
+ *                  admin         - admin                      *
+ *                  action        - action                     *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK, ESA_FATAL - err               *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC CTSTINT_insert(INTERCEPT_HANDLE_rec_typ   * tbl_handle,
+                       INTERCEPT_TIMES_rec_typ           * timestamp,
+                       char                              * object,
+                       char                              * admin,
+                       char                                action,
+                       CTSAMSG_DEST_TABLE_rec_ptr          dest,
+                       CTSAMSG_HANDLE_rec_ptr              msgs)
+ {
+
+   ESA_RC                       rc = ESA_OK;
+   static char                  func[]="CTSTINT_insert";
+   int                          index;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, 3, func);
+
+   CTSTINT_clear_expired_records(tbl_handle, dest, msgs);
+
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 2,
+                   "tbl_handle->used=%d", tbl_handle->used_entries);
+
+   if (tbl_handle->used_entries EQ tbl_handle->allocated_entries) {
+       CTSTINT_compress_records(tbl_handle);
+       if (tbl_handle->used_entries EQ
+                       tbl_handle->allocated_entries) {
+
+          CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                        comp,func, "Cache table is full",
+                        16,__LINE__);
+          rc = ESA_ERR;
+          goto exit;
+       }
+   }
+
+  /*
+   *   Insert new entry
+   */
+
+   index = tbl_handle->used_entries;
+   memcpy( (char *)&tbl_handle->ctstint_table[index].timestamp,
+           (char *)timestamp, sizeof(INTERCEPT_TIMES_rec_typ) );
+
+   strcpy( tbl_handle->ctstint_table[index].object, object);
+   strcpy( tbl_handle->ctstint_table[index].admin, admin);
+   tbl_handle->ctstint_table[index].action      = action;
+   tbl_handle->ctstint_table[index].item_status = INTERCEPT_ITEM_ACTIVE;
+
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 3,
+                   "Inserted rec %d. %s/%s/%c", index,
+                   tbl_handle->ctstint_table[index].object,
+                   tbl_handle->ctstint_table[index].admin,
+                   tbl_handle->ctstint_table[index].action);
+
+   tbl_handle->used_entries++;
+
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 2,
+           "tbl_handle->used_entries=%d",  tbl_handle->used_entries);
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, 3, func, rc);
+   return rc;
+
+}     /*  CTSTINT_insert */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : CTSTINT_is_in_table                        *
+ *                                                             *
+ * DESCRIPTION    : Search record in table                     *
+ *                                                             *
+ * INPUT          : handle        - intercept handle           *
+ *                  timestamp     - timestamp                  *
+ *                  object        - object ID                  *
+ *                  admin         - admin                      *
+ *                  action        - action                     *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : found  - rec index in the table            *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK, ESA_FATAL - err               *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC CTSTINT_is_in_table
+                      (INTERCEPT_HANDLE_rec_typ          * tbl_handle,
+                       INTERCEPT_TIMES_rec_typ           * timestamp,
+                       char                              * object,
+                       char                              * admin,
+                       char                                action,
+                       CTSAMSG_DEST_TABLE_rec_ptr          dest,
+                       CTSAMSG_HANDLE_rec_ptr              msgs)
+ {
+
+   ESA_RC              rc = ESA_ERR;
+   static char         func[]="CTSTINT_is_in_table";
+   char                mode[20];
+   int                 debugl;
+   int                 difft;
+   int                 i;
+   int                 delta = tbl_handle->max_delay_interval ;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, 3, func);
+
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 3,
+                   "Search rec (delta=%d). %s/%s/%c", delta,
+                   object, admin, action);
+  /*
+   *   Search record
+   */
+
+   if ( ESA_DIAG_get_debug_level(ESA_COMP_RSS_INTERCEPT ) GT 0)
+     debugl = 1;
+
+   strcpy ( mode, INTERCEPT_DIFF_TIME);
+   for (i=0;  i LT tbl_handle->used_entries; i++) {
+     if (tbl_handle->ctstint_table[i].item_status EQ
+                                               INTERCEPT_ITEM_REMOVED)
+        continue;
+
+     ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 3,
+                     "Current rec %d. %s/%s/%c", i,
+                     tbl_handle->ctstint_table[i].object,
+                     tbl_handle->ctstint_table[i].admin,
+                     tbl_handle->ctstint_table[i].action);
+
+     if ((strcmp(tbl_handle->ctstint_table[i].object, object) EQ 0)
+                AND
+         (strcmp(tbl_handle->ctstint_table[i].admin, admin)   EQ 0)
+                AND
+         (tbl_handle->ctstint_table[i].action   EQ action )    ) {
+       /* SAS2IBMT
+       ctsatim( &debugl, mode, timestamp,                            */
+       (*(ASM_RTN_TYP *)&ctsatim)                         /* SAS2IBMT */
+              ( &debugl, mode, timestamp,
+                &tbl_handle->ctstint_table[i].timestamp,
+                &difft);
+
+       ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 2, "difft=%d", difft);
+
+       if ( difft LE delta) {
+         tbl_handle->ctstint_table[i].item_status =
+                                               INTERCEPT_ITEM_REMOVED;
+
+         ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 3,
+                        "Found rec %d. %s/%s/%c", i,
+                        tbl_handle->ctstint_table[i].object,
+                        tbl_handle->ctstint_table[i].admin,
+                        tbl_handle->ctstint_table[i].action);
+
+         /* Delete item from table */
+
+         tbl_handle->ctstint_table[i].item_status =
+                                               INTERCEPT_ITEM_REMOVED;
+         rc = ESA_OK;
+         break;
+       }
+     }
+   }
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, 3, func, rc);
+   return rc;
+
+}     /*  CTSTINT_is_in_table   */
+
+/**************************************************************
+*                                                             *
+* Subroutine name : CTSCINT_TSS_event                         *
+*                                                             *
+* DESCRIPTION     : Notify of TSS event to Control-SA         *
+*                                                             *
+* INPUT           :                                           *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+
+ESA_RC CTSCINT_TSS_event (char                           type,
+                          char                         * group,
+                          char                         * user,
+                          ACTION_typ                     action,
+                          int                            date,
+                          int                            time,
+                          char                         * uadmin,
+                          char                         * terminal,
+                          int                            msg_flag,
+                          INTERCEPT_RSS_PARAMS_rec_typ * rss_parm,
+                          ADMIN_PARAMS_rec_typ         * admin_params,
+                          char                           get_conn_flag)
+                                                 /* bs2618  ps0295 */
+{
+
+ static char func[] = "CTSCINT_TSS_event";
+ ESA_RC                rc = ESA_OK ;
+ CTSAMSG_DEST_TABLE_rec_typ * dest =
+                     rss_parm->msg_params->ctsamsg_dest;
+ CTSAMSG_HANDLE_rec_typ     * msgs =
+                     rss_parm->msg_params->ctsamsg_handle;
+
+ /*** For TSS_chk_acid ***/
+
+ ERR_STRUCT_rec_typ      err;
+ ADMIN_PARAMS_rec_typ    admin;
+ char                    real_acid_type[TSS_ACID_TYPE_LEN+1]="";
+ OBJECT_TYPE_typ         real_obj_type = TYPE_IGNORE;
+
+ /*** For TSS event filtering ***/
+
+ static INTERCEPT_HANDLE_rec_typ  * filter_handle = NULL;
+ int                     filter_entries = 0;
+ int                     filter_delay = 0;
+ int                     filter_expire = 0;
+ INTERCEPT_TIMES_rec_typ filter_timestamp;
+ char                    parm_get[256] ;
+ char                    action_char;
+ char                    real_type = '?';                /* IS10020 */
+ char                    tss_ignore_multi_conns[2];      /* IS10165 */
+ char                    astrx[]= "********";            /* IS10183 */
+
+ ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT,1, func);
+
+ /*******************************************************************/
+ /*                                                                 */
+ /*    Create filtering table on first event                        */
+ /*                                                                 */
+ /*******************************************************************/
+
+ if ( filter_handle EQ NULL ) {
+
+    /*** Max Entries in filter table ***/
+
+    rc = rssprm_get (rss_parm->name, PARAM_MAX_EVENT_RECS,
+                     sizeof(parm_get), parm_get);
+    if (rc NE ESA_OK) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 2,
+                     "Max Events=%s", parm_get );
+    sscanf ( parm_get, "%d", &filter_entries );
+
+    /*** Expiration Time of Events in filter table ***/
+
+    rc = rssprm_get (rss_parm->name, PARAM_EXPIRE_INTERVAL,
+                     sizeof(parm_get), parm_get);
+    if (rc NE ESA_OK) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 2,
+                     "Expire Interval=%s", parm_get );
+    sscanf ( parm_get, "%d", &filter_expire );
+
+    /*** Allowed delay for event to be filtered ***/
+
+    rc = rssprm_get (rss_parm->name, PARAM_DELAY_INTERVAL,
+                     sizeof(parm_get), parm_get);
+    if (rc NE ESA_OK) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 2,
+                     "Delay Interval=%s", parm_get );
+    sscanf ( parm_get, "%d", &filter_delay );
+
+    /*** At last, create table ***/
+
+    rc = CTSTINT_create_filter_table( filter_entries, filter_expire,
+                                      filter_delay, &filter_handle,
+                                      dest, msgs);
+    if (rc NE ESA_OK) {
+       CTSAMSG_print( ERR_INTERNAL, msgs, NULL, dest,
+                      comp, __FILE__, 1, __LINE__);
+       rc = ESA_FATAL;
+       goto exit;
+
+    }
+
+ }
+
+ /*******************************************************************/
+ /*                                                                 */
+ /*    Determine action type                                        */
+ /*                                                                 */
+ /*******************************************************************/
+
+ filter_timestamp.p_date = date;
+ filter_timestamp.p_time = time;
+
+ switch  (action) {
+
+    case ACT_ADD:
+         action_char = TSS_EVNT_ACTION_ADD;
+         break;
+
+    case ACT_DELETE:
+         action_char = TSS_EVNT_ACTION_DELETE;
+         break;
+
+    case ACT_UPDATE:
+         action_char = TSS_EVNT_ACTION_UPDATE;
+         break;
+
+    case ACT_REVOKE:
+         action_char = TSS_EVNT_ACTION_REVOKE;
+         break;
+
+    case ACT_PWD_UPD:
+         action_char = TSS_EVNT_ACTION_CHG_PASSWORD;
+         break;
+
+    default:
+         action_char = TSS_EVNT_ACTION_UNKNOWN;
+         break;
+ }
+
+ /* override action type in case connection notification     BS2429 */
+
+ if (type EQ TSS_EVNT_CONNECTION)                         /* BS2429 */
+    action_char = TSS_EVNT_ACTION_UPDCONN;                /* BS2429 */
+
+ /*******************************************************************/
+ /*                                                                 */
+ /*    if notification from cs, add to filtering table              */
+ /*                                                                 */
+ /*******************************************************************/
+
+ if (strcmp( terminal, TSS_CS_NOTIFY_TERM ) EQ 0)   {
+   if (action_char NE TSS_EVNT_ACTION_CHG_PASSWORD)    /* IS10183 */
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 3,
+                   "Notification for %s/%s by %s of %c at %X,%X",
+                   user, group, uadmin, action_char,date,time);
+   /* IS10183 - start */
+   else
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 3,
+                   "Notification for %s/%s by %s of %c at %X,%X",
+                   user,astrx, uadmin, action_char,date,time);
+   /* IS10183 - end   */
+
+    filter_timestamp.p_date = date;
+    filter_timestamp.p_time = time;
+
+    if (type EQ TSS_EVNT_GROUP)
+       rc = CTSTINT_insert( filter_handle, &filter_timestamp,
+                            group, uadmin, action_char, dest, msgs);
+    else
+       rc = CTSTINT_insert( filter_handle, &filter_timestamp,
+                            user, uadmin, action_char, dest, msgs);
+
+    if (rc NE ESA_OK) {
+       CTSAMSG_print( ERR_INTERNAL, msgs, NULL, dest, comp,
+                      __FILE__, 1, __LINE__ );
+       rc = ESA_FATAL;
+    }
+    goto exit;
+
+ }
+
+ /*******************************************************************/
+ /*                                                                 */
+ /*    Filter out event if appears in event filter table            */
+ /*                                                                 */
+ /*******************************************************************/
+
+ if (action_char NE TSS_EVNT_ACTION_CHG_PASSWORD)    /* IS10183 */
+  ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 3,
+                 "Interception for %s/%s by %s of %c at %X,%X",
+                 user, group, uadmin, action_char,date,time);
+   /* IS10183 - start */
+ else
+  ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 3,
+                 "Interception for %s/%s by %s of %c at %X,%X",
+                   user,astrx, uadmin, action_char,date,time);
+   /* IS10183 - end   */
+
+ if (type EQ TSS_EVNT_GROUP)
+    rc = CTSTINT_is_in_table ( filter_handle, &filter_timestamp,
+                               group, uadmin, action_char, dest, msgs);
+ else
+    rc = CTSTINT_is_in_table ( filter_handle, &filter_timestamp,
+                               user, uadmin, action_char, dest, msgs);
+
+ ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 3,
+                 "Filter rc = %d" , rc );
+
+ switch (rc) {
+
+    case ESA_OK:
+        goto exit;    /* Event filtered */
+
+    case ESA_ERR:
+        rc = ESA_OK;
+        break;
+
+    default:
+       CTSAMSG_print( ERR_INTERNAL, msgs, NULL, dest, comp,
+                      __FILE__, 1, __LINE__ );
+       rc = ESA_FATAL;
+       goto exit;
+ }
+
+ /* IS10018 strart */
+ /* Move the verify_password for TSS to here from evnt2rs in CTSCINT */
+ if (action_char EQ TSS_EVNT_ACTION_CHG_PASSWORD)
+ {
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,2,
+      "verifying the change password event with the RSS %s",
+      rss_parm->name);
+    /*IS10002 rc = verify_password(user, group, rss_parm);*/
+    rc = verify_password(user, group, rss_parm,admin_params);/*IS10002*/
+    if (rc NE ESA_OK)
+    {
+       ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,2,
+          "the password for user %s was not accepted",user );
+       CTSAMSG_print(MSG_ONLI_USER_PASS_NOT_VERIFIED,
+       /*          msgs, NULL, dest, user);                 WS10064*/
+                   msgs, NULL, dest, "Password", user);  /* WS10064*/
+       CTSAMSG_print(MSG_ONLI_EVENT_IGNORED,
+                   msgs, NULL, dest);
+       goto exit;
+    }
+ }
+ /* IS10018 end */
+
+ ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 3,
+                 "Object type %c" , type );
+
+ /*******************************************************************/
+ /*                                                                 */
+ /*    Event was not filtered - process it                          */
+ /*                                                                 */
+ /*******************************************************************/
+
+ /*IS10020 if ( type EQ TSS_EVNT_UNKNOWN ) { */
+
+ if (( type EQ TSS_EVNT_UNKNOWN ) OR                  /* IS10020 */
+     ( type EQ 'N')) { /* 'N'='M' & add user          /* IS10020 */
+     if ( type EQ 'N')  /* IS10020 */
+     {  /* IS10020 */
+      real_type = 'N'; /* IS10020 */
+      type = 'U';    /* set type = add user           /* IS10020 */
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 3,  /* IS10020 */
+                      "type is set to U.");  /* IS10020 */
+     }  /* IS10020 */
+    /*
+     *  If action is 'Delete' and we have no idea of the
+     *  object type to be deleted -  delete all object types
+     */
+
+     if (action EQ ACT_DELETE) {
+
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 3,  /* IS10020 */
+                      "action is Delete.");  /* IS10020 */
+        rc = CTSCINT_write_event ( TSS_EVNT_OE, group, user, action,
+             /* WS10064            msg_flag, rss_parm, admin_params);
+                                                          ps0295 */
+             /* WS10064 */         msg_flag, rss_parm, admin_params,
+             /* WS10064 */         NULL_STRING) ;
+
+ /* ws2505 - try to delete all object types and don't relate to rc */
+   /*   if (rc EQ ESA_OK)    ws2505 */
+           rc = CTSCINT_write_event ( 'G', user, user, action,
+             /* WS10064              msg_flag, rss_parm, admin_params);
+                                                            ps0295 */
+             /* WS10064 */         msg_flag, rss_parm, admin_params,
+             /* WS10064 */         NULL_STRING) ;
+
+  /*    if (rc EQ ESA_OK)    ws2505 */
+           rc = CTSCINT_write_event ( 'U', group, user, action,
+             /* WS10064              msg_flag, rss_parm, admin_params);
+                                                            ps0295 */
+             /* WS10064 */         msg_flag, rss_parm, admin_params,
+             /* WS10064 */         NULL_STRING) ;
+     }
+
+     /*
+      *  If action is 'Add' or 'Update' and we have no idea of the
+      *  object type - check its existance to determine
+      */
+
+      else if ( (action EQ ACT_UPDATE) OR (action EQ ACT_ADD) ) {
+
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 3,  /* IS10020 */
+                      "action is Add or Upd.");  /* IS10020 */
+         /*** CAll TSS_chk_acid  ***/
+
+         CLEAR_STRUCT(admin);
+         CLEAR_STRUCT(err);
+
+         admin.ctsamsg_handle = msgs;
+         admin.ctsamsg_dest = dest;
+
+         rc = TSS_chk_acid ( ESA_COMP_RSS_INTERCEPT , user,
+                             "Object", TYPE_USER, OBJ_EXIST, FALSE,
+                             real_acid_type,
+                             &real_obj_type, &admin, & err );
+
+         /*** If failed to determine, issue for all types  ***/
+
+         if  ( real_obj_type EQ TYPE_IGNORE ) {
+
+             rc = CTSCINT_write_event ( TSS_EVNT_OE,
+                                        group, user, action,
+                                        msg_flag, rss_parm,
+             /* WS10064                 admin_params);       ps0295 */
+             /* WS10064 */              admin_params,
+             /* WS10064 */              NULL_STRING) ;
+             if (rc EQ ESA_OK)
+                rc = CTSCINT_write_event ( TSS_EVNT_GROUP,
+                                           user, user, action,
+                                           msg_flag, rss_parm,
+             /* WS10064                    admin_params);    ps0295 */
+             /* WS10064 */                 admin_params,
+             /* WS10064 */                 NULL_STRING) ;
+             if (rc EQ ESA_OK)
+                rc = CTSCINT_write_event ( TSS_EVNT_USER,
+                                            group, user, action,
+                                           msg_flag, rss_parm,
+             /* WS10064                    admin_params);    ps0295 */
+             /* WS10064 */                 admin_params,
+             /* WS10064 */                 NULL_STRING) ;
+
+         } /** Failed to determine object type **/
+
+         /*** else, issue for correct type  ***/
+
+         else {
+
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 3,     /* IS10020 */
+                      "switch by real_obj_type");    /* IS10020 */
+           switch ( real_obj_type ) {
+
+              case TYPE_USER:
+                 rc = CTSCINT_write_event ( TSS_EVNT_USER,
+                                            group, user, action,
+                                            msg_flag, rss_parm,
+             /* WS10064                     admin_params);    ps0295 */
+             /* WS10064 */                  admin_params,
+             /* WS10064 */                  NULL_STRING) ;
+                 if ( (rc EQ ESA_OK) AND (action EQ ACT_ADD)) {
+                  /*
+                   * Check if needed to retrieve the user connections
+                   * (currently used for rename user action)   BS2618
+                   */
+                   if ( get_conn_flag EQ ONLI_SEND_ALL_CONNECTIONS ) {
+                      rc = TSS_notify_acid_connections(
+                              user,
+                              TYPE_USER,
+                              action,
+                              msg_flag, rss_parm, admin_params);
+                   }
+                 }
+                 break;
+
+              case TYPE_GROUP:
+                 rc = CTSCINT_write_event ( TSS_EVNT_GROUP,
+                                            user, user, action,
+                                            msg_flag, rss_parm,
+             /* WS10064                     admin_params);    ps0295 */
+             /* WS10064 */                  admin_params,
+             /* WS10064 */                  NULL_STRING) ;
+
+                 if ( (rc EQ ESA_OK) AND (action EQ ACT_ADD)) {
+                  /*
+                   * Check if needed to retrieve the group connections
+                   * (currently used for rename user action)   BS2618
+                   */
+                   if ( get_conn_flag EQ ONLI_SEND_ALL_CONNECTIONS ) {
+                      rc = TSS_notify_acid_connections(
+                              user,
+                              TYPE_GROUP,
+                              action,
+                              msg_flag, rss_parm, admin_params);
+                   }
+                 }
+                 break;
+
+              case TYPE_CONTAINER:
+                 rc = CTSCINT_write_event ( TSS_EVNT_OE,
+                                            group, user, action,
+                                            msg_flag, rss_parm,
+             /* WS10064                     admin_params);    ps0295 */
+             /* WS10064 */                  admin_params,
+             /* WS10064 */                  NULL_STRING) ;
+                 break;
+
+              default:
+                 rc = CTSCINT_write_event ( type, group, user, action,
+                                            msg_flag, rss_parm,
+             /* WS10064                     admin_params);    ps0295 */
+             /* WS10064 */                  admin_params,
+             /* WS10064 */                  NULL_STRING) ;
+                 break;
+
+           } /* Switch on object_type */
+
+         }/** object type determined **/
+
+      }/** Action is add or update **/
+
+     /*
+      *  Otherwise, we must be dealing with password update or revoke
+      *  so it must be user ....
+      */
+
+     else
+         rc = CTSCINT_write_event ( TSS_EVNT_USER,
+                                    group, user, action,
+             /* WS10064             msg_flag, rss_parm, admin_params);
+                                                           ps0295 */
+             /* WS10064 */          msg_flag, rss_parm, admin_params,
+             /* WS10064 */          NULL_STRING) ;
+
+ } /** Object type is unknown **/
+
+ /*
+  *  Object type is known - use asis
+  */
+
+ /*
+  *  Handle multiple connection update event             BS2438
+  */
+
+                                                      /* BS2429 */
+  else  if (type EQ 'M')                              /* BS2438 */
+  {                                                   /* IS10165 */
+   rc = rssprm_get_opt (rss_parm->name, "TSS_IGNORE_MULTI_CONNS",
+                   sizeof(tss_ignore_multi_conns),
+                   tss_ignore_multi_conns,
+                   OPT_TRUE,
+                   OPT_FALSE);                        /* IS10165 */
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 3,         /* IS10165 */
+               "TSS_IGNORE_MULTI_CONNS=<%s>",
+               tss_ignore_multi_conns);
+   if (tss_ignore_multi_conns[0] NE 'Y')              /* IS10165 */
+        {                                             /* BS2429 */
+         ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 3,
+               "calling TSS_notify_acid_connections");
+         rc = TSS_notify_acid_connections(             /* BS2618 */
+                user,
+                TYPE_USER,
+                ACT_UPDATE,
+                msg_flag, rss_parm, admin_params);    /* BS2429 */
+        }                                             /* BS2429 */
+ /* if (tss_ignore_multi_conns[0] EQ 'Y') we ignore the event IS10165 */
+  } /* IS10165 */
+  else
+        rc = CTSCINT_write_event (type, group, user, action,
+             /* WS10064           msg_flag, rss_parm, admin_params);
+                                                       ps0295 */
+             /* WS10064 */        msg_flag, rss_parm, admin_params,
+             /* WS10064 */        NULL_STRING) ;
+
+  /********************** IS10020 ********************************/
+  if (real_type EQ 'N')
+     {
+        rc = TSS_notify_acid_connections(
+                user,
+                TYPE_USER,
+                ACT_UPDATE,
+                msg_flag, rss_parm, admin_params);
+
+        ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 3,
+                        "type=N ==> multiple connections.");
+     }
+  /********************** end of IS10020 *************************/
+  exit:
+
+ ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT,1, func, rc );
+
+ return rc;
+
+}
+
+ /* bs2426 */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_notify_acid_connections                *
+ *                                                             *
+ * DESCRIPTION    : Notify about connections                   *
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  acid      - acid                           *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : actual_num - actual num                    *
+ *                  have_more  - have more flag                *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_notify_acid_connections(char * altered_acid, /*BS2618 */
+                   OBJECT_TYPE_typ                obj_type,
+                   ACTION_typ                     action,
+                   int                            msg_flag,
+                   INTERCEPT_RSS_PARAMS_rec_typ * rss_parm,
+                   ADMIN_PARAMS_rec_typ         * admin_params)
+{
+
+   static char func[]="TSS_notify_acid_connections";
+
+   static char   *main_user_cmd = " LIST(%s) DATA(PROFILE,NOSORT) ";
+   static char   *main_group_cmd =                          /* BS2618 */
+                             " LIST(%s) DATA(EXPIRE,ACIDS,NOSORT) ";
+   static char   *main_cmd;                                 /* BS2618 */
+
+   ESA_DIAG_COMP_typ            comp = ESA_COMP_RSS_INTERCEPT;
+   TSS_LIST_HANDLE_rec_typ      handle;
+   ERR_STRUCT_rec_typ           err;
+   CTSAMSG_HANDLE_rec_typ     * msgs;
+   CTSAMSG_DEST_TABLE_rec_typ * dest;
+   ESA_RC                       rc  = ESA_OK;
+   ESA_RC                       rc1 = ESA_OK;
+   ESA_RC                       rc_cmd = ESA_OK,
+                                rc_p = ESA_OK,
+                                rc_f = ESA_OK;
+   int                          logout_done = 0;
+   TSS_CMD_BUF_rec_typ          ret_buf;
+   TSS_CMD_BUF_rec_typ          cmd = { 0, 0, "" };
+   char                         user_acid[20];             /* BS2618 */
+   char                         profile_acid[20];
+   char                         cmd_handle[TSS_CMD_HANDLE_LEN];
+   char                        *token;
+   TSS_OUTPUT_typ              *line_desc;
+   char                         temp[MAX_TSS_PARAM_LEN];   /* BS2618 */
+
+ /********************************************************************
+  * Output example for "LIST(<user acid>) DATA(PROFILE,NOSORT)":     *
+  *                                                                  *
+  *   ACCESSORID = CTSUSR1   NAME       = TEST USER #1               *
+  *   ACCESSORID = CTSGRP1   NAME       = TEST GROUP                 *
+  *   ACCESSORID = CTSPRF1   NAME       = TEST PROFILE               *
+  ********************************************************************/
+
+  static char            get_acid[TSS_USER_NAME_LEN + 1];
+  static char           *accss_k[]={"ACCESSORID", "=", NULL};
+  static TSS_OUTP_typ    accss_d[] = {
+                     { sizeof(get_acid), get_acid },
+                     { 0,                NULL     }
+                               };
+  TSS_LIST_LINE(accss, LIST_ACCESSORID, CURRENT_LINE);
+
+  static TSS_OUTPUT_typ  user_line_desc[] = {              /* BS2618 */
+        { &accss,    NULL   },
+        { NULL,      NULL   } };
+
+ /*********************************************************** BS2618 *
+  * Output example for "LIST(<group acid>) DATA(EXPIRE,ACIDS)":      *
+  *                                                                  *
+  *   ACCESSORID = CTSPRF1   NAME       = TEST PROFILE #1            *
+  *   ACID = CTSUSR1    UNTIL(11/11/98)                              *
+  *   ACID = CTSUSR2-ZC UNTIL(11/11/98)                              *
+  *   ACID = CTSUSR5                                                 *
+  ********************************************************************/
+
+  static char            expiration[MAX_TSS_PARAM_LEN + 1];
+  static char           *acid_k[]={"ACID", "=", NULL};
+  static TSS_OUTP_typ    acid_d[] = {
+                     { sizeof(get_acid),   get_acid },
+                     { sizeof(expiration),  expiration},   /* FFU    */
+                     { 0,                NULL    } };
+  TSS_LIST_LINE(acid, LIST_ACCESSORID, CURRENT_LINE);
+
+  static TSS_OUTPUT_typ  group_line_desc[] = {
+        { &acid,     NULL   },
+        { NULL,      NULL   } };
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 6, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   ESA_DIAG_printf(comp,3, "input acid=%s", altered_acid); /* BS2618 */
+
+   rc = CTSCRSS_set_authority( &logout_done,
+                               SET_TO_STARTED_TASK_AUTH,
+                               admin_params, &err );
+   if ( rc NE ESA_OK )
+       goto exit;
+
+   /* BS2618
+    * Set command and data structures for requested current ACID type
+    */
+   switch ( obj_type ) {   /* Set command data by ACID type BS2618 */
+      case TYPE_USER:
+         main_cmd = main_user_cmd;           /* Set command string */
+         line_desc = &user_line_desc[0];     /* Set descriptor     */
+         break;
+
+      case TYPE_GROUP:
+         main_cmd = main_group_cmd;          /* Set command string */
+         line_desc = &group_line_desc[0];    /* Set descriptor     */
+         break;
+
+      default:
+         ESA_DIAG_printf( comp, 0, "Bad ACID type=%c", obj_type);
+         rc = ESA_FATAL;
+         goto exit;
+         break;
+   } /* End switch on obj_type */
+
+   sprintf(cmd.buffer, main_cmd, altered_acid); /* BS2618 */
+   cmd.max_len = strlen(cmd.buffer);
+   cmd.use_len = strlen(cmd.buffer);
+
+  /*
+   *   Send cmd to TSS
+   */
+
+   rc_cmd = TSS_send_cmd(comp, TSS_CMD_DEFAULT_MODE,
+                         &cmd, cmd_handle, FALSE,
+                         dest, msgs);
+   if ( rc_cmd NE ESA_OK )
+      goto exit;
+
+   rc_p = TSS_get_output(comp, cmd_handle, &ret_buf, dest, msgs);
+   if ( rc_p EQ ESA_FATAL )
+       goto exit;
+
+  /*
+   *  Connections List Processing
+   */
+
+   /* BS2618
+    * Copy the base ACID to the relevant event ACID variable
+    */
+   if ( obj_type EQ TYPE_USER ) {
+      strcpy(user_acid, altered_acid);
+   }
+   else {
+      strcpy(profile_acid, altered_acid);
+   }
+
+   while (rc_p NE ESA_EOF) {
+     if ( rc_p EQ ESA_OK)  {
+       handle.start_line_ptr   = ret_buf.buffer;
+       handle.current_line_ptr = ret_buf.buffer;
+
+       ESA_DIAG_printf (comp, 10, "Obtained data=%s",ret_buf.buffer);
+
+       rc1 = TSS_identify_rec(comp, &handle, line_desc,    /* BS2618 */
+                dest,msgs);
+       if ( rc1 NE ESA_SKIP ) {      /* Record found */
+
+         token = handle.current_line_ptr;
+
+         ESA_DIAG_printf (comp, 10,
+                          "var=%d/%s max_var_len=%d",
+                          strlen(token), token , sizeof(get_acid) );
+
+         /* BS2618 ( code taken from CTSTCMC TSS_get_ug_connections() )
+          * Check overflow aginst max tss params length
+          */
+         rc=TSS_check_param_overflow(comp, NULL, NULL, NULL,
+                                     strlen(token),sizeof(temp),
+                                     dest,msgs);
+         if (rc NE ESA_OK)
+           goto exit;
+         else
+           strcpy(temp, token);
+
+         /*
+          *   Solve special user ACID with 8 Chars. For example:
+          *      ACID       = QAHO3DEP-DC
+          */
+         if ( temp[8] EQ '-' )     /* Remove - from ACID string       */
+            temp[8] = NULL_CHAR;
+
+         rc=TSS_check_param_overflow(comp, NULL, NULL, NULL,
+                                     strlen(temp),sizeof(get_acid),
+                                     dest,msgs);
+         if (rc NE ESA_OK)
+           goto exit;
+         else
+            strcpy(get_acid, temp);                         /* BS2618 */
+
+         ESA_DIAG_printf (comp, 5, "acid=%s connected acid=%s",
+                          altered_acid, get_acid);
+
+         /* BS2618
+          * Copy the connected ACID to the relevant event ACID variable
+          */
+         if ( obj_type EQ TYPE_USER ) {
+            strcpy(profile_acid, get_acid);
+         }
+         else {
+            strcpy(user_acid, get_acid);
+         }
+
+         ESA_DIAG_printf (comp, 5, "user_acid=%s profile_acid=%s",
+                          user_acid, profile_acid);        /* BS2618 */
+
+
+         if (strcmp(user_acid, profile_acid) NE 0) {
+           rc = CTSCINT_write_event ('C',    /* Connections */
+                                 profile_acid, user_acid,
+                                 action, msg_flag,
+             /* WS10064          rss_parm, admin_params);          */
+             /* WS10064 */       rss_parm, admin_params,
+             /* WS10064 */       NULL_STRING) ;
+           if (rc NE ESA_OK)
+             goto exit;
+         }
+       }/* record identified */
+     }/* rc = ESA_OK after get_output */
+     else  if ( rc_p EQ ESA_FATAL)
+       goto exit;
+
+      rc_p = TSS_get_output(comp, cmd_handle, &ret_buf, dest, msgs);
+   }
+
+   rc_p = ESA_OK;
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   rc_f = TSS_free_output(comp, cmd_handle, dest, msgs);
+
+   if ( ( rc_cmd NE ESA_OK ) OR
+        ( rc_p   NE ESA_OK ) OR
+        ( rc_f   NE ESA_OK )  )
+     rc = ESA_FATAL;
+
+  if (logout_done)
+    CTSCRSS_set_authority( &logout_done,
+                           RETURN_FROM_STARTED_TASK_AUTH,
+                           admin_params, &err );
+
+  ESA_DIAG_exit(comp, 6, func, rc);
+
+  return rc;
+
+ }
+
+/* The following code was test but was not used BS2618 Amir   */
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_notify_group_connections      BS2618   *
+*                                                             *
+* DESCRIPTION    : Notify CD about ACID connections           *
+*                                                             *
+* INPUT          : group_acid                                 *
+*                  action                                     *
+*                  msg_flag                                   *
+*                  admin_params                               *
+*                                                             *
+* OUTPUT         :                                            *
+*                                                             *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+**************************************************************
+
+static ESA_RC TSS_notify_group_connections(char * group_acid,
+                  ACTION_typ                      action,
+                  int                             msg_flag,
+                  INTERCEPT_RSS_PARAMS_rec_typ  * rss_parm,
+                  ADMIN_PARAMS_rec_typ          * admin_params)
+{
+
+  static char func[] = "TSS_notify_group_connections";
+  ESA_DIAG_COMP_typ            comp = ESA_COMP_RSS_INTERCEPT;
+  ESA_RC                       rc  = ESA_OK;
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+  int                          i;
+  ERR_STRUCT_rec_typ           err;
+  TSS_TRAP_CNN_BUF_rec_typ   * cnn_data = NULL;
+  TSS_CMD_MODE_typ        cmd_get_ug_mode  =  TSS_CMD_WEAK_QUIET_MODE;
+
+  *
+  *    Initialize
+  *
+
+  ESA_DIAG_enter(comp, 6, func);
+  ESA_DIAG_printf(comp, 7, "group: %s, action: %c",
+                  group_acid, action);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+   *
+   * Build group connection data into trap table cnn_data
+   * Issued command: LIST(<group>) DATA(EXPIRE,ACIDS)
+   *
+   rc = TSS_get_ug_connections(
+                    comp,
+                    cmd_get_ug_mode,   * TSS output mode    *
+                    group_acid,        * Requested group    *
+                    &cnn_data,         * Output trap buffer *
+                    admin_params, &err );
+
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   *
+   * Loop on group connected ACIDs and send notification to CD
+   * for each.
+   *
+  for (i=0; i LT cnn_data->used_entries; i++ ) {
+     ESA_DIAG_printf(comp, 10, "%d. Connected ACID =%s",
+                     i, cnn_data->c_data[i].user_acid);
+
+      * Notify connection event *
+     rc = CTSCINT_write_event ( 'C',     * Connections *
+                                group_acid,
+                                cnn_data->c_data[i].user_acid,
+                                action, msg_flag,
+                                rss_parm, admin_params);
+     if (rc NE ESA_OK) {
+        rc = ESA_FATAL;
+        goto exit;
+     }
+  }  * End for loop *
+
+  exit:;
+
+  if ( cnn_data ) {  * Free allocated buffer (if exists) *
+     TSS_free_cnn_trap_handle(comp, &cnn_data, dest, msgs);
+  }
+
+  ESA_DIAG_exit(comp, 6, func, rc);
+  return rc;
+
+}  * End of TSS_notify_group_connections() BS2618 */

@@ -1,0 +1,736 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Delete a user  (RACF)                    *
+ *                                                             *
+ * File Name        : ctsrdus.c                                *
+ *                                                             *
+ * Author           : Doron Cohen                              *
+ *                                                             *
+ * Creation Date    : 14/06/94                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * dc1005   Doron    10/5/95  USe RACF_extract_defug           *
+ * as2806   Alex     28/06/95 Change logic of cmdfile process  *
+ * spr136   Alex     30/07/95 Correct BUG in new logic of      *
+ *                            cmdfile process                  *
+ * as0801   Alex     08/01/96 Replace TRACEOFF to TRACEON      *
+ * as1101   Alex     11/01/96 Replace TRACEON  to TRACEOFF     *
+ * SAS2IBMT SeligT   30/06/16 SAS/C to IBM C Conversion Project*
+ * IS10174  NuritY   31/12/17 Dynamic EXECOUT support.         *
+ * WS10082  MauriC   24/11/22 Replace cpair++ with ppair macro *
+ * WS10082N NuritY   21/09/23 addinfo new structure.           *
+ *                            Few changes only because all     *
+ *                            values are expected to be short. *
+ **************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+ #include   TIME
+ #include   ERRNO                                         /* SAS2IBMT */
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_API
+ #include ESA_API_CODES
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_OS_CLI
+
+ /*
+  *   RACF include files
+  */
+
+ #include RACF_CODES
+ #include API_ADDINFO
+ #include RACF
+ #include RACF_UT100
+
+ static   char   component[]="DELUSER";
+
+ /*
+  *     Delete option conversion table
+  */
+
+  typedef enum {
+     DEL_UNDEF, DEL_REVOKE, DEL_DELETE, DEL_SCAN, DEL_FULL, DEL_FORCE
+  } RACF_DELETE_OPT_typ;
+
+  typedef struct {
+        char                * opt_str;
+        RACF_DELETE_OPT_typ   opt_code;
+  }  RACF_DELETE_OPTCONV_TABLE_rec_typ;
+
+  static RACF_DELETE_OPTCONV_TABLE_rec_typ opt_table[] = {
+    { "REVOKE", DEL_REVOKE },
+    { "DELETE", DEL_DELETE },
+    { "SCAN"  , DEL_SCAN   },
+    { "FULL"  , DEL_FULL   },
+    { "FORCE" , DEL_FORCE  },
+    { ""      , DEL_DELETE }
+  };
+
+ /*
+  *     MKT for DELUSER
+  *         (Mandatory Keywords Table)
+  */
+
+ static ADDINFO_MKTE_rec_typ mkt[] = {
+       ""         /* a null string indicate end-of-mkt */
+  };
+
+ /*
+  *     KDT for DELUSER COMMAND
+  *         (Keyword Decscription Table)
+  */
+
+ static ADDINFO_KDTE_rec_typ kdt[] =      {
+
+  /*                                                            */
+  /* keyword             type   negative       value delimiters */
+  /*                             value                          */
+  /* =================== ====== ============== ================ */
+
+   {"CMDFILE"              ,KDT_IGN ,""            ,""   ,"" },
+   {"MODE"                 ,KDT_IGN ,""            ,""   ,"" },
+   {"REPLACE"              ,KDT_IGN ,""            ,""   ,"" },
+   {"DELAY"                ,KDT_IGN ,""            ,""   ,"" },
+   {"CONNECT_OWNER",        KDT_IGN ,""            ,""   ,"" },
+   {"DS_OWNER"             ,KDT_IGN ,""            ,""   ,"" },
+   {"GENRES_OWNER"         ,KDT_IGN ,""            ,""   ,"" },
+   {"GROUP_OWNER"          ,KDT_IGN ,""            ,""   ,"" },
+   {"NOTIFY"               ,KDT_IGN ,""            ,""   ,"" },
+   {"RESOWNER"             ,KDT_IGN ,""            ,""   ,"" },
+   {"USER_OWNER"           ,KDT_IGN ,""            ,""   ,"" },
+   {""                     ,KDT_FLG ,""            ,""   ,"" }
+
+   };
+
+ #define DELUSER_REQUEST     "DELUSER"
+ #define RACF_DELAY_DELUSER  "RCF_DELAY_DELUSR"
+
+ static ESA_RC chk_delay_enabl(ADMIN_PARAMS_rec_typ      * admin_params,
+                               char                      * keyword,
+                               CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                               CTSAMSG_HANDLE_rec_ptr      msgs);
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : deluser                                    *
+ *                                                             *
+ * DESCRIPTION    : Delete a RACF user                         *
+ *                                                             *
+ * INPUT          : user, addinfo, admin
+ *                                                             *
+ * OUTPUT         : err
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC CTSDelUser (USER_PARAMS_rec_typ  * user_params,
+                    ADDINFO_rec_typ      * addinfo,
+                    ADMIN_PARAMS_rec_typ * admin_params,
+                    ERR_STRUCT_rec_typ   * err)
+ {
+
+   static char                   func[]="CTSDelUser";
+
+  /*
+   *     Variables
+   */
+
+   ESA_RC                        rc, chk_rc;
+   char                          cmd[MAX_API_ST];
+   RACF_UT100_ID_typ             replace;
+   CTSAMSG_HANDLE_rec_typ      * msgs;
+   CTSAMSG_DEST_TABLE_rec_typ  * dest;
+   RACF_DELETE_OPTIONS_rec_typ   opts;
+   ONE_FIELD_rec_typ           * cpair;
+   ONE_FIELD_rec_typ           * dly_pair, * del_pair;
+   int                           i;
+   ADDINFO_rec_typ             * laddinfo = NULL;
+   char                          fnr[MAX_FILENAME_LEN+1];
+   FILE                        * fr;
+   RACF_DELETE_OPT_typ           del_opt;
+   RACF_UT100_ID_typ             racf_id;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_DELUSER, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   if (ADDINFO_alloc(func, 5,&laddinfo, dest, msgs) NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *  Check that delete flag was specified
+   */
+
+   del_pair = ADDINFO_search("MODE", RCF_ADDINFO_KWD_LEN,
+                             addinfo->pair,
+                             addinfo->num_pairs);
+   if (del_pair EQ NULL) {
+      CTSAMSG_print(RACF_MANDATORY_MISS,   msgs, NULL, dest, "MODE");
+      rc = ESA_FATAL;
+      goto exit;
+   }
+   ESA_DIAG_printf(ESA_COMP_DELUSER, 1,
+                   "DELETE parameter found. %s=%s",
+                   del_pair->keyword, del_pair->value);
+
+  /*
+   *   Convert delete option string to a token
+   */
+
+   del_opt = DEL_UNDEF;
+   for (i=0; strlen(opt_table[i].opt_str) GT 0; i++)
+       if (strcmp(del_pair->value,opt_table[i].opt_str) EQ 0) {
+          del_opt = opt_table[i].opt_code;
+          break;
+       }
+   if (del_opt EQ DEL_UNDEF) {
+      CTSAMSG_print(RACF_UNDEF_OPTION,   msgs, NULL, dest,
+                    "MODE", del_pair->value );
+      rc = ESA_FATAL;
+      goto exit;
+   };
+   ESA_DIAG_printf(ESA_COMP_DELUSER, 1,
+                  "DELETE parameter converted to %d",del_opt);
+
+  /*
+   *  For DELETE or REVOKE mode check user's existance
+   */
+
+   if ( (del_opt EQ DEL_DELETE) OR
+        (del_opt EQ DEL_REVOKE)  ) {
+     rc = RACF_chk_user(user_params->user, OBJ_EXIST,TRUE,dest,msgs);
+     if ( rc NE ESA_OK ) {
+        rc = ESA_FATAL;
+        goto exit;
+     }
+   }
+
+  /*
+   *  Search DELAY option
+   */
+
+   dly_pair = ADDINFO_search("DELAY", RCF_ADDINFO_KWD_LEN,
+                             addinfo->pair,
+                             addinfo->num_pairs);
+   if ( dly_pair NE NULL)
+     if (strcmp(dly_pair->value, KWD_FLAG_OFF) EQ 0)
+         dly_pair = NULL;
+
+  /*
+   *   Check user dataset profiles existance
+   *   if no DELAY option requested
+   */
+
+   if ( dly_pair EQ NULL) {
+      if (del_opt EQ DEL_FULL) {
+         ESA_DIAG_printf(ESA_COMP_DELUSER, 1,
+                         "Checking hi level ds %s existance",
+                         user_params->user);
+         chk_rc = RACF_chk_hilvds(user_params->user, OBJ_NOT_EXIST,
+                                  TRUE, dest, msgs);
+         if ( chk_rc EQ ESA_ERR ) {
+            CTSAMSG_print(RACF_USERDS,   msgs, NULL, dest,
+                          user_params->user);
+            rc = ESA_FATAL;
+            goto exit;
+         }
+      }
+   }
+
+  /*
+   *  Check DELAY option validity
+   */
+
+   if ( dly_pair NE NULL) {
+
+       /*
+        *  Check enable/disable delay delete processing
+        */
+
+        rc = chk_delay_enabl(admin_params, RACF_DELAY_DELUSER,
+                             dest, msgs);
+        if ( rc NE ESA_OK )  /* Delay delete processing disable */
+           goto exit;
+
+        if ( ( del_opt EQ DEL_DELETE ) OR
+             ( del_opt EQ DEL_REVOKE )  ) {
+           CTSAMSG_print(RACF_ERR_UNSUPP_DELAY,   msgs, NULL, dest,
+                         del_pair->value );
+           rc = ESA_FATAL;
+           goto exit;
+        }
+   }
+
+  /*
+   *    REVOKE delete option
+   */
+
+   if (del_opt EQ DEL_REVOKE)  {
+
+      ESA_DIAG_printf(ESA_COMP_DELUSER, 1,
+                      "Revoking user %s", user_params->user);
+      user_params->rev_status = USER_STAT_REVOKED;
+      rc = CTSRevokeUser (user_params, laddinfo, admin_params, err);
+      if (rc NE ESA_OK) {
+         rc = ESA_FATAL;
+         goto exit;
+      }
+
+      CTSAMSG_print(RACF_USER_REVOKED,
+                    msgs, NULL, dest, user_params->user );
+
+   }
+  /*
+   *  Scan RACF database if delete=scan/full/force
+   */
+
+   if (   (del_opt EQ DEL_SCAN) OR
+          (del_opt EQ DEL_FULL) OR
+          (del_opt EQ DEL_FORCE)   ) {
+
+       strcpy(opts.id, user_params->user);
+
+      /*
+       *  Obtain user default group
+       */
+
+       ESA_DIAG_printf(ESA_COMP_DELUSER, 1,
+                       "Obtaining user %s details", user_params->user);
+
+       rc = RACF_extract_defug( user_params->user, opts.dfltgrp,
+                               dest , msgs );
+
+       /*** Serious error during acces to RACF database ***/
+
+       if ( rc EQ ESA_FATAL ) {
+          CTSAMSG_print(RACF_USER_NODELETE, msgs, NULL, dest,
+                        user_params->user );
+          goto exit;
+       }
+
+       /*** Profile not found ***/
+
+       else if (rc EQ ESA_ERR)
+          strcpy(opts.dfltgrp, "?");
+
+       /*** Obtained default group ***/
+
+       else
+          ESA_DIAG_printf(ESA_COMP_DELUSER, 1,
+                         "Obtained dfltgrp = %s", opts.dfltgrp);
+
+       strcpy(opts.sup_grp, NULL_STRING);
+
+       /* force option  */
+
+       if ( del_opt EQ DEL_FORCE )
+        opts.dsnforce = RACF_YES;
+       else opts.dsnforce = RACF_NO;
+
+       /* clear detailed options  */
+
+       strcpy(opts.cmdfile,NULL_STRING);  /* command file */
+       strcpy(opts.wrkfile,NULL_STRING);  /* work    file */
+
+       /* handle global substitue option */
+
+       cpair = ADDINFO_search("REPLACE", RCF_ADDINFO_KWD_LEN,
+                               addinfo->pair,
+                               addinfo->num_pairs);
+       if (cpair NE NULL) {
+          if (strlen(cpair->value) NE 0) {
+             strcpy(replace, cpair->value );
+             strcpy(opts.ds_owner,cpair->value);
+             strcpy(opts.grp_owner,cpair->value);
+             strcpy(opts.usr_owner,cpair->value);
+             strcpy(opts.gen_owner,cpair->value);
+             strcpy(opts.cnct_owner,cpair->value);
+             strcpy(opts.notify_id,cpair->value);
+             strcpy(opts.resown_id,cpair->value);
+          }
+       }
+       else {
+          strcpy(replace, "");
+          strcpy(opts.ds_owner,"");
+          strcpy(opts.grp_owner,"");
+          strcpy(opts.usr_owner,"");
+          strcpy(opts.gen_owner,"");
+          strcpy(opts.cnct_owner,"");
+          strcpy(opts.notify_id,"");
+          strcpy(opts.resown_id,"");
+       }
+
+       /* scan specified options */
+
+       cpair = addinfo->pair;
+
+       for (i=0; i LT addinfo->num_pairs; i++) {
+           /* WS10082N
+           ESA_DIAG_printf(ESA_COMP_DELUSER, 1,
+                           "%s=%s", cpair->keyword, cpair->value);  */
+           ESA_DIAG_printf(ESA_COMP_DELUSER, 1,             /*WS10082N*/
+                           "%s=%*.s (%d)",                  /*WS10082N*/
+                           cpair->keyword, cpair->value,    /*WS10082N*/
+                           ((cpair->twin NE cpair) ? 100 :  /*WS10082N*/
+                                             cpair->vallen),/*WS10082N*/
+                            cpair->vallen);                 /*WS10082N*/
+           if (strcmp(cpair->keyword,"CMDFILE") EQ 0)
+              strcpy(opts.cmdfile,cpair->value);
+           else if (strcmp(cpair->keyword,"DS_OWNER") EQ 0)
+              strcpy(opts.ds_owner,cpair->value);
+           else if (strcmp(cpair->keyword,"GROUP_OWNER") EQ 0)
+              strcpy(opts.grp_owner,cpair->value);
+           else if (strcmp(cpair->keyword,"USER_OWNER") EQ 0)
+              strcpy(opts.usr_owner,cpair->value);
+           else if (strcmp(cpair->keyword,"GENRES_OWNER") EQ 0)
+              strcpy(opts.gen_owner,cpair->value);
+           else if (strcmp(cpair->keyword,"CONNECT_OWNER") EQ 0)
+              strcpy(opts.cnct_owner,cpair->value);
+           else if (strcmp(cpair->keyword,"NOTIFY") EQ 0)
+              strcpy(opts.notify_id,cpair->value);
+           else if (strcmp(cpair->keyword,"RESOWNER") EQ 0)
+              strcpy(opts.resown_id,cpair->value);
+           cpair++;   /* WS10082N - all are expectd to be short */
+       }
+
+       ESA_DIAG_printf(ESA_COMP_DELUSER, 1,
+                       "Default grp  = %s", opts.dfltgrp);
+       ESA_DIAG_printf(ESA_COMP_DELUSER, 1,
+                       "Command file = %s", opts.cmdfile);
+       ESA_DIAG_printf(ESA_COMP_DELUSER, 1,
+                       "DS_Owner     = %s", opts.ds_owner);
+       ESA_DIAG_printf(ESA_COMP_DELUSER, 1,
+                       "Group_Owner  = %s", opts.grp_owner);
+       ESA_DIAG_printf(ESA_COMP_DELUSER, 1,
+                       "User_Owner   = %s", opts.usr_owner);
+       ESA_DIAG_printf(ESA_COMP_DELUSER, 1,
+                       "Genres_Owner = %s", opts.gen_owner);
+       ESA_DIAG_printf(ESA_COMP_DELUSER, 1,
+                       "Connect_Owner = %s",opts.cnct_owner);
+       ESA_DIAG_printf(ESA_COMP_DELUSER, 1,
+                       "Notify       = %s", opts.notify_id);
+       ESA_DIAG_printf(ESA_COMP_DELUSER, 1,
+                       "Resowner     = %s", opts.resown_id);
+
+      /*
+       *  Handle delayed processing
+       */
+
+       if ( dly_pair NE NULL) {
+           ESA_DIAG_printf(ESA_COMP_DELUSER, 1,
+                          "Delayed processing requested");
+
+           CTSAMSG_print(RACF_USER_NODELETE, msgs, NULL, dest,
+                         opts.id );
+
+          /*
+           *   Back to CS - server authority
+           */
+
+           rc = CTSRSSLogout (admin_params->rss_name,
+                              admin_params->admin_uname,
+                              admin_params->admin_gname,
+                              LOGOUT_MODE,
+                              &(admin_params->login_handle),
+                              admin_params, err);
+           if ( rc NE ESA_OK ) {
+             CTSAMSG_print(RACF_DELAY_REQUEST_NO_SAVED,
+                           msgs, NULL, dest, opts.id);
+             goto exit;
+           }
+
+           rc = UT100_write_request(DELUSER_REQUEST, del_pair->value,
+                                    replace, &opts , admin_params);
+          /*
+           *   Back to administrator authority
+           */
+
+           CTSRSSLogin (admin_params->rss_name,
+                        admin_params->admin_uname,
+                        admin_params->admin_gname,
+                        "",
+                        LOGIN_MODE,
+                        &(admin_params->login_handle),
+                        admin_params, err);
+
+          /*
+           *  Delete request saved. Revoke the user
+           */
+
+           if ( rc EQ ESA_OK ) {
+              CTSAMSG_print(RACF_DELAY_REQUEST_SAVED,
+                            msgs, NULL, dest, opts.id);
+
+              if ( strcmp(opts.dfltgrp, "?") NE 0 ) {
+                ESA_DIAG_printf(ESA_COMP_DELUSER, 1,
+                                "Revoking user %s", user_params->user);
+                user_params->rev_status = USER_STAT_REVOKED;
+                rc = CTSRevokeUser (user_params, laddinfo,
+                                    admin_params, err);
+                if (rc NE ESA_OK) {
+                   rc = ESA_FATAL;
+                   goto exit;
+                }
+                CTSAMSG_print(RACF_USER_REVOKED,
+                              msgs, NULL, dest, user_params->user );
+                rc = ESA_WARN;
+              }
+           }       /* Delete request saved successfully */
+
+           else CTSAMSG_print(RACF_DELAY_REQUEST_NO_SAVED,
+                            msgs, NULL, dest, opts.id);
+           goto exit;
+       }     /* DELAY process handling */
+
+      /* as2806 Start */
+      /*
+       *  If cmdfile is not supplied - allocate it
+       */
+
+       time(&opts.crttime); /* spr136. obtain created date, time */
+       if ( strlen(opts.cmdfile) EQ 0 ) {
+          rc = UT100_allocate(DELUSER_REQUEST,
+                              user_params->user , admin_params,
+                              opts.cmdfile, opts.crttime );
+          if ( rc NE ESA_OK )
+             goto exit;
+       }
+
+      /*
+       *  Check cmdfile accessability (and clear it ... )
+       */
+
+       if ( strlen(opts.cmdfile) GT 0 ) {
+          /* SAS2IBMT sprintf(fnr, "dsn:%s", opts.cmdfile);          */
+          strcpy(fnr,"//'");                              /* SAS2IBMT */
+          strcat(fnr, opts.cmdfile);                      /* SAS2IBMT */
+          strcat(fnr,"'");                                /* SAS2IBMT */
+          fr = fopen( fnr, FILE_OPEN_WRITE_TEXT);
+          if (fr EQ NULL) {
+             CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                           "OPEN","UT100_CLEANUP",fnr,strerror(errno));
+             rc = ESA_FATAL;
+             goto exit;
+          }
+          fputs("/* File was cleared for RACF cleanup commands */", fr);
+          if (ferror(fr)) {
+             CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                           "PUT","UT100_CLENAUP",fnr,strerror(errno));
+             rc = ESA_FATAL;
+             fclose(fr);
+             goto exit;
+          }
+          fclose(fr);
+       }
+       else {
+          CTSAMSG_print(ERR_INTERNAL2,msgs,NULL,dest,
+                        component, func,"Invalid file name",
+                        "",__LINE__);
+          goto exit;
+       }
+
+      /* as2806 End   */
+
+      /*
+       *  Activate IRRUT100 to find userid occurences in RACF database
+       */
+       strncpy( racf_id, user_params->user, sizeof(racf_id) );
+       rc = UT100_activate(&racf_id,1,dest,msgs);
+       if (rc NE ESA_OK) {
+          CTSAMSG_print(RACF_UT100ACT_ERR, msgs, NULL, dest,
+                        "user", user_params->user);
+          rc = ESA_FATAL;
+          goto exit;
+       }
+
+      /*
+       *  Analyze IRRUT100 output and produce cleanup commands
+       */
+
+       rc = UT100_analyze(&opts, dest, msgs);
+       if (rc NE ESA_OK) {
+          CTSAMSG_print(RACF_UT100ANL_ERR, msgs, NULL, dest,
+                        "user", user_params->user);
+          rc = ESA_FATAL;
+          goto exit;
+       }
+
+      /*
+       *  Execute cleanup commands if delete=full/force
+       */
+
+       if ( (del_opt EQ DEL_FULL) OR (del_opt EQ DEL_FORCE) ) {
+          strcat(opts.cmdfile,"' ");
+
+          /* as0801  delete, as1101 added */
+
+          strcat(opts.cmdfile,"'TRACEOFF");
+
+          /* as0801  added , as1101 deleted
+           * strcat(opts.cmdfile,"'TRACEON");
+           * -------------------------------- */
+
+          /* IS10174 rc = UT100_execute_file(&opts, dest, msgs);  */
+          rc = UT100_execute_file(&opts, admin_params);  /* IS10174 */
+          if (rc NE ESA_OK) {
+             rc = ESA_FATAL;
+             goto exit;
+          }
+       }
+
+   }
+
+  /*
+   *  Delete the user, if delete was requested
+   */
+
+   if ( (del_opt EQ DEL_DELETE) OR
+        (del_opt EQ DEL_FULL)  OR
+        (del_opt EQ DEL_FORCE)   ) {
+
+       /*
+        *   Check user existance
+        */
+
+        if (del_opt EQ DEL_DELETE) {
+           ESA_DIAG_printf(ESA_COMP_DELUSER, 1,
+                          "Checking user %s existance",
+                          user_params->user);
+           chk_rc = RACF_chk_user(user_params->user, OBJ_EXIST,
+                                  TRUE,dest,msgs);
+           if ( chk_rc NE ESA_OK ) {
+              rc = ESA_FATAL;
+              goto exit;
+           }
+        }
+
+       /*
+        *   Execute DELUSER command
+        */
+
+        sprintf(cmd, "DELUSER %s ", user_params->user);
+        ESA_DIAG_printf(ESA_COMP_DELUSER, 1,
+                        "Command header prepared (%s)", cmd);
+        rc = racfcmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+                     cmd, MAX_OK_RC_0,
+                     0, NULL, mkt, kdt, admin_params,    /* IS10174 */
+                     CMDOUT_YES, RACF_YES);
+          /* IS10174 0, NULL, mkt, kdt, dest, msgs,    */
+
+   }
+
+  /*
+   *  If the user was not really deleted set error code (to avoid
+   *  confusing of the CS since the user is not really deleted) and
+   *  issue explaination message .
+   */
+
+   else {
+      CTSAMSG_print(RACF_DELETE_OPTION,   msgs, NULL, dest,
+                    user_params->user, del_pair->value );
+      rc = ESA_ERR;
+      goto exit;
+   }
+
+  /*
+   *   Finish
+   */
+
+   exit:;
+
+   ADDINFO_free(&laddinfo);
+
+   ESA_DIAG_exit(ESA_COMP_DELUSER, 1, func, rc);
+   return rc;
+
+ }
+
+/****************************************************
+ * Procedure Name: chk_delay_enabl
+ * Description   : Check enabling of delay processing
+ *
+ * Input         : admin_params
+ *                 keyword
+ *                 dest
+ *                 msgs
+ *
+ * Output        : None
+ *
+ * Input/Output  : admin, err
+ *
+ * Return Value  : ESA_OK     delay delete processing enable
+ *                 ESA_ERR    delay delete processing disable
+ ****************************************************/
+
+ static ESA_RC chk_delay_enabl(ADMIN_PARAMS_rec_typ      * admin_params,
+                               char                      * keyword,
+                               CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                               CTSAMSG_HANDLE_rec_ptr      msgs)
+  {
+
+   /*
+    *    Variables
+    */
+
+    ESA_RC       rc;
+    char         result[80];
+    static char  func[]="chk_delay_enabl";
+
+   /*
+    *    Initialize
+    */
+
+    ESA_DIAG_enter(ESA_COMP_DELUSER, 1, func);
+
+    rc = admin_params->cs_func.rssprm_get_ptr(admin_params->rss_name,
+                                              keyword,
+                                              sizeof(result),result);
+    if (rc NE ESA_OK) {
+        CTSAMSG_print(RACF_DELAY_PARM_NOTFOUND,msgs,NULL,dest, keyword);
+        rc=ESA_ERR;
+    }
+
+    if (strcmp(result, KWD_FLAG_ON) NE 0) {
+        CTSAMSG_print(RACF_DELAY_DISABLE, msgs, NULL, dest);
+        rc=ESA_ERR;
+    }
+
+
+    ESA_DIAG_exit(ESA_COMP_DELUSER, 1, func, rc);
+
+    return rc;
+
+  }
+

@@ -1,0 +1,295 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Update a user (TSS)                      *
+ *                                                             *
+ * File Name        : ctstuus.c                                *
+ *                                                             *
+ * Author           : Alexander Shvartsman                     *
+ *                                                             *
+ * Creation Date    : 30/06/96                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * ws2458   Yonatan  17/02/02 support for VERIFY_PWD flag from *
+ *                            ESS                              *
+ * WS10009  MeirS    18/10/07 Support ru_locked & RU_SUSPENDED.*
+ * IS10091  NuritY   06/06/13 Add Diags.  (WS10034)            *
+ * CIQ#6    SeligT   19/03/17 Account Aggr includes Connections*
+ * WS10082  MauriC   14/11/22 Recompile for new ADDINFO macros *
+ **************************************************************/
+
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_API
+ #include ESA_API_CODES
+
+ #include MVS_ONLINE_INTERCEPTOR
+
+
+ #include API_ADDINFO
+
+ #include TSS
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : CTSUpdUser                                 *
+ *                                                             *
+ * DESCRIPTION    : Update a TSS  user                         *
+ *                                                             *
+ * INPUT          : User, addinfo, admin                       *
+ *                                                             *
+ * OUTPUT         : err                                        *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC CTSUpdUser (USER_PARAMS_rec_typ  * user_params,
+                    ADDINFO_rec_typ      * addinfo,
+                    ADMIN_PARAMS_rec_typ * admin_params,
+                    ERR_STRUCT_rec_typ   * err)
+ {
+
+   static char                func[]="CTSUpdUser";
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                     rc = ESA_OK;
+   CTSAMSG_HANDLE_rec_ptr     msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr dest;
+   ADDINFO_rec_ptr            get_addinfo = NULL;
+   ADDINFO_rec_ptr            ess_addinfo = NULL;
+   TSS_CMD_HANDLE_typ        *cmd_handle  = NULL;
+
+  /*
+   *  Get User parameters
+   */
+
+   TSS_RTT_rec_typ          * rtt;
+   short                      rtt_num_items;
+   OBJ_EXISTS_typ             obj_exist  = OBJ_NOT_EXIST;
+   HAVE_MORE_typ              have_more  = NO_MORE;
+   void                     * handle     = NULL;
+   short                      actual_num = 0;
+   USER_PARAMS_rec_typ        user;
+   OE_typ                     oe         = "";
+   char                       get_conn   = 'N'; /* CIQ#6 */
+
+   /*** For TSS_chk_acid ***/
+
+   char                       real_acid_type[TSS_ACID_TYPE_LEN+1]="";
+   OBJECT_TYPE_typ            real_obj_type = TYPE_IGNORE;
+
+   ONE_FIELD_rec_ptr            cpair; /* ws2458 */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_UPDUSER, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+  /*
+   * Initialize global parameters
+   */
+
+   rc = TSS_global_init (ESA_COMP_UPDUSER, admin_params, err);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   rtt = TSS_get_global_rtt();
+   rtt_num_items  = TSS_get_global_rtt_num_items();
+
+  /*
+   *  Check user existance
+   */
+
+   rc = TSS_chk_acid(ESA_COMP_UPDUSER, user_params->user,
+                     TSS_USER, TYPE_USER,
+                     OBJ_EXIST, TRUE, real_acid_type, &real_obj_type,
+                     admin_params, err);
+   if (rc NE ESA_OK)
+      goto exit;
+
+  /*
+   *   Create command handle
+   */
+
+   rc = TSS_alloc_cmd_handle (ESA_COMP_UPDUSER,
+                              MAX_TSS_CMD_USER_ENTRIES,
+                              &cmd_handle, dest, msgs );
+   if ( rc NE ESA_OK )
+      goto exit;
+
+  /*
+   *   Build internal addinfo
+   */
+
+   rc = ADDINFO_alloc(func, addinfo->num_pairs,
+                      &ess_addinfo, dest, msgs);
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   ADDINFO_copy( ess_addinfo, addinfo );
+
+  /*
+   *   Update user processing
+   */
+
+  /*
+   *   Prepare parameters to obtain user info
+   */
+
+   rc = ADDINFO_alloc(func, rtt_num_items, &get_addinfo, dest, msgs);
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   rc = TSS_rtt_2_addinfo(ESA_COMP_UPDUSER,
+                          rtt, get_addinfo, dest, msgs);
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *  Get user information
+   */
+
+   strcpy(user.user, user_params->user);
+   rc = CTSGetUsers ( GET_MANY_USERS, oe, 1, &actual_num,
+                      &have_more, &handle,
+                      1, user_params, &user, &get_addinfo, &obj_exist,
+                      admin_params, err,
+                      get_conn);                            /* CIQ#6 */
+
+   ESA_DIAG_printf(ESA_COMP_UPDUSER, 1,
+                   "user=%s rc=%d exists=%d",
+                    user.user, rc, obj_exist);
+
+   if ( (obj_exist EQ OBJ_NOT_EXIST) OR ( rc NE ESA_OK )) {
+       rc = ESA_FATAL;
+       goto exit;
+   }
+
+ /****************************************************************
+ * ws2458                                                        *
+ *   If VERIFY_PWD was sent, disregard all other changes and     *
+ *   only verify the password.                                   *
+ *                                                               *
+ ****************************************************************/
+
+ if ( ESA_DIAG_get_debug_level(ESA_COMP_UPDUSER) GE 6 )
+ {
+   ESA_DIAG_printf(ESA_COMP_UPDUSER, 6,          /* IS10091 */
+                   "input addinfo");             /* IS10091 */
+   ADDINFO_dump(addinfo,1);                      /* IS10091 */
+                                                 /* IS10091 */
+   ESA_DIAG_printf(ESA_COMP_UPDUSER, 6,          /* IS10091 */
+                   "get addinfo");               /* IS10091 */
+   ADDINFO_dump(get_addinfo,1);                  /* IS10091 */
+                                                 /* IS10091 */
+   ESA_DIAG_printf(ESA_COMP_UPDUSER, 6,          /* IS10091 */
+                   "IIQ/IDN addinfo");           /* IS10091 */
+   ADDINFO_dump(ess_addinfo,1);
+ }
+
+ cpair = ADDINFO_search ( "VERIFY_PWD", TSS_ADDINFO_KWD_LEN,
+                           ess_addinfo->pair,
+                           ess_addinfo->num_pairs );
+ if (cpair NE NULL)
+  {
+   ESA_DIAG_printf(ESA_COMP_UPDUSER, 2,
+                   "VERIFY_PWD=%s",cpair->value);
+   if (strcmp(cpair->value,KWD_FLAG_ON) EQ 0)
+   {
+    rc = CTSUpdPassword (user_params, ess_addinfo, admin_params, err);
+    goto exit;
+   }
+  }
+  /*
+   *  Check whether need MOVE operation
+   *  If YES, do it now
+   *  after that all additional changes
+   */
+
+   rc = TSS_check_moving(ESA_COMP_UPDUSER, TSS_USER_TYPE,
+                         rtt, user_params->user,
+                         user_params->parent_oe, ess_addinfo, user.user,
+                         user.parent_oe, get_addinfo, TYPE_USER,
+                         admin_params,err);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   rc = TSS_do_revoke_status(ESA_COMP_UPDUSER, cmd_handle, user_params,
+        /* WS10009     ess_addinfo, &user, get_addinfo, dest, msgs );*/
+        /* WS10009 */  ess_addinfo, &user, get_addinfo, dest, msgs,
+        /* WS10009 */  admin_params);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   rc = TSS_do_addinfo (ESA_COMP_UPDUSER, cmd_handle, rtt,
+                        ess_addinfo, get_addinfo, dest, msgs);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   rc = TSS_do_password(ESA_COMP_UPDUSER, cmd_handle, user_params,
+                        ess_addinfo, dest, msgs );
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   rc = TSS_do_cmd( ESA_COMP_UPDUSER, (char *)user_params->user,
+                    TYPE_USER,       TSS_EVNT_ACTION_UPDATE,
+                    cmd_handle, admin_params);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+  /*
+   *   Finish
+   */
+
+ exit:;
+
+   if (cmd_handle)
+      TSS_free_cmd_handle( ESA_COMP_UPDUSER,
+                           &cmd_handle, dest, msgs);
+
+   if (get_addinfo)
+      ADDINFO_free(&get_addinfo);
+
+   if (ess_addinfo)
+      ADDINFO_free(&ess_addinfo);
+
+   ESA_DIAG_exit(ESA_COMP_UPDUSER, 1, func, rc);
+
+   return rc;
+
+ }

@@ -1,0 +1,600 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Revoke a user (RACF)                     *
+ *                                                             *
+ * File Name        : ctsrurv.c                                *
+ *                                                             *
+ * Author           : Doron Cohen                              *
+ *                                                             *
+ * Creation Date    : 28/03/94                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ *                   dd/mm/yy                                  *
+ * BS10006  MeirS    28/08/07 REVOKE/RESUME for z/os 1.7       *
+ * IS10100  NuritY   29/07/13 Support CTSA internal custom     *
+ *                            fields (CTSACFs) and revoke      *
+ *                            reason.                          *
+ * IS10161  MeirS    09/11/17 remove calling to CTSRVRS rtns   *
+ * IS10174  NuritY   31/12/17 Dynamic EXECOUT support.         *
+ * WS10082  MauriC   07/11/22 Recompile for new ADDINFO macros *
+ *                                                             *
+ **************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+
+ /*
+  *   CONTROL-SA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_API
+ #include ESA_CTSAMSG
+
+ #include MVS_OS_CLI
+
+ #include RACF_CODES
+ #include API_ADDINFO
+ #include RACF
+
+ /* IS10100 - start */
+ static ESA_RC CTSRevokeUser_rvkrsn_PostCmd(ESA_DIAG_COMP_typ  comp,
+                                char                     *cf_name,
+                                ONE_FIELD_rec_ptr         in_pair,
+                                ADDINFO_rec_ptr           addinfo,
+                                ADDINFO_rec_ptr           uaddinfo,
+                                void                     *entity_parms,
+                                ADMIN_PARAMS_rec_typ     *admin_params,
+                                int                       args_num,
+                                va_list                   args_list);
+
+ static RACF_CTSACF_PROC_rec_typ CTSACF_post_cmd[2] = {
+   { LOCKED_ACCOUNT,  CTSRevokeUser_rvkrsn_PostCmd },
+   { NONE,            NULL                         }
+ };
+ /* IS10100 - end   */
+
+ /*
+  *     MKT for REVUSER
+  *         (Mandatory Keywords Table)
+  */
+
+ static ADDINFO_MKTE_rec_typ mkt[] = {
+        ""   };  /* a null string indicate end-of-mkt */
+
+ /*
+  *     RKT for REVUSER
+  *         (Reserved Keywords Table)
+  */
+
+ static ADDINFO_RKTE_rec_typ rkt[] = {
+    "REVOKE",
+    "RESUME",
+    ""      };  /* a null string indicate end-of-mkt */
+
+ /*
+  *     KDT for REVUSER COMMAND
+  *         (Keyword Decscription Table)
+  */
+
+ static ADDINFO_KDTE_rec_typ kdt[] =      {
+
+  /*                                                            */
+  /* keyword             type   negative       value delimiters */
+  /*                             value                          */
+  /* =================== ====== ============== ================ */
+
+   {"REVOKE_DATE"      ,KDT_IGN ,""           ,"(" ,") " },
+   {"RESUME_DATE"      ,KDT_IGN ,""           ,"(" ,") " },
+   {"REVOKE"           ,KDT_KEY ,"REVOKE"     ,"(" ,")"  },
+   {"RESUME"           ,KDT_KEY ,"RESUME"     ,"(" ,")"  },
+   /* BS10006  NORESUME & NOREVOKE             --> start              */
+   {"NORESUME"           ,KDT_KEY ,"NORESUME"           ,""  , " " },
+   {"NOREVOKE"           ,KDT_KEY ,"NOREVOKE"           ,""  , " " },
+   /* BS10006  NORESUME & NOREVOKE             --> end                */
+   {""                 ,KDT_FLG ,""           ,""  ,""   }  };
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : revuser                                    *
+ *                                                             *
+ * DESCRIPTION    : Revoke/Resume a user                       *
+ *                                                             *
+ * INPUT          :                                            *
+ *                                                             *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+ ESA_RC CTSRevokeUser (USER_PARAMS_rec_typ  * user_params,
+                       ADDINFO_rec_typ      * addinfo,
+                       ADMIN_PARAMS_rec_typ * admin_params,
+                       ERR_STRUCT_rec_typ   * err)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                       rc = ESA_OK, chk_rc;
+   char                         cmd[MAX_API_ST];
+   static char                  func[]="CTSRevokeUser";
+   /* BS10006 unused variable                           BS10006
+   char                         racf_date[10];          BS10006   */
+   RACF_FLAG_typ                at_least_Z17;        /* BS10006   */
+   RACF_PARAMS_rec_typ          * params_ptr = NULL; /* BS10006   */
+   ONE_FIELD_rec_typ          * rev_pair, * res_pair;
+   ADDINFO_rec_ptr              laddinfo = NULL;
+   ADDINFO_rec_ptr              addinfo_vec[2] = { NULL, NULL };
+   CTSAMSG_HANDLE_rec_typ     * msgs;
+   CTSAMSG_DEST_TABLE_rec_typ * dest;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_REVUSER, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   /* IS10100 - start */
+   ESA_DIAG_printf(ESA_COMP_REVUSER, 5,
+                  "input: user%s   rev_status=%d",
+                  user_params->user, user_params->rev_status);
+
+   ESA_DIAG_printf(ESA_COMP_REVUSER, 5, "Input addinfo ");
+   if ( ESA_DIAG_get_debug_level(ESA_COMP_REVUSER) GE 5 )
+     ADDINFO_dump(addinfo,1);
+   /* IS10100 - end */
+
+  /*
+   *   Check that Reserved Keywords were not used
+   */
+
+   if (ADDINFO_rkt_check(func, 1, &addinfo, rkt,
+                         dest, msgs ) NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *   Check user existance
+   */
+
+   chk_rc = RACF_chk_user(user_params->user,OBJ_EXIST,TRUE,dest, msgs);
+   if ( chk_rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *   Obtain a local addinfo buffer
+   */
+
+   if (ADDINFO_alloc(func, 5, &laddinfo, dest, msgs) NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   addinfo_vec[0] = laddinfo;
+   addinfo_vec[1] = addinfo;
+ /* ------------------------------------------------------------ *
+  *  BS10006  -  Reflect the changes done in RACF for z/os 1.7:  *
+  *              1. NOREVOKE parameter in ALTUSER to clear the   *
+  *                 REVOKE date                                  *
+  *              2. NORESUME parameter in ALTUSER to clear the   *
+  *                 RESUME date                                  *
+  *              3. Retrieve RSSPARM's RESUME_CLEAR_REVOKEDATE   *
+  *                 to decide whethe or not to clear REVOKE      *
+  *                 date when REVOKE flag set off                *
+  *              4. Retrieve RSSPARM's REVOKE_CLEAR_RESUMEDATE   *
+  *                 to decide whethe or not to clear RESUME      *
+  *                 date when REVOKE flag set on                 *
+  *  ----------------------------------------------------------- */
+  /*  BS10006 Retrieve RACF version ==> start */
+  /*  IS10161 start - remove RACF version retrieving
+   rc = RACF_version_at_least(RACFZ17,
+                             &at_least_Z17);
+
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+      IS10161 end                                             */
+   at_least_Z17 = RACF_YES ;              /* IS10161          */
+  /*  BS10006  Retrieve RACF version ==> end       */
+
+  /*  BS10006  Retrieve RSSPARM's CLEAR  ==> start */
+   params_ptr = admin_params->apiinit_handle;
+   ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+    "RESUME_CLEARS_REVOKEDATE = <%c> , REVOKE_CLEARS_RESUMEDATE = <%c>",
+    params_ptr->rssparm_RES_CLR_REV[0],
+    params_ptr->rssparm_REV_CLR_RES[0]);
+  /*  BS10006  Retrieve RSSPARM's CLEAR  ==> end   */
+
+   rev_pair = ADDINFO_search("REVOKE_DATE", RCF_ADDINFO_KWD_LEN,
+                             addinfo->pair,
+                             addinfo->num_pairs);
+   res_pair = ADDINFO_search("RESUME_DATE", RCF_ADDINFO_KWD_LEN,
+                             addinfo->pair,
+                             addinfo->num_pairs);
+
+   ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+                   "rev_date at %X, res_date at %X",
+                   rev_pair, res_pair);
+  /*
+   *  Handle Revoke
+   */
+
+   if (user_params->rev_status EQ USER_STAT_REVOKED) {
+      ADDINFO_insert( TYPE_1A, "REVOKE", "", laddinfo,
+                      RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                      UNIQUE);
+      /* BS10006 NORESUME if RSSPARM's specified     ==> start    */
+      if(params_ptr->rssparm_REV_CLR_RES[0] == REV_CLR_RES_ON)
+         if (at_least_Z17 EQ RACF_YES)
+            ADDINFO_insert( TYPE_1A, "NORESUME", "", laddinfo,
+                           RCF_ADDINFO_KWD_LEN,
+                           RCF_ADDINFO_VAL_LEN,
+                           UNIQUE);
+         else {
+            CTSAMSG_print(RACF_ZOS_CLEARING,  msgs, NULL, dest,
+                          REV_CLR_RES);
+            rc = ESA_FATAL;
+            goto exit;
+         }
+      /* BS10006 NORESUME if RSSPARM's specified     ==> end      */
+      /* BS10006 dead code (res_pair always NULL)    ==> start
+
+       *         The following code was commented due to APAR     *
+       *         BS2034 in which this module is never performed   *
+       *         and implied res_pair & rev_pair always NULL      *
+
+      if (res_pair NE NULL) {
+         ESA_DIAG_printf(ESA_COMP_REVUSER, 1,
+                         "RESUME_DATE located. %s=%s",
+                         res_pair->keyword, res_pair->value);
+         if (strlen(res_pair->value) GT 0) {
+            rc=RACF_revoke_date(res_pair->value, racf_date, dest, msgs);
+            if (rc NE ESA_OK) {
+               rc = ESA_FATAL;
+             goto exit;
+            }
+            ADDINFO_insert(TYPE_1A, "RESUME", racf_date, laddinfo,
+                           RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                           UNIQUE);
+         }
+      }
+      if (rev_pair NE NULL)
+         CTSAMSG_print(RACF_REVDATE_IGN,   msgs, NULL, dest);
+         BS10006 dead code (res_pair always NULL)    ==> end      */
+   }
+
+  /*
+   *  Handle Resume
+   */
+
+   else if (user_params->rev_status EQ USER_STAT_ACTIVE) {
+      ADDINFO_insert( TYPE_1A, "RESUME", "", laddinfo,
+                      RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                      UNIQUE);
+      /* BS10006 NOREVOKE if RSSPARM's specified     ==> start    */
+      if(params_ptr->rssparm_RES_CLR_REV[0] == RES_CLR_REV_ON)
+         if (at_least_Z17 EQ RACF_YES)
+            ADDINFO_insert( TYPE_1A, "NOREVOKE", "", laddinfo,
+                           RCF_ADDINFO_KWD_LEN,
+                           RCF_ADDINFO_VAL_LEN,
+                           UNIQUE);
+         else {
+            CTSAMSG_print(RACF_ZOS_CLEARING,  msgs, NULL, dest,
+                          RES_CLR_REV);
+            rc = ESA_FATAL;
+            goto exit;
+         }
+      /* BS10006 NOREVOKE if RSSPARM's specified     ==> end      */
+      /* BS10006 dead code (rev_pair always NULL)    ==> start
+
+       *         The following code was commented due to APAR     *
+       *         BS2034 in which this module is never performed   *
+       *         and implied res_pair & rev_pair always NULL      *
+
+      if (rev_pair NE NULL) {
+         ESA_DIAG_printf(ESA_COMP_REVUSER, 1,
+                         "REVOKE_DATE located. %s=%s",
+                         rev_pair->keyword, rev_pair->value);
+         if (strlen(rev_pair->value) GT 0) {
+            rc=RACF_revoke_date(rev_pair->value, racf_date, dest, msgs);
+            if (rc NE ESA_OK) {
+               rc = ESA_FATAL;
+             goto exit;
+            }
+            ADDINFO_insert(TYPE_1A, "REVOKE", racf_date, laddinfo,
+                           RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                           UNIQUE);
+         }
+      }
+      if (res_pair NE NULL)
+         CTSAMSG_print(RACF_RESDATE_IGN,   msgs, NULL, dest);
+   }
+         BS10006 dead code (rev_pair always NULL)    ==> end      */
+
+  /*
+   *  Handle RESUME_DATE/REVOKE_DATE
+   */
+
+  /*     BS10006 dead code (rev_pair always NULL)    ==> start
+
+   *         The following code was commented due to APAR     *
+   *         BS2034 in which this module is never performed   *
+   *         and implied res_pair & rev_pair always NULL      *
+
+   else {
+
+      /@* revoke_date *@/
+
+      if (rev_pair NE NULL) {
+         ESA_DIAG_printf(ESA_COMP_REVUSER, 1,
+                         "REVOKE_DATE located. %s=%s",
+                         rev_pair->keyword, rev_pair->value);
+         if (strlen(rev_pair->value) GT 0) {
+            rc=RACF_revoke_date(rev_pair->value, racf_date, dest, msgs);
+            if (rc NE ESA_OK) {
+               rc = ESA_FATAL;
+             goto exit;
+            }
+            ADDINFO_insert(TYPE_1A, "REVOKE", racf_date, laddinfo,
+                           RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                           UNIQUE);
+         }
+         else {
+  /@* BS10006 NORESUME & NOREVOKE             --> start              *@/
+             ESA_DIAG_printf(ESA_COMP_REVUSER, 1,
+                             "NOREVOKE was requested");
+             if (at_least_Z17 EQ RACF_YES)
+               ADDINFO_insert( TYPE_1A, "NOREVOKE", "", laddinfo,
+                               RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                               UNIQUE);
+             else {
+               CTSAMSG_print(RACF_REVOKE_CLEAR,   msgs, NULL, dest,
+                             rev_pair->keyword);
+               rc = ESA_FATAL;
+               goto exit;
+            }
+  /@* BS10006 NORESUME & NOREVOKE             --> end                *@/
+         } /@* revoke_date was cleared *@/
+      }
+
+      /@* resume_date *@/
+
+      if (res_pair NE NULL) {
+         ESA_DIAG_printf(ESA_COMP_REVUSER, 1,
+                         "RESUME_DATE located. %s=%s",
+                         res_pair->keyword, res_pair->value);
+         if (strlen(res_pair->value) GT 0) {
+            rc=RACF_revoke_date(res_pair->value, racf_date, dest, msgs);
+            if (rc NE ESA_OK) {
+               rc = ESA_FATAL;
+               goto exit;
+            }
+            ADDINFO_insert(TYPE_1A, "RESUME", racf_date, laddinfo,
+                           RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                           UNIQUE);
+         }
+         else {
+  /@* BS10006 NORESUME & NOREVOKE             --> start              *@/
+             ESA_DIAG_printf(ESA_COMP_REVUSER, 1,
+                             "NORESUME was requested");
+             if (at_least_Z17 EQ RACF_YES)
+               ADDINFO_insert( TYPE_1A, "NORESUME", "", laddinfo,
+                               RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                               UNIQUE);
+             else {
+               CTSAMSG_print(RACF_REVOKE_CLEAR,   msgs, NULL, dest,
+                             res_pair->keyword);
+               rc = ESA_FATAL;
+               goto exit;
+             }
+  /@* BS10006 NORESUME & NOREVOKE             --> end                *@/
+         } /@* revoke_date was cleared *@/
+      } /@* resume_date was specified *@/
+         BS10006 dead code                           ==> end      */
+   }
+
+  /*
+   *  ALTUSER command
+   */
+
+   sprintf(cmd, "ALTUSER %s ", user_params->user);
+   rc = racfcmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+                cmd, MAX_OK_RC_0,
+                2, addinfo_vec, mkt, kdt,                /* IS10174 */
+                admin_params,                            /* IS10174 */
+                CMDOUT_YES, RACF_YES);
+     /* IS10174 2, addinfo_vec, mkt, kdt, dest, msgs,    */
+
+   /* IS10100 - start */
+   /*
+    *  Do command post-processing required for CTSACF features.
+    */
+   if (rc NE ESA_OK)
+     goto exit;
+
+   RACF_Handle_CTSACF_Features(ESA_COMP_REVUSER, 'U', CTSACF_post_cmd,
+                               addinfo, NULL, user_params,
+                               admin_params,
+                               1, laddinfo);
+   /* IS10100 - end   */
+  /*
+   *   Finish
+   */
+
+   exit:;
+
+   ADDINFO_free(&laddinfo);
+
+   /* IS10100 - start */
+   ESA_DIAG_printf(ESA_COMP_REVUSER, 5,
+                  "Output: user%s   rev_status=%d",
+                  user_params->user, user_params->rev_status);
+
+   ESA_DIAG_printf(ESA_COMP_REVUSER, 5, "Output addinfo ");
+   if ( ESA_DIAG_get_debug_level(ESA_COMP_REVUSER) GE 5 )
+     ADDINFO_dump(addinfo,1);
+   /* IS10100 - end */
+
+   ESA_DIAG_exit(ESA_COMP_REVUSER, 1, func, ESA_OK);
+
+   return rc;
+
+ }
+
+ /* IS10100 - start  */
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : CTSRevokeUser_rvkrsn_PostCmd               *
+*                                                             *
+* DESCRIPTION    : Called after the RACF command is issued    *
+*                  to handle the revoke reason, if needed:    *
+*                  - If the command contains REVOKE, set      *
+*                    revoke reason 'C'.                       *
+*                  - if the command contains RESUME, set      *
+*                    revoke reason = '?' (GetUser will remove *
+*                    it or set 'D'if revoked becasue of date. *
+*                                                             *
+* INPUT          : cf_name     - CTSACF custom field name.    *
+*                : in_pair     - N/A                          *
+*                : addinfo     - addinfo containing required  *
+*                                changes.                     *
+*                : uaddinfo    - NULL                         *
+*                : user_params - user params recieved from    *
+*                                UpdateUser caller            *
+*                : args_num    - 1                            *
+*                : args_list:                                 *
+*                : 1. laddinfo - containing additional        *
+*                                changes.                     *
+*                                                             *
+* OUTPUT         :                                            *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+* NOTE           : We return always ESA_RC because the        *
+*                  return code of this function will not      *
+*                  affect the return code of the program.     *
+*                                                             *
+**************************************************************/
+ static ESA_RC CTSRevokeUser_rvkrsn_PostCmd(ESA_DIAG_COMP_typ  comp,
+                                char                     *cf_name,
+                                ONE_FIELD_rec_ptr         in_pair,
+                                ADDINFO_rec_ptr           addinfo,
+                                ADDINFO_rec_ptr           uaddinfo,
+                                void                     *entity_parms,
+                                ADMIN_PARAMS_rec_typ     *admin_params,
+                                int                       args_num,
+                                va_list                   args_list)
+{
+
+  char     func[] = "CTSRevokeUser_rvkrsn_PostCmd";
+  ESA_RC   rc;
+  USER_PARAMS_rec_typ  *user_params;
+  ONE_FIELD_rec_ptr     rvk_pair;
+  ONE_FIELD_rec_ptr     rsm_pair;
+  ADDINFO_rec_ptr       laddinfo;
+
+  CTSAMSG_HANDLE_rec_ptr        msgs;
+  CTSAMSG_DEST_TABLE_rec_ptr    dest;
+
+  /*
+   *  Initialization
+   */
+  ESA_DIAG_enter(ESA_COMP_UPDUSER, 1, func);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  ESA_DIAG_printf(ESA_COMP_REVUSER, 5,
+         "Input parms:  up=%8x  addinfo=%8X   uaddinfo=%8X  args#=%d",
+         entity_parms, addinfo, uaddinfo, args_num);
+  if (entity_parms EQ NULL  OR   args_num NE 1  OR
+      addinfo EQ NULL)
+    goto exit;                    /* out of parameters are missing */
+
+  user_params = (USER_PARAMS_rec_typ *)entity_parms;
+  laddinfo = va_arg(args_list, ADDINFO_rec_ptr);
+
+  ESA_DIAG_printf(ESA_COMP_REVUSER, 5,
+         "Input parms:  laddinfo=%8X", laddinfo);
+  if (laddinfo EQ NULL)
+    goto exit;
+
+  /*
+   *  If laddinfo contains REVOKE, set revoke reason = C (command)
+   */
+  rvk_pair = ADDINFO_search("REVOKE",
+                            RCF_ADDINFO_KWD_LEN,
+                            laddinfo->pair,
+                            laddinfo->num_pairs );
+
+  if (rvk_pair NE NULL  AND  rvk_pair->vallen EQ 0)
+  {
+    ESA_DIAG_printf(ESA_COMP_REVUSER, 5,
+                  "REVOKE: Set revoke reason 'C'");
+    rc = RACF_Update_Revoke_Reason(comp, user_params->user,
+                                   'U', 'V', 'C',
+                                   cf_name, admin_params);
+    ESA_DIAG_printf(ESA_COMP_REVUSER, 5,
+             "RACF_Update_Revoke_Reason returned with rc = %d", rc);
+  }
+  else
+  {
+    /*
+     *  If laddinfo contains RESUME, set revoke reason = ? (unknown)
+     *  GetUser will later remove it, if the user is active, or set
+     *  'D' if the user is revoked because of date.
+     *
+     *  RESUME is checked only if no REVOKE becasue if both are
+     *  specified, RACF uses REVOKE (from the manual).
+     */
+    rsm_pair = ADDINFO_search("RESUME",
+                              RCF_ADDINFO_KWD_LEN,
+                              laddinfo->pair,
+                              laddinfo->num_pairs );
+    if ( rsm_pair NE NULL  AND  rsm_pair->vallen EQ 0 )
+    {
+      ESA_DIAG_printf(ESA_COMP_REVUSER, 5,
+                  "RESUME: Set revoke reason '?'");
+      rc = RACF_Update_Revoke_Reason(comp, user_params->user,
+                                     'U', 'V', '?',
+                                     cf_name, admin_params);
+      ESA_DIAG_printf(ESA_COMP_REVUSER, 5,
+             "RACF_Update_Revoke_Reason returned with rc = %d", rc);
+    }
+  }
+
+  /*
+   *  Termination
+   */
+ exit:;
+  ESA_DIAG_exit(ESA_COMP_REVUSER, 1, func, ESA_OK);
+
+  return ESA_OK;
+}
+
+ /* IS10100 - end    */

@@ -1,0 +1,557 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Isuuing TSS  commands                    *
+ *                                                             *
+ * File Name        : ctstcmc (connection functions)           *
+ *                                                             *
+ * Author           : Alexander Shvartsman                     *
+ *                                                             *
+ * Creation Date    : 16/06/96                                 *
+ *                                                             *
+ * Description      : TSS  issuing command                     *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * PS0316   Alex     10/07/98 Correct handling users with      *
+ *                            'dash' symbol.                   *
+ * ps0380   AS       05/05/99 Download fails, when acid deleted*
+ *                            during the download              *
+ * IS10027  AvnerL   25/01/09 Memory leak S878 at BOFA.        *
+ * WS10082  AvnerL   18/09/23 ADDINFO - update lengths         *
+  **************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDIO
+ #include   STDLIB
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_CTSAMSG
+ #include ESA_API
+ #include ESA_API_CODES
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_COMP
+ #include MVS_OS_MVS
+ /*WS10082 #include API_ADDINFO ---not used  */
+ #include API_AUTH
+
+ /*
+  *   TSS include files
+  */
+
+ #include TSS
+ #include TSS_XCNN
+ #include TSS_CODES
+
+ /*************************************************
+  *       GET CONNECTION RELATED PROGRAMS         *
+  *************************************************/
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_get_user_connections                   *
+ *                                                             *
+ * DESCRIPTION    : For entering user acid issue TSS command   *
+ *                  and save obtained connections              *
+ *                                                             *
+ * INPUT          : comp        - diag component               *
+ *                  user_acid   - user acid                    *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : trap_buffer - connection info              *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_get_user_connections(ESA_DIAG_COMP_typ       comp,
+     /* ps0380 */         TSS_CMD_MODE_typ               mode,
+                          char                         * user_acid,
+                          TSS_TRAP_CNN_BUF_rec_typ    ** trap_buffer,
+                          ADMIN_PARAMS_rec_typ         * admin_params,
+                          ERR_STRUCT_rec_typ           * err)
+ {
+
+  /*
+   *    Local Variables
+   */
+
+   static char func[]="TSS_get_user_connections";
+
+   static char   *main_cmd = " LIST(%s) DATA(PROFILE,NOSORT) ";
+   TSS_LIST_HANDLE_rec_typ      handle;
+   CTSAMSG_HANDLE_rec_typ     * msgs;
+   CTSAMSG_DEST_TABLE_rec_typ * dest;
+   TSS_TRAP_CNN_BUF_rec_typ   * tmp = NULL;
+   ESA_RC                       rc  = ESA_OK;
+   ESA_RC                       rc1 = ESA_OK;
+   ESA_RC                       rc_cmd = ESA_OK,
+                                rc_p = ESA_OK,
+                                rc_f = ESA_OK;
+   int                          i_trap = 0;
+   int                          logout_done = 0;
+   TSS_CMD_BUF_rec_typ          ret_buf;
+   TSS_CMD_BUF_rec_typ          cmd = { 0, 0, "" };
+   char                         cmd_handle[TSS_CMD_HANDLE_LEN];
+   char                         tmp_handle[TSS_CMD_HANDLE_LEN];
+   char                        *token;
+
+ /********************************************************************
+  *   ACCESSORID = CTSUSR1   NAME       = TEST USER #1               *
+  *   ACCESSORID = CTSGRP1   NAME       = TEST GROUP                 *
+  *   ACCESSORID = CTSPRF1   NAME       = TEST PROFILE               *
+  ********************************************************************/
+
+  static char            get_acid[TSS_USER_NAME_LEN + 1];
+  static char           *accss_k[]={"ACCESSORID", "=", NULL};
+  static TSS_OUTP_typ    accss_d[] = {
+                     { sizeof(get_acid), get_acid },
+                     { 0,                NULL     }
+                               };
+  TSS_LIST_LINE(accss, LIST_ACCESSORID, CURRENT_LINE);
+
+  static TSS_OUTPUT_typ  line_desc[] = {
+        { &accss,    NULL   },
+        { NULL,      NULL   } };
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 6, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   /* ESA_DIAG_printf(comp,3, "user acid=%s", user_acid); ps0380 */
+   ESA_DIAG_printf(comp,3,                             /* ps0380 */
+                   "cmd mode=%d user acid=%s",         /* ps0380 */
+                   mode, user_acid);                   /* ps0380 */
+
+   rc = CTSCRSS_set_authority( &logout_done,
+                               SET_TO_STARTED_TASK_AUTH,
+                               admin_params, err );
+   if ( rc NE ESA_OK )
+       goto exit;
+
+   sprintf(cmd.buffer, main_cmd, user_acid);
+   cmd.max_len = strlen(cmd.buffer);
+   cmd.use_len = strlen(cmd.buffer);
+
+  /*
+   *   Send cmd to TSS
+   */
+
+   rc_cmd = TSS_send_cmd(comp,
+                         /*  TSS_CMD_DEFAULT_MODE, ps0380 */
+                         mode,                  /* ps0380 */
+                         &cmd, cmd_handle, FALSE, dest, msgs);
+   if ( rc_cmd NE ESA_OK )
+      goto exit;
+
+  /*
+   * Calculate number of output lines
+   */
+
+   memcpy(tmp_handle, cmd_handle, sizeof(cmd_handle) );
+   rc_p = TSS_get_output(comp, tmp_handle, &ret_buf, dest, msgs);
+   if ( rc_p EQ ESA_FATAL)
+       goto exit;
+
+   while (rc_p NE ESA_EOF) {
+        i_trap++;
+        rc_p = TSS_get_output(comp, tmp_handle, &ret_buf, dest, msgs);
+        if ( rc_p EQ ESA_FATAL)
+            goto exit;
+   }
+
+   rc_p = ESA_OK;
+
+   ESA_DIAG_printf(comp,6, "Detected %d output lines", i_trap );
+
+  /*
+   *  Create trap command handle
+   */
+
+   i_trap += 2;
+
+   if ( (*trap_buffer) EQ NULL) {
+     rc = TSS_alloc_cnn_trap_handle (comp, i_trap, &tmp, dest, msgs );
+     ESA_DIAG_printf(comp,2,                               /*IS10027*/
+                     "tmp for output lines at=<%x>",tmp);
+     if ( rc NE ESA_OK )
+        goto exit;
+   }
+   else {
+      tmp = *trap_buffer;
+      rc = TSS_realloc_cnn_trap_buffer(comp, tmp, i_trap, dest, msgs);
+      if ( rc NE ESA_OK )
+        goto exit;
+   }
+
+   rc_p = TSS_get_output(comp, cmd_handle, &ret_buf, dest, msgs);
+   if ( rc_p EQ ESA_FATAL )
+       goto exit;
+
+  /*
+   *  Save obtained connections
+   */
+
+   while (rc_p NE ESA_EOF) {
+     if ( rc_p EQ ESA_OK)  {
+       handle.start_line_ptr   = ret_buf.buffer;
+       handle.current_line_ptr = ret_buf.buffer;
+
+       ESA_DIAG_printf (comp, 10, "Obtained data=%s",ret_buf.buffer);
+
+       rc1 = TSS_identify_rec(comp, &handle, &line_desc[0],dest,msgs);
+       if ( rc1 NE ESA_SKIP ) {      /* Record found */
+
+         token = handle.current_line_ptr;
+
+         ESA_DIAG_printf (comp, 10,
+                          "var=%d/%s max_var_len=%d",
+                          strlen(token), token , sizeof(get_acid) );
+
+         rc=TSS_check_param_overflow(comp, NULL, NULL, NULL,
+                                     strlen(token), sizeof(get_acid),
+                                     dest,msgs);
+         if ( rc NE ESA_OK )
+           goto exit;
+         else
+            strcpy(get_acid, token);
+
+         ESA_DIAG_printf (comp, 5, "user_acid=%s get_acid=%s",
+                          user_acid, get_acid);
+
+         if ( strcmp(user_acid, get_acid) NE 0 ) {
+            rc = TSS_save_user_cnn_list(comp, tmp,
+                                        user_acid, get_acid,
+                                        dest, msgs );
+            if ( rc NE ESA_OK )
+               goto exit;
+         }
+       } /* record identified */
+     } /* rc = ESA_OK after get_output */
+     else  if ( rc_p EQ ESA_FATAL)
+       goto exit;
+
+      rc_p = TSS_get_output(comp, cmd_handle, &ret_buf, dest, msgs);
+   }
+
+   TSS_create_cnn_relative_info(comp, tmp);
+
+   rc_p = ESA_OK;
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   rc_f = TSS_free_output(comp, cmd_handle, dest, msgs);
+
+   if ( ( rc_cmd NE ESA_OK ) OR
+        ( rc_p   NE ESA_OK ) OR
+        ( rc_f   NE ESA_OK )  )
+     rc = ESA_FATAL;
+
+  if (logout_done)
+    CTSCRSS_set_authority( &logout_done,
+                           RETURN_FROM_STARTED_TASK_AUTH,
+                           admin_params, err );
+
+  *trap_buffer = tmp;
+  ESA_DIAG_printf(comp,2,                               /*IS10027*/
+                  "trap_buffer is set with tmp=<%x>",trap_buffer);
+
+  ESA_DIAG_exit(comp, 6, func, rc);
+
+  return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_get_ug_connections                     *
+ *                                                             *
+ * DESCRIPTION    : For entering grp  acid issue TSS command   *
+ *                  and save obtained connections              *
+ *                                                             *
+ * INPUT          : comp        - diag component               *
+ *                  ug_acid     - ug acid                      *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : trap_buffer - connection info              *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_get_ug_connections(ESA_DIAG_COMP_typ         comp,
+     /* ps0380 */         TSS_CMD_MODE_typ               mode,
+                          char                         * ug_acid,
+                          TSS_TRAP_CNN_BUF_rec_typ    ** trap_buffer,
+                          ADMIN_PARAMS_rec_typ         * admin_params,
+                          ERR_STRUCT_rec_typ           * err)
+ {
+
+  /*
+   *    Local Variables
+   */
+
+   static char func[]="TSS_get_ug_connections";
+
+   static char   *main_cmd = " LIST(%s) DATA(EXPIRE,ACIDS) ";
+   TSS_LIST_HANDLE_rec_typ      handle;
+   CTSAMSG_HANDLE_rec_typ     * msgs;
+   CTSAMSG_DEST_TABLE_rec_typ * dest;
+   TSS_TRAP_CNN_BUF_rec_typ   * tmp = NULL;
+   ESA_RC                       rc  = ESA_OK;
+   ESA_RC                       rc1 = ESA_OK;
+   ESA_RC                       rc_cmd = ESA_OK,
+                                rc_p = ESA_OK,
+                                rc_f = ESA_OK;
+   int                          i_trap = 0;
+   int                          logout_done = 0;
+   TSS_CMD_BUF_rec_typ          ret_buf;
+   TSS_CMD_BUF_rec_typ          cmd = { 0, 0, "" };
+   char                         cmd_handle[TSS_CMD_HANDLE_LEN];
+   char                         tmp_handle[TSS_CMD_HANDLE_LEN];
+   char                         temp[MAX_TSS_PARAM_LEN];
+   char                        *token;
+   char                        *wptr;
+
+ /********************************************************************
+  *   ACCESSORID = CTSPRF1   NAME       = TEST PROFILE #1            *
+  *   ACID = CTSUSR1    UNTIL(11/11/98)                              *
+  *   ACID = CTSUSR2-ZC UNTIL(11/11/98)                              *
+  *   ACID = CTSUSR5                                                 *
+  ********************************************************************/
+
+  static char            user_acid[TSS_USER_NAME_LEN + 1];
+  static char            work[MAX_TSS_PARAM_LEN + 1];
+  /*WS10082 static char  expiration[MAX_TSS_PARAM_LEN + 1];        */
+  static char            expiration[20 + 1];              /*WS10082*/
+  static char           *acid_k[]={"ACID", "=", NULL};
+  static TSS_OUTP_typ    acid_d[] = {
+                     { sizeof(user_acid),   user_acid },
+                     { sizeof(expiration),  expiration},
+                     { 0,                NULL    } };
+  TSS_LIST_LINE(acid, LIST_ACCESSORID, CURRENT_LINE);
+
+  static TSS_OUTPUT_typ  line_desc[] = {
+        { &acid,     NULL   },
+        { NULL,      NULL   } };
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 6, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   /* ESA_DIAG_printf(comp,3, "ug acid=%s", ug_acid);   ps0380 */
+   ESA_DIAG_printf(comp,3,                           /* ps0380 */
+                   "cmd mode=%d ug acid=%s",         /* ps0380 */
+                   mode, ug_acid);                   /* ps0380 */
+
+   rc = CTSCRSS_set_authority( &logout_done,
+                               SET_TO_STARTED_TASK_AUTH,
+                               admin_params, err );
+   if ( rc NE ESA_OK )
+       goto exit;
+
+   sprintf(cmd.buffer, main_cmd, ug_acid);
+   cmd.max_len = strlen(cmd.buffer);
+   cmd.use_len = strlen(cmd.buffer);
+
+  /*
+   *   Send cmd to TSS
+   */
+
+   rc_cmd = TSS_send_cmd(comp,
+                         /* TSS_CMD_DEFAULT_MODE,   ps0380 */
+                         mode,                   /* ps0380 */
+                         &cmd, cmd_handle, FALSE, dest, msgs);
+   if ( rc_cmd NE ESA_OK )
+      goto exit;
+
+  /*
+   * Calculate number of output lines
+   */
+
+   memcpy(tmp_handle, cmd_handle, sizeof(cmd_handle) );
+   rc_p = TSS_get_output(comp, tmp_handle, &ret_buf, dest, msgs);
+   if ( rc_p EQ ESA_FATAL)
+       goto exit;
+
+   while (rc_p NE ESA_EOF) {
+        i_trap++;
+        rc_p = TSS_get_output(comp, tmp_handle, &ret_buf, dest, msgs);
+        if ( rc_p EQ ESA_FATAL)
+            goto exit;
+   }
+
+   rc_p = ESA_OK;
+
+   ESA_DIAG_printf(comp,6, "Detected %d output lines", i_trap );
+
+  /*
+   *  Create trap command handle
+   */
+
+   i_trap += 2;
+
+   if ( (*trap_buffer) EQ NULL) {
+     rc = TSS_alloc_cnn_trap_handle (comp, i_trap, &tmp, dest, msgs );
+     ESA_DIAG_printf(comp,2,                               /*IS10027*/
+                     "ug:tmp for output lines at=<%x>",tmp);
+     if ( rc NE ESA_OK )
+        goto exit;
+   }
+   else {
+      tmp = *trap_buffer;
+      rc = TSS_realloc_cnn_trap_buffer(comp, tmp, i_trap, dest, msgs);
+      if ( rc NE ESA_OK )
+        goto exit;
+   }
+
+   rc_p = TSS_get_output(comp, cmd_handle, &ret_buf, dest, msgs);
+   if ( rc_p EQ ESA_FATAL )
+       goto exit;
+
+  /*
+   *  Save obtained connections
+   */
+
+   while (rc_p NE ESA_EOF) {
+     if ( rc_p EQ ESA_OK)  {
+       handle.start_line_ptr   = ret_buf.buffer;
+       handle.current_line_ptr = ret_buf.buffer;
+
+       ESA_DIAG_printf (comp, 10, "Obtained data=%s",ret_buf.buffer);
+
+       rc1 = TSS_identify_rec(comp, &handle, &line_desc[0],dest,msgs);
+       if ( rc1 NE ESA_SKIP ) {      /* Record found */
+
+         token = handle.current_line_ptr;
+
+         /***   Obtaine user acid   ***/
+
+         ESA_DIAG_printf (comp, 10,
+                          "var=%d/%s max_var_len=%d",
+                          strlen(token), token , sizeof(user_acid) );
+
+         /***   Check overflow aginst max tss params length ***/
+
+         rc=TSS_check_param_overflow(comp, NULL, NULL, NULL,
+                                     strlen(token),sizeof(temp),
+                                     dest,msgs);
+         if (rc NE ESA_OK)
+           goto exit;
+         else
+           strcpy(temp, token);   /* user acid */
+
+         /*** Now, check additional (unnecessary) info ***/
+
+         /* Deleted by PS0316         */
+         /* wptr = strchr(temp, '-'); */   /* Search addinfo sign */
+         /* if (wptr)                 */   /* If found,           */
+         /*  *wptr = NULL_CHAR;       */   /* Remove it           */
+
+
+         if ( temp[8] EQ '-' )       /* PS0316 */
+            temp[8] = NULL_CHAR;     /* PS0316 */
+
+         rc=TSS_check_param_overflow(comp, NULL, NULL, NULL,
+                                     strlen(temp),sizeof(user_acid),
+                                     dest,msgs);
+         if (rc NE ESA_OK)
+           goto exit;
+         else
+            strcpy(user_acid, temp);
+
+         expiration[0] = NULL_CHAR;
+         token = strtok(NULL, " \n");
+         while (token)  {
+           if ( strlen(token) LT sizeof(expiration) ) {
+              strcpy(work, token);  /* UNTIL(11/1189) */
+              wptr = strstr(work, "UNTIL(");
+              if ( wptr )  {
+                 strcpy(expiration, wptr + 6);
+                 TSS_strip_val(expiration, ')' ,TSS_STRIP_BOTH);
+                 TSS_ConvertDateTSS2ESS(comp, expiration, dest, msgs);
+              }
+           }
+           token = strtok(NULL, " \n");
+         }
+
+         ESA_DIAG_printf (comp, 5, "user_acid=%s expiration=%s",
+                          user_acid, expiration);
+
+         rc = TSS_save_ug_cnn_list(comp, tmp, ug_acid,
+                                   user_acid, expiration,
+                                   dest, msgs );
+            if ( rc NE ESA_OK )
+               goto exit;
+       } /* record identified */
+     } /* rc = ESA_OK after get_output */
+     else  if ( rc_p EQ ESA_FATAL)
+       goto exit;
+
+      rc_p = TSS_get_output(comp, cmd_handle, &ret_buf, dest, msgs);
+   }
+
+   rc_p = ESA_OK;
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   rc_f = TSS_free_output(comp, cmd_handle, dest, msgs);
+
+   if ( ( rc_cmd NE ESA_OK ) OR
+        ( rc_p   NE ESA_OK ) OR
+        ( rc_f   NE ESA_OK )  )
+     rc = ESA_FATAL;
+
+  if (logout_done)
+    CTSCRSS_set_authority( &logout_done,
+                           RETURN_FROM_STARTED_TASK_AUTH,
+                           admin_params, err );
+
+  *trap_buffer = tmp;
+  ESA_DIAG_printf(comp,2,                               /*IS10027*/
+                  "trap_buffer is set with tmp=<%x>",trap_buffer);
+
+  ESA_DIAG_exit(comp, 6, func, rc);
+
+  return rc;
+
+ }
+

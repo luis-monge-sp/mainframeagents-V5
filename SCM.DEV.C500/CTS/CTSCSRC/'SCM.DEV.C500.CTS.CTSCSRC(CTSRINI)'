@@ -1,0 +1,548 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Initialize RACF api                      *
+ *                                                             *
+ * File Name        : ctsrini.c                                *
+ *                                                             *
+ * Author           : A.Shv                                    *
+ *                                                             *
+ * Creation Date    : 31/07/94                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * IS0153   MichaelC 30Dec2003 Use callable services           *
+ * IS0263   AvnerL   04Aug2004 Verify RACF ver once at apiinit *
+ * IS0322   AvnerL   05Aug2005 Support z/OS 1.7.               *
+ * IS10002  AvnerL   31Jan2007 set VERIFY_PASSWORD_BY_LOGIN val*
+ *                             & implement IS0381 of V3103.    *
+ * WS10004  AvnerL   11Jun2007 regret from adding global var.  *
+ * BS10006  MeirS    28Aug2007 REVOKE/RESUME for z/os 1.7      *
+ * WS10013  AvnerL   06Nov2007 Add LOGIN_INTERCEPT parm.       *
+ * IS10076  NuritY   07/05/12  Support Custom Fields.          *
+ * IS10100  NuritY   29/07/13  Support CTSA internal custom    *
+ *                             fields (CTSACFs)                *
+ * WS10054  SeligT   26/07/16  Add ENQ/DEQ SYSTEMS RNL Parm    *
+ * sasc     NuritY   07/09/16 Standards...                     *
+ * SAS2IBMT SeligT   05/02/17 SAS/C to IBM C Conversion Project*
+ * SAS2IBMN NuritY   05/02/17 SAS/C to IBM C Conversion Project*
+ * IS10161  MeirS    09/11/17 remove calling to CTSRVRS rtns   *
+ * IS10174  NuritY   31/12/17 1. Dyncamic EXECUOT support.     *
+ *                            2. Move VERIFY_BY_LOGIN to       *
+ *                               common params.                *
+ * IS10182  AvnerL   17/07/19  S0C4/S0C1 due to DIAG vsprintf  *
+ * IS10184  NuritY   31/08/21  Improve scripts performance     *
+ * ws10082  MauriC   10/08/22  Add global vars for ADDINFO chg *
+ ***************************************************************/
+
+ /* IS10174
+ #define VERIFY_PASSWORD_BY_LOGIN "VERIFY_PASSWORD_BY_LOGIN"  *IS10002*
+ */
+ #define LOGIN_INTERCEPT          "LOGIN_INTERCEPT"          /*IS10013*/
+ #define CUSTOM_FIELDS_SUPPORT    "CUSTOM_FIELDS_SUPPORT"    /*IS10076*/
+ #include <globs.h>
+
+ /* WSN10082 */
+ #include   ESA_API_CODES                                 /* IS0381 */
+ #include ESA_API
+ #include ESA_DIAG
+ /* IS0153 */
+ /* sasc   #include <CTSCSRV.h> */
+ #include MVS_SRV                                          /* sasc   */
+ #include API_AUTH                                        /* IS10174 */
+
+ /* is0263 - add RACF include files below */
+ #include RACF
+ #include RACF_CODES
+
+ /* WSN10082 */
+ /*#include   ESA_API_CODES                               * IS0381 */
+ #include   STDIO                                          /* IS0381 */
+ #include   STDLIB                                         /* IS0381 */
+ #include   STRING                                         /* IS0381 */
+
+ /* ws10082 - store ref to admin_params */
+ ADMIN_PARAMS_rec_typ * admin_params_copy;
+ /* ws10082 - store ref to admin params */
+
+
+/********************************************************************
+ *
+ * Procedure Name : apiinit
+ *
+ * Description    : API initialization
+ *
+ * Input          : admin
+ *
+ * Output         : err
+ *
+ * Input/Output   : addinfo,
+ *
+ * Return Value   : ESA_RC
+ *
+ * Side Effects   :
+ *
+ * Comments       : Platform-dependent operations to be performed
+ *                  prior to any API call.
+ *
+ * DIAG levels    : 1 - All functions entry/exit
+ *                : 3 - CTSAPIInit and second-level functions
+ *                :     (functions called by CTSAPIInit)
+ *                : 5 - Third-level functions.
+ *
+ ********************************************************************/
+
+ ESA_RC CTSAPIInit (ADMIN_PARAMS_rec_typ * admin_params,
+                    ERR_STRUCT_rec_typ   * err)
+{
+   char          component[] = "CTSRINI";                /* IS10002*/
+   char          func[] = "CTSAPIInit";                  /* IS0263 */
+   char          real_racf_ver[5] = "";                  /* IS0263 */
+   ESA_RC        rc = ESA_OK ;                           /* IS0263 */
+   RACF_PARAMS_rec_typ * params_ptr = NULL;              /* IS10002 */
+   char  errmsg[81] = "";                                /* IS10002 */
+   RACF_CUSTOM_FIELDS_block_ptr  p_ucfield_block = NULL; /* IS10076 */
+   RACF_CUSTOM_FIELDS_block_ptr  p_gcfield_block = NULL; /* IS10076 */
+   RACF_CUSTOM_FIELDS_block_ptr *pp_ucfield_block = NULL; /* IS10100 */
+   RACF_CUSTOM_FIELDS_block_ptr *pp_gcfield_block = NULL; /* IS10100 */
+   RACF_CTSACF_block_ptr         p_u_ctsacfs = NULL;      /* IS10100 */
+   RACF_CTSACF_block_ptr         p_g_ctsacfs = NULL;      /* IS10100 */
+   int           msg_issued = FALSE;                     /* IS10076 */
+
+   int               i;                                  /* IS10076 */
+   RACF_DYNKDT_typ   dynkdt_types[] = {                  /* IS10076 */
+                              RACF_INSERT_USER,          /* IS10076 */
+                              RACF_UPDATE_USER,          /* IS10076 */
+                              RACF_INSERT_GROUP,         /* IS10076 */
+                              RACF_UPDATE_GROUP };       /* IS10076 */
+
+   #define DYNKDT_NUM sizeof(dynkdt_types) / sizeof(RACF_DYNKDT_typ)
+   int    dynkdt_types_num = DYNKDT_NUM ;                /* IS10076 */
+   RACF_DYNAMIC_KDT_info_typ dynkdt_info[DYNKDT_NUM];    /* IS10076 */
+
+   COMMON_PARAMS_rec_typ      * comm_parms = NULL;       /* IS10174 */
+   RSS_ADMINS_LIST_rec_typ    * admins_list = NULL;      /* IS10174 */
+   int                          do_build = FALSE;        /* IS10184 */
+
+   CTSAMSG_HANDLE_rec_typ     * msgs;                    /* SAS2IBMT */
+   CTSAMSG_DEST_TABLE_rec_typ * dest;                    /* SAS2IBMT */
+ /* IS0153 - no need to initialize Diag
+   char log[]    = NULL_STRING;
+   char shadow[] = NULL_STRING;
+   char progname[] = "CTSAPIInit";
+
+
+      ESA_DIAG_initialize (log, shadow, progname,
+                        &admin_params->esadiag_handle) ;
+ */
+
+   init_global_admin_params(admin_params);    /* IS0153 */
+
+   ADDINFO_spi_init(admin_params);  /* WS10082 store ptr */
+
+   msgs = admin_params->ctsamsg_handle;                  /* SAS2IBMT */
+   dest = admin_params->ctsamsg_dest;                    /* SAS2IBMT */
+   /* IS0263 starts
+    * Verify RACF version only once at apiinit.
+    * If version is not supported, send a Warning message and
+    * continue working.                                       */
+
+   admin_params->cs_func.DIAG_enter_ptr(
+     ESA_COMP_APIINIT, 1, func );
+
+   /*IS10182 admin_params->cs_func.DIAG_printf_ptr(*/
+   ESA_DIAG_printf(                                /*IS10182*/
+     ESA_COMP_APIINIT, 3,
+     "Verify version of %s ", admin_params->rss_type);
+
+  /*  IS10161 start - remove RACF version retrieving                 */
+    /*
+   rc = RACF_version_get(admin_params->rss_type,
+                           real_racf_ver);
+   if ( rc NE ESA_OK )
+     {
+      admin_params->cs_func.DIAG_printf_ptr(
+       ESA_COMP_APIINIT, 0,
+       "Version %s identified for rss_type %s. Operation continues.",
+       real_racf_ver, admin_params->rss_type);
+    */
+    /* "Version %s is not supported for rss_type %s", IS0322*/
+
+       /* SAS2IBMN admin_params->cs_func.MSG_printf_ptr(
+         INVALID_RSS_VER,real_racf_ver);  */
+   /*  CTSAMSG_print(INVALID_RSS_VER, msgs, NULL, dest,     SAS2IBMN */
+   /*                real_racf_ver);                        SAS2IBMN */
+   /*}                                                               */
+    /*
+   admin_params->cs_func.DIAG_printf_ptr(
+     ESA_COMP_APIINIT, 1,
+     "Version %s is supported for rss_type %s",
+     real_racf_ver, admin_params->rss_type);
+    */
+  /*  IS10161 end                                                    */
+
+   /*  IS10076 - DIAG exit message moved to the end
+   admin_params->cs_func.DIAG_exit_ptr(
+     ESA_COMP_APIINIT, 1, func, ESA_OK );                     */
+   /* end of IS0263                                           */
+
+   /********************* IS10002 starts ****************************/
+   /*                     -------------                             */
+   /* When function is first called, do the following:              */
+   /*  1. allocate area for RACF usa-api global parameters.         */
+   /*  2. set MSG_CONNGRP_ERR parm value in it.                     */
+   /********************* Additionals for BS10006 *******************/
+   /*  3. set RESUME_CLEARS_REVOKEDATE value in it.                 */
+   /*  4. set REVOKE_CLEARS_RESUMEDATE value in it.                 */
+   /*****************************************************************/
+   /*  5. set LOGIN_INTERCEPT parm value.                   WS10013 */
+   /*  6. set CUSTOM_FIELDS_SUPPORT value.                  WS10013 */
+   /*  7. Crate the Custom Field Blocks                     IS10076 */
+   /*  8. Crate the Dynamic KDTs.                           IS10076 */
+   /*  9. Allocate the Common params.                       IS10174 */
+   /* 10.  Allocate and initialize the Administrators list  IS10174 */
+   /* 11.  Set allocated area addr in admin_params->apiinit_handle. */
+   /*****************************************************************/
+
+   /* IS10184 - start                                             */
+   /*           we build tha params block when:                   */
+   /*           1. No parameters block exists.                    */
+   /*           2. A parameter block exists but there is no       */
+   /*              common_params block.                           */
+   /*           3. A common_params block exists, and the          */
+   /*              PARASM_type in it is not us.                   */
+   /*                                                             */
+   /*           We do not build the params block When there is    */
+   /*           a parameters block pointing to a common_params    */
+   /*           block, and the PARAMS_type is ours.               */
+
+   /* IS10184 if (admin_params->apiinit_handle EQ 0) */
+   if (admin_params->apiinit_handle NE NULL) /* there is params_block */
+   {
+     GET_P_CMNPRMS(admin_params, comm_parms, rc, NULL)
+     if (comm_parms EQ NULL)  /* When no Common_params */
+       do_build = TRUE;       /* ... create all */
+     else                     /* common_[arams exists */
+       /* check params block type */
+       if (comm_parms->PARAMS_type EQ PARAMS_TYPE_RACF)  /* ours ? */
+         do_build = FALSE;   /* yes, no need to re-create */
+       else
+         do_build = TRUE;    /* no - probably dummy - recreate */
+   }
+   else
+     do_build = TRUE;
+   /* IS10184 - end */
+
+   if (do_build)                                          /* IS10184 */
+   {
+   /*  1. allocate area for RACF usa-api global parameters.       */
+   /*IS10182admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT, 3,*/
+    ESA_DIAG_printf(ESA_COMP_APIINIT, 3,                 /*IS10182*/
+       "Allocating <%d> bytes for RACF_PARAMS ",
+       sizeof(RACF_PARAMS_rec_typ));
+    params_ptr = malloc(sizeof(RACF_PARAMS_rec_typ));
+    if (params_ptr EQ NULL)
+     {
+      sprintf(errmsg,"RACF_PARAMS in comp=%s fn=%s",component,func);
+      /* SAS2IBMN admin_params->cs_func.MSG_printf_ptr (
+          ERR_MALLOC, errmsg,sizeof(RACF_PARAMS_rec_typ)); */
+       CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,       /* SAS2IBMN */
+                     errmsg,sizeof(RACF_PARAMS_rec_typ));/* SAS2IBMN */
+      rc = ESA_FATAL;
+      goto exit;
+     }
+    else
+     {
+     /*IS1018admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,3,*/
+      ESA_DIAG_printf(ESA_COMP_APIINIT, 3,               /*IS10182*/
+      "RACF_PARAMS allocated at %X",params_ptr);
+    /*params_ptr->db2_open_done = FALSE;               /* BS2679 */
+     }
+    /*  2. set MSG_CONNGRP_ERR parm value in it.                   */
+    rc = admin_params->cs_func.rssprm_get_opt_ptr(
+                    admin_params->rss_name,
+                    MSG_CONNGRP_ERR,
+                    sizeof(params_ptr->rssparm_MSG_CONNGRP_ERR),
+                    params_ptr->rssparm_MSG_CONNGRP_ERR,
+                    OPT_TRUE,
+                    OPT_TRUE) ;
+    /*IS10182admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,3,*/
+    ESA_DIAG_printf(ESA_COMP_APIINIT, 3,                   /*IS10182*/
+      "MSG_CONNGRP_ERR = <%s> ,rc = <%d> ",
+      params_ptr->rssparm_MSG_CONNGRP_ERR, rc);
+
+    if (rc NE ESA_OK) {                                  /* IS10001 */
+      params_ptr->rssparm_MSG_CONNGRP_ERR[0] = MSG_CONNGRP_ERR_ON ;
+      rc = ESA_OK; /*parm is not mandatory, set rc=0     /* IS10001 */
+      }                                                  /* IS10001 */
+
+    /* IS10174 - the field is moved to common parameters and
+                 the code is moved to CTSCSRV
+     *   . set VERIFY_PASSWORD_BY_LOGIN parm value in it.           *
+    rc = admin_params->cs_func.rssprm_get_opt_ptr(
+                    admin_params->rss_name,
+                    VERIFY_PASSWORD_BY_LOGIN,
+                    sizeof(params_ptr->rssparm_VERIFY_PASS_LOGIN),
+                    params_ptr->rssparm_VERIFY_PASS_LOGIN,
+                    OPT_TRUE,
+                    OPT_TRUE) ;
+    admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT, 3,
+      "VERIFY_PASSWORD_BY_LOGIN = <%s> ,rc = <%d> ",
+      params_ptr->rssparm_VERIFY_PASS_LOGIN, rc);
+
+    if (rc NE ESA_OK) {  * default for RACF is 'N'-password compare*
+      params_ptr->rssparm_VERIFY_PASS_LOGIN[0] = 'N';
+      rc = ESA_OK;  *parm is not mandatory, set rc=0 *
+      }
+    */
+
+  /*  3. BS10006 Retrieve RSSPARM: RESUME_CLEARS_REVOKEDATE */
+   rc = admin_params->cs_func.rssprm_get_opt_ptr(
+                   admin_params->rss_name,
+                   RES_CLR_REV,
+                   sizeof(params_ptr->rssparm_RES_CLR_REV),
+                   params_ptr->rssparm_RES_CLR_REV,
+                   OPT_TRUE,
+                   OPT_TRUE) ;
+   if (rc EQ ESA_OK)
+    /*IS10182admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,3,*/
+     ESA_DIAG_printf(ESA_COMP_APIINIT, 3,           /*IS10182*/
+                     "RESUME PARM: %s = %s",
+                     RES_CLR_REV,
+                     params_ptr->rssparm_RES_CLR_REV);
+   else {  /* default for RACF is 'N'= don't clear    */
+      params_ptr->rssparm_RES_CLR_REV[0] = RES_CLR_REV_OFF;
+      rc = ESA_OK; /*parm is not mandatory, set rc=0 */
+      }
+
+  /*  4. BS10006 Retrieve RSSPARM: REVOKE_CLEARS_RESUMEDATE */
+   rc = admin_params->cs_func.rssprm_get_opt_ptr(
+                   admin_params->rss_name,
+                   REV_CLR_RES,
+                   sizeof(params_ptr->rssparm_REV_CLR_RES),
+                   params_ptr->rssparm_REV_CLR_RES,
+                   OPT_TRUE,
+                   OPT_TRUE) ;
+   if (rc EQ ESA_OK)
+    /*IS10182admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,3,*/
+     ESA_DIAG_printf(ESA_COMP_APIINIT, 3,             /*IS10182*/
+                     "REVOKE PARM: %s = %s",
+                     REV_CLR_RES,
+                     params_ptr->rssparm_REV_CLR_RES);
+   else {  /* default for RACF is 'N'= don't clear    */
+      params_ptr->rssparm_REV_CLR_RES[0] = REV_CLR_RES_OFF;
+      rc = ESA_OK; /*parm is not mandatory, set rc=0 */
+      }
+  /*  BS10006 Retrieve RSSPARM: RESUME_CLEARS_REVOKEDATE ==> end */
+
+  /***************  start of WS10054  ********************/
+  /*   . set common usaapi parameters.                   */
+  /*  See comments related to this fix in CTSCSRV.
+  set_common_usaapi_parms(admin_params,
+                         (DUMMY_PARAMS_rec_typ *) params_ptr); */
+  /***************  end of WS10054  **********************/
+
+    /*************************** WS10013 start ***********************
+     * The code below setting LOGIN_INTERCEPT is here for doc purpose
+       only. This parameter is relevant for the Interceptors only. */
+
+     /* 5. set LOGIN_INTERCEPT parm value in it.           */
+    rc = admin_params->cs_func.rssprm_get_opt_ptr(
+                    admin_params->rss_name,
+                    LOGIN_INTERCEPT,
+                    sizeof(params_ptr->rssparm_LOGIN_INTERCEPT),
+                    params_ptr->rssparm_LOGIN_INTERCEPT,
+                    OPT_TRUE,
+                    OPT_TRUE) ;
+    /*IS10182admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,3,*/
+    ESA_DIAG_printf(ESA_COMP_APIINIT, 3,                 /*IS10182*/
+      "LOGIN_INTERCEPT = <%s> ,rc = <%d> ",
+      params_ptr->rssparm_LOGIN_INTERCEPT, rc);
+
+    if (rc NE ESA_OK) { /* default for RACF is 'Y'-password compare*/
+      params_ptr->rssparm_LOGIN_INTERCEPT[0] = 'Y';
+      rc = ESA_OK; /*parm is not mandatory, set rc=0 */
+      }
+    /*************************** WS10013 end   ***********************
+
+    /*************************** IS10076 start **********************/
+    /* 6. set CUSTOM_FIELS_SUPPORT value in it.           */
+    rc = admin_params->cs_func.rssprm_get_opt_ptr(
+                    admin_params->rss_name,
+                    CUSTOM_FIELDS_SUPPORT,
+                    sizeof(params_ptr->rssparm_CUSTOM_FIELDS_SUPPORT),
+                    params_ptr->rssparm_CUSTOM_FIELDS_SUPPORT,
+                    OPT_TRUE,
+                    OPT_TRUE) ;
+    /*IS10182admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,3,*/
+    ESA_DIAG_printf(ESA_COMP_APIINIT, 3,                 /*IS10182*/
+      "CUSTOM FIELDS SUPPORT = <%s> ,rc = <%d> ",
+      params_ptr->rssparm_CUSTOM_FIELDS_SUPPORT, rc);
+
+    if (rc NE ESA_OK) { /* default 'N' - do not support custom fields */
+      params_ptr->rssparm_CUSTOM_FIELDS_SUPPORT[0] = 'N';
+      rc = ESA_OK; /*parm is not mandatory, set rc=0 */
+      }
+
+    /* 7. Call RACF_Create_CFields_Blocks to retrieve the Custom
+          Fields definitions, and save them in Custom Field
+          Blocks (CFBs) chained on RACF params.                   */
+
+    params_ptr->p_user_CFields = NULL;    /* Initialize...        */
+    params_ptr->p_group_CFields = NULL;   /*   ... pointers.      */
+    params_ptr->p_u_ctsacfs = NULL;    /* Initialize...   IS10100 */
+    params_ptr->p_g_ctsacfs = NULL;    /*   ... pointers. IS10100 */
+
+    if (params_ptr->rssparm_CUSTOM_FIELDS_SUPPORT[0] EQ 'Y')
+    {
+      pp_ucfield_block = &p_ucfield_block;               /* IS10100 */
+      pp_gcfield_block = &p_gcfield_block;               /* IS10100 */
+    }                                                    /* IS10100 */
+    /* IS10100
+      rc = RACF_Create_CField_Blocks(ESA_COMP_APIINIT,
+                                     &p_ucfield_block,
+                                     &p_gcfield_block,
+                                     &msg_issued, admin_params);  */
+      rc = RACF_Init_Custom_Fields(ESA_COMP_APIINIT,      /* IS10100 */
+                                     pp_ucfield_block,    /* IS10100 */
+                                     pp_gcfield_block,    /* IS10100 */
+                                     &p_u_ctsacfs,        /* IS10100 */
+                                     &p_g_ctsacfs,        /* IS10100 */
+                                     &msg_issued,         /* IS10100 */
+                                     admin_params);       /* IS10100 */
+      /* IS10100 if (rc EQ ESA_OK) /* blocks created successfully... */
+      if (rc LT ESA_ERR) /* blocks created successfully...   IS10100 */
+      {
+        params_ptr->p_user_CFields = p_ucfield_block;   /* hang...  */
+        params_ptr->p_group_CFields = p_gcfield_block;  /*  ...them */
+        params_ptr->p_u_ctsacfs = p_u_ctsacfs;  /* hang...  IS10100 */
+        params_ptr->p_g_ctsacfs = p_g_ctsacfs;  /*  ...them IS10100 */
+
+        /* IS10100 - remove messages, done by RACF_Init_Custom_Fields
+        admin_params->cs_func.MSG_printf_ptr(RACF_CFIELDS_LOADED);
+        */
+      }
+        /* IS10100 - remove messages, done by RACF_Init_Custom_Fields
+      else
+        if (NOT msg_issued)        * if error and no msg, issue msg *
+          admin_params->cs_func.MSG_printf_ptr(
+                        RACF_CFIELDS_LOAD_FAILED);
+        */
+    /* IS10100  }  */
+
+    /*  8. Call RACF_Create_KDTs to create the KDTs for Add User,
+           Update User, Add Group and Update Group and chain them
+           on RACF params.                                           */
+    rc = RACF_Init_Dynamic_KDTs(ESA_COMP_APIINIT, dynkdt_types,
+                                dynkdt_types_num, params_ptr,
+                                dynkdt_info, admin_params);
+
+    if (rc EQ ESA_OK)     /* blocks created successfully...       */
+    {
+      for (i=0; i LT dynkdt_types_num; i++)
+      {
+        switch (dynkdt_types[i])
+        {
+          case RACF_INSERT_USER:
+            params_ptr->iu_kdt = dynkdt_info[i];
+            break;
+          case RACF_UPDATE_USER:
+            params_ptr->uu_kdt = dynkdt_info[i];
+            break;
+          case RACF_INSERT_GROUP:
+            params_ptr->ig_kdt = dynkdt_info[i];
+            break;
+          case RACF_UPDATE_GROUP:
+            params_ptr->ug_kdt = dynkdt_info[i];
+            break;
+          default:
+            break;
+        }
+      }
+    }
+    else
+      /* SAS2IBMN admin_params->cs_func.MSG_printf_ptr(
+                      RACF_DYNKDT_CREATE_FAILED);   */
+       CTSAMSG_print(RACF_DYNKDT_CREATE_FAILED,          /* SAS2IBMN */
+                     msgs, NULL, dest);                  /* SAS2IBMN */
+
+
+    /*************************** IS10076 end   **********************/
+
+   /* IS10174 - start */
+   /*
+    *   9. Allocate the Common params.
+    *
+    *     If we were called after common_params was created and is
+    *     pointed to by dummy_params, we do not need to create a
+    *     new block. Justtake the address we retrieved from the
+    *     dummy_params block.
+    */
+    if (comm_parms EQ NULL)  /* if not allocated yet...    * IS10184 */
+    {                                                     /* IS10184 */
+      /* IS10184
+      rc = Common_params_Handle ("INIT", &comm_parms, admin_params); */
+      rc = Common_params_Handle ("INIT",                  /* IS10184 */
+                                 COMMON_PARAMS_OWNER_SPI, /* IS10184 */
+                                 &comm_parms,             /* IS10184 */
+                                 admin_params);           /* IS10184 */
+      /*IS10182 admin_params->cs_func.DIAG_printf_ptr(*/
+      ESA_DIAG_printf(                            /*IS10182*/
+                      ESA_COMP_APIINIT, 3,
+                      "Common_params_Handle(INIT): rc = %d   area=%8X",
+                      rc, comm_parms);
+      if (rc NE ESA_OK)
+        goto exit;
+    };                                                    /* IS10184 */
+
+    comm_parms->PARAMS_type = PARAMS_TYPE_RACF;           /* IS10184 */
+    params_ptr->common_params = comm_parms;
+
+    /* IS10184 - the code bellow was moved to Common_params_handle
+                 to be executed each time comon_params is created
+                 either by CC or by SPI.
+   /@
+    *  10. Allocate and initialize the Administrators list
+    @/
+    rc = CTSCRSS_AdminsList_Handle ("INIT",
+                       (RSS_ADMINS_LIST_rec_typ **)&admins_list,
+                        ESA_COMP_APIINIT,
+                        admin_params);
+
+    /@IS10182 admin_params->cs_func.DIAG_printf_ptr(@/
+    ESA_DIAG_printf(                          /@IS10182@/
+                    ESA_COMP_APIINIT, 3,
+                    "AdminsLIst_Handle(INIT): rc = %d   area=%8X",
+                    rc, admins_list);
+    if (rc NE ESA_OK)
+      goto exit;
+
+    params_ptr->common_params->RSS_Admins_list = (void *)admins_list;
+     end of removed code - IS10184 */
+
+   /* IS10174 - end   */
+
+   /*  11. Set allocated area addr in admin_params->apiinit_handle. */
+
+    /* If dummy_params exist, free it                        IS10184 */
+    if (admin_params->apiinit_handle NE NULL)             /* IS10184 */
+      free (admin_params->apiinit_handle);                /* IS10184 */
+
+    admin_params->apiinit_handle = params_ptr;
+   }
+ exit:                                                    /* IS0381 */
+   /* IS10001 return rc...and not ESA_OK ... */
+   admin_params->cs_func.DIAG_exit_ptr(                     /*IS10076*/
+                ESA_COMP_APIINIT, 1, func, rc);             /*IS10076*/
+   return rc;
+   /***************** end of IS0381 *********************************/
+
+}
+

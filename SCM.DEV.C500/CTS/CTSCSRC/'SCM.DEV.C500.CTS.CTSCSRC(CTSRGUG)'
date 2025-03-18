@@ -1,0 +1,1549 @@
+/**************************************************************
+*                                                             *
+* Title            : Get group information (RACF)             *
+*                                                             *
+* File Name        : ctsrgug.c                                *
+*                                                             *
+* Author           : Alexander Shvartsman                     *
+*                                                             *
+* Creation Date    : 12/04/94                                 *
+*                                                             *
+* Description      :                                          *
+*                                                             *
+* Assumptions and                                             *
+*   Considerations :                                          *
+*                                                             *
+**************************************************************/
+
+/**************************************************************
+* Mod.Id   Who          When     Description                  *
+* -------- --------  -------  ------------------------------- *
+* ASHV1    Alex     12/01/95  Added support for mode=wild     *
+*                                                             *
+* AS1902   Alex     19/02/95  Change extractor debug component*
+*                                                             *
+* r0003    Doron    28/05/95  Use malloc for output line      *
+*                                                             *
+* AS0309   Alex     03/09/95  Add DEBUG prints                *
+*                                                             *
+* spr163   Alex     05/09/95  Support Download restart        *
+*                                                             *
+* spr...   Alex     05/09/95  Correct Support Download restart*
+* spr...   Alex     03/01/96  New emplamantation of restart   *
+* ps0004   Alex     09/10/96  Adjust to new common code       *
+* BS2703   yonim    26/03/06 Support Multi subgroup keyword   *
+* WS10004  AvnerL   05/06/07 Extend ICHEINTY & add SUBGROUP3  *
+* BS10008  AvnerL   25/03/08 1 more parm to RACF_Extract      *
+* IS10076  NuritY   31/01/13 Support Custom Fields.           *
+* IS10100  NuritY   19/10/13 changes required because of      *
+*                            CTSACF feature support for USER. *
+* SAS2IBMT SeligT   09/10/16 SAS/C to IBM C Conversion Project*
+* IS10181  SeligT   06/06/19 Display Message When ADDINFO     *
+*                            Value Is Too Large - No Change;  *
+*                            Recompile Because of Larger      *
+*                            RACF_OUTPUT_SIZE                 *
+* WS10082  MauriC   07/11/22 Recompile for new ADDINFO macros *
+**************************************************************/
+
+#include   <globs.h>
+
+/*
+ *   Standard include files
+ */
+
+#include   STDIO
+#include   STDLIB
+#include   STRING
+
+/*
+ *   ESA include files
+ */
+
+#include   ESA_API
+#include   ESA_DIAG
+#include   ESA_CTSAMSG
+#include   ESA_API_CODES
+
+#include   MVS_COMP
+#include   MVS_CODES                                     /* IS10076 */
+
+#include   RACF_CODES
+#include   RACF
+
+/*
+ *  A list of special keywords :
+ *
+ *  When extracting information from RACF data base
+ *  the values of these keywords will be put in the local
+ *  addinfo, and copied from there to UG_PARAMS structure
+ *
+ */
+
+ static char   *spec_keywords[]={"GROUP","SUPGROUP",""} ;
+ static short  num_spec_keywords = 10 ;
+
+ static char   component[]="GETUGS" ;
+
+/*
+ *     Entry structure
+ */
+
+#define GRP_EYECATCHER         "GRP "
+
+typedef struct S_ENTRY    {
+   char            eyecatcher[4];      /* eyecatcher 'GRP'          */
+   char            entry_name[RCF_UG_NAME_LEN+1] ;
+   char            entry_prefix[RCF_UG_NAME_LEN+1] ;
+   char            wild_op_code[10];   /* locate/next (for wild)    */
+   short           star_flag;          /* prefix with(*)=1,else=0   */
+   short           entry_prefix_len ;  /* prefix len (for wild)     */
+   short           entry_ind ;         /* index of prefix (for wild)*/
+   ADDINFO_rec_ptr laddinfo;
+   char            func_name[10];      /* program name              */
+ } ENTRY_typ , *ENTRY_ptr ;
+
+/*
+ *   Assmebler access program to RACF data base
+ */
+
+ /* SAS2IBMT typedef and prototype changed for IBM C
+ extern int ctsfrlg(char                     * option,
+                    char                     * entry_typ,
+                    char                     * entry,
+                    int                      * generic_flag,
+                    RACF_OUTPUT_LINE_rec_typ * output,
+                    int                      * debug,
+                    int                      * rc_racf,
+                    int                      * reason_code,
+                    char                     * sep);                 */
+ extern int ctsfrlg();                                    /* SAS2IBMT */
+
+ static int debug=0 ;           /* debug_level */
+
+/*
+ *    Routine for mode=all
+ */
+
+ /* SAS2IBMT typedef and prototype changed for IBM C
+ static ESA_RC do_all(RACF_ACCESS_PROG              racfprg,         */
+ static ESA_RC do_all(ASM_RTN_TYP                 * racfprg, /*SAS2IBMT*/
+                      RACF_OUTPUT_LINE_rec_typ    * output,
+                      ENTRY_typ                   * entry,
+                      short                         num_ugs_in,
+                      UG_PARAMS_rec_typ             ug_params_in[1],
+                      short                         max_ugs,
+                      short                       * actual_num,
+                      HAVE_MORE_typ               * have_more,
+                      UG_PARAMS_rec_typ             ug_params[1],
+                      ADDINFO_rec_ptr               addinfo[1],
+                      OBJ_EXISTS_typ                objs_exist[1],
+       /* IS10076     CTSAMSG_HANDLE_rec_typ     * msgs,      */
+       /* IS10076     CTSAMSG_DEST_TABLE_rec_typ * dest);     */
+       /* IS10076  */ ADMIN_PARAMS_rec_typ       * admin_params);
+
+/*
+ *    Routine for mode=many
+ */
+
+ /* SAS2IBMT typedef and prototype changed for IBM C
+ static ESA_RC do_many(RACF_ACCESS_PROG              racfprg,        */
+ static ESA_RC do_many(ASM_RTN_TYP                 * racfprg,
+                       RACF_OUTPUT_LINE_rec_typ    * output,
+                       ENTRY_typ                   * entry,
+                       short                         max_ugs,
+                       short                       * actual_num,
+                       HAVE_MORE_typ               * have_more,
+                       short                         num_ugs_in,
+                       UG_PARAMS_rec_typ             ug_params_in[1],
+                       UG_PARAMS_rec_typ             ug_params[1],
+                       ADDINFO_rec_ptr               addinfo[1],
+                       OBJ_EXISTS_typ                objs_exist[1],
+        /* IS10076     CTSAMSG_HANDLE_rec_typ     * msgs,      */
+        /* IS10076     CTSAMSG_DEST_TABLE_rec_typ * dest);     */
+        /* IS10076  */ ADMIN_PARAMS_rec_typ       * admin_params);
+
+/*
+ *    Routine for mode=wild
+ */
+
+#if 0
+ /* SAS2IBMT typedef and prototype changed for IBM C
+ static ESA_RC do_wild(RACF_ACCESS_PROG              racfprg,        */
+ static ESA_RC do_wild(ASM_RTN_TYP                 * racfprg,
+                       RACF_OUTPUT_LINE_rec_ptr      output,
+                       ENTRY_typ                   * entry,
+                       short                         max_ugs,
+                       short                       * actual_num,
+                       HAVE_MORE_typ               * have_more,
+                       void                       ** handle,
+                       short                         num_ugs_in,
+                       UG_PARAMS_rec_typ             ug_params_in[1],
+                       UG_PARAMS_rec_typ             ug_params[1],
+                       ADDINFO_rec_ptr               addinfo[1],
+                       OBJ_EXISTS_typ                objs_exist[1],
+                       ADMIN_PARAMS_rec_typ        * admin_params,
+                       CTSAMSG_HANDLE_rec_typ     * msgs,
+                       CTSAMSG_DEST_TABLE_rec_typ * dest);
+#endif  /* if 0 */
+
+
+/*
+ *   Routine to get information from RACF database
+ */
+
+ /* SAS2IBMT typedef and prototype changed for IBM C
+ static ESA_RC do_it_get(RACF_ACCESS_PROG           racfprg,         */
+ static ESA_RC do_it_get(ASM_RTN_TYP                *racfprg,
+                         char                       *opcode,
+                         RACF_OUTPUT_LINE_rec_ptr    output,
+                         ENTRY_typ                  *entry,
+                         RACF_FLAG_typ               locate_err_flag,
+                         CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                         CTSAMSG_HANDLE_rec_ptr      msgs);
+
+
+/*
+ *   Routine to put information in additional info
+ */
+
+ static ESA_RC do_it_put(int                         i,
+                         ENTRY_typ                  *entry,
+                         RACF_OUTPUT_LINE_rec_ptr    output,
+                         UG_PARAMS_rec_typ           ug_params[1],
+                         ADDINFO_rec_ptr             addinfo[1],
+          /* IS10076     CTSAMSG_HANDLE_rec_typ     * msgs,      */
+          /* IS10076     CTSAMSG_DEST_TABLE_rec_typ * dest);     */
+          /* IS10076  */ ADMIN_PARAMS_rec_typ       * admin_params);
+
+/*
+ *       check handle value
+ */
+
+ static ESA_RC check_handle(ENTRY_typ                  ** entry,
+                            void                       ** handle,
+                            CTSAMSG_DEST_TABLE_rec_ptr    dest,
+                            CTSAMSG_HANDLE_rec_ptr        msgs);
+
+/*
+ *   Internal subroutines for wild request
+ */
+
+#if 0
+ static ESA_RC get_next_prefix(ENTRY_typ             *entry,
+                               UG_PARAMS_rec_typ     ug_params_in[1],
+                               HAVE_MORE_typ         *have_more,
+                               short                 num_ugs_in,
+                               CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                               CTSAMSG_HANDLE_rec_ptr      msgs);
+
+ static ESA_RC get_wild_entry(ENTRY_typ               * entry,
+                              UG_PARAMS_rec_typ       ug_params_in[1],
+                              CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                              CTSAMSG_HANDLE_rec_ptr      msgs);
+#endif   /* if 0 */
+
+/*********************************************************************
+*
+* Function      : CTSGetUgs
+*
+* Description   : Get one, two, many or all user groups
+*
+* Input         : mode         - ALL,
+*                                MANY (or one),
+*                                WILD (wildcard - not implemented).
+*                 max_ugs      - # of elements in ug_params & addinfo
+*                                arrays.
+*                 num_ugs_in   - # of elements in ug_params_in.
+*                 ug_params_in - array of num_ugs_in, filled with
+*                                ugs requested.
+*                 admin_params -
+*
+* Output        : actual_num   - # of ugs returned.
+*                 have_more    - HAVE_MORE if more ugs, else NO_MORE.
+*                 err          - error indication, message, etc.
+*                 objs_exist   - array of max_ugs:
+*                                OBJ_EXIST if ug exists, else
+*                                OBJ_NOT_EXIST.
+*                 ug_params    - array of max_ugs:
+*                                callee fills with groups returned.
+*
+* Input/Output  : addinfo      - array of max_users pointers:
+*                                add.info per group, Caller puts
+*                                requested keywords, callee returns
+*                                actual add.info.
+*                 handle       - NULL on first call, filled by callee,
+*                                used by callee to keep track.
+*                                Freed by caller.
+*
+* Return Value  : ESA_RC
+*
+* Side Effects  : Callee allocates handle; Caller MUST free when done.
+*
+* Comments      : Caller must reset I/O params to their initial values
+*                 when using subsequent calls (if HAVE_MORE).
+*
+* Scope         : Global
+*
+*********************************************************************/
+
+ESA_RC CTSGetUGs (GET_GROUP_MODE         mode,
+                  OE_typ                 oe,
+                  short                  max_ugs,
+                  short                * actual_num,
+                  HAVE_MORE_typ        * have_more,
+                  void                ** handle,
+                  short                  num_ugs_in,
+                  UG_PARAMS_rec_typ      ug_params_in[1],
+                  UG_PARAMS_rec_typ      ug_params[1],
+                  ADDINFO_rec_ptr        addinfo[1],
+                  OBJ_EXISTS_typ         objs_exist[1],
+                  ADMIN_PARAMS_rec_typ * admin_params,
+                  ERR_STRUCT_rec_typ   * err)
+{
+
+ static char func[]="CTSGetUGs";
+
+/*
+ *    Variables
+ */
+
+ ESA_RC rc = ESA_OK ;
+
+ RACF_OUTPUT_LINE_rec_typ  * output = NULL;    /* r0003 */
+ ENTRY_typ                 * entry ;           /* entry structure */
+ int                         i_dump;
+
+ CTSAMSG_HANDLE_rec_ptr msgs;
+ CTSAMSG_DEST_TABLE_rec_ptr dest;
+
+/*
+ *    Initialize
+ */
+
+ ESA_DIAG_enter(ESA_COMP_GETUGS, 1, func);
+
+ debug = ESA_DIAG_get_debug_level(PLT_COMP_RCFGRP_EXT);
+
+ msgs = admin_params->ctsamsg_handle;
+ dest = admin_params->ctsamsg_dest;
+
+ *have_more = NO_MORE ;
+ *actual_num = 0 ;
+
+ ESA_DIAG_printf(ESA_COMP_GETUGS,1, "mode=%d handle=%X max_ugs=%d",
+                 mode, *handle , max_ugs);
+
+/*
+ *    Check if handle was passed ( if no create it )
+ */
+
+ if ( mode NE GET_FREE_HANDLE_GROUPS ) {
+     rc = check_handle( &entry, handle, dest, msgs ) ;
+     if ( rc NE ESA_OK )
+        goto exit ;
+ }
+
+/*
+ *  Allocate output line buffer
+ */
+
+ output = (RACF_OUTPUT_LINE_rec_typ *)malloc(          /* r0003 */
+                 sizeof(RACF_OUTPUT_LINE_rec_typ) );   /* r0003 */
+ if (output EQ NULL) {                                 /* r0003 */
+    CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,        /* r0003 */
+                 "OUTPUT BUFFER",                      /* r0003 */
+                 sizeof(RACF_OUTPUT_LINE_rec_typ) );   /* r0003 */
+    CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,     /* r0003 */
+                 component, func, "MALLOC OUTPUT",     /* r0003 */
+                 8, __LINE__);                         /* r0003 */
+    rc = ESA_FATAL;                                    /* r0003 */
+    goto exit ;                                        /* r0003 */
+ }                                                     /* r0003 */
+
+/*
+ *  Execute according to mode
+ */
+
+ switch (mode) {
+
+    case GET_FREE_HANDLE_GROUPS :
+
+          if ( *handle NE NULL ) {
+             entry = (ENTRY_typ *)(*handle);
+             if ( entry->laddinfo NE NULL )
+                ADDINFO_free(&(entry->laddinfo));
+             free(*handle) ;
+             *handle=NULL ;
+             entry=NULL ;
+          }
+          goto exit;
+          break ;
+
+    case GET_ALL_GROUPS  :
+
+ /* SAS2IBMT typedef and prototype changed for IBM C
+          rc=do_all(&ctsfrlg, output, entry, num_ugs_in,             */
+          rc=do_all((ASM_RTN_TYP *) &ctsfrlg,             /* SAS2IBMT */
+                    output, entry, num_ugs_in,
+                    ug_params_in, max_ugs, actual_num,
+                    have_more, ug_params, addinfo, objs_exist,
+      /* IS10076    dest, msgs) ;    */
+      /* IS10076 */ admin_params);
+          break ;
+
+    case GET_MANY_GROUPS :
+
+ /* SAS2IBMT typedef and prototype changed for IBM C
+          rc=do_many(&ctsfrlg, output, entry, max_ugs, actual_num,   */
+          rc=do_many((ASM_RTN_TYP *) &ctsfrlg,            /* SAS2IBMT */
+                     output, entry, max_ugs, actual_num,
+                     have_more, num_ugs_in, ug_params_in, ug_params,
+       /* IS10076    addinfo, objs_exist, dest, msgs) ;
+       /* IS10076 */ addinfo, objs_exist, admin_params);
+          break ;
+
+#if 0
+    case GET_WILD :
+
+ /* SAS2IBMT typedef and prototype changed for IBM C
+          rc=do_wild(&ctsfrlg, output, entry, max_ugs,               */
+          rc=do_wild((ASM_RTN_TYP *) &ctsfrlg,            /* SAS2IBMT */
+                     output, entry, max_ugs,
+                     actual_num, have_more, handle, num_ugs_in,
+                     ug_params_in, ug_params, addinfo, objs_exist,
+                     admin_params, dest, msgs );
+          break ;
+#endif /* if 0 */
+
+    case GET_SUBTREE_GROUPS :
+
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                        func, "Not supported mode", mode, __LINE__) ;
+          rc = ESA_NOT_SUPP;
+          goto exit;
+
+    default       :
+
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                        func, "Invalid mode", mode, __LINE__) ;
+          rc = ESA_FATAL;
+          goto exit;
+ }
+
+/*
+ *  Print diagnostic inforamtion
+ */
+
+ ESA_DIAG_printf(ESA_COMP_GETUGS,1,
+                 "Max_ugs=%d, actual_num=%d", max_ugs, *actual_num);
+
+ if ( ESA_DIAG_get_debug_level(ESA_COMP_GETUGS) GE 1 ) {
+    for (i_dump = 0; i_dump LT *actual_num; i_dump++) {
+        ESA_DIAG_printf(ESA_COMP_GETUGS,0,
+                        "Group=%s exist=%d parent=%s",
+                        ug_params[i_dump].group, objs_exist[i_dump],
+                        ug_params[i_dump].parent_group);
+        if ( ( objs_exist[i_dump] EQ OBJ_EXIST ) AND
+             ( ESA_DIAG_get_debug_level(ESA_COMP_GETUGS) GE 2 ) )
+           ADDINFO_dump(addinfo[i_dump],1);
+    }
+ }
+
+/*
+ *  Finish
+ */
+
+ exit : ;
+
+/*
+ *  Set flags and handle
+ */
+
+ if ( (rc NE ESA_OK) OR (*have_more EQ NO_MORE) ) {
+    if ( *handle NE NULL ) {
+       entry=(ENTRY_typ *)(*handle);
+       if ( entry->laddinfo NE NULL )
+          ADDINFO_free ( &( entry->laddinfo) );
+       free(*handle) ;
+       *handle=NULL ;
+       entry=NULL ;
+    }
+    *have_more = NO_MORE ;
+ }
+
+/*
+ *  Free output line area
+ */
+
+ if (output NE NULL)                                   /* r0003 */
+    free (output);                                     /* r0003 */
+
+/*
+ *  Retrun to caller
+ */
+
+ ESA_DIAG_printf(ESA_COMP_GETUGS, 2,
+            "Exiting with rc = %d actual num=%d have_more=%d",
+             rc, *actual_num, *have_more);
+ ESA_DIAG_exit(ESA_COMP_GETUGS, 1, func, rc );
+
+ return rc ;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : do_all                                    *
+*                                                             *
+* DESCRIPTION     : Handle mode=all                           *
+*                                                             *
+* INPUT           : 1. racfprg -  Addr of RACF access program *
+*                   2. output   - Output area for RACF        *
+*                                 extractor                   *
+*                   3. entry    - Entry parameter             *
+*                   4. max_ugs  - Max count of return area    *
+*                   5. dest     - Message destination ptr     *
+*                   6. msgs     - Message handle ptr          *
+*                                                             *
+* OUTPUT          : 1. ug_params  -Output area                *
+*                   2. addinfo    - Addinfo                   *
+*                   3. obj_exist  - Obj exist vector          *
+*                   4. have_more  - Have_more parameter       *
+*                   5. actual_num - Actual num                *
+*                                                             *
+* RETURN VALUE    : ESA_ERR   - end of database               *
+*                   ESA_FATAL - serious error                 *
+*                                                             *
+*                                                             *
+**************************************************************/
+
+ /* SAS2IBMT typedef and prototype changed for IBM C
+static ESA_RC do_all(RACF_ACCESS_PROG             racfprg,           */
+static ESA_RC do_all(ASM_RTN_TYP                * racfprg,  /*SAS2IBMT*/
+                     RACF_OUTPUT_LINE_rec_typ   * output,
+                     ENTRY_typ                  * entry,
+                     short                        num_ugs_in,
+                     UG_PARAMS_rec_typ            ug_params_in[1],
+                     short                        max_ugs,
+                     short                      * actual_num,
+                     HAVE_MORE_typ              * have_more,
+                     UG_PARAMS_rec_typ            ug_params[1],
+                     ADDINFO_rec_ptr              addinfo[1],
+                     OBJ_EXISTS_typ               objs_exist[1],
+      /* IS10076     CTSAMSG_HANDLE_rec_typ     * msgs,           */
+      /* IS10076     CTSAMSG_DEST_TABLE_rec_typ * dest);            */
+      /* IS10076  */ ADMIN_PARAMS_rec_typ       * admin_params)
+{
+
+  /*
+   *  Variables
+   */
+
+   ESA_RC rc_all=ESA_OK ;
+   int i ;
+   static char func[]="do_all";
+
+   CTSAMSG_HANDLE_rec_ptr        msgs;                     /* IS10076 */
+   CTSAMSG_DEST_TABLE_rec_ptr    dest;                     /* IS10076 */
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GETUGS, 3,func);
+
+   msgs = admin_params->ctsamsg_handle;                    /* IS10076 */
+   dest = admin_params->ctsamsg_dest;                      /* IS10076 */
+
+   *have_more = HAVE_MORE ;
+
+   /* spr163 */
+
+   ESA_DIAG_printf(ESA_COMP_GETUGS, 3,
+                   "entry->entry_name=%d/%s  num_ugs_in=%d",
+                    strlen(entry->entry_name),
+                    entry->entry_name, num_ugs_in );
+
+  /* spr ... */
+  if ( num_ugs_in GT 1 )
+     CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                   component,func,
+                   "Invalid num_ugs_in parameter",
+                   num_ugs_in, __LINE__);
+
+  /*
+   * GET_ALL - continue process checking
+   */
+
+  /*
+   *  Start old emplamantation of get_all restart
+   *
+   *   if ( ( entry->entry_name[0] EQ ' ' )         AND
+   *        (strlen(ug_params_in[0].group) GT 0)    AND
+   *         ug_params_in[0].group[0]   NE '*'        )
+   *      strcpy( entry->entry_name, ug_params_in[0].group );
+   *
+   *  End   old emplamantation of get_all restart
+   */
+
+  /*
+   *   New emplamantation of get_all restart
+   */
+
+   if ( entry->entry_name[0] EQ ' ' )
+     if ( num_ugs_in EQ 1 )
+       strcpy( entry->entry_name, ug_params_in[0].group );
+
+  /*
+   *  Loop on output ugs
+   */
+
+   i = 0;
+   while ( i LT max_ugs ) {
+
+       ESA_DIAG_printf(ESA_COMP_GETUGS, 3,
+                       "Extracting group no. %d addinfo %p",
+                       i, addinfo);
+
+       rc_all = do_it_get(racfprg, RACF_OPERATION_NEXT ,
+                          output, entry, RACF_NO, dest, msgs);
+
+       if ( rc_all EQ ESA_ERR ) { /* ESA_ERR = End of DB */
+          rc_all =  ESA_OK ;
+          *have_more = NO_MORE ;
+          break ;
+       }
+       else if ( rc_all EQ ESA_FATAL ) {       /* Serious error */
+          *have_more = NO_MORE ;
+          break ;
+       }
+
+       rc_all = do_it_put(i,entry,
+            /* IS10076    output, ug_params, addinfo, dest, msgs) ; */
+            /* IS10076 */ output, ug_params, addinfo, admin_params);
+
+      if ( rc_all EQ ESA_OK ) {
+         objs_exist[i] = OBJ_EXIST ;
+         (*actual_num)++ ;
+         i++;
+      }
+      else                        /* internal error */
+         rc_all = ESA_OK;
+
+
+   } /* for - loop on groups */
+
+  /*
+   *  Finish
+   */
+
+   ESA_DIAG_exit(ESA_COMP_GETUGS, 3, func, rc_all);
+
+   return rc_all  ;
+
+}
+
+/***************************************************************
+*                                                              *
+* Subroutine name : do_many                                    *
+*                                                              *
+* DESCRIPTION     : Handle mode=many                           *
+*                                                              *
+* INPUT           : 1. racfprg       - Addr of RACF access     *
+*                                      program                 *
+*                   2. output        - Output area for RACF    *
+*                                      extractor               *
+*                   3. entry         - Entry parameter         *
+*                   4. max_ugs       - Max count of return area*
+*                   5. num_ugs_in    - Count of requested ugs  *
+*                   6. ug_params_in  - List of requested ugs   *
+*                   7. dest          - Message destination ptr *
+*                   8. msgs          - Message handle ptr      *
+*                                                              *
+* OUTPUT          : 1. ugs_params    - Output area             *
+*                   2. addinfo       - Addinfo                 *
+*                   3. obj_exist     - Obj exist vector        *
+*                   4. have_more     - Have_more parameter     *
+*                   5. actual_num    - Actual num              *
+*                                                              *
+* RETURN VALUE    : ESA_ERR   - user not define to RACF        *
+*                   ESA_FATAL - serious error                  *
+*                                                              *
+***************************************************************/
+
+ /* SAS2IBMT typedef and prototype changed for IBM C
+static ESA_RC do_many(RACF_ACCESS_PROG             racfprg,          */
+static ESA_RC do_many(ASM_RTN_TYP                * racfprg, /*SAS2IBMT*/
+                      RACF_OUTPUT_LINE_rec_typ   * output,
+                      ENTRY_typ                  * entry,
+                      short                        max_ugs,
+                      short                      * actual_num,
+                      HAVE_MORE_typ              * have_more,
+                      short                        num_ugs_in,
+                      UG_PARAMS_rec_typ            ug_params_in[1],
+                      UG_PARAMS_rec_typ            ug_params[1],
+                      ADDINFO_rec_ptr              addinfo[1],
+                      OBJ_EXISTS_typ               objs_exist[1],
+       /* IS10076     CTSAMSG_HANDLE_rec_typ     * msgs,      */
+       /* IS10076     CTSAMSG_DEST_TABLE_rec_typ * dest);     */
+       /* IS10076  */ ADMIN_PARAMS_rec_typ       * admin_params)
+{
+
+/*
+ *    Variables
+ */
+
+ ESA_RC rc_many;
+ int i ;
+ static char func[]="do_many";
+
+ CTSAMSG_HANDLE_rec_ptr        msgs;                     /* IS10076 */
+ CTSAMSG_DEST_TABLE_rec_ptr    dest;                     /* IS10076 */
+
+/*
+ *    Initialize
+ */
+
+ ESA_DIAG_enter(ESA_COMP_GETUGS, 3, func);
+
+ msgs = admin_params->ctsamsg_handle;                    /* IS10076 */
+ dest = admin_params->ctsamsg_dest;                      /* IS10076 */
+
+ *have_more = HAVE_MORE ;
+
+ ESA_DIAG_printf(ESA_COMP_GETUGS, 1, "num_ugs_in=%d",num_ugs_in);
+
+/*
+ *    Loop on input ugs
+ */
+
+ for (i=0 ; i LT num_ugs_in ; i++) {
+
+     strcpy(entry->entry_name,ug_params_in[i].group) ;
+
+    /*
+     *   Set UG_PARAMS defaults in case that
+     *   do_it_get failed ( group not found )
+     *   See also do_it_put prog.
+     */
+
+     ug_params[i].group[0]        = NULL_CHAR;
+     ug_params[i].parent_group[0] = NULL_CHAR;
+     ug_params[i].parent_oe[0]    = NULL_CHAR;
+
+     strcpy(ug_params[i].group,entry->entry_name) ;
+     (*actual_num)++ ;
+
+     ESA_DIAG_printf(ESA_COMP_GETUGS, 3,
+                     "Group no. %d, Entry=%s", i,entry->entry_name);
+
+     rc_many = do_it_get(racfprg, RACF_OPERATION_LOCATE ,
+                         output, entry, RACF_NO, dest, msgs);
+
+     if ( rc_many EQ ESA_OK ) {
+        rc_many=do_it_put(i, entry,
+            /* IS10076    output, ug_params, addinfo,dest,msgs);  */
+            /* IS10076 */ output, ug_params, addinfo,admin_params);
+        if ( rc_many EQ ESA_OK )
+           objs_exist[i] = OBJ_EXIST ;
+        else {                      /* Internal error */
+           rc_many = ESA_OK ;       /* to addinfo     */
+           objs_exist[i]=OBJ_NOT_EXIST ;
+        }
+     }
+
+     else if ( rc_many EQ ESA_ERR ) {        /* Grp  not defined */
+        objs_exist[i]=OBJ_NOT_EXIST ;
+        rc_many = ESA_OK ;
+     }
+     else break ;                           /* serious error */
+
+ } /* for - loop on groups */
+
+ *have_more = NO_MORE ;
+
+/*
+ *    Finish
+ */
+
+ ESA_DIAG_exit(ESA_COMP_GETUGS, 3, func, rc_many);
+
+ return rc_many ;
+
+}
+
+#if 0
+/**************************************************************
+*                                                             *
+* Subroutine name : do_wild                                   *
+*                                                             *
+* DESCRIPTION     : handle mode=wild                          *
+*                                                             *
+* INPUT           : none                                      *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+
+/* SAS2IBMT typedef and prototype changed for IBM C
+static ESA_RC do_wild(RACF_ACCESS_PROG             racfprg,          */
+static ESA_RC do_wild(ASM_RTN_TYP                * racfprg, /*SAS2IBMT*/
+                      RACF_OUTPUT_LINE_rec_ptr     output,
+                      ENTRY_typ                  * entry,
+                      short                        max_ugs,
+                      short                      * actual_num,
+                      HAVE_MORE_typ              * have_more,
+                      void                      ** handle,
+                      short                        num_ugs_in,
+                      UG_PARAMS_rec_typ            ug_params_in[1],
+                      UG_PARAMS_rec_typ            ug_params[1],
+                      ADDINFO_rec_ptr              addinfo[1],
+                      OBJ_EXISTS_typ               objs_exist[1],
+                      ADMIN_PARAMS_rec_typ       * admin_params,
+                      CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                      CTSAMSG_HANDLE_rec_ptr       msgs)
+{
+
+
+ /*
+  *   Varaiables
+  */
+
+  ESA_RC    rc_wild=ESA_OK;
+  char      op_code[10];
+  int       i ;
+  RACF_FLAG_typ  send_err_msg;
+  static char func[]="do_wild";
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_GETUGS, 3, func);
+
+  ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+                  "num_groups_in=%d",num_ugs_in);
+
+  if ( num_ugs_in EQ 0 )
+     goto exit_no_more ;
+ /*
+  *   Handle first time
+  */
+
+  if (  entry->wild_op_code[0] EQ BLANK ) {
+     rc_wild=get_wild_entry(entry, ug_params_in,dest,msgs) ;
+     if (  rc_wild NE ESA_OK )
+        goto exit_no_more ;
+
+  }
+
+ /*
+  *    Operation code for begining treatment request for
+  *    each  prefix   -  locate
+  *    for continue   -  next
+  */
+
+  strcpy(op_code, entry->wild_op_code);
+
+  *have_more = HAVE_MORE;
+
+  i=0 ;
+  do {
+
+       /*
+        *  Each prefix can be - entry name and prefix too.
+        *  before scanning data base need check if defined
+        *  grp  with requested prefix. During this checking
+        *  not need issue error messages ( grp  not defined to RACF).
+        *
+        *  For instance :  prefix = n67*
+        *  In RACF database defined grp  = n67, n67a, n67b.
+        *  So, first entry can be found with 'locate' operation
+        *  and other with 'next' operation.
+        */
+
+      if (( strcmp(op_code,RACF_OPERATION_LOCATE) EQ 0 ) AND
+          ( entry->star_flag EQ 1 ) )
+           send_err_msg=RACF_NO ;
+      else
+           send_err_msg=RACF_YES;
+
+      rc_wild= do_it_get(racfprg, op_code , output, entry,
+                         send_err_msg, dest, msgs);
+
+      ESA_DIAG_printf(ESA_COMP_GETUGS,3,
+                     "wild entry=%s op_code=%s star_flag=%d rc=%d",
+                     entry->entry_name,op_code,
+                     entry->star_flag, rc_wild );
+
+      if ( rc_wild EQ ESA_FATAL )
+           goto exit_no_more ;
+
+     /*
+      *  star_flag=0 means : entry_wild prefix was witout
+      *  '*' symbol. Valid only LOCATE operation.
+      */
+
+      if ( entry->star_flag EQ 0 ) {
+
+        /*
+         *   Group ( not wild prefix ) not found
+         */
+
+         if (rc_wild NE ESA_OK ) {
+             (*actual_num)++ ;
+            /*
+             *   Set UG_PARAMS defaults in case that
+             *   do_it_get failed ( group not found )
+             *   See also do_it_put prog.
+             */
+
+             ug_params[i].group[0]        = NULL_CHAR;
+             ug_params[i].parent_group[0] = NULL_CHAR;
+             ug_params[i].parent_oe[0]    = NULL_CHAR;
+
+             strcpy(ug_params[i].group,entry->entry_name );
+             objs_exist[i] = OBJ_NOT_EXIST ;
+             i++;
+         }
+
+        /*
+         *   Group ( not wild prefix ) found
+         */
+
+         else {
+
+             rc_wild=do_it_put(i, entry, output, ug_params,
+                /* IS10076     addinfo, dest, msgs) ;      */
+                /* IS10076 */  addinfo, admin_params);
+             if ( rc_wild NE ESA_OK )  /* Internal error */
+               {                       /* to addinfo     */
+                rc_wild=ESA_OK ;
+                objs_exist[i] = OBJ_NOT_EXIST ;
+               }
+             else
+               objs_exist[i] = OBJ_EXIST ;
+
+             (*actual_num)++ ;
+             ESA_DIAG_printf(ESA_COMP_GETUGS, 3,
+                        "Group %d,entry=%s", i,entry->entry_name);
+             i++ ;
+         }
+
+         rc_wild=get_next_prefix(entry, ug_params_in,
+                                 have_more, num_ugs_in,
+                                 dest,msgs ) ;
+         if ( ( *have_more EQ NO_MORE )  OR
+              ( rc_wild NE ESA_OK     )   )
+            goto exit ;
+         strcpy(op_code, entry->wild_op_code);
+         continue ;
+
+      }     /* star_flag=0 */
+
+      /*
+       *    If was op_code = 'locate' and return code NE 0
+       *    need try again with operation code 'next'
+       */
+
+      if ( (strcmp(op_code,RACF_OPERATION_LOCATE) EQ 0) AND
+           (rc_wild NE ESA_OK      ) ) {
+
+           /*
+            *    Unseccessful locate.
+            *    Change op_code to 'next' and try again
+            */
+
+             strcpy(op_code,RACF_OPERATION_NEXT);
+             strcpy( entry->wild_op_code,RACF_OPERATION_NEXT);
+
+             continue ;
+       }
+
+      /*
+       *    Uncoditionally after first access need change
+       *    op_code to 'next' for scan RACF data base
+       */
+
+       strcpy(op_code,RACF_OPERATION_NEXT);
+       strcpy( entry->wild_op_code,RACF_OPERATION_NEXT);
+
+       if (   rc_wild EQ ESA_OK )  {
+
+         /*
+          *    Check if current entry name has required prefix
+          */
+
+          ESA_DIAG_printf(ESA_COMP_GETUGS,3,
+                     "wild entry=%s prefix=%s len=%d",
+                     entry->entry_name, entry->entry_prefix,
+                     entry->entry_prefix_len);
+
+          if ( memcmp( entry->entry_name, entry->entry_prefix,
+                      entry->entry_prefix_len) EQ 0 ) {
+
+             rc_wild=do_it_put(i, entry, output, ug_params,
+                /* IS10076     addinfo, dest, msgs) ;     */
+                /* IS10076 */  addinfo, admin_params);
+             if ( rc_wild NE ESA_OK )  /* Internal error */
+                rc_wild=ESA_OK;
+             else {
+               (*actual_num)++ ;
+               objs_exist[i] = OBJ_EXIST ;
+               ESA_DIAG_printf(ESA_COMP_GETUGS, 3,
+                        "Group %d,entry=%s", i,entry->entry_name);
+               i++;
+             }
+          }
+
+         /*
+          *   Current entry name not include required prefix ,
+          *   get next prefix
+          */
+
+          else {
+             rc_wild=get_next_prefix(entry, ug_params_in,
+                                     have_more, num_ugs_in,
+                                     dest,msgs ) ;
+             if ( ( *have_more EQ NO_MORE )  OR
+                  ( rc_wild NE ESA_OK     )   )
+                goto exit ;
+             strcpy(op_code, entry->wild_op_code);
+          }
+      }        /* rc_wild  EQ ESA_OK */
+
+     /*
+      *   Entry name not found anyway ( locate/next op_code )
+      *   get next prefix
+      */
+
+      else if ( rc_wild NE ESA_FATAL ) {
+         rc_wild = get_next_prefix(entry, ug_params_in, have_more,
+                                   num_ugs_in,dest,msgs) ;
+         if ( ( *have_more EQ NO_MORE ) OR ( rc_wild NE ESA_OK ) )
+            goto exit ;
+         strcpy(op_code, entry->wild_op_code);
+      } /* rc_wild EQ ESA_ERR */
+
+      else {
+          *have_more = NO_MORE ;
+          goto exit_no_more ;   /* Serious error       */
+      }
+
+  } while (i LT max_ugs);     /* for - loop on users  */
+  goto exit ;
+
+ /*
+  *   Finish
+  */
+
+  exit_no_more : ;
+
+     *have_more = NO_MORE;
+
+  exit : ;
+
+  ESA_DIAG_exit(ESA_COMP_GETUGS, 3, func, rc_wild);
+
+  return rc_wild ;
+
+
+}
+#endif  /* if 0 */
+
+/**************************************************************
+*                                                             *
+* FUNCTION        : check_handle                              *
+*                                                             *
+* DESCRIPTION     : Check handle parameter                    *
+*                   1. If NULL allocate memory and create     *
+*                      entry stucture                         *
+*                   2. If not NULL, reuse handle for          *
+*                      entry stucture                         *
+*                                                             *
+* INPUT           : 1. handle    -  handle ptr                *
+*                   2. dest      -  msg dest ptr              *
+*                   3. msgs      -  msgs handle ptr           *
+*                                                             *
+* OUTPUT          : 1. entry     -  entry structure ptr       *
+*                                                             *
+* RETURN VALUE    : ESA_OK    - ok                            *
+*                   ESA_FATAL - malloc() failed               *
+*                                                             *
+**************************************************************/
+
+static ESA_RC check_handle(ENTRY_typ                  ** entry,
+                           void                       ** handle,
+                           CTSAMSG_DEST_TABLE_rec_ptr    dest,
+                           CTSAMSG_HANDLE_rec_ptr        msgs)
+{
+
+  ESA_RC rc_check = ESA_OK ;
+  static char func[]="check_handle";
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_GETUGS, 3, func);
+
+ /*
+  *   First time, obtain handle structure and local ADDINFO
+  */
+
+  if ( *handle EQ NULL ) {
+     *handle = (char *)malloc(sizeof(ENTRY_typ));
+     if ( *handle EQ NULL ) {
+        CTSAMSG_print( ERR_MALLOC, msgs, NULL, dest, "GROUP HANDLE",
+                       RCF_UG_NAME_LEN+1 );
+        rc_check = ESA_FATAL ;
+        goto exit ;
+     }
+
+     *entry = *handle ;
+     memcpy( (*entry)->eyecatcher, GRP_EYECATCHER ,4 );
+     memset( (*entry)->entry_name, BLANK ,RCF_UG_NAME_LEN);
+     (*entry)->entry_name[RCF_UG_NAME_LEN]=NULL_CHAR ;
+
+     memset( (*entry)->entry_prefix, BLANK, RCF_UG_NAME_LEN);
+     (*entry)->entry_prefix[RCF_UG_NAME_LEN] = NULL_CHAR ;
+     memset( (*entry)->wild_op_code, BLANK, RCF_UG_NAME_LEN);
+     (*entry)->wild_op_code[RCF_UG_NAME_LEN] = NULL_CHAR ;
+
+     (*entry)->entry_ind        = 0 ;
+     (*entry)->entry_prefix_len = 0 ;
+     (*entry)->star_flag        = 0 ;
+     strcpy( (*entry)->func_name ,component );
+
+    /*
+     *   Create Local addinfo
+     */
+
+     (*entry)->laddinfo=NULL ;
+     rc_check= ADDINFO_alloc(component, num_spec_keywords,
+                             &( (*entry)->laddinfo ), dest, msgs);
+     if (rc_check NE ESA_OK)
+       {
+         free( (*handle) ) ;
+         *handle=NULL ;
+         rc_check=ESA_ERR;
+         goto exit;
+       }
+  }
+
+ /*
+  *   Reuse handle
+  */
+
+  else
+    {
+       *entry = *handle ;
+       if ( memcmp( (*entry)->eyecatcher,
+                    GRP_EYECATCHER ,4 ) NE 0 ) {
+          CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                        component, func,
+                        "Invalid handle", 16,__LINE__);
+          rc_check=ESA_ERR;
+          goto exit;
+       }
+    }
+
+
+ exit :;
+
+  ESA_DIAG_exit(ESA_COMP_GETUGS, 3, func, rc_check );
+
+  return rc_check ;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : do_it_get                                 *
+*                                                             *
+* DESCRIPTION     : Extract information from RACF database    *
+*                                                             *
+* INPUT           : 1. racfprg - Addr of racf-access program  *
+*                   2. opcode  - Operation code(locate/next)  *
+*                   3. output  - Output area for extractor    *
+*                   4. entry   - Entry name                   *
+*                   5. locate_err_flag                        *
+*                   6. dest    - Message destination ptr      *
+*                   7. msgs    - Message handle ptr           *
+*                                                             *
+*                                                             *
+* OUTPUT          : 1. output  - Output area for extractor    *
+*                                                             *
+* RETURN VALUE    : racf_extract rc                           *
+*                                                             *
+**************************************************************/
+
+/* SAS2IBMT typedef and prototype changed for IBM C
+static ESA_RC do_it_get(RACF_ACCESS_PROG           racfprg,          */
+static ESA_RC do_it_get(ASM_RTN_TYP                *racfprg, /*SAS2IBMT*/
+                        char                       *opcode,
+                        RACF_OUTPUT_LINE_rec_ptr    output,
+                        ENTRY_typ                  *entry,
+                        RACF_FLAG_typ               locate_err_flag,
+                        CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                        CTSAMSG_HANDLE_rec_ptr      msgs)
+
+{
+
+/*
+ *   Variables
+ */
+
+ ESA_RC rc_doit = ESA_OK ;
+ char   racf_entry[RCF_UG_NAME_LEN+1];
+ static char func[]="do_it_get";
+
+/*
+ *   Initialize
+ */
+
+ ESA_DIAG_enter(ESA_COMP_GETUGS, 3, func);
+
+/*
+ *   Get the info
+ */
+
+ strcpy(racf_entry, entry->entry_name) ;
+ output->max_len  = RACF_OUTPUT_SIZE;
+ output->used_len = 0 ;
+ /* SAS2IBMT typedef and prototype changed for IBM C
+ rc_doit = RACF_extract((RACF_ACCESS_PROG_E) racfprg,   *BS10008*    */
+ rc_doit = RACF_extract(racfprg,
+                        opcode, RACF_GROUP_PROFILE,
+                        racf_entry, 0, component, output, debug,
+                        locate_err_flag,  dest, msgs,0); /*BS10008*/
+
+ racf_entry[RCF_UG_NAME_LEN] = NULL_CHAR ;
+
+ ESA_DIAG_printf(ESA_COMP_GETUGS, 3,           /* AS0309 */
+                 "Extracted group=%s", racf_entry);
+
+ strcpy( entry->entry_name,racf_entry) ;
+
+/*
+ *   Finish
+ */
+
+ exit : ;
+
+ ESA_DIAG_exit(ESA_COMP_GETUGS, 3, func, rc_doit);
+
+ return rc_doit ;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : do_it_put                                 *
+*                                                             *
+* DESCRIPTION     : Put information to addinfo                *
+*                                                             *
+* INPUT           : 1. i       - Index of current entry name  *
+*                   2. output  - Output area for extractor    *
+*                   3. dest    - Message destination ptr      *
+*                   4. msgs    - Message handle ptr           *
+*                                                             *
+*                                                             *
+* OUTPUT          : 1. ug_params   - Grp  params structure    *
+*                   2. addinfo     - Addinfo                  *
+*                                                             *
+* RETURN VALUE    : addinfo_alloc rc (if failed), or:         *
+*                   racf_extract rc                           *
+*                                                             *
+**************************************************************/
+
+static ESA_RC do_it_put(int                         i,
+                        ENTRY_typ                  *entry,
+                        RACF_OUTPUT_LINE_rec_ptr    output,
+                        UG_PARAMS_rec_typ           ug_params[1],
+                        ADDINFO_rec_ptr             addinfo[1],
+         /* IS10076     CTSAMSG_HANDLE_rec_typ     * msgs,      */
+         /* IS10076     CTSAMSG_DEST_TABLE_rec_typ * dest);     */
+         /* IS10076  */ ADMIN_PARAMS_rec_typ       * admin_params)
+
+{
+
+/*
+ *   Variables
+ */
+
+ ESA_RC            rc_doit = ESA_OK ;
+ static char       msg_buf[100];
+ static char       func[]="do_it_put";
+ ONE_FIELD_rec_ptr pair;
+
+ CTSAMSG_HANDLE_rec_ptr        msgs;                     /* IS10076 */
+ CTSAMSG_DEST_TABLE_rec_ptr    dest;                     /* IS10076 */
+ RACF_PARAMS_rec_typ         * params_ptr;               /* IS10076 */
+
+/*
+ *   Initialize
+ */
+
+ ESA_DIAG_enter(ESA_COMP_GETUGS, 3, func );
+
+ msgs = admin_params->ctsamsg_handle;                    /* IS10076 */
+ dest = admin_params->ctsamsg_dest;                      /* IS10076 */
+ params_ptr = admin_params->apiinit_handle;              /* IS10076 */
+
+/*
+ *   Load information to addinfo
+ */
+ ESA_DIAG_printf(ESA_COMP_GETUGS, 9,
+                 "kplog addinfo %p", addinfo[i]);
+
+ /* If Custom Fields are not supported, but ESS/IIQ   */  /* IS10076 */
+ /* requested them, issue a message.                  */  /* IS10076 */
+ if (params_ptr->rssparm_CUSTOM_FIELDS_SUPPORT[0] EQ 'N') /* IS10076 */
+ {                                                        /* IS10076 */
+   pair = ADDINFO_prefix_search("CSDATA.",                /* IS10076 */
+                         RCF_ADDINFO_KWD_LEN,             /* IS10076 */
+                         TRUE,                            /* IS10076 */
+                         addinfo[i]->pair,                /* IS10076 */
+                         addinfo[i]->num_pairs );         /* IS10076 */
+                                                          /* IS10076 */
+   if (pair EQ NULL)                                      /* IS10076 */
+     pair = ADDINFO_search("NOCSDATA",                    /* IS10076 */
+                           RCF_ADDINFO_KWD_LEN,           /* IS10076 */
+                           addinfo[i]->pair,              /* IS10076 */
+                           addinfo[i]->num_pairs );       /* IS10076 */
+                                                          /* IS10076 */
+   if (pair NE NULL)                                      /* IS10076 */
+     CTSAMSG_print(ERR_NOT_SUPP_DUE_RSSP_NO, msgs, NULL,  /* IS10076 */
+                   dest, "CSDATA. and NOCSDATA keywords", /* IS10076 */
+                   "CUSTOM_FIELDS_SUPPORT", "N");         /* IS10076 */
+ }                                                        /* IS10076 */
+
+ ADDINFO_empty( entry->laddinfo );
+ ADDINFO_clear( addinfo[i] );
+ RACF_output_to_addinfo(output , addinfo[i] , entry->laddinfo,
+       /* IS10076       spec_keywords, dest, msgs );     */
+       /* IS10076 */    spec_keywords, params_ptr->p_group_CFields,
+    /* IS10076, IS10100 */ NULL, admin_params);  /* no CTSACF blk yet */
+
+/*
+ *  Set UG_PARAMS defaults
+ */
+
+ ug_params[i].group[0]        = NULL_CHAR;
+ ug_params[i].parent_group[0] = NULL_CHAR;
+ ug_params[i].parent_oe[0]    = NULL_CHAR;
+
+/*
+ *   Handle special keyword - Group
+ */
+
+ pair = ADDINFO_search("GROUP", RCF_ADDINFO_KWD_LEN,
+                       entry->laddinfo->pair,
+                       entry->laddinfo->num_pairs);
+ if (pair NE NULL) {
+    strcpy(ug_params[i].group,pair->value) ;
+
+    ESA_DIAG_printf(ESA_COMP_GETUGS, 3,           /* AS0309 */
+                    "Put Group=%s", pair->value);
+ }
+ else {
+    CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                  func, "GROUP field not found", 0, __LINE__);
+    rc_doit = ESA_ERR;
+    goto exit;
+ }
+
+/*
+ *   Handle special keyword - SUPGROUP
+ */
+
+ pair = ADDINFO_search("SUPGROUP", RCF_ADDINFO_KWD_LEN,
+                        entry->laddinfo->pair,
+                        entry->laddinfo->num_pairs);
+ if (pair NE NULL)
+    strcpy(ug_params[i].parent_group,pair->value) ;
+ else {
+    if ( strcmp(ug_params[i].group, "SYS1") NE 0 ) {
+       sprintf(msg_buf,"SUPGROUP field not found. GROUP=%s",
+               ug_params[i].group) ;
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component, func,
+                     msg_buf, 0,__LINE__);
+       rc_doit = ESA_ERR;
+       goto exit;
+    }
+ }
+
+/*
+ *   Finish
+ */
+
+ exit : ;
+
+ ESA_DIAG_exit(ESA_COMP_GETUGS, 3, func, rc_doit);
+
+ return rc_doit ;
+
+}
+
+#if 0
+/**************************************************************
+*                                                             *
+* Subroutine name : get_wild_entry                            *
+*                                                             *
+* DESCRIPTION     : create entry for wild request with        *
+*                   prefix                                    *
+*                                                             *
+* INPUT           : entry struc                               *
+*                   ug_params_in   - list of prefix           *
+*                   dest           - dest ptr                 *
+*                   msgs           - msgs ptr                 *
+*                                                             *
+* OUTPUT          : entry name , prefix name                  *
+*                                                             *
+* RETURN VALUE    : ESA_ERR - Prefix is without the '*'       *
+*                                                             *
+**************************************************************/
+
+static ESA_RC get_wild_entry(ENTRY_typ                *entry,
+                             UG_PARAMS_rec_typ         ug_params_in[1],
+                             CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                             CTSAMSG_HANDLE_rec_ptr      msgs)
+{
+
+ /*
+  *   Variables
+  */
+
+  ESA_RC    rc = ESA_OK ;
+  char    * char_ptr ;
+  short     i ;
+  short     len;
+  static    char func[]="get_wild_entry";
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_GETUGS, 3, func );
+
+  i = entry->entry_ind ;
+
+ /*
+  *          Get current entry_prefix_name
+  */
+
+  strcpy( entry->entry_name,ug_params_in[i].group);    /* prefix */
+  len = strlen(entry->entry_name);
+  strcpy( entry->entry_prefix,ug_params_in[i].group);  /* prefix */
+  strcpy( entry->wild_op_code,RACF_OPERATION_LOCATE);
+
+  ESA_DIAG_printf(ESA_COMP_GETUGS,3,
+                  "wild entry=%s", entry->entry_name);
+
+  char_ptr=strchr( entry->entry_name,'*') ;
+
+ /*
+  *  Symbol '*' found
+  */
+
+  if ( char_ptr NE NULL ) {
+     entry->star_flag=1;
+     *char_ptr=NULL_CHAR ;           /* Erase '*'   */
+     entry->entry_prefix_len = strlen( entry->entry_prefix)-1 ;
+
+    /*
+     *  '*' must be ended symbol in prefix name
+     *  Check len before erase '*' and after
+     */
+
+     if ( len NE ( strlen(entry->entry_name) + 1 ) ) {
+       CTSAMSG_print(RACF_INVALID_WILD,   msgs, NULL,
+                     dest, entry->entry_name);
+       rc=ESA_ERR ;
+     }
+  }
+ /*
+  *  Symbol '*' not found
+  */
+
+  else
+     entry->star_flag=0;
+
+ /*
+  *          Finish
+  */
+
+  ESA_DIAG_printf(ESA_COMP_GETUGS, 3,
+                  "entry_prefix=%s  len=%d star_flag=%d rc=%d",
+                   entry->entry_prefix, entry->entry_prefix_len,
+                   entry->star_flag, rc );
+
+  ESA_DIAG_exit(ESA_COMP_GETUGS, 3, func, rc);
+
+  return rc ;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : get_next_prefix                           *
+*                                                             *
+* DESCRIPTION     : create next entry for wild request        *
+*                                                             *
+* INPUT           : 1.entry          - Entry structure        *
+*                   2.ug_params_in   - List of prefix         *
+*                   3.num_ugs_in     - Count of users prefix  *
+*                   4.dest           - dest ptr               *
+*                   5.msgs           - msgs ptr               *
+*                                                             *
+* OUTPUT          : 1.have_more      - Have more parameter    *
+*                                                             *
+* RETURN VALUE    : HAVE_MORE , NO_MORE                       *
+*                                                             *
+**************************************************************/
+
+static ESA_RC get_next_prefix(ENTRY_typ           * entry,
+                              UG_PARAMS_rec_typ     ug_params_in[1],
+                              HAVE_MORE_typ       * have_more,
+                              short                 num_ugs_in,
+                              CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                              CTSAMSG_HANDLE_rec_ptr      msgs)
+
+{
+
+  ESA_RC rc=ESA_OK ;
+  static char func[]="get_next_prefix";
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_GETUGS, 3, func );
+
+ /*
+  *   Advance to next prefix
+  */
+
+  (entry->entry_ind)++;
+
+  ESA_DIAG_printf(ESA_COMP_GETUGS,3,
+                  "wild index=%d num_ugs_in=%d",
+                  entry->entry_ind,num_ugs_in);
+
+  if (entry->entry_ind GE num_ugs_in)
+     *have_more=NO_MORE;
+  else rc = get_wild_entry(entry, ug_params_in,dest,msgs) ;
+
+ /*
+  *          Finish
+  */
+
+  ESA_DIAG_exit(ESA_COMP_GETUGS, 3, func, rc );
+
+  return rc ;
+
+}
+#endif  /* if 0 */

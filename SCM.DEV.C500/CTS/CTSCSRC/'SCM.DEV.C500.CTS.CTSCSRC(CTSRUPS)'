@@ -1,0 +1,1602 @@
+/**************************************************************
+*                                                             *
+* Title            : Update user password (RACF)              *
+*                                                             *
+* File Name        : ctsrups.c                                *
+*                                                             *
+* Author           : Doron Cohen                              *
+*                                                             *
+* Creation Date    : 08/05/94                                 *
+*                                                             *
+* Description      :                                          *
+*                                                             *
+* Assumptions and                                             *
+*   Considerations :                                          *
+*                                                             *
+**************************************************************/
+
+/**************************************************************
+* Mod.Id   Who      When     Description                      *
+* -------- -------- -------  -------------------------------- *
+* dc0806   Doron    8/6/95   Remove INTERVAL handling (moved  *
+*                            to upduser due to RACF21).       *
+* dc0701   Doron    7/1/96   Restore INTERVAL support .       *
+* PS0300   AS       18/08/98 EXPIRED/NOEXPIRED KEYWORD SUPPORT*
+*                            FOR RACF26                       *
+* PS0301   dc       19/08/98 fix ps0300 to correctly handle   *
+*                            PASSWORD_LIFE_IGNORED            *
+* BS2412   YB       21/12/99 don't issue altuser password when*
+*                            admin_user = user                *
+* WS2367   YB       06/03/00 if password fails due to history *
+*                            update as temporary password     *
+*                            (re-design of code)              *
+* ps0460   sk       03/04/01 Support "PROTECTED" user         *
+*                   Major change with code/flow reorder +     *
+*                   Change in password functionality to       *
+*                          perform permanent password change  *
+*                          using ALTUSER PASS NOEXPIRED       *
+* ws2399   sk       04/07/01 Support EXPIRED/NOEXPIRED kwrds  *
+*                   change local var expired to expire1       *
+* ps0491   sk       09/11/01 Use ALTUSER PASSWORD NOEXPIRED   *
+*                   instead RACROUTE if RACF at least 2.6     *
+* WS2457   Yonatan  13/02/02 Support VERIFY_PWD keyword       *
+* WS2516   AmirH    15/10/04 Add ALTUSER RESUME before        *
+*                            password change (optional)       *
+* IS10002  AvnerL   31/01/07 VERIFY_PASSWORD_BY_LOGIN use val *
+* WS10015  MeirS    22/11/07 Unify ALTUSER: RESUME & PW       *
+* IS10066  NuritY   14/02/12 1.Verify password succeeds even  *
+*                               when user is revoked/expired  *
+*                            2.Remove old racf supprot.       *
+* SAS2IBMT SeligT   09/10/16 SAS/C to IBM C Conversion Project*
+* IS10147A SeligT   29/05/17 Add support for password phrase  *
+* IS10147B AvnerL   13/06/17 Empty pswd 4 protected user only.*
+* IS10161  MeirS    09/11/17 remove calling to CTSRVRS rtns   *
+* IS10170  AvnerL   01/04/18 Verify-password fails with blank.*
+* IS10174  NuritY   25/12/17 1. Take VERIFY_PASSWORD_BY_LOGIN *
+*                               from common_params.           *
+*                            2. Replcae RACF_YES and RACF_NO  *
+*                               with MS-YES and MS_NO for     *
+*                               RACF_pro_user proteced parm.  *
+* WS10074  Kailas   24/12/18 Check Password history when its  *
+*                            a self password change.          *
+* IS10184  NuritY   02/09/21 Improve scripts performance      *
+* WS10082  MauriC   07/11/22 Recompile for new ADDINFO macros *
+*                                                             *
+*                                                             *
+**************************************************************/
+
+#include   <globs.h>
+
+/*
+ *   Standard include files
+ */
+
+#include   STDLIB
+#include   STDIO
+#include   STRING
+
+/*
+ *   CONTROL-SA include files
+ */
+
+#include ESA_DIAG
+#include ESA_API
+#include ESA_CTSAMSG
+#include ESA_API_CODES
+
+#include MVS_OS_CLI
+
+#include RACF_CODES
+#include API_ADDINFO
+#include RACF
+#include MVS_OS_DYNAM
+
+/*
+ *   Field blocking and coversion
+ */
+
+/* Drop the macro which is not used any more since IS10161. IS10170
+#define FIELD_BLOCK(a,b)                     \
+      memset(a, BLANK, sizeof(a) );          \
+      memcpy(a, b, MIN(strlen(b),sizeof(a)) ); end of drop...IS10170*/
+
+/*
+ *     Assembler, new password routine
+ */
+
+/* SAS2IBMT prototype changed for IBM C
+extern int ctsfnps (char *user, char *npass, char *opass, int  *dbg,
+                    int *racf_r15, int *racf_rc, int *racf_reason);  */
+/* extern int ctsfnps (); /* This module not used here.      SAS2IBMT */
+
+/*
+ *     MKT for PASSWORD
+ *         (Mandatory Keywords Table)
+ */
+
+static ADDINFO_MKTE_rec_typ mkt[] = {
+       ""         /* a null string indicate end-of-mkt */
+ };
+
+/*
+ *     KDT for ALTUSER PASSWORD command
+ */
+
+static ADDINFO_KDTE_rec_typ altuser_kdt[] = {
+   {"PASSWORD"  ,KDT_KEY ,"PASSWORD()","(" , ")" },
+   {"NOPASSWORD",KDT_FLG ,""          ,"(" , ")" },
+   {"PHRASE"    ,KDT_KEY ,""          ,"('" , "') " },    /* IS10147A */
+   {"NOPHRASE"  ,KDT_FLG ,""          ,"" , " "  },       /* IS10147A */
+ /*{"EXPIRED"   ,KDT_FLG ,"NOEXPIRED" ,"" , ""   },    /* ps0300 */
+   {"EXPIRED"   ,KDT_IGN ,""          ,"" , ""   },    /* ws2399 */
+   {"NOEXPIRED" ,KDT_IGN ,""          ,"" , ""   },    /* ws2399 */
+   {""          ,KDT_FLG ,""          ,""  ,""   }
+};
+
+/*
+ *     KDT for PASSWORD command (interval change)
+ */
+
+static ADDINFO_KDTE_rec_typ password_kdt[] = {         /* dc0701 */
+   {"INTERVAL"  ,KDT_KEY, "INTERVAL", "(" , ")" },     /* dc0701 */
+   {"NOINTERVAL",KDT_FLG, "INTERVAL", "(" , ")" },     /* dc0701 */
+   {"USER"      ,KDT_KEY, ""        , "(" , ")" },     /* dc0701 */
+   {""          ,KDT_FLG, ""        , ""  , ""  }      /* dc0701 */
+};                                                     /* dc0701 */
+
+/* WS10074 - start                                   *
+ * KDT for PASSWORD command (self password change)   *
+ *                                                   */
+
+static ADDINFO_KDTE_rec_typ self_password_kdt[] = {
+   {"PASSWORD"  ,KDT_KEY , "PASSWORD", "(" , ")" },
+   {"PHRASE"    ,KDT_KEYM, "PHRASE"  , "(" , ")" },
+   {""          ,KDT_FLG , ""        , ""  , ""  }
+};
+/* WS10074 - end */
+
+/* WS2367 - restructure code:
+   new functions for each password operation    */
+
+static ESA_RC chg_pass_temp  (USER_PARAMS_rec_typ  * user_params,
+                              ADDINFO_rec_typ      * addinfo,
+                              ADDINFO_rec_typ      * laddinfo,
+                              ADMIN_PARAMS_rec_typ * admin_params,
+                              ERR_STRUCT_rec_typ   * err,
+                /*WS10015     char                 * cmd);   */
+                /*WS10015 */  char                 * cmd,
+                /*WS10015 */  char                 * resume_res);
+/*   IS10066 - remove old racf support
+static ESA_RC chg_pass_perm  (USER_PARAMS_rec_typ  * user_params,
+                              ADDINFO_rec_typ      * addinfo,
+                              ADDINFO_rec_typ      * laddinfo,
+                              ADMIN_PARAMS_rec_typ * admin_params,
+                              ERR_STRUCT_rec_typ   * err,
+                              RACF_FLAG_typ        * expired);/*ps0460*
+  */
+static ESA_RC chg_pass_perm26(USER_PARAMS_rec_typ  * user_params,
+                              ADDINFO_rec_typ      * addinfo,
+                              ADDINFO_rec_typ      * laddinfo,
+                              ADMIN_PARAMS_rec_typ * admin_params,
+                              ERR_STRUCT_rec_typ   * err,
+                /*WS10015     char                 * cmd);   */
+                /*WS10015 */  char                 * cmd,
+                /*WS10015 */  char                 * resume_res);
+/*ps0460
+static ESA_RC chg_pass_perm_wreset (USER_PARAMS_rec_typ  * user_params,
+  ps0460*/
+static ESA_RC chg_pass_expireset   (USER_PARAMS_rec_typ  * user_params,
+                              ADDINFO_rec_typ      * addinfo,
+                              ADDINFO_rec_typ      * laddinfo,
+                              ADMIN_PARAMS_rec_typ * admin_params,
+                              ERR_STRUCT_rec_typ   * err,
+                     /*ps0460 int                  * reason_code, */
+                              char                 * cmd) ;
+
+/* WS2367 - end of new function declerations */
+
+/* WS2516 Resume user function */
+static ESA_RC resume_user    (USER_typ             * user,
+                              ADDINFO_rec_typ      * laddinfo,
+                              ADMIN_PARAMS_rec_typ * admin_params);
+/* WS2516 end */
+
+/* IS10174
+#define VERIFY_PASSWORD_BY_LOGIN "VERIFY_PASSWORD_BY_LOGIN"        */
+#define RACF_FUNCTION_OK_RC      0
+/* IS10066 #define RACF_FUNCTION_FAILED_RC  8      */
+/* IS10066 #define RACF_PASSWORD_EXPIRED_RC 12     */
+/* IS10066 #define RACF_USER_REVOKED_RC     28     */
+
+ static char component[]="UpdPass";                    /*IS10184*/
+
+/***************************************************************
+* Procedure Name : updpass                                     *
+* Description    : Update password and its parameters          *
+* Input          : user, password, addinfo, admin              *
+* Output         : err                                         *
+* Input/Output   :                                             *
+* Return Value   : ESA_RC                                      *
+* Side Effects   :                                             *
+* Comments       :                                             *
+***************************************************************/
+
+ESA_RC CTSUpdPassword (USER_PARAMS_rec_typ  * user_params,
+                       ADDINFO_rec_typ      * addinfo,
+                       ADMIN_PARAMS_rec_typ * admin_params,
+                       ERR_STRUCT_rec_typ   * err)
+{
+
+  static char       func[]="CTSUpdPassword";
+
+  /*
+   *   Variables
+   */
+
+  ESA_RC       rc = ESA_OK, chk_rc;
+  char         cmd[MAX_API_ST];
+  ADDINFO_rec_typ * laddinfo = NULL;
+  ONE_FIELD_rec_ptr cpair;
+  char       * interval = NULL;
+  char         result[80];                         /* PS0149 */
+  char         resume_res[80];                     /* WS10015 */
+  /* PS0460
+  char         racf_version[10]= "";               /* PS0300 */
+  MS_FLAG_typ protected;                 /* IS10147B  PS0460 */
+  RACF_FLAG_typ expire1;                           /* PS0460 */
+  RACF_FLAG_typ noexpired;                         /* ws2399 */
+ /* is10066 RACF_FLAG_typ at_least_26;                * PS0491 *  */
+
+  /*ws2457*/
+  int         create_racf_rc, create_racf_out, create_racf_reason;
+  int         delete_racf_rc, delete_racf_out, delete_racf_reason;
+  /* IS10002 int   prm_rc; drop it as it is not used any more */
+  int         verify_password_rc,dbg_lvl;
+  /* IS10184 char      * how_to_verify = " ";  */
+  char        how_to_verify = ' ';                        /* IS10184 */
+  /* IS10184 RACF_PARAMS_rec_typ * params_ptr = NULL;     * IS10002 * */
+  COMMON_PARAMS_rec_typ    * cmnp_ptr = NULL;              /* IS10184 */
+  /*ws2457*/
+  char                     chk_pwd_history[7];     /* WS10074 */
+  char                     errmsg[170] = "";              /* IS10184 */
+
+  CTSAMSG_HANDLE_rec_ptr     msgs;
+  CTSAMSG_DEST_TABLE_rec_ptr dest;
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_UPDPASS, 1, func);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+  if ( ESA_DIAG_get_debug_level(ESA_COMP_UPDPASS) GE 1 ) /* ws2399 */
+    ADDINFO_dump(addinfo,1);                             /* ws2399 */
+
+  /* ws2457 start
+   *
+   *  Check if VERIFY_PWD was requested
+   *  If it was, call the verify password routine and exit,
+   * Otherwise continue as normal.
+   *
+   */
+
+  cpair = ADDINFO_search("VERIFY_PWD",
+                         RCF_ADDINFO_KWD_LEN,
+                         addinfo->pair,
+                         addinfo->num_pairs);
+
+  if (cpair NE NULL)
+    {
+     ESA_DIAG_printf(ESA_COMP_UPDPASS, 2,
+                     "VERIFY_PWD = %s", cpair->value);
+     if (strcmp(cpair->value,KWD_FLAG_ON) EQ 0)
+      {
+       /* IS10184 - replace with a call to GET_P_CMNPRMS
+       params_ptr = admin_params->apiinit_handle;           /@IS10002@/
+       /@ IS10174 - start @/
+       /@ * how_to_verify =                              *IS10002*
+         params_ptr->rssparm_VERIFY_PASS_LOGIN[0];       *IS10002*  @/
+       *how_to_verify =
+         params_ptr->common_params->rssparm_VERIFY_PASS_LOGIN[0];
+          end of replaced code  */
+       GET_P_CMNPRMS(admin_params, cmnp_ptr, rc, errmsg ) /* IS10184 */
+       if (rc NE ESA_OK)       /* no common_params - err     IS10184 */
+       {                                                  /* Is18184 */
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,   /* IS10184 */
+                       component, func, errmsg,           /* IS10184 */
+                       16, __LINE__);                     /* IS10184 */
+         goto exit;                                       /* IS10184 */
+       };                                                 /* Is18184 */
+
+       how_to_verify =                                    /* IS10184 */
+                 cmnp_ptr->rssparm_VERIFY_PASS_LOGIN[0];  /* IS10184 */
+       /* IS10174 - end   */
+       ESA_DIAG_printf(ESA_COMP_UPDPASS, 3,
+         "VERIFY_PASSWORD_BY_LOGIN:<%c> ", how_to_verify); /* IS10184 */
+       /* IS10184  "VERIFY_PASSWORD_BY_LOGIN:<%c> ", *how_to_verify); */
+       /*IS10002 prm_rc = admin_params->cs_func.rssprm_get_opt_ptr
+                        (admin_params->rss_name,
+                        VERIFY_PASSWORD_BY_LOGIN,
+                        sizeof(how_to_verify),
+                        how_to_verify,
+                        OPT_TRUE,
+                        OPT_FALSE);
+        if (prm_rc NE ESA_OK)
+          how_to_verify = KWD_FLAG_OFF; /* verify using login by
+                                                 default */
+        rc=ESA_FATAL;
+        dbg_lvl =
+           (int)ESA_DIAG_get_debug_level(ESA_COMP_UPDPASS);
+        if ( dbg_lvl GT 0 )
+           dbg_lvl = 1;
+
+        /* SAS2IBMT
+        verify_password_rc =  OS_DYNAM_call("CTSAVPS ",1,            */
+        verify_password_rc = (*(ASM_RTN_TYP *)&OS_DYNAM_call)
+                                     ("CTSAVPS ",1,
+                                     user_params->user,
+                                     user_params->passwd,
+                     /* IS10184      how_to_verify,                  */
+                                     &how_to_verify,      /* IS10184 */
+                                     admin_params->rss_type,
+                                     &dbg_lvl,
+                                     &create_racf_out,
+                                     &create_racf_rc,
+                                     &create_racf_reason,
+                                     &delete_racf_out,
+                                     &delete_racf_rc,
+                                     &delete_racf_reason);
+
+        ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT,2,
+                     "CTSAVPS create: FRC=%d, RC=%d  rc=%d, rs=%d",
+                     verify_password_rc,create_racf_out,
+                     create_racf_rc,create_racf_reason);
+
+ /* IS10066 if ((verify_password_rc EQ RACF_FUNCTION_OK_RC) OR
+            ((verify_password_rc EQ RACF_FUNCTION_FAILED_RC ) AND
+             ((create_racf_rc EQ RACF_PASSWORD_EXPIRED_RC) OR
+             (create_racf_rc EQ RACF_USER_REVOKED_RC))))  */
+        if (verify_password_rc EQ RACF_FUNCTION_OK_RC)   /* IS10066 */
+                rc = ESA_OK;
+        CTSAMSG_print(RACF_VERIFY_PWD, msgs, NULL, dest,
+                   user_params->user,rc);
+        goto exit_verify_password;
+      }
+     }
+  /* ws2457 end */
+
+ /*
+  *   Check user existance
+  */
+
+  ESA_DIAG_printf(ESA_COMP_UPDPASS, 1,
+                 "Checking user %s existance", user_params->user);
+  chk_rc = RACF_chk_user(user_params->user,OBJ_EXIST,TRUE,dest, msgs);
+  if ( chk_rc NE ESA_OK ) {
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+ /*
+  *   Obtain a local addinfo buffer
+  */
+
+  rc = ADDINFO_alloc(func,5,&laddinfo,dest,msgs);
+  if (rc NE ESA_OK) {
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+ /* ps0460
+ RACF_version_get(racf_version);     /* ps0300 */
+
+ /* WS2516 Resume user prior to password change if option is set */
+ rc = admin_params->cs_func.rssprm_get_opt_ptr( admin_params->rss_name,
+              "RCF_RESUME_BEFORE_PASSCHG",
+              sizeof(result),
+              result,
+              OPT_TRUE,
+              OPT_FALSE);
+
+ if ( rc EQ ESA_OK ) {
+    ESA_DIAG_printf(ESA_COMP_UPDPASS, 1,
+       "RCF_RESUME_BEFORE_PASSCHG set %s in RSSPARM", result);
+  strcpy(resume_res,result) ;  /* keep result for future WS10015 */
+  /* The following code was commented      WS10015 - start       */
+  /*if ( strcmp(result, KWD_FLAG_ON) EQ 0 )  {  */
+       /* Issue "ALTUSER <user> RESUME" command */
+  /*   rc = resume_user( &(user_params->user),
+                         laddinfo,
+                         admin_params );
+
+       if (rc NE ESA_OK) {
+          rc = ESA_FATAL;
+          goto exit;
+       }
+    } */  /* End if rssprm_get_ptr rc EQ ESA_OK */
+  /*                                       WS10015 - end         */
+ } /* end WS2516 */
+
+ /*-------------------------------------------------------------------
+  *   temporary password change
+  *-----------------------------------------------------------------*/
+ /*ws2399 replaced code
+ if (user_params->passwd_life NE PASS_LIFE_PERMANENT) { */
+ /*start of ws2399 replacing code */
+ if (user_params->passwd_life EQ PASS_LIFE_PERMANENT)
+      noexpired = RACF_YES;
+ else noexpired = RACF_NO;
+
+ cpair = ADDINFO_search ( "EXPIRED", RCF_ADDINFO_KWD_LEN,
+                           addinfo->pair,
+                           addinfo->num_pairs );
+ if ((cpair NE NULL) AND (strcmp(cpair->value,KWD_FLAG_ON) EQ 0))
+    noexpired = RACF_NO;
+ cpair = ADDINFO_search ( "NOEXPIRED", RCF_ADDINFO_KWD_LEN,
+                           addinfo->pair,
+                           addinfo->num_pairs );
+ if ((cpair NE NULL) AND (strcmp(cpair->value,KWD_FLAG_ON ) EQ 0))
+    noexpired = RACF_YES;
+
+ ESA_DIAG_printf(ESA_COMP_UPDPASS, 1,"passwd_life= %d, noexpired = %d",
+     user_params->passwd_life, noexpired);
+
+ if  (noexpired EQ RACF_NO) {
+ /*end of ws2399 replacing code*/
+    rc = chg_pass_temp (user_params, addinfo,laddinfo,
+          /* WS10015    admin_params, err, cmd) ; */
+          /* WS10015 */ admin_params, err, cmd, resume_res);
+    if (rc NE ESA_OK) {
+       CTSAMSG_print(RACF_TEMPPASS_FAIL, msgs, NULL, dest,
+                     user_params->user);
+       rc = ESA_FATAL;
+       goto exit;
+    }
+
+ } /* temporary password change */
+
+ /*-------------------------------------------------------------------
+  *    Permanent Password Replacement
+  *-----------------------------------------------------------------*/
+
+ else {
+
+   /* WS10074 - Start   */
+
+   /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+    *                                                                 *
+    * WS10074 introduces 2 changes:                                   *
+    * 1. Do not issue the PASSWORD command to set a default password  *
+    *    when RACF password security enhancement, per APAR OA43999    *
+    *    is installed.                                                *
+    * 2. Support for end user to change his own password while        *
+    *    considering password history. This involves setting the      *
+    *    reversed password as temporary password.                     *
+    * Both enhancements are detailed below.                           *
+    *                                                                 *
+    * User password at the end of the process:                        *
+    * ========================================                        *
+    * > New password as permanent - when all is OK.                   *
+    *                                                                 *
+    *                                                                 *
+    * > New password as temporary - when setting of the permanent     *
+    *   password failed, and setting of the same password as          *
+    *   temporary is successful                                       *
+    *                                                                 *
+    * > New password as reversed password - when password history     *
+    *   support is active, setting of the reversed password is        *
+    *   successful, but setting of the new password as permanent      *
+    *   or temporary failed.                                          *
+    *                                                                 *
+    *                                                                 *
+    * > Password not changed - when                                   *
+    *   - Password extended support is not installed and the          *
+    *     PASSWORD command failed.                                    *
+    *   - Support for password history is active, and setting of      *
+    *     the reversed password failed.                               *
+    *   - All commands failed.                                        *
+    *                                                                 *
+    * > Default password - when RACF password security enhancement    *
+    *   is not installed, the PASSWORD command was successful, but    *
+    *   setting the new password as permanent or temporary failed.    *
+    *                                                                 *
+    * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+
+   /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+    * RACF password security enhancement introduced with APAR OA43999 *
+    * does not allow setting a null password for a user because this  *
+    * led to setting a default password equal to the default group    *
+    * name -> security breach.                                        *
+    * When this enhancement is installed, an error message is         *
+    * issued when no password is specified in the PASSWORD command.   *
+    *                                                                 *
+    * Without this enhancement, setting a user password as expired    *
+    * requires generating a temporary password. This was done using   *
+    * the PASSWORD command without a password parameter.              *
+    * With this enhancement this is no longer needed. Furthermore,    *
+    * issuing the PASSWORD command without a password leads to an     *
+    * error messgae.                                                  *
+    *                                                                 *
+    * Therefore, when this enhancement is installed, we should skip   *
+    * the PASSWORD command as we are able to control password         *
+    * expiration using ALTUSER without the need to set a default      *
+    * password.                                                       *
+    *                                                                 *
+    * There is a flag is RCVT indicating whether this enhancement is  *
+    * installed. We check this flag in order to decide whether to     *
+    * issue the PASSWORD command or not.                              *
+    * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+   rc = RACF_get_option_value("PASSWORD.EXTENDED",TYPE_1A,
+                                result, dest, msgs);
+   if ( (rc EQ ESA_OK) AND (result[0] EQ 'N' ) )
+   {
+   /* WS10074 - End */
+     rc = admin_params->cs_func.rssprm_get_ptr( admin_params->rss_name,
+                   "RCF_EXPIRE_PASSCHG", sizeof(result), result);
+
+     ESA_DIAG_printf(ESA_COMP_UPDPASS, 1,
+        "RCF_EXPIRE_PASSCHG set %s in RSSPARM", result);
+     if (( rc EQ ESA_OK ) AND
+         (strcmp(result, KWD_FLAG_ON) EQ 0))
+     {
+       rc = chg_pass_expireset (user_params, addinfo,laddinfo,
+                                admin_params, err, cmd);
+       switch (rc) {
+          case ESA_OK: expire1 = RACF_YES; break;
+          case ESA_FATAL: goto exit;
+          default: expire1 = RACF_NO; break;}
+
+     }
+   }
+   /* WS10074 - Start */
+   else
+   {
+     if ( rc NE ESA_OK )
+     {
+       rc = ESA_FATAL;
+       goto exit;
+     }
+   }
+   /* WS10074 - End */
+   /*
+    *   Password change via ALTUSER if RACF 2.6 and up
+    */
+
+   /*PS0491
+    if ((strcmp(admin_params->rss_type,RACF26_RSS_TYPE) EQ 0) OR
+        (strcmp(admin_params->rss_type,RACF_RSS_TYPE)   EQ 0)  ) */
+   /*   IS10066 - remove old racf support
+    rc = RACF_version_at_least(RACF26, &at_least_26);  *ps0491*
+    if (rc NE ESA_OK) {rc=ESA_ERR;goto exit;}          *ps0491*
+                                                       *ps0491*
+       if (at_least_26) {                              *ps0491*   */
+            rc = chg_pass_perm26 (user_params, addinfo,laddinfo,
+                    /* WS10015    admin_params, err, cmd) ; */
+                    /* WS10015 */ admin_params, err, cmd, resume_res);
+   /*   IS10066 - remove old racf support
+       }                                               *ps0491*
+    else    rc = chg_pass_perm (user_params, addinfo,laddinfo,
+                                  admin_params, err, &expire1);  */
+
+    /*** If failed - change to temporary password ***/
+
+    if   (rc NE ESA_OK) {
+     /* WS10074 - start
+      *  If chg_pass_perm26 return ESA_SKIP it means setting of
+      *  a temporary password failed, so no reason to do it again.
+      */
+      if( rc EQ ESA_SKIP)
+      {
+        rc = ESA_FATAL;
+        goto exit;
+      }
+      /* WS10074 - end */
+      ESA_DIAG_printf(ESA_COMP_UPDPASS, 1,
+         "Permanent pass change failed rc=%d;trying temp. change",rc);
+                                                            /*ps0491*/
+      CTSAMSG_print(RACF_PERMFAIL_TRYTMP,                   /*ps0491*/
+                    msgs, NULL, dest, user_params->user);   /*ps0491*/
+                                                            /*ps0491*/
+      rc = chg_pass_temp (user_params, addinfo,laddinfo,
+                  /* WS10015    admin_params, err, cmd) ; */
+                  /* WS10015 */ admin_params, err, cmd, resume_res);
+                                                            /*ps0491*/
+      if (rc NE ESA_OK) {                                   /*ps0491*/
+             CTSAMSG_print(RACF_TEMPPASS_FAIL, msgs, NULL,  /*ps0491*/
+                     dest, user_params->user);              /*ps0491*/
+             rc = ESA_FATAL;                                /*ps0491*/
+             goto exit;                                     /*ps0491*/
+          }                                                 /*ps0491*/
+      /* WS10074 - start */
+      else
+      {
+     /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+      * WS10074 Password history fix                                  *
+      * The functionality is optional and can be enabled by setting   *
+      * RCF_CHK_PWD_HISTORY rss parameter to either 'Y_OK' or 'Y_FAIL'*
+      * RCF_CHK_PWD_HISTORY can have following values,                *
+      * 'N'      - This is the default value for the parameter.       *
+      *            setting it to 'N' or removing the parameter from   *
+      *            rss_parm disables the functionality.               *
+      * 'Y_OK'   - If setting permanent password operation fails and  *
+      *            the password is set to temporary password then the *
+      *            return code is set to OK which means the           *
+      *            transaction is successful.                         *
+      * 'Y_FAIL' - If setting permanent password operation fails and  *
+      *            the password is set to temporary password then the *
+      *            return code is set to FATAL which means the        *
+      *            transaction is not successful.                     *
+      * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+         rc = admin_params->cs_func.rssprm_get_opt_ptr(
+                            admin_params->rss_name,
+                            "RCF_CHK_PWD_HISTORY",
+                            sizeof(chk_pwd_history),chk_pwd_history,
+                            OPT_TRUE, OPT_TRUE);
+
+         ESA_DIAG_printf(ESA_COMP_UPDPASS, 6,
+             "RCF_CHK_PWD_HISTORY set %s in RSSPARM", chk_pwd_history);
+
+         /* The password change to permanent mode has failed and the
+            password is set to temporary mode. If RCF_CHK_PWD_HISTORY
+            is set to "Y_OK" then we want to proceed considering it as
+            a successful password change. If the value is not set or
+            set to 'N' or "Y_FAIL" then the transaction must be set to
+            error.                                                    */
+
+         if ((rc EQ ESA_OK) AND
+             (strcmp(chk_pwd_history,"Y_OK") EQ 0))
+         {
+            rc = ESA_OK;
+         }
+         else
+         {
+            rc = ESA_FATAL;
+            goto exit;
+         }
+      }
+      /* WS10074 - end */
+    }
+
+ } /* permanent password change */
+
+ /*
+  *     Issue success message
+  */
+
+ if (rc EQ ESA_OK) {
+    /* IS10147A start - added a variable to message CTS3021I */
+    if (strlen(user_params->passwd) LT MIN_RSS_PSWDPHRS_LEN)
+       CTSAMSG_print(RACF_PASSOK, msgs, NULL, dest,
+                     "", user_params->user);
+    else
+       CTSAMSG_print(RACF_PASSOK, msgs, NULL, dest,
+                     "phrase", user_params->user);
+    /* IS10147A end */
+ }
+ /* WS10074 - start */
+ else
+ {
+   rc = ESA_FATAL;
+   goto exit;
+ }
+ /* WS10074 - end */
+
+ /*
+  *   dc0701 - INTERVAL paramter can be set to the following values :
+  *
+  *       YES - use default site interval
+  *       NO  - no password interval enforced
+  *       nnn - interval in days
+  */
+
+ cpair = ADDINFO_search ( "INTERVAL", RCF_ADDINFO_KWD_LEN,
+                           addinfo->pair,
+                           addinfo->num_pairs );
+ if (cpair NE NULL) {
+
+  interval = cpair->value;
+  /*ps0460 from here*/
+  ESA_DIAG_printf(ESA_COMP_UPDPASS, 1,
+          "Extracting user %s PROTECTED attribute", user_params->user);
+  /* change parameters                                        IS10147B*/
+  /*chk_rc=RACF_pro_user(user_params->user,&protected,TRUE,dest,msgs);*/
+    chk_rc = RACF_pro_user(user_params->user,&protected,admin_params);
+  if (chk_rc NE ESA_OK) {;
+     rc = ESA_FATAL;
+     goto exit;
+  }
+  /* IS10174 if (protected EQ RACF_YES) {   */
+  if (protected EQ MS_YES) {                             /* IS10174 */
+      CTSAMSG_print(RACF_PROTECTED_INTERVAL,
+                         msgs, NULL, dest, interval, user_params->user);
+     rc = ESA_FATAL;
+     goto exit;
+  }    /* to here ps0460 */
+
+    if (strcmp(interval, "YES") EQ 0 )
+       ADDINFO_insert(TYPE_1A,"INTERVAL", NULL_STRING, laddinfo,
+                      RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                      UNIQUE);
+    else if (strcmp(interval, "NO") EQ 0 )
+       ADDINFO_insert(TYPE_1A,"NOINTERVAL", KWD_FLAG_ON, laddinfo,
+                      RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                      UNIQUE);
+    else
+       ADDINFO_insert(TYPE_1A,"INTERVAL", interval, laddinfo,
+                      RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                      UNIQUE);
+
+    /*
+     *     Insert the user name to local addinfo
+     */
+
+    ADDINFO_insert( TYPE_1A, "USER",user_params->user, laddinfo,
+                    RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                    UNIQUE);
+
+    /*
+     *     issue PASSWORD command to change user's interval
+     */
+
+    strcpy(cmd, "PASSWORD ");
+    rc = racfcmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+                 cmd, MAX_OK_RC_0,
+                 1, &laddinfo, mkt, password_kdt,        /* IS10174 */
+                 admin_params,                           /* IS10174 */
+                 CMDOUT_YES, RACF_YES);
+      /* IS10174 1, &laddinfo, mkt, password_kdt, dest, msgs,     */
+
+    ESA_DIAG_printf(ESA_COMP_UPDPASS, 1,
+                    "password command rc = %d", rc);
+
+    ADDINFO_empty( laddinfo );
+
+    /*
+     *     Issue success/failure message for interval change
+     */
+
+    if (rc NE ESA_OK) {
+       CTSAMSG_print( RACF_INTERVAL_FAIL, msgs, NULL, dest,
+                      user_params->user);
+       goto exit;
+    }
+    CTSAMSG_print( RACF_INTERVAL_OK, msgs, NULL, dest,
+                   user_params->user);
+
+ } /* interval change */
+
+ /*
+  *   Finish
+  */
+ exit:
+
+ ADDINFO_free(&laddinfo);
+
+ exit_verify_password:
+
+ ESA_DIAG_exit(ESA_COMP_UPDPASS, 1, func, rc );
+
+ return rc;
+
+} /*main*/
+
+/* WS2367 - password functions re-structure */
+
+/*****************************************************************
+*
+*  Change with temporary password
+*
+*****************************************************************/
+
+static ESA_RC chg_pass_temp  (USER_PARAMS_rec_typ  * user_params,
+                       ADDINFO_rec_typ      * addinfo,
+                       ADDINFO_rec_typ      * laddinfo ,
+                       ADMIN_PARAMS_rec_typ * admin_params,
+                       ERR_STRUCT_rec_typ   * err,
+         /*WS10015     char                 * cmd);   */
+         /*WS10015 */  char                 * cmd,
+         /*WS10015 */  char                 * resume_res)
+{
+
+ static char       func[]="chg_pass_temp";
+
+ ESA_RC            rc = ESA_OK;
+ /* char              cmd[MAX_API_ST]; */
+
+ CTSAMSG_HANDLE_rec_ptr     msgs = admin_params->ctsamsg_handle;
+ CTSAMSG_DEST_TABLE_rec_ptr dest = admin_params->ctsamsg_dest;
+ RACF_FLAG_typ              at_least_Z17;           /* WS10015  */
+ RACF_PARAMS_rec_typ        * params_ptr = NULL;    /* WS10015  */
+
+ /*
+  *   Initialize
+  */
+
+ ESA_DIAG_enter(ESA_COMP_UPDPASS, 1, func);
+
+ /*
+  *   Issue ALTUSER command
+  */
+
+ if (strlen(user_params->passwd) LT MIN_RSS_PSWDPHRS_LEN) /* IS10147A */
+  /*sprintf( cmd,"ALTUSER %s PASSWORD(%s)",               WS10074 */
+    sprintf( cmd,"ALTUSER %s EXPIRED PASSWORD(%s)", /*WS10074 */
+              user_params->user, user_params->passwd );
+ else                                                     /* IS10147A */
+  /*sprintf( cmd,"ALTUSER %s PHRASE('%s')",    * IS10147A * WS10074 */
+    sprintf( cmd,"ALTUSER %s EXPIRED PHRASE('%s')",/*IS10147A*WS10074*/
+              user_params->user, user_params->passwd );   /* IS10147A */
+ /*       4                               WS10015 - start       */
+ if ( strcmp(resume_res, KWD_FLAG_ON) EQ 0 ) {
+     /* Add "RESUME" to command */
+     strcat(cmd, " RESUME ") ;
+    /* IS10161 start - remove RACF version retrieving
+     rc = RACF_version_at_least(RACFZ17,
+                              &at_least_Z17);
+       if (rc NE ESA_OK) {
+          rc = ESA_FATAL;
+          goto exit_temp;
+       }
+     * IS10161 end                                               */
+     params_ptr = admin_params->apiinit_handle;
+  /*   IS10161 start - remove RACF version retrieving            */
+  /* if(params_ptr->rssparm_RES_CLR_REV[0] == RES_CLR_REV_ON AND */
+  /*    at_least_Z17 EQ RACF_YES)             only for z/os >= 1.7  */
+     if(params_ptr->rssparm_RES_CLR_REV[0] == RES_CLR_REV_ON)
+  /* * IS10161 end                                               */
+           strcat(cmd, "NOREVOKE ") ;
+  }
+ /*                                       WS10015 - end         */
+
+ rc = racfcmd(func, EXECOUT_DDNAME,
+              admin_params->admin_uname,
+              cmd, MAX_OK_RC_0, 0, &laddinfo, mkt,
+              altuser_kdt, admin_params,                 /* IS10174 */
+              CMDOUT_YES, RACF_YES);                     /* IS10174 */
+  /* IS10174  altuser_kdt, dest, msgs, CMDOUT_YES, RACF_YES);      */
+ ESA_DIAG_printf(ESA_COMP_UPDPASS, 1,
+         "Upduser %s, rc = %d",
+          user_params->user, rc);
+
+ if (rc NE ESA_OK) {
+     CTSAMSG_print(RACF_TEMPPASS_FAIL, msgs, NULL, dest,
+                    user_params->user);
+      rc = ESA_ERR;
+      goto exit_temp ;
+ }
+
+ /*
+  *   Finish
+  */
+
+ exit_temp:
+
+ ESA_DIAG_exit(ESA_COMP_UPDPASS, 1, func, rc );
+
+ return rc;
+
+}
+
+/*****************************************************************
+*
+* Change permanent password for RACF26 or higher
+*
+*****************************************************************/
+
+static ESA_RC chg_pass_perm26 (USER_PARAMS_rec_typ  * user_params,
+                       ADDINFO_rec_typ      * addinfo,
+                       ADDINFO_rec_typ      * laddinfo,
+                       ADMIN_PARAMS_rec_typ * admin_params,
+                       ERR_STRUCT_rec_typ   * err,
+         /*WS10015     char                 * cmd);   */
+         /*WS10015 */  char                 * cmd,
+         /*WS10015 */  char                 * resume_res)
+{
+
+ static char       func[]="chg_pass_perm26";
+ ESA_RC            rc = ESA_OK;
+ RACF_FLAG_typ            at_least_Z17;           /* WS10015  */
+ RACF_PARAMS_rec_typ      * params_ptr = NULL;    /* WS10015  */
+ /* char              cmd[MAX_API_ST]; */
+
+ CTSAMSG_HANDLE_rec_ptr     msgs = admin_params->ctsamsg_handle;
+ CTSAMSG_DEST_TABLE_rec_ptr dest = admin_params->ctsamsg_dest;
+ /* WS10074 - start */
+ char                     curr_passwd[MAX_RSS_PASSWD_LEN * 2 + 2];
+ char                     chk_pwd_history[7];
+ char                     sep[3];
+ char                     command[9]= "";
+ ONE_FIELD_rec_ptr        pair;
+ ESA_RC                   rc_login_u = ESA_ERR;
+ ESA_RC                   rc_login   = ESA_ERR;
+ void                     *login_handle = NULL;
+ ADDINFO_rec_typ          *taddinfo = NULL;
+ /* WS10074 - end */
+
+ /*
+  *   Initialize
+  */
+
+ ESA_DIAG_enter(ESA_COMP_UPDPASS, 1, func);
+
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+  * WS10074 - start                                                   *
+  *                                                                   *
+  * The requirement not allow using password from history for self    *
+  * change password. If we use ALU to reset the password of user,     *
+  * the history is not checked. The password history will be checked  *
+  * only when user change own password with PASSWORD command.         *
+  * With the change, we run PASSWORD command by logging in as the     *
+  * user and execute PASSWORD command. To be able to run PASSWORD     *
+  * command for self we need old and new password. Since we dont get  *
+  * old password from IdentityIQ we issue ALU and reset the password  *
+  * to a temporary password. This temporary password is reverse of    *
+  * the password entered by user. If there is policy defined at RACF  *
+  * system the temporary password would not be checked against it.    *
+  *                                                                   *
+  * MINCHANGE parameter - The MINCHANGE parameter specifies the       *
+  * number of days that must pass between a user's password or        *
+  * password phrase changes.                                          *
+  * With the fix we run ALU command to set temporary password with    *
+  * EXPIRE parameter. This parameter sets PASS-DATE to 0 allowing     *
+  * the PASSWORD command to work. This makes MINCHANGE ineffective    *
+  * and the solution works for any scehario except MSAdmin.           *
+  * The Managed System Administrator defined is an exception. For     *
+  * Managed System Administrator the MINCHANGE parameter will be in   *
+  * effect for the ALU command that sets the temporary password.      *
+  *                                                                   *
+  * The functionality is optional and can be enabled by setting       *
+  * RCF_CHK_PWD_HISTORY rss parameter to either 'Y_OK' or 'Y_FAIL'    *
+  * RCF_CHK_PWD_HISTORY can have following values,                    *
+  * 'N'      - This is the default value for the parameter. Setting   *
+  *            it to 'N' or removing the parameter from rss parm      *
+  *            disables the functionality.                            *
+  * 'Y_OK'   - If setting permanent password operation fails and the  *
+  *            password is set to temporary password then the return  *
+  *            code is set to OK which means the transaction is       *
+  *            successful.                                            *
+  * 'Y_FAIL' - If setting permanent password operation fails and the  *
+  *            password is set to temporary password then the return  *
+  *            code is set to FATAL which means the transaction is    *
+  *            not successful.                                        *
+  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+ strcpy (curr_passwd, user_params->passwd);
+
+ rc = admin_params->cs_func.rssprm_get_opt_ptr( admin_params->rss_name,
+                  "RCF_CHK_PWD_HISTORY", sizeof(chk_pwd_history),
+                   chk_pwd_history, OPT_TRUE, OPT_TRUE);
+
+ ESA_DIAG_printf(ESA_COMP_UPDPASS, 6,
+       "RCF_CHK_PWD_HISTORY set %s in RSSPARM", chk_pwd_history);
+
+ if (( rc EQ ESA_OK ) AND
+     (chk_pwd_history[0] EQ 'Y'))
+ {
+    rc = My_strrev (curr_passwd);
+
+    if (rc NE ESA_OK) {
+       rc = ESA_FATAL;
+       CTSAMSG_print(ERR_TL_FUNC_CALL,msgs, NULL, dest, func,
+                     __LINE__, "My_strrev failed for curr_password");
+       goto exit_perm26;
+    }
+
+    sprintf(cmd,"ALTUSER %s EXPIRED ", user_params->user);
+ }
+ else
+ {
+    sprintf(cmd,"ALTUSER %s NOEXPIRED ", user_params->user);
+    chk_pwd_history[0] = 'N';
+ }
+ /* WS10074 - end */
+
+ if (strlen(user_params->passwd) LT MIN_RSS_PSWDPHRS_LEN) /* IS10147A */
+    ADDINFO_insert( TYPE_1A,"PASSWORD",
+    /* WS10074 */   curr_passwd, laddinfo, RCF_ADDINFO_KWD_LEN,
+                    RCF_ADDINFO_VAL_LEN, UNIQUE);
+    /* WS10074     user_params->passwd, laddinfo, RCF_ADDINFO_KWD_LEN,*/
+ else                                                     /* IS10147A */
+    ADDINFO_insert( TYPE_1A,"PHRASE",                     /* IS10147A */
+    /* WS10074 */   curr_passwd, laddinfo, RCF_ADDINFO_KWD_LEN,
+                    RCF_ADDINFO_VAL_LEN, UNIQUE);         /* IS10147A */
+    /* WS10074     user_params->passwd, laddinfo, RCF_ADDINFO_KWD_LEN,*/
+ /* ws2399
+ ADDINFO_insert( TYPE_1A,"EXPIRED",
+                 KWD_FLAG_OFF, laddinfo, RCF_ADDINFO_KWD_LEN,
+                 RCF_ADDINFO_VAL_LEN, UNIQUE);
+
+ sprintf(cmd,"ALTUSER %s ", user_params->user); */
+ /*WS10074 - Following code is moved above
+ sprintf(cmd,"ALTUSER %s NOEXPIRED ", user_params->user);  *ws2399* */
+ /*                                       WS10015 - start       */
+ if ( strcmp(resume_res, KWD_FLAG_ON) EQ 0 ) {
+     /* Add "RESUME" to command */
+     strcat(cmd, "RESUME ") ;
+
+    /* IS10161 start - remove RACF version retrieving
+     rc = RACF_version_at_least(RACFZ17,
+                              &at_least_Z17);
+       if (rc NE ESA_OK) {
+          rc = ESA_FATAL;
+          goto exit_perm26;
+       }
+     * IS10161 end                                               */
+     params_ptr = admin_params->apiinit_handle;
+  /*   IS10161 start - remove RACF version retrieving            */
+  /* if(params_ptr->rssparm_RES_CLR_REV[0] == RES_CLR_REV_ON AND */
+  /*    at_least_Z17 EQ RACF_YES)          /* only for z/os >= 1.7  */
+     if(params_ptr->rssparm_RES_CLR_REV[0] == RES_CLR_REV_ON)
+  /* * IS10161 end                                               */
+           strcat(cmd, "NOREVOKE ") ;
+ }
+ /*                                       WS10015 - end         */
+
+ rc = racfcmd(func, EXECOUT_DDNAME,
+              admin_params->admin_uname,
+              cmd, MAX_OK_RC_0,
+              1, &laddinfo, mkt, altuser_kdt,            /* #exout@ */
+              admin_params,                              /* #exout@ */
+              CMDOUT_YES, RACF_YES);
+   /* IS10174 1, &laddinfo, mkt, altuser_kdt, dest, msgs,   */
+
+ ESA_DIAG_printf(ESA_COMP_UPDPASS, 1,
+         "Upduser %s, rc = %d",
+          user_params->user, rc);
+
+ /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+  * WS10074 - start                                                 *
+  * Following code checks if RCF_CHK_PWD_HISTORY rss parameter is   *
+  * set to 'Y' and executes PASSWORD command by logging in as end   *
+  * user. For more details check explaination above.                *
+  * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+ if (chk_pwd_history[0] EQ 'Y')
+ {
+   /* If racfcmd does not return ESA_OK we want to send ESA_SKIP
+      so that we dont run ALU command again in calling method trying
+      to set temporary password again                                */
+
+   if( rc NE ESA_OK )
+   {
+     rc = ESA_SKIP;
+   }
+   else
+   {
+   /* If racfcmd returns ESA_OK and RCF_CHK_PWD_HISTORY rss parameter
+      is set to Y we want to continue with self PASSWORD change      */
+
+     ESA_DIAG_printf(ESA_COMP_UPDPASS, 6,
+              "Setting self password");
+
+     /* Allocate memory for temporary addinfo*/
+     rc = ADDINFO_alloc(func,5,&taddinfo,dest,msgs);
+
+     if (rc NE ESA_OK)
+     {
+        rc = ESA_FATAL;
+        goto exit_perm26;
+     }
+
+     /*
+      * Prepare the PASSWORD/PHRASE parameter:
+      * PASSWORD/PHRASE(curr new)
+      */
+     if (strlen(user_params->passwd) LT MIN_RSS_PSWDPHRS_LEN)
+     {
+       strcpy(command,"PASSWORD");
+     }
+     else
+     {
+       strcpy(command,"PHRASE");
+     }
+     /* Add curr_password - the temporary password/phrase set
+        in preceeding ALU command                            */
+     rc = ADDINFO_insert(TYPE_1B,command,curr_passwd,
+                         taddinfo, RCF_ADDINFO_KWD_LEN,
+                         RCF_ADDINFO_VAL_LEN, UNIQUE);
+
+     if (rc NE ESA_OK)
+     {
+       rc = ESA_FATAL;
+       CTSAMSG_print(ERR_PROCESS_ADDINFO, msgs, NULL, dest, func,
+                     __LINE__, "failed for ADDINFO_insert(%s)",
+                     command);
+       goto exit_perm26;
+     }
+
+     ESA_DIAG_printf(ESA_COMP_UPDPASS, 6,
+                     "Setting value of %s in taddinfo",command);
+
+     pair = ADDINFO_search(command, RCF_ADDINFO_KWD_LEN,
+                           taddinfo->pair, taddinfo->num_pairs);
+
+     if (pair NE NULL)
+     {
+       /* Add a new password/phrase */
+       rc = ADDINFO_addval(user_params->passwd, RCF_ADDINFO_VAL_LEN,
+                           ADDINFO_LIST_ENTRY, pair,
+                           dest, msgs);
+       if (rc NE ESA_OK)
+       {
+         rc = ESA_FATAL;
+         CTSAMSG_print(ERR_PROCESS_ADDINFO, msgs, NULL, dest, func,
+                       __LINE__, "failed for ADDINFO_addval(%s)",
+                       command);
+         goto exit_perm26;
+       }
+     }
+     else
+     {
+       rc = ESA_FATAL;
+       CTSAMSG_print(ERR_PROCESS_ADDINFO, msgs, NULL, dest, func,
+                     __LINE__, "failed for ADDINFO_search(%s)",
+                     command);
+       goto exit_perm26;
+     }
+       /* Add curr_password - the temporary password set
+          in preceding ALU command                            *
+       ADDINFO_insert( TYPE_1B,"PASSWORD",curr_passwd,
+                       taddinfo, RCF_ADDINFO_KWD_LEN,
+                       RCF_ADDINFO_VAL_LEN, UNIQUE);
+
+       ESA_DIAG_printf(ESA_COMP_UPDPASS, 6,
+                   "Setting value of PASSWORD in taddinfo");
+
+       pair = ADDINFO_search("PASSWORD", RCF_ADDINFO_KWD_LEN,
+                             taddinfo->pair, taddinfo->num_pairs);
+
+       if (pair NE NULL)
+       {
+          * Add new password *
+         rc = ADDINFO_addval(user_params->passwd, RCF_ADDINFO_VAL_LEN,
+                             ADDINFO_LIST_ENTRY, pair,
+                             dest, msgs);
+         if (rc NE ESA_OK )
+         {
+           rc = ESA_FATAL;
+           CTSAMSG_print(ERR_PROCESS_ADDINFO, msgs, NULL, dest, func,
+                      __LINE__, "failed for ADDINFO_addval(PASSWORD)");
+           goto exit_perm26;
+         }
+       }
+     }
+     else
+     {
+       /* Add curr_phrase - the temporary phrase set
+          in preceding ALU command)                       *
+       ADDINFO_insert( TYPE_1B,"PHRASE",curr_passwd,
+                       taddinfo, RCF_ADDINFO_KWD_LEN,
+                       RCF_ADDINFO_VAL_LEN, UNIQUE);
+
+       ESA_DIAG_printf(ESA_COMP_UPDPASS, 6,
+                   "Setting value of PASSWORD PHRASE in taddinfo");
+
+       pair = ADDINFO_search("PHRASE", RCF_ADDINFO_KWD_LEN,
+                             taddinfo->pair, taddinfo->num_pairs);
+
+       if (pair NE NULL)
+       {
+          * Add new password phrase *
+         rc = ADDINFO_addval(user_params->passwd,RCF_ADDINFO_VAL_LEN,
+                             ADDINFO_LIST_ENTRY, pair,
+                             dest, msgs);
+         if (rc NE ESA_OK )
+         {
+           rc = ESA_FATAL;
+           CTSAMSG_print(ERR_PROCESS_ADDINFO, msgs, NULL, dest, func,
+                        __LINE__, "failed for ADDINFO_addval(PHRASE)");
+           goto exit_perm26;
+         }
+       } */
+
+     }
+     /* Current session is opened by Administrator. To run PASSWORD
+        command we want to open a session by logging in as a end user */
+
+     /* Initialize login environment for end user */
+
+     ESA_DIAG_printf(ESA_COMP_UPDPASS,6,
+              "Call to CTSRSSLogin for user=%s mode=%s(%d) (admin=%s)",
+              user_params->user,"LOGIN_MODE_FIRST_USER",
+              LOGIN_MODE_FIRST_USER,admin_params->admin_uname);
+
+     rc_login_u = CTSRSSLogin (admin_params->rss_name,
+                               user_params->user,
+                               "",
+                               "",
+                               LOGIN_MODE_FIRST_USER,
+                               &login_handle,
+                               admin_params, err);
+
+     if ( rc_login_u NE ESA_OK )
+     {
+       CTSAMSG_print(ERR_TL_FUNC_CALL,msgs, NULL, dest, func,
+                     __LINE__, "CTSRSSLogin(LOGIN_MODE_FIRST_USER)");
+       ESA_DIAG_printf(ESA_COMP_UPDPASS,1,
+                       "CTSRSSLogin(%s) failed for user=%s (admin=%s)",
+                       "LOGIN_MODE_FIRST_USER", user_params->user,
+                       admin_params->admin_uname);
+       rc = ESA_FATAL;
+     }
+     else
+     {
+       /* Login as end user */
+       ESA_DIAG_printf(ESA_COMP_UPDPASS,6,
+             "Call to CTSRSSLogin for user=%s mode=%s(%d) (admin=%s)",
+             user_params->user,"LOGIN_MODE",
+             LOGIN_MODE, admin_params->admin_uname);
+
+       rc_login = CTSRSSLogin (admin_params->rss_name,
+                               user_params->user,
+                               "",
+                               "",
+                               LOGIN_MODE,
+                               &login_handle,
+                               admin_params, err);
+
+       if ( rc_login NE ESA_OK )
+       {
+         CTSAMSG_print(ERR_TL_FUNC_CALL,msgs, NULL, dest, func,
+                       __LINE__, "CTSRSSLogin(LOGIN_MODE)");
+         ESA_DIAG_printf(ESA_COMP_UPDPASS,1,
+                       "CTSRSSLogin(%s) failed for user=%s (admin=%s)",
+                       "LOGIN_MODE", user_params->user,
+                       admin_params->admin_uname);
+         rc = ESA_FATAL;
+       }
+       else
+       {
+         /* Logged in as user - issue the PASSWORD command */
+         ESA_DIAG_printf(ESA_COMP_UPDPASS,6,
+                         "LOGIN_MODE with <%s> done successfully",
+                         user_params->user);
+
+         sprintf(cmd,"PASSWORD ");
+
+         rc = racfcmd(func, EXECOUT_DDNAME,
+                      admin_params->admin_uname,
+                      cmd, MAX_OK_RC_0,
+                      1, &taddinfo, mkt, self_password_kdt,
+                      admin_params,
+                      CMDOUT_YES, RACF_YES);
+
+         ESA_DIAG_printf(ESA_COMP_UPDPASS, 3,
+               "PASSWORD command executed for user %s, rc = %d",
+               user_params->user, rc);
+       }
+     }
+
+     /* If logged in as user - log out */
+     if ( rc_login EQ ESA_OK )
+     {
+       ESA_DIAG_printf(ESA_COMP_UPDPASS,6,
+            "Call to CTSRSSLogout for user=%s mode=%s(%d) (admin=%s)",
+             user_params->user,"LOGIN_MODE",
+             LOGIN_MODE,admin_params->admin_uname);
+
+       rc_login = CTSRSSLogout(admin_params->rss_name,
+                               user_params->user,
+                               "",
+                               LOGOUT_MODE,
+                               &login_handle,
+                               admin_params, err);
+       if ( rc_login NE ESA_OK )
+       {
+         CTSAMSG_print(ERR_TL_FUNC_CALL,msgs, NULL, dest, func,
+                       __LINE__, "CTSRSSLogout(LOGOUT_MODE)");
+         ESA_DIAG_printf(ESA_COMP_UPDPASS,1,
+                     "CTSRSSLogout(%s) failed for user=%s (admin=%s)",
+                     "LOGOUT_MODE",user_params->user,
+                     admin_params->admin_uname);
+       }
+       else
+         ESA_DIAG_printf(ESA_COMP_UPDPASS,6,
+                         "LOGOUT_MODE with <%s> done successfully",
+                         user_params->user);
+     }
+
+     /* If login environment for user was initialize - terminate it */
+     if ( rc_login_u EQ ESA_OK )
+     {
+       ESA_DIAG_printf(ESA_COMP_UPDPASS,6,
+            "Call to CTSRSSLogout for user=%s mode=%s(%d) (admin=%s)",
+            user_params->user,"LOGOUT_MODE_LAST",
+            "LOGOUT_MODE_LAST",admin_params->admin_uname);
+
+       rc_login_u = CTSRSSLogout(admin_params->rss_name,
+                                 user_params->user,
+                                 "",
+                                 LOGOUT_MODE_LAST,
+                                 &login_handle,
+                                 admin_params, err);
+
+       if ( rc_login_u NE ESA_OK )
+       {
+         CTSAMSG_print(ERR_TL_FUNC_CALL,msgs, NULL, dest, func ,
+                       __LINE__, "CTSRSSLogout(LOGOUT_MODE_LAST)");
+         ESA_DIAG_printf(ESA_COMP_UPDPASS,1,
+                     "CTSRSSLogout(%s) failed for user=%s (admin=%s)",
+                     "LOGOUT_MODE_LAST",user_params->user,
+                     admin_params->admin_uname);
+       }
+       else
+         ESA_DIAG_printf(ESA_COMP_UPDPASS,6,
+                        "LOGOUT_MODE_LAST with <%s> done successfully",
+                        user_params->user);
+     }
+
+     /* Cleanup */
+
+     ADDINFO_free(&taddinfo);
+
+ }
+ /* WS10074 - end */
+ /*
+  *   Finish
+  */
+
+ exit_perm26:
+
+ ESA_DIAG_exit(ESA_COMP_UPDPASS, 1, func, rc );
+
+ return rc;
+
+}
+
+
+/*****************************************************************
+*
+*  Expire password (RESET) ps0460
+*
+*****************************************************************/
+
+static ESA_RC chg_pass_expireset (
+                       USER_PARAMS_rec_typ  * user_params,
+                       ADDINFO_rec_typ      * addinfo,
+                       ADDINFO_rec_typ      * laddinfo,
+                       ADMIN_PARAMS_rec_typ * admin_params,
+                       ERR_STRUCT_rec_typ   * err,
+                       char                 * cmd)
+{
+
+ static char       func[]="chg_pass_expireset";
+ MS_FLAG_typ nopassword;                              /* IS10147B */
+ /* IS10147B RACF_FLAG_typ nopassword; */
+ ESA_RC            rc = ESA_OK, pro_rc;
+
+ CTSAMSG_HANDLE_rec_ptr     msgs = admin_params->ctsamsg_handle;
+ CTSAMSG_DEST_TABLE_rec_ptr dest = admin_params->ctsamsg_dest;
+
+ ESA_DIAG_enter(ESA_COMP_UPDPASS, 1, func);               /*PS0460*/
+
+ /*
+  *    Reset password if user not protected
+  */
+   /* change parameters                                      IS10147B
+ pro_rc = RACF_pro_user(user_params->user,&nopassword,TRUE,dest,msgs);*/
+ pro_rc = RACF_pro_user(user_params->user,&nopassword,admin_params);
+       if (pro_rc NE ESA_OK) {;
+          rc = ESA_FATAL;
+          goto rexit;
+       }
+       /* IS10174 if (nopassword EQ RACF_YES) {   */
+       if (nopassword EQ MS_YES) {                       /* IS10174 */
+               CTSAMSG_print(RACF_PROTECTED_EXPIRE,
+               msgs, NULL, dest, user_params->user);
+               rc = ESA_ERR;
+       }
+       else
+  {
+  sprintf(cmd,"PASSWORD USER(%s)", user_params->user);
+
+  rc = racfcmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+               cmd, MAX_OK_RC_0, 0, &laddinfo, mkt, password_kdt,
+               admin_params, CMDOUT_YES, RACF_YES);      /* IS10174 */
+    /* IS10174 dest, msgs, CMDOUT_YES, RACF_YES);    */
+
+  ESA_DIAG_printf(ESA_COMP_UPDPASS, 1,
+                  "Reset pass %s, rc = %d", user_params->user,rc);
+
+  if (rc NE ESA_OK) {
+     CTSAMSG_print(RACF_TEMPPASS_FAIL, msgs, NULL, dest,
+                     user_params->user);
+     rc = ESA_ERR;
+  }
+ }
+
+ rexit:
+
+ ESA_DIAG_exit(ESA_COMP_UPDPASS, 1, func, rc );
+
+ return rc;
+
+}
+
+/*****************************************************************
+*
+*  Permanent Password change via RACROUTE
+*
+*****************************************************************/
+
+   /*   IS10066 - remove old racf support
+static ESA_RC chg_pass_perm (USER_PARAMS_rec_typ  * user_params,
+                       ADDINFO_rec_typ      * addinfo,
+                       ADDINFO_rec_typ      * laddinfo,
+                       ADMIN_PARAMS_rec_typ * admin_params,
+                       ERR_STRUCT_rec_typ   * err,
+                       RACF_FLAG_typ        * expirok)
+{
+
+ static char       func[]="chg_pass_perm";
+
+ char              npw_uid[9], npw_pass[9], oldpass[9];
+ char             *opass   = NULL;
+ int               racf_r15, racf_rc, racf_reason;
+ int               npw_dbg = 0;
+ int               npw_rc = 0;
+ UG_typ            defug;
+ ESA_RC     dug_rc, rc = ESA_OK;
+
+ CTSAMSG_HANDLE_rec_ptr     msgs = admin_params->ctsamsg_handle;
+ CTSAMSG_DEST_TABLE_rec_ptr dest = admin_params->ctsamsg_dest;
+
+  *
+  *   Initialize
+  *
+
+  ESA_DIAG_enter(ESA_COMP_UPDPASS, 1, func);
+
+ *
+  *   Password change via RACROUTE
+  *
+
+
+  if (strlen(user_params->passwd) EQ 0)
+     goto exit_perm;
+
+  if (*expirok EQ RACF_YES)
+  {
+  dug_rc = RACF_extract_defug( user_params->user, defug,
+                                        dest, msgs);
+       if (dug_rc NE ESA_OK) {
+           rc = ESA_FATAL;
+           goto exit_perm;
+       }
+  FIELD_BLOCK(oldpass,defug)
+  opass = oldpass;
+  }
+  FIELD_BLOCK(npw_uid, user_params->user)
+  FIELD_BLOCK(npw_pass, user_params->passwd)
+  if (ESA_DIAG_get_debug_level(ESA_COMP_UPDPASS) GT 0)
+     npw_dbg = 1;
+
+  npw_rc = ctsfnps(npw_uid,       * userid            *
+                   npw_pass,      * new password      *
+                   opass,         *     old password  *
+                   &npw_dbg,      * debug level       *
+                   &racf_r15,     * saf rc            *
+                   &racf_rc,      * racf return code *
+                   &racf_reason); * racf reason code *
+
+ *
+  *   Check result of password change
+  *
+
+  ESA_DIAG_printf( ESA_COMP_UPDPASS, 1,
+                   "New password stage = %d rc = %d,%d,%d",
+                    npw_rc, racf_r15, racf_rc, racf_reason);
+
+    if (npw_rc NE 0) {
+       CTSAMSG_print(RACF_PERMPASS_FAIL,   msgs, NULL, dest,
+                     user_params->user, npw_rc);
+
+       if ( (npw_rc EQ 8) AND (racf_r15 EQ 8) )
+          switch (racf_rc) {
+             case 16:
+               CTSAMSG_print(RACF_ERR_NEWPASS, msgs, NULL, dest);
+               break;
+             case 28:
+               CTSAMSG_print(RACF_RACF_REVOKED, msgs, NULL, dest);
+               break;
+             default:
+               CTSAMSG_print(RACF_PERMPASS_DETAIL, msgs, NULL, dest,
+                             user_params->user, npw_rc, racf_r15,
+                             racf_rc, racf_reason);
+               break;
+          }
+       else
+          CTSAMSG_print(RACF_PERMPASS_DETAIL, msgs, NULL, dest,
+                        user_params->user, npw_rc, racf_r15,
+                        racf_rc, racf_reason);
+
+       rc = ESA_ERR;
+       ESA_DIAG_printf(ESA_COMP_UPDPASS, 1,
+       "r15=%  reason code=%d racf_rc=%d ", racf_r15,
+                                            racf_reason, racf_rc);
+
+    } *** ctsfnps failure ***
+
+ *
+  *   Finish
+  *
+
+ exit_perm:
+
+ ESA_DIAG_exit(ESA_COMP_UPDPASS, 1, func, rc );
+
+ return rc;
+
+}
+ */
+
+/***************************************************************
+* Procedure Name : resume_user                          WS2516 *
+* Description    : Resume RACF user id using command           *
+*                  "ALTUSER <user> RESUME"                     *
+* Input          : user                                        *
+* Return Value   : ESA_RC                                      *
+* Comments       :                                             *
+***************************************************************/
+
+
+static ESA_RC resume_user ( USER_typ             * user,
+                            ADDINFO_rec_typ      * laddinfo,
+                            ADMIN_PARAMS_rec_typ * admin_params )
+{
+
+ static char       func[]="resume_user";
+
+ ESA_RC            rc = ESA_OK;
+ char              cmd[MAX_API_ST];
+
+ CTSAMSG_HANDLE_rec_ptr     msgs = admin_params->ctsamsg_handle;
+ CTSAMSG_DEST_TABLE_rec_ptr dest = admin_params->ctsamsg_dest;
+
+ /*
+  *   Initialize
+  */
+
+ ESA_DIAG_enter(ESA_COMP_UPDPASS, 1, func);
+
+ /*
+  *   Issue ALTUSER command
+  */
+
+ sprintf( cmd,"ALTUSER %s RESUME", user );
+
+ ESA_DIAG_printf(ESA_COMP_UPDPASS, 3,
+         "Issue resume command (%s)", cmd);
+
+ rc = racfcmd(func, EXECOUT_DDNAME,
+              admin_params->admin_uname,
+              cmd, MAX_OK_RC_0, 0, &laddinfo, mkt,
+              altuser_kdt, admin_params,                 /* IS10174 */
+              CMDOUT_YES, RACF_YES);                     /* IS10174 */
+   /* IS10174 altuser_kdt, dest, msgs, CMDOUT_YES, RACF_YES);   */
+
+
+ if (rc NE ESA_OK) {
+      CTSAMSG_print(RACF_TEMPPASS_FAIL, msgs, NULL, dest, user);
+      ESA_DIAG_printf(ESA_COMP_UPDPASS, 1,
+         "Failed ot resume user %s, rc = %d", user, rc);
+
+      rc = ESA_ERR;
+      goto exit ;
+ }
+
+ /*
+  *   Finish
+  */
+
+ exit:
+
+ ESA_DIAG_exit(ESA_COMP_UPDPASS, 1, func, rc );
+
+ return rc;
+
+}

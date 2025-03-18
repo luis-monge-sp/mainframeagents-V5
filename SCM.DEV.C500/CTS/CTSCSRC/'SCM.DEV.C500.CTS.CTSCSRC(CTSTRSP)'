@@ -1,0 +1,1748 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : get resource/ACL common functions (TSS)  *
+ *                                                             *
+ * File Name        : ctstrsp.c                                *
+ *                                                             *
+ * Author           : Alexander Shvartsman                     *
+ *                    Doron Cohen                              *
+ *                                                             *
+ * Creation Date    : 24/04/96                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * BS2550   BP       13/02/03 Resource download problem when   *
+ *                        the resource owner is named TSSXXXXX *
+ * IS0358   YoniMa   17/08/06 memory leak.(BS2698)             *
+ * IS10092  NuritY   10/06/13 Adapt to changes in cmd struct...*
+ *                            ... (IS10077)                    *
+ * WS10082  MauriC   14/11/22 Recompile for new ADDINFO macros *
+ **************************************************************/
+
+ /*
+  *   Standard include files
+  */
+
+ #include   <globs.h>
+ #include   STDIO
+ #include   STDLIB
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include   ESA_API
+ #include   ESA_DIAG
+ #include   ESA_CTSAMSG
+ #include   ESA_API_CODES
+ #include   API_ADDINFO
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_COMP
+
+ #include MVS_ONLINE_INTERCEPTOR
+
+ #include MVS_OS_MVS
+
+ /*
+  *   TSS include files
+  */
+
+ #include TSS
+ #include TSS_XRES
+ #include TSS_CODES
+
+ static ESA_RC TSS_add_res_before(ESA_DIAG_COMP_typ      comp,
+                             TSS_RES_INFO_typ           *items,
+                             TSS_RES_INFO_typ           *tmp_items,
+                             TSS_RES_NAMES_AREA_typ     *res_names,
+                             int                         index,
+                             int                        *place,
+                             CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                             CTSAMSG_HANDLE_rec_ptr      msgs);
+
+ static ESA_RC TSS_add_res_after(ESA_DIAG_COMP_typ       comp,
+                             TSS_RES_INFO_typ           *items,
+                             TSS_RES_INFO_typ           *tmp_items,
+                             TSS_RES_NAMES_AREA_typ     *res_names,
+                             int                         index,
+                             int                        *place,
+                             CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                             CTSAMSG_HANDLE_rec_ptr      msgs);
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_bsearch                                *
+ *                                                             *
+ * DESCRIPTION    : bsearch function with extended param list  *
+ *                                                             *
+ * INPUT          : ADDITIONAL PARAMETERS :                    *
+ *                  basek     - ptr to res names base          *
+ *                  rc_comp   - rc code from  compare func     *
+ *                  cptr      - last accessed ptr              *
+ *                  cind      - index of last accesssed ptr    *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : get_handle- get handle                     *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+static void * TSS_bsearch(ESA_DIAG_COMP_typ   comp,
+                         void                *key,
+                         void                *basek,
+                         void                *base0,
+                         size_t               nmemb,
+                         size_t               size,
+                         int (*compar)(ESA_DIAG_COMP_typ  comp,
+                                       void  *, void *, void *),
+                         int                 *rc_comp,
+                         void               **cptr,
+                         int                 *cind)
+{
+
+ register char *base      = base0;
+ register int lim, cmp;
+ register void *p;
+
+ for (lim = nmemb; lim != 0; lim >>= 1) {
+      p = base + (lim >> 1) * size;
+      *cptr = p;
+      *cind = ( (char *)p - (char *)base0 )/size;
+      cmp = (*compar)(comp, key, p, basek);
+      *rc_comp = cmp;
+      if (cmp == 0)
+         return (p);
+      if (cmp > 0) {      /* key > p: move right */
+         base = (char *)p + size;
+         lim--;
+      } /* else move left */
+ }
+ return (NULL);
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_cmp_res_names                          *
+ *                                                             *
+ * DESCRIPTION    : Compare function, invoked by bsearch       *
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  p_key     - ptr to key                     *
+ *                  p         - ptr to res item                *
+ *                  p_basek   - base for res names             *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : 0, <0, >0                                  *
+ *                                                             *
+ **************************************************************/
+
+static int TSS_cmp_res_names(ESA_DIAG_COMP_typ comp,
+                             void              *p_key,
+                             void              *p,
+                             void              *p_basek)
+{
+   int    compare;
+   char   *wrk;
+   char   *key               = (char *)p_key;
+   char   *base_k            = (char *)p_basek;
+   TSS_RES_ITEM_typ  *p_item = (TSS_RES_ITEM_typ  *)p;
+
+   wrk = base_k + p_item->ref_to_name;
+
+   compare = strcmp(key, wrk);
+
+   ESA_DIAG_printf(comp, 5, "bsearch compare '%s' and '%s' result=%d",
+                   key, wrk, compare );
+
+   return compare;
+}
+
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_init_res_handle                        *
+ *                                                             *
+ * DESCRIPTION    : Check and create get handle                *
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  handle    - entered handle                 *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : get_handle- get handle                     *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_init_res_handle (ESA_DIAG_COMP_typ            comp,
+                             TSS_GET_RES_HANDLE_typ    ** get_handle,
+                             void                      ** handle,
+                             ADMIN_PARAMS_rec_typ       * admin_params,
+                             ERR_STRUCT_rec_typ         * err)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                       rc   = ESA_OK ;
+   CTSAMSG_HANDLE_rec_typ     * msgs;
+   CTSAMSG_DEST_TABLE_rec_typ * dest;
+   size_t                       size;
+   static char func[]="TSS_init_res_handle";
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(comp, 3, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+  /*
+   *   First time, obtain handle
+   */
+
+   if ( *handle EQ NULL ) {
+      size = sizeof(TSS_GET_RES_HANDLE_typ);
+      *handle = malloc(size);
+      if ( *handle EQ NULL ) {
+         CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                       "Get Res Handle", size);
+         rc = ESA_FATAL ;
+         goto exit ;
+      }
+
+      ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,               /*IS0358*/
+        "malloc (%d) bytes at address (%x) (%d,%s)",
+         size, *handle, __LINE__, __FILE__ );
+      *get_handle = (TSS_GET_RES_HANDLE_typ *)(*handle);
+
+     /*
+      *   Initialize entry structure variables
+      */
+
+      (*get_handle)->list_ind             = 0;
+      (*get_handle)->trap_buffer          = NULL;
+      (*get_handle)->acid_buffer          = NULL;
+      (*get_handle)->aux_handle           = NULL;
+
+      memset( (char *)&( (*get_handle)->file_pos ),  '\0',
+              sizeof(fpos_t) );
+      /*
+       * Initialize global parameters
+       */
+
+       rc = TSS_global_init (comp, admin_params, err);
+   }
+
+  /*
+   *   NO first time, move handle address to entry address
+   */
+
+   else
+      *get_handle = (TSS_GET_RES_HANDLE_typ *)(*handle);
+
+  /*
+   *   Finish
+   */
+
+   exit :;
+
+   ESA_DIAG_exit(comp, 3, func, rc);
+
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_free_res_handle                        *
+ *                                                             *
+ * DESCRIPTION    : Free get handle                            *
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  handle    - entered handle                 *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_free_res_handle (ESA_DIAG_COMP_typ            comp,
+                             void                      ** handle,
+                             CTSAMSG_DEST_TABLE_rec_typ * dest,
+                             CTSAMSG_HANDLE_rec_typ     * msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   static char func[]="TSS_free_res_handle";
+   ESA_RC                      rc = ESA_OK ;
+   TSS_GET_RES_HANDLE_typ    * get_handle;
+   TSS_TRAP_RES_BUF_typ      * tmp;
+   TSS_TRAP_BUF_rec_typ      * tmp_acid_buffer;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(comp, 3, func);
+
+   get_handle = (TSS_GET_RES_HANDLE_typ *)(*handle);
+   tmp             = get_handle->trap_buffer;
+   tmp_acid_buffer = get_handle->acid_buffer;
+
+   if ( tmp NE NULL ) {
+
+      ESA_DIAG_printf(comp,5,
+                   ">< Free(names) ptr %x",
+                   tmp->res_names.res_names);
+      ESA_DIAG_printf(comp,5,
+                   ">< Free(items) ptr %x",
+                   tmp->res_info.res_items);
+      ESA_DIAG_printf(comp,5,
+                   ">< Free(tmp_items) ptr %x",
+                   tmp->tmp_res_info.res_items);
+
+      if ( tmp->res_names.res_names NE NULL )
+      {
+       ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,        /*IS0358*/
+        "Free address (%x) (%d,%s)",
+         tmp->res_names.res_names, __LINE__, __FILE__ );
+       free(tmp->res_names.res_names);
+      }
+      if ( tmp->res_info.res_items NE NULL )
+      {
+       ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,        /*IS0358*/
+        "Free address (%x) (%d,%s)",
+         tmp->res_info.res_items, __LINE__, __FILE__ );
+       free(tmp->res_info.res_items);
+      }
+      if ( tmp->tmp_res_info.res_items NE NULL )
+      {
+       ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,        /*IS0358*/
+        "Free address (%x) (%d,%s)",
+        tmp->tmp_res_info.res_items, __LINE__, __FILE__ );
+       free(tmp->tmp_res_info.res_items);
+      }
+      ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,        /*IS0358*/
+        "Free address (%x) (%d,%s)",
+        tmp, __LINE__, __FILE__ );
+      free( tmp );
+   }
+
+   if (tmp_acid_buffer)
+     TSS_free_trap_handle(comp, &tmp_acid_buffer, dest, msgs);
+
+   ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,        /*IS0358*/
+        "Free address (%x) (%d,%s)",
+        *handle, __LINE__, __FILE__ );
+   free( (*handle) );
+
+  /*
+   *   Finish
+   */
+
+   exit :;
+
+   ESA_DIAG_exit(comp, 3, func, rc);
+
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_alloc_res_trap_buffer                  *
+ *                                                             *
+ * DESCRIPTION    : Allocate resource buffer                   *
+ *                                                             *
+ * INPUT          : comp          - diag component             *
+ *                  max_entries   - max entries                *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : trap_handle   - command trap handle        *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK, ESA_FATAL - err               *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_alloc_res_trap_buffer(ESA_DIAG_COMP_typ  comp,
+                        int                          max_entries,
+                        TSS_TRAP_RES_BUF_typ       **trap_handle,
+                        CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                        CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   ESA_RC                rc = ESA_OK;
+   static char           func[]="TSS_alloc_res_trap_buffer";
+   size_t                size;
+   TSS_TRAP_RES_BUF_typ *tmp_trap_handle;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 3, func);
+
+  /*
+   *  Allocate trap handle structure
+   */
+
+   tmp_trap_handle =(TSS_TRAP_RES_BUF_typ *) malloc(
+                     sizeof(TSS_TRAP_RES_BUF_typ));
+   if (tmp_trap_handle EQ NULL ) {
+       CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                     "trap res handle", sizeof(TSS_TRAP_RES_BUF_typ));
+       OS_MVS_btrace();
+       rc = ESA_FATAL;
+       goto exit;
+   }
+
+   ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,               /*IS0358*/
+        "malloc (%d) bytes at address (%x) (%d,%s)",
+         sizeof(TSS_TRAP_RES_BUF_typ),tmp_trap_handle,
+         __LINE__, __FILE__ );
+   ESA_DIAG_printf(comp,3, "trap handle ptr=%x", tmp_trap_handle);
+
+  /*
+   *   Initialize res names area, res info area
+   */
+
+   tmp_trap_handle->res_names.max_len        = 0;
+   tmp_trap_handle->res_names.used_len       = 0;
+   tmp_trap_handle->res_names.res_names      = NULL;
+   tmp_trap_handle->res_info.alloc_items     = 0;
+   tmp_trap_handle->res_info.used_items      = 0;
+   tmp_trap_handle->res_info.res_items       = NULL;
+   tmp_trap_handle->tmp_res_info.alloc_items = 0;
+   tmp_trap_handle->tmp_res_info.used_items  = 0;
+   tmp_trap_handle->tmp_res_info.res_items   = NULL;
+
+  /*
+   *   Allocate res names area
+   */
+
+   size = TSS_RES_NAMES_AREA_LEN;
+   tmp_trap_handle->res_names.res_names = (char *) malloc(size);
+   if (tmp_trap_handle->res_names.res_names EQ NULL ) {
+      CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                    "Get Res Table", size);
+      ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,       /*IS0358*/
+        "Free address (%x) (%d,%s)", func,
+         tmp_trap_handle,  __LINE__, __FILE__ );
+      free(tmp_trap_handle);
+      tmp_trap_handle = NULL;
+      OS_MVS_btrace();
+      rc = ESA_FATAL ;
+      goto exit ;
+   }
+
+   ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,               /*IS0358*/
+        "malloc (%d) bytes at address (%x) (%d,%s)",
+         size,tmp_trap_handle->res_names.res_names,
+         __LINE__, __FILE__ );
+   tmp_trap_handle->res_names.max_len = TSS_RES_NAMES_AREA_LEN;
+
+   ESA_DIAG_printf(comp,5,
+         "<> Allocated res names at %x",
+         tmp_trap_handle->res_names.res_names);
+
+   ESA_DIAG_printf(comp,3, "Allocated res names area at %x max_len=%d",
+                   tmp_trap_handle->res_names.res_names,
+                   tmp_trap_handle->res_names.max_len);
+
+  /*
+   *   Initialize res info table
+   */
+
+   rc = TSS_alloc_res_info_table (comp, max_entries,
+                                  &(tmp_trap_handle->res_info),
+                                  dest, msgs);
+   if (rc NE ESA_OK ) {
+      ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,               /*IS0358*/
+        "Free address (%x) (%d,%s)",
+         tmp_trap_handle->res_names.res_names,
+         __LINE__, __FILE__ );
+      free(tmp_trap_handle->res_names.res_names);
+      ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,               /*IS0358*/
+        "Free address (%x) (%d,%s)",
+         tmp_trap_handle,  __LINE__, __FILE__ );
+      free(tmp_trap_handle);
+      tmp_trap_handle = NULL;
+      rc = ESA_FATAL ;
+      goto exit ;
+   }
+
+   ESA_DIAG_printf(comp,3, "Allocated res info area at %x max_items=%d",
+                   tmp_trap_handle->res_info.res_items,
+                   tmp_trap_handle->res_info.alloc_items);
+
+   *trap_handle = tmp_trap_handle;
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 3, func, rc);
+
+   return rc;
+
+}     /*  TSS_alloc_res_trap_handle  */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_alloc_res_info_table                   *
+ *                                                             *
+ * DESCRIPTION    : Allocate resource info table               *
+ *                                                             *
+ * INPUT          : comp          - diag component             *
+ *                  max_entries   - max entries                *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : trap_handle   - command trap handle        *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK, ESA_FATAL - err               *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_alloc_res_info_table (ESA_DIAG_COMP_typ  comp,
+                        int                          max_entries,
+                        TSS_RES_INFO_typ            *info_table,
+                        CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                        CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   ESA_RC                rc = ESA_OK;
+   static char           func[]="TSS_alloc_res_info_table";
+   size_t                size;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 3, func);
+
+  /*
+   *   Initialize res info table
+   */
+
+   size = sizeof(TSS_RES_ITEM_typ) * max_entries;
+   info_table->res_items = (TSS_RES_ITEM_typ *) malloc(size);
+   if (info_table->res_items EQ NULL ) {
+      CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                    "Get Res Info Table", size);
+      OS_MVS_btrace();
+      rc = ESA_FATAL ;
+      goto exit ;
+   }
+
+   ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,               /*IS0358*/
+        "malloc (%d) bytes at address (%x) (%d,%s)",
+         size,info_table->res_items,
+         __LINE__, __FILE__ );
+   ESA_DIAG_printf(comp,5,
+         "<> Allocated res info table at %x", info_table->res_items);
+
+   info_table->alloc_items = max_entries;
+   info_table->used_items  = 0;
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 3, func, rc);
+
+   return rc;
+
+}     /*  TSS_alloc_res_info_table   */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_realloc_res_trap_buffer                *
+ *                                                             *
+ * DESCRIPTION    : RE Allocate trap buffer                    *
+ *                                                             *
+ * INPUT          : cmd_handle    -  trap_handle               *
+ *                  incr          -  increment value           *
+ *                  comp          -  diag component            *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK, ESA_FATAL - err               *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_realloc_res_trap_buffer (ESA_DIAG_COMP_typ      comp,
+                               TSS_RES_INFO_typ            *items,
+                               int                          incr,
+                               CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                               CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   ESA_RC                 rc = ESA_OK;
+   TSS_RES_ITEM_typ      *wrk;
+   size_t                 size;
+   static char            func[]="TSS_realloc_res_trap_buffer";
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp,10, func);
+
+   ESA_DIAG_printf(comp,10,"used=%d alloc=%d incr=%d",
+                   items->used_items, items->alloc_items, incr );
+
+   if ( (items->used_items + incr) GE items->alloc_items) {
+
+    /*
+     *  RE Allocate trap data buffer
+     */
+
+     if ( incr EQ 1 )
+        items->alloc_items += TSS_RES_INFO_ITEMS;
+     else
+        items->alloc_items += incr;
+
+     ESA_DIAG_printf(comp,3, "trap res buffer items=%d",
+                     items->alloc_items);
+
+     wrk = items->res_items;
+     size = sizeof(TSS_RES_ITEM_typ) * items->alloc_items;
+     ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,               /*IS0358*/
+        "Before realloc (%d) bytes at address (%x) (%d,%s)",
+         size, items->res_items, __LINE__, __FILE__ );
+     items->res_items = (TSS_RES_ITEM_typ *)
+                                   realloc(items->res_items, size);
+     if (items->res_items EQ NULL ) {
+         CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                       "Get Res Info Table", size);
+         rc = ESA_FATAL ;
+         OS_MVS_btrace();
+         items->res_items = wrk;
+         goto exit ;
+     }
+
+     ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,               /*IS0358*/
+        "After realloc (%d) bytes at address (%x) (%d,%s)",
+         size, items->res_items, __LINE__, __FILE__ );
+     ESA_DIAG_printf(comp,10,
+              "re-allocated res trap buffer ptr=%x", items->res_items);
+   }         /* realloc trap data buffer */
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp,10, func, rc);
+
+   return rc;
+
+}     /* TSS_realloc_res_trap_buffer */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_save_res_info                          *
+ *                                                             *
+ * DESCRIPTION    : Save res info                              *
+ *                                                             *
+ * INPUT          : trap_buffer    -    res trap buffer        *
+ *                  owner_acid     -    res_owner              *
+ *                  ace_acid       -    ace acid               *
+ *                  owns           -    cons "OWNS"            *
+ *                  res_type       -    res type               *
+ *                  res_name       -    res name               *
+ *                  comp           -    diag component         *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK  , ESA_FATAL - err             *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_save_res_info(ESA_DIAG_COMP_typ           comp,
+                          TSS_TRAP_RES_BUF_typ      * trap_buff,
+                          char                      * owner_acid,
+                          char                      * ace_acid,
+                          char                      * owns,
+                          char                      * res_type,
+                          char                      * res_name,
+                          TSS_SAVE_ACL_MODE_typ       save_mode,
+                          TSS_ACL_ITEM_SOURCE_typ     acl_source,
+                          CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                          CTSAMSG_HANDLE_rec_ptr      msgs)
+ {
+
+   ESA_RC                    rc = ESA_OK;
+   static char               func[]="TSS_save_res_info";
+   int                       k;
+   TSS_RES_INFO_typ         *items;
+   TSS_RES_INFO_typ         *tmp_items;
+   TSS_RES_NAMES_AREA_typ   *res_names;
+   char                     *wrk;
+   void                     *cptr;
+   int                       rc_cmp;
+   int                       cind;
+   int                       duplicate_saved = FALSE;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp,10, func);
+
+   ESA_DIAG_printf(comp,10, "%s %s %s %s",
+                   owner_acid, owns, res_type, res_name);
+
+   if ( strcmp(owns, "OWNS") NE 0 ) {
+  /*bs2550 - begin */
+
+   /* Save res info */
+
+    items = &(trap_buff->res_info);
+
+   tmp_items = &(trap_buff->tmp_res_info);
+
+   ESA_DIAG_printf(comp,5, "Res info area ptr=%x",items->res_items);
+
+  /*bs2550  - end */
+     rc = ESA_SKIP;
+     goto exit;
+   }
+
+   if (TSS_realloc_res_trap_buffer(comp, &(trap_buff->res_info),
+                                   1, dest, msgs) NE ESA_OK)
+      goto exit;
+
+  /*
+   * Save res info
+   */
+
+   items = &(trap_buff->res_info);
+
+   ESA_DIAG_printf(comp,5, "Res info area ptr=%x", items->res_items);
+
+   tmp_items = &(trap_buff->tmp_res_info);
+
+   ESA_DIAG_printf(comp,5, "Tmp res info area ptr=%x",
+                   tmp_items->res_items);
+
+   if ( tmp_items->res_items EQ NULL ) {
+      /*
+       *   Initialize res info table
+       */
+
+       rc = TSS_alloc_res_info_table (comp, items->alloc_items,
+                                      &(trap_buff->tmp_res_info),
+                                      dest, msgs);
+       if (rc NE ESA_OK ) {
+          rc = ESA_FATAL ;
+          goto exit ;
+       }
+   }
+
+   res_names = &(trap_buff->res_names);
+
+   ESA_DIAG_printf(comp,5,
+                   "Res names area:ptr=%x", res_names->res_names);
+
+   ESA_DIAG_printf(comp,5, "Res names area:used_len=%d max_len=%d",
+                   res_names->used_len, res_names->max_len);
+
+  /*
+   * Duplicate res name checking
+   */
+
+   ESA_DIAG_printf(comp,5,
+                   "items->used_items=%d save_mode=%d",
+                    items->used_items, save_mode);
+
+   if ( items->used_items GT 0 ) {
+      wrk = TSS_bsearch( comp, res_name, res_names->res_names,
+                         items->res_items,
+                         items->used_items, sizeof(TSS_RES_ITEM_typ),
+                         TSS_cmp_res_names, &rc_cmp, &cptr, &cind );
+
+      ESA_DIAG_printf(comp,5,
+                      "bsearch:key=%s result ptr=%x rc=%d cind=%d\n",
+                       res_name, wrk, rc_cmp, cind );
+      if ( wrk EQ NULL ) {         /* Item not found */
+        tmp_items->used_items = 0;
+        if (rc_cmp LT 0)
+          rc = TSS_add_res_before(comp, items, tmp_items, res_names,
+                                  cind, &k, dest, msgs);
+        else
+          rc = TSS_add_res_after(comp, items, tmp_items,  res_names,
+                                 cind, &k, dest, msgs);
+        if ( rc NE ESA_OK )
+          goto exit;
+      }
+      else {       /* Found Duplicate res name */
+        if ( save_mode EQ TSS_SAVE_UNIQ_RES_NAME_ONLY )
+           goto exit;
+        duplicate_saved = TRUE;
+        rc = TSS_add_res_after(comp, items, tmp_items,  res_names,
+                               items->used_items - 1,
+                               &k, dest, msgs);
+      }
+   }    /* if ( items->used_items GT 0 ) {      */
+   else
+     k = items->used_items;
+
+   strcpy(items->res_items[k].owner, owner_acid);
+   strcpy(items->res_items[k].ace_acid, ace_acid);
+   items->res_items[k].acl_source = acl_source;
+
+   if ( strlen(owner_acid) EQ 0 )
+     strcpy(items->res_items[k].has_owner, KWD_FLAG_OFF);
+   else
+     strcpy(items->res_items[k].has_owner, KWD_FLAG_ON);
+
+  /*
+   * Save res name
+   */
+
+   if ( NOT duplicate_saved ) {
+     if ( (res_names->used_len + strlen(res_name) + 1) GT
+                                    res_names->max_len  ) {
+       res_names->max_len += TSS_RES_NAMES_AREA_LEN;
+       ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,               /*IS0358*/
+        "Before realloc (%d) bytes at address (%x) (%d,%s)",
+         res_names->max_len, res_names->res_names,
+         __LINE__, __FILE__ );
+       wrk = realloc(res_names->res_names, res_names->max_len);
+       if (wrk EQ NULL ) {
+           CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                         "Get Res Names Table", res_names->max_len);
+           OS_MVS_btrace();
+           rc = ESA_FATAL ;
+           goto exit ;
+       }
+
+       ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,               /*IS0358*/
+        "After realloc (%d) bytes at address (%x) (%d,%s)",
+         res_names->max_len, wrk,  __LINE__, __FILE__ );
+       ESA_DIAG_printf(comp,5,
+                       "Reallocated res names area=%x old ptr=%x",
+                       wrk, res_names->res_names);
+
+       res_names->res_names = wrk; /* New obtained ptr */
+     }
+
+     wrk = res_names->res_names + res_names->used_len;
+     ESA_DIAG_printf(comp,5,
+                     "Save res name at %x (base=%x used_len=%d)",
+                     wrk, res_names->res_names , res_names->used_len);
+
+     strcpy(wrk, res_name);
+
+     items->res_items[k].ref_to_name = res_names->used_len;
+
+     ESA_DIAG_printf(comp,5, "Saved item %d %s offset %d",
+                     k, res_name, items->res_items[k].ref_to_name);
+
+     res_names->used_len += strlen(res_name) + 1;
+   } /* if ( NOT duplicate_saved ) { */
+   else {
+     ESA_DIAG_printf(comp,5,
+                     "Used previous ref to name %d from item=%d",
+                     items->res_items[cind].ref_to_name, cind);
+
+     items->res_items[k].ref_to_name =
+                      items->res_items[cind].ref_to_name;
+   }
+
+   items->used_items++;
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp,10, func, rc);
+
+   return rc;
+
+}     /* TSS_save_res_info */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_res_buf_dump                           *
+ *                                                             *
+ * DESCRIPTION    : Dump trap buffer  (resources)              *
+ *                                                             *
+ * INPUT          : trap_buff    - trap buffer                 *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ void TSS_res_buf_dump(ESA_DIAG_COMP_typ      comp,
+                       TSS_TRAP_RES_BUF_typ * trap_buff)
+ {
+
+   int                       i;
+   static char               func[]="TSS_res_buf_dump";
+   TSS_RES_INFO_typ         *items;
+   TSS_RES_NAMES_AREA_typ   *res_names;
+   char                     *wrk;
+
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 0, func);
+
+   items     = &(trap_buff->res_info);
+   res_names = &(trap_buff->res_names);
+
+   ESA_DIAG_printf(comp,0,
+                   "alloc items=%d used=%d",
+                   items->alloc_items, items->used_items);
+
+   for (i=0; i LT items->used_items; i++) {
+       wrk = res_names->res_names + items->res_items[i].ref_to_name;
+       ESA_DIAG_printf(comp,0, "%d %s %s %s %s %s %d",
+                       i, trap_buff->res_type, wrk,
+                       items->res_items[i].owner,
+                       items->res_items[i].has_owner,
+                       items->res_items[i].ace_acid,
+                       items->res_items[i].acl_source);
+   }
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 0, func, ESA_OK);
+
+}     /* TSS_trap_buf_dmp  */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_get_res_list                           *
+ *                                                             *
+ * DESCRIPTION    : Obtain resource list                       *
+ *                                                             *
+ * INPUT          : get_handle     -    get_handle             *
+ *                  res_in         -    resource input         *
+ *                  comp           -    diag component         *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK  , ESA_FATAL - err             *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_get_res_list (ESA_DIAG_COMP_typ              comp,
+                          TSS_CMD_MODE_typ               cmd_mode,
+                          TSS_RES_LIST_MODE_typ          mode,
+                          RES_PARAMS_rec_typ           * res_in,
+                          TSS_GET_RES_HANDLE_typ       * get_handle,
+                          TSS_SAVE_ACL_MODE_typ          acl_save_mode,
+                          ADMIN_PARAMS_rec_typ         * admin_params,
+                          ERR_STRUCT_rec_typ           * err)
+ {
+
+   ESA_RC                    rc = ESA_OK;
+   static char               func[]="TSS_get_res_list";
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 3, func);
+
+  /*
+   *  Get res list by invoke WHOOWNS cmd
+   */
+
+   if ( ( mode EQ TSS_WHOOWNS_LIST_ONLY )    OR
+        ( mode EQ TSS_WHOHAS_AND_WHOOWNS_LIST ) ) {
+      rc = TSS_get_whoowns_res (comp, cmd_mode, res_in, get_handle,
+                                acl_save_mode, admin_params, err);
+      if (rc NE ESA_OK)
+        goto exit;
+   }
+
+   if ( ( mode EQ TSS_WHOHAS_LIST_ONLY )     OR
+        ( mode EQ TSS_WHOHAS_AND_WHOOWNS_LIST ) ) {
+      rc = TSS_get_whohas_res (comp, cmd_mode, res_in, get_handle,
+                               acl_save_mode, admin_params, err);
+      if (rc NE ESA_OK)
+        goto exit;
+   }
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   if ( ESA_DIAG_get_debug_level(comp) GE 5 )
+     TSS_res_buf_dump(comp, get_handle->trap_buffer);
+
+   ESA_DIAG_exit(comp, 3, func, rc);
+
+   return rc;
+
+}     /* TSS_get_res_list  */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_copy_item                              *
+ *                                                             *
+ * DESCRIPTION    : copy acl item                              *
+ *                                                             *
+ * INPUT          : copy_title     -    title                  *
+ *                  res_name       -    resource name          *
+ *                  items_from     -    ptr to source items    *
+ *                  items_to       -    ptr to target items    *
+ *                  i_from         -    ind of source items    *
+ *                  i_to           -    ind to target items    *
+ *                  comp           -    diag component         *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ static void TSS_copy_item(ESA_DIAG_COMP_typ      comp,
+                           char                  *copy_title,
+                           char                  *res_name,
+                           TSS_RES_INFO_typ      *items_from,
+                           int                    i_from,
+                           TSS_RES_INFO_typ      *items_to,
+                           int                    i_to)
+ {
+
+  ESA_DIAG_printf(comp,5, "%s. %d-%d %s %s %s %s %d",
+                  copy_title,
+                  i_to, i_from, res_name,
+                  items_from->res_items[i_from].owner,
+                  items_from->res_items[i_from].has_owner,
+                  items_from->res_items[i_from].ace_acid,
+                  items_from->res_items[i_from].acl_source);
+
+       items_to->res_items[i_to].ref_to_name =
+                           items_from->res_items[i_from].ref_to_name;
+       items_to->res_items[i_to].acl_source  =
+                           items_from->res_items[i_from].acl_source;
+       strcpy( items_to->res_items[i_to].owner,
+                           items_from->res_items[i_from].owner);
+       strcpy( items_to->res_items[i_to].has_owner,
+                           items_from->res_items[i_from].has_owner);
+       strcpy( items_to->res_items[i_to].ace_acid,
+                           items_from->res_items[i_from].ace_acid);
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_set_empty_item                         *
+ *                                                             *
+ * DESCRIPTION    : set empty acl item                         *
+ *                                                             *
+ * INPUT          : items          -    ptr to items area      *
+ *                  index          -    index, before one      *
+ *                                      build place for new res*
+ *                  comp           -    diag component         *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ static void TSS_set_empty_item(ESA_DIAG_COMP_typ      comp,
+                                TSS_RES_INFO_typ      *items,
+                                int                    i)
+ {
+
+   items->res_items[i].ref_to_name = 0;
+   items->res_items[i].acl_source  = TSS_ACL_ITEM_SOURCE_UNKNOWN;
+   strcpy( items->res_items[i].owner, "");
+   strcpy( items->res_items[i].has_owner, "");
+   strcpy( items->res_items[i].ace_acid, "");
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_add_res_before                         *
+ *                                                             *
+ * DESCRIPTION    : Build free place for one resource before   *
+ *                  obtained index                             *
+ *                                                             *
+ * INPUT          : items          -    ptr to items area      *
+ *                  index          -    index, before one      *
+ *                                      build place for new res*
+ *                  comp           -    diag component         *
+ *                                                             *
+ * OUTPUT         : place          -    new created index      *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK  , ESA_FATAL - err             *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_add_res_before(ESA_DIAG_COMP_typ      comp,
+                             TSS_RES_INFO_typ           *items,
+                             TSS_RES_INFO_typ           *tmp_items,
+                             TSS_RES_NAMES_AREA_typ     *res_names,
+                             int                         index,
+                             int                        *place,
+                             CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                             CTSAMSG_HANDLE_rec_ptr      msgs)
+ {
+
+   ESA_RC                    rc = ESA_OK;
+   static char               func[]="TSS_add_res_before";
+   char                     *wrk;
+   char                      empty_res_name[] = " ";
+   int                       i, k;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func);
+
+   *place = index;
+
+   ESA_DIAG_printf(comp,5,
+                   "tmp_items->alloc_items=%d items->alloc_items=%d",
+                   tmp_items->alloc_items, items->alloc_items);
+
+   if (TSS_realloc_res_trap_buffer(comp, tmp_items,
+                           items->alloc_items, dest, msgs) NE ESA_OK)
+      goto exit;
+
+   ESA_DIAG_printf(comp,5, "Add before index=%d", index);
+
+  /*
+   * Copy items before requested index
+   */
+
+   if ( (index - 1) GE 0 ) {
+     for (i=0; i LE index-1; i++) {
+       wrk = res_names->res_names + items->res_items[i].ref_to_name;
+       TSS_copy_item(comp, "Copy before", wrk, items, i, tmp_items, i);
+     }
+   }
+
+   *place = index;
+   TSS_set_empty_item(comp, tmp_items, index);
+   k = index + 1;
+
+  /*
+   * Copy items after requested index
+   */
+
+   for (i=index; i LT items->used_items; i++, k++) {
+     wrk = res_names->res_names + items->res_items[i].ref_to_name;
+     TSS_copy_item(comp, "Copy after", wrk, items, i, tmp_items, k);
+   }
+
+  /*
+   * Copy items back
+   */
+
+   for (i=0; i LT items->used_items+1; i++) {
+
+     if ( i NE index ) {
+        wrk=res_names->res_names + tmp_items->res_items[i].ref_to_name;
+        ESA_DIAG_printf(comp,5, "Copy back(OLD ITEM)" );
+     }
+     else {
+        wrk=empty_res_name;
+        ESA_DIAG_printf(comp,5, "Copy back(NEW ITEM)" );
+     }
+     TSS_copy_item(comp, "Copy back", wrk, tmp_items, i, items, i);
+   }
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_add_res_after                          *
+ *                                                             *
+ * DESCRIPTION    : Build free place for one resource after    *
+ *                  obtained index                             *
+ *                                                             *
+ * INPUT          : items          -    ptr to items area      *
+ *                  index          -    index, before one      *
+ *                                      build place for new res*
+ *                  comp           -    diag component         *
+ *                                                             *
+ * OUTPUT         : place          -    new created index      *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK  , ESA_FATAL - err             *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_add_res_after(ESA_DIAG_COMP_typ       comp,
+                             TSS_RES_INFO_typ           *items,
+                             TSS_RES_INFO_typ           *tmp_items,
+                             TSS_RES_NAMES_AREA_typ     *res_names,
+                             int                         index,
+                             int                        *place,
+                             CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                             CTSAMSG_HANDLE_rec_ptr      msgs)
+ {
+
+   ESA_RC                    rc = ESA_OK;
+   static char               func[]="TSS_add_res_after";
+   char                     *wrk;
+   char                      empty_res_name[] = " ";
+   int                       i, k;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func);
+
+   *place = index + 1;
+
+   ESA_DIAG_printf(comp,5, "Add after index=%d", index);
+
+   if ( index EQ (items->used_items-1) )
+     goto exit;
+
+   ESA_DIAG_printf(comp,5,
+                   "tmp_items->alloc_items=%d items->alloc_items=%d",
+                   tmp_items->alloc_items, items->alloc_items);
+
+   if (TSS_realloc_res_trap_buffer(comp, tmp_items,
+                           items->alloc_items, dest, msgs) NE ESA_OK)
+      goto exit;
+  /*
+   * Copy items before requested index
+   */
+
+   for (i=0; i LE index; i++) {
+     wrk = res_names->res_names + items->res_items[i].ref_to_name;
+     TSS_copy_item(comp, "Copy before", wrk, items, i, tmp_items, i);
+   }
+
+   *place = index + 1;
+   TSS_set_empty_item(comp, tmp_items, index+1);
+   k = index + 2;
+
+  /*
+   * Copy items after requested index
+   */
+
+   for (i=index+1; i LT items->used_items; i++, k++) {
+     wrk = res_names->res_names + items->res_items[i].ref_to_name;
+     TSS_copy_item(comp, "Copy after", wrk, items, i, tmp_items, k);
+   }
+
+  /*
+   * Copy items back
+   */
+
+   for (i=0; i LT items->used_items+1; i++) {
+
+     if ( i NE (index+1) ) {
+        wrk=res_names->res_names + tmp_items->res_items[i].ref_to_name;
+        ESA_DIAG_printf(comp,5, "Copy back(OLD ITEM)" );
+     }
+     else {
+        wrk=empty_res_name;
+        ESA_DIAG_printf(comp,5, "Copy back(NEW ITEM)" );
+     }
+     TSS_copy_item(comp, "Copy back", wrk, tmp_items, i, items, i);
+   }
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_select_res                             *
+ *                                                             *
+ * DESCRIPTION    : Select resource                            *
+ *                                                             *
+ * INPUT          : get_handle   - get res handle              *
+ *                  res_params   - resource params structure   *
+ *                  comp         - diag component              *
+ *                                                             *
+ * OUTPUT         : res_item     - ptr to res internal table   *
+ *                  res_name     - ptr to res_name             *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_select_res(ESA_DIAG_COMP_typ          comp,
+                       TSS_GET_RES_HANDLE_typ   * get_handle,
+                       RES_PARAMS_rec_typ       * res_params,
+                       TSS_RES_ITEM_typ        ** res,
+                       char                    ** res_name)
+ {
+
+   ESA_RC                     rc = ESA_OK;
+   int                        i;
+   static char                func[]="TSS_select_res";
+   TSS_TRAP_RES_BUF_typ     * trap_buff = get_handle->trap_buffer;
+   TSS_RES_INFO_typ         * items;
+   TSS_RES_NAMES_AREA_typ   * res_names;
+   char                     * wrk;
+
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func);
+
+   items     = &(trap_buff->res_info);
+   res_names = &(trap_buff->res_names);
+
+   *res      = NULL;
+   *res_name = NULL;
+
+   if ( strcmp(trap_buff->res_type, res_params->restype) NE 0 ) {
+     rc = ESA_ERR;
+     goto exit;
+   }
+
+   ESA_DIAG_printf(comp, 5,
+                   "alloc items=%d used=%d",
+                   items->alloc_items, items->used_items);
+
+   for (i=0; i LT items->used_items; i++) {
+       wrk = res_names->res_names + items->res_items[i].ref_to_name;
+       ESA_DIAG_printf(comp,5, "%d %s %s %s %s %s",
+                       i, trap_buff->res_type, wrk,
+                       items->res_items[i].owner,
+                       items->res_items[i].has_owner,
+                       items->res_items[i].ace_acid);
+       if ( strcmp(wrk, res_params->resource) EQ 0 ) {
+          *res      = &(items->res_items[i]);
+          *res_name = wrk;
+          rc        = ESA_OK;
+          goto exit;
+       }
+
+   }
+
+   rc = ESA_ERR;
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+   return rc;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_set_rsimple_key                        *
+ *                                                             *
+ * DESCRIPTION    : Set TSS key  (ACL)                         *
+ *                                                             *
+ * INPUT          : see func prototype                         *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK  , ESA_FATAL - err             *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_set_rsimple_key(ESA_DIAG_COMP_typ         comp,
+                           TSS_CMD_HANDLE_typ        *cmd_handle,
+                           void                      *rtt_table,
+                           void                      *rttv,
+                           ONE_FIELD_rec_ptr          ess_pair,
+                           ADDINFO_rec_ptr            get_addinfo,
+                           ADDINFO_rec_ptr            ess_addinfo,
+                           CTSAMSG_DEST_TABLE_rec_ptr dest,
+                           CTSAMSG_HANDLE_rec_ptr     msgs)
+ {
+
+   ESA_RC               rc = ESA_OK;
+   static char          func[]="TSS_set_rsimple_key";
+   char                *kwd;
+   /* IS10092 TSS_CMD_SET_rec_typ cmd = { 0, "", 0 };              */
+   TSS_CMD_SET_rec_typ  cmd = { 0, "", 0 ,0};              /* IS10092 */
+   TSS_RTT_rec_typ     *rtt = (TSS_RTT_rec_typ *)rttv;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 3, func);
+
+   if ( ess_pair->vallen EQ 0 )
+     goto exit;
+
+  /*
+   *  Determine what kind of keyword to use
+   */
+
+   if (rtt->tss_keyword EQ NULL)
+     kwd = rtt->addinfo_keyword;
+   else
+     kwd = rtt->tss_keyword;
+
+  /*
+   *   Put simple key processing
+   */
+
+   cmd.type = TSS_CMD_PERMIT;
+
+   rc=TSS_check_param_overflow(comp, NULL, kwd, (char *)ess_pair->value,
+                               TSS_LENGTH_UNDEFINED, MAX_TSS_PARAM_LEN,
+                               dest,msgs);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+  /*
+   *  Create parameter
+   */
+
+   sprintf(cmd.param, "%s(%s) ", kwd, ess_pair->value);
+
+   ESA_DIAG_printf(comp, 5, "subparameter=%s", cmd.param);
+
+   rc = TSS_put_cmd(comp, cmd_handle, &cmd, dest, msgs);
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 3, func, rc);
+
+   return rc;
+
+}      /* TSS_set_rsimple_key */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_set_rsimple_lst                        *
+ *                                                             *
+ * DESCRIPTION    : Set TSS lst  (ACL)                         *
+ *                                                             *
+ * INPUT          : see func prototype                         *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK  , ESA_FATAL - err             *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_set_rsimple_lst(ESA_DIAG_COMP_typ         comp,
+                           TSS_CMD_HANDLE_typ        *cmd_handle,
+                           void                      *rtt_table,
+                           void                      *rttv,
+                           ONE_FIELD_rec_ptr          ess_pair,
+                           ADDINFO_rec_ptr            get_addinfo,
+                           ADDINFO_rec_ptr            ess_addinfo,
+                           CTSAMSG_DEST_TABLE_rec_ptr dest,
+                           CTSAMSG_HANDLE_rec_ptr     msgs)
+ {
+
+   ESA_RC               rc = ESA_OK;
+   static char          func[]="TSS_set_rsimple_lst";
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 3, func);
+
+   if ( ess_pair->vallen EQ 0 )
+     goto exit;
+
+
+   ADDINFO_convert_list_sep( ess_pair->value,
+                             ADDINFO_LIST_ENTRY, ADDINFO_LIST_SUBFIELD,
+                             ',', ',' );
+
+   rc = TSS_set_rsimple_key(comp, cmd_handle, rtt_table, rttv, ess_pair,
+                            get_addinfo, ess_addinfo, dest, msgs);
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 3, func, rc);
+
+   return rc;
+
+}      /* TSS_set_rsimple_lst */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_set_rdate                              *
+ *                                                             *
+ * DESCRIPTION    : Set TSS date (ACL)                         *
+ *                                                             *
+ * INPUT          : see func prototype                         *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK  , ESA_FATAL - err             *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_set_rdate(ESA_DIAG_COMP_typ         comp,
+                      TSS_CMD_HANDLE_typ        *cmd_handle,
+                      void                      *rtt_table,
+                      void                      *rttv,
+                      ONE_FIELD_rec_ptr          ess_pair,
+                      ADDINFO_rec_ptr            get_addinfo,
+                      ADDINFO_rec_ptr            ess_addinfo,
+                      CTSAMSG_DEST_TABLE_rec_ptr dest,
+                      CTSAMSG_HANDLE_rec_ptr     msgs)
+ {
+
+   ESA_RC               rc = ESA_OK;
+   static char          func[]="TSS_set_rdate";
+   char                 date_format[20];
+   char                 ess_tss_date[20] ="" ;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 3, func);
+
+   if ( ess_pair->vallen EQ 0 )
+     goto exit;
+
+  /*
+   *    Get TSS RSS Option "DATE" ( format of date )
+   */
+
+   rc = TSS_get_global_parameter(comp,  TSS_GLOBAL_DATE_FORMAT,
+                                 date_format, dest, msgs);
+   if ( rc NE ESA_OK ) {
+      strcpy( date_format, TSS_DATE_FORMAT_DEFAULT);
+      rc = ESA_OK;
+   }
+
+   ESA_DIAG_printf(comp, 3, "date format=%s", date_format);
+
+   rc = TSS_ConvertDateESS2TSS( comp, date_format, ess_pair->value,
+                                ess_tss_date, dest, msgs );
+   if ( rc NE ESA_OK ) {
+     rc = ESA_FATAL;
+     goto exit;
+   }
+
+   ADDINFO_updval( ess_tss_date, TSS_ADDINFO_VAL_LEN, ess_pair );
+
+   rc = TSS_set_rsimple_key(comp, cmd_handle, rtt_table, rttv, ess_pair,
+                            get_addinfo, ess_addinfo, dest, msgs);
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 3, func, rc);
+
+   return rc;
+
+}      /* TSS_set_rdate */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_determine_acid                         *
+ *                                                             *
+ * DESCRIPTION    : Determine object for ACL commands          *
+ *                                                             *
+ * INPUT          : ace - ptr to ace structure                 *
+ *                                                             *
+ * OUTPUT         : acid                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ void TSS_determine_acid(ACE_rec_typ      * ace,
+                         char             * acid,
+                         OBJECT_TYPE_typ  * acid_type)
+ {
+
+  /*
+   * Determine acid
+   */
+
+   if ( strlen(ace->user_name) GT 0 )  {
+     strcpy(acid, ace->user_name);
+     *acid_type = TYPE_USER;
+   }
+   else if ( strlen(ace->ug_name) GT 0 ) {
+     strcpy(acid, ace->ug_name);
+     *acid_type = TYPE_GROUP;
+   }
+   else if ( strlen(ace->oe_name) GT 0 ) {
+     strcpy(acid, ace->oe_name);
+     *acid_type = TYPE_CONTAINER;
+   }
+   else if ( ace->ace_type EQ ACE_TYPE_WORLD ) {
+     strcpy(acid, "ALL");
+     *acid_type = TYPE_IGNORE;
+   }
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_acid_restype_handling                  *
+ *                                                             *
+ * DESCRIPTION    : Handle resource type ACID                  *
+ *                                                             *
+ * INPUT          : res_params, addinfo                        *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK      - valid ACID function          *
+ *                  ESA_FATAL   - invalid                      *
+ **************************************************************/
+
+ ESA_RC TSS_acid_restype_handling(ESA_DIAG_COMP_typ        comp,
+                           RES_PARAMS_rec_typ            * res_params,
+                           ADDINFO_rec_typ               * addinfo_data,
+                           ADMIN_PARAMS_rec_typ          * admin_params,
+                           ERR_STRUCT_rec_typ            * err)
+
+ {
+
+   ESA_RC                          rc = ESA_OK;
+   static char                     func[]="TSS_acid_restype_handling";
+   ONE_FIELD_rec_typ             * pair;
+   CTSAMSG_DEST_TABLE_rec_ptr      dest;
+   CTSAMSG_HANDLE_rec_ptr          msgs;
+
+   /*** For TSS_chk_acid ***/
+
+   char                       real_acid_type[TSS_ACID_TYPE_LEN+1]="";
+   OBJECT_TYPE_typ            real_obj_type = TYPE_IGNORE;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 3, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+  /*
+   *    Insure that the ACID was not given an owner
+   */
+
+   pair=ADDINFO_search( TSS_RES_OWNER,
+                        TSS_ADDINFO_KWD_LEN,
+                        addinfo_data->pair,
+                        addinfo_data->num_pairs);
+
+   if ( pair NE NULL ) {
+      CTSAMSG_print(TSS_RESOURCE_CANNOT_BE_OWNED, msgs, NULL, dest,
+                    res_params->resource, res_params->restype);
+      rc = ESA_FATAL ;
+      goto exit ;
+   }
+
+  /*
+   * Validate resname. For ACID restype the resname length
+   * must be up to 8 chars
+   */
+
+   if (strlen(res_params->resource) GT TSSCFILE_ACID_LEN) {
+      CTSAMSG_print(ERR_RES_BAD_NAME , msgs, NULL, dest,
+                    res_params->resource);
+      rc = ESA_ERR;
+      goto exit;
+   }
+
+  /*
+   *    Insure that the ACID exists
+   */
+
+   rc = TSS_chk_acid(comp, res_params->resource,
+                     TSS_USER, TYPE_USER,
+                     OBJ_EXIST, TRUE, real_acid_type,
+                     &real_obj_type, admin_params, err);
+
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 3, func, rc);
+
+   return rc;
+
+ }

@@ -1,0 +1,594 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Service TSS  functions                   *
+ *                                                             *
+ * File Name        : ctstcrv                                  *
+ *                                                             *
+ * Author           : Alexander Shvartsman                     *
+ *                                                             *
+ * Creation Date    : 19/05/97                                 *
+ *                                                             *
+ * Description      : TSS  service functions for CTSTCMD       *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * IS0358   YoniMa   17/8/06  memory leak.(BS2698)             *
+ * IS10027  AvnerL   25/01/09 memory size formated as heX diag *
+ * SAS2IBMT SeligT   12/07/16 SAS/C to IBM C Conversion Project*
+ * WS10082A AvnerL   12/11/23 Remove API_ADDINFO               *
+  **************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDIO
+ #include   STDLIB
+ #include   STRING
+ /* #include   LCLIB                                         SAS2IBMT */
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_CTSAMSG
+ #include ESA_API
+ #include ESA_API_CODES
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_COMP
+ #include MVS_OS_MVS
+ /*WS10082A #include API_ADDINFO --- not used */
+
+ /*
+  *   TSS include files
+  */
+
+ #include TSS
+ #include TSS_CODES
+
+ static char component[] = "CTSTCRV";
+
+ static int  TSS_trap_info_compare(const void * inf1,
+                                   const void * inf2);
+
+/**************************************************************
+*                                                             *
+* Procedure Name   : TSS_trap_info_compare                    *
+*                                                             *
+* Description      : Compare routine for qsort                *
+*                                                             *
+* Input            : 1) cmd entry 1                           *
+*                    2) cmd entry 2                           *
+*                                                             *
+* Output           : None                                     *
+*                                                             *
+* Return Value     : negative - cmd1 less than cmd2           *
+*                  : zero     - cmd1 equal to  cmd2           *
+*                  : positive - cmd1 greater than cmd2        *
+*                                                             *
+**************************************************************/
+
+static int TSS_trap_info_compare (const void * inf1,
+                                  const void * inf2)
+{
+
+  TSS_TRAP_DATA_typ *trap_inf1 = (TSS_TRAP_DATA_typ *)inf1;
+  TSS_TRAP_DATA_typ *trap_inf2 = (TSS_TRAP_DATA_typ *)inf2;
+
+  return( strcmp(trap_inf1->data,trap_inf2->data));
+
+}    /* TSS_trap_info_compare */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_type_tss2ess                           *
+ *                                                             *
+ * DESCRIPTION    : Convert acid types                         *
+ *                                                             *
+ * INPUT          : acid_type - acid type                      *
+ *                                                             *
+ * OUTPUT         : acid_type - acid type                      *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+ void TSS_type_tss2ess(ESA_DIAG_COMP_typ      comp,
+                       char                 * acid_type)
+ {
+
+  static char func[]="TSS_type_tss2ess";
+  int     i;
+  struct  type_tr_table {
+        char   * tss_type;
+        char   * ess_type;
+   } ;
+
+  static struct type_tr_table  type_t[] = {
+           {  "MASTER"    ,  TSS_MSCA       },
+           {  "CENTRAL"   ,  TSS_SCA        },
+           {  "LIMITED"   ,  TSS_LSCA       },
+           {  "ZONE C/A"  ,  TSS_ZCA        },
+           {  "ZONE  C/A" ,  TSS_ZCA        },
+           {  "ZONE"      ,  TSS_ZONE       },
+           {  "DIV C/A"   ,  TSS_VCA        },
+           {  "DIV  C/A"  ,  TSS_VCA        },
+           {  "DIV"       ,  TSS_DIVISION   },
+           {  "DEPT C/A"  ,  TSS_DCA        },
+           {  "DEPT  C/A" ,  TSS_DCA        },
+           {  "DEPT"      ,  TSS_DEPARTMENT },
+           {  NULL        ,  NULL           }
+                              };
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(comp,5,func);
+
+  ESA_DIAG_printf(comp,5, "entering acid_type=%s", acid_type);
+
+  if (strlen(acid_type) EQ 0 )
+    goto exit;
+
+  for (i=0; type_t[i].tss_type; i++) {
+     if (strcmp(acid_type, type_t[i].tss_type) EQ 0 ) {
+         strcpy(acid_type, type_t[i].ess_type);
+         goto exit;
+     }
+  }
+
+  exit :;
+
+  ESA_DIAG_printf(comp,5, "exiting acid_type=%s", acid_type);
+
+  ESA_DIAG_exit(comp, 5, func, ESA_OK );
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_save_output                            *
+ *                                                             *
+ * DESCRIPTION    : Put TSS command output into the buffer     *
+ *                                                             *
+ * INPUT          : trap_handle    -    trap handle            *
+ *                  cmd            -    command                *
+ *                  comp           -    diag component         *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK  , ESA_FATAL - err             *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_save_output (ESA_DIAG_COMP_typ          comp,
+                         TSS_TRAP_BUF_rec_typ      *trap_handle,
+                         char                      *line,
+                         CTSAMSG_DEST_TABLE_rec_ptr dest,
+                         CTSAMSG_HANDLE_rec_ptr     msgs)
+ {
+
+   ESA_RC              rc = ESA_OK;
+   static char         func[]="TSS_save_output";
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp,10, func);
+
+   if (TSS_realloc_trap_buffer(comp,trap_handle,1,dest,msgs) NE ESA_OK)
+      goto exit;
+
+   rc=TSS_check_param_overflow(comp, NULL, NULL, line,
+                               TSS_LENGTH_UNDEFINED,
+                               MAX_TSS_API_ST_TRAP,
+                               dest,msgs);
+   if ( rc NE ESA_OK )
+     goto exit;
+
+  /*
+   *  Save parameter
+   */
+
+   strcpy((char *)
+          &trap_handle->trap_data[trap_handle->used_entries].data,
+          (char *) line);
+
+   trap_handle->trap_data[trap_handle->used_entries].used = 0;
+   trap_handle->used_entries++;
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp,10, func, rc);
+
+   return rc;
+
+}     /* TSS_save_output */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_alloc_trap_handle                      *
+ *                                                             *
+ * DESCRIPTION    : Allocate command trap handle               *
+ *                                                             *
+ * INPUT          : comp          - diag component             *
+ *                  max_entries   - max cmd entries            *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : trap_handle   - command trap handle        *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK, ESA_FATAL - err               *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_alloc_trap_handle (ESA_DIAG_COMP_typ     comp,
+                        int                          max_entries,
+                        TSS_TRAP_BUF_rec_typ       **trap_handle,
+                        CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                        CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   ESA_RC                rc = ESA_OK;
+   static char           func[]="TSS_alloc_trap_handle";
+   TSS_TRAP_BUF_rec_typ *tmp_trap_handle;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func);
+
+  /*
+   *  Allocate trap handle structure
+   */
+
+   tmp_trap_handle =(TSS_TRAP_BUF_rec_typ *) malloc(
+                                sizeof(TSS_TRAP_BUF_rec_typ));
+   if (tmp_trap_handle EQ NULL ) {
+       CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                     "trap handle", sizeof(TSS_TRAP_BUF_rec_typ));
+       rc = ESA_FATAL;
+       OS_MVS_btrace();
+       goto exit;
+   }
+
+   ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,                /*IS0358*/
+      "malloc (%6X) bytes at address (%x) (%d,%s)",     /*IS10027*/
+      sizeof(TSS_TRAP_BUF_rec_typ),
+      tmp_trap_handle, __LINE__, __FILE__ );
+   ESA_DIAG_printf(comp,5, "trap handle ptr=%x", tmp_trap_handle);
+
+  /*
+   *  Allocate data buffer
+   */
+
+   tmp_trap_handle->max_expected_entries = max_entries;
+
+   ESA_DIAG_printf(comp,5, "trap buffer entries=%d",
+                   tmp_trap_handle->max_expected_entries);
+
+   tmp_trap_handle->trap_data = (TSS_TRAP_DATA_typ *)malloc(
+                               sizeof(TSS_TRAP_DATA_typ) *
+                               tmp_trap_handle->max_expected_entries);
+
+   if (tmp_trap_handle->trap_data EQ NULL ) {
+       CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                  "trap data buffer 1",                /*IS0358*/
+                  sizeof(TSS_TRAP_DATA_typ) *
+                  tmp_trap_handle->max_expected_entries);
+       rc = ESA_FATAL;
+       OS_MVS_btrace();
+       ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,         /*IS0358*/
+       "malloc fails for trap(%x) * entries(%x) (%d,%s)",
+       sizeof(TSS_TRAP_DATA_typ),tmp_trap_handle->max_expected_entries,
+       __LINE__, __FILE__ );
+       ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,         /*IS0358*/
+         "Free address (%x) (%d,%s)",
+         tmp_trap_handle, __LINE__, __FILE__ );
+       free(tmp_trap_handle);
+       goto exit;
+   }
+
+   ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,   /*IS0358 & IS10027 */
+      "malloc trap data buffer (%6X) bytes at address (%x) (%d,%s)",
+      sizeof(TSS_TRAP_DATA_typ)* tmp_trap_handle->max_expected_entries,
+      tmp_trap_handle->trap_data, __LINE__, __FILE__ );
+   ESA_DIAG_printf(comp,5,
+                   "allocated trap data buffer ptr=%x",
+                   tmp_trap_handle->trap_data);
+
+   tmp_trap_handle->allocated_entries = max_entries;
+   tmp_trap_handle->used_entries      = 0;
+
+   *trap_handle = tmp_trap_handle;
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc;
+
+}     /*  TSS_alloc_trap_handle  */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_realloc_trap_buffer                    *
+ *                                                             *
+ * DESCRIPTION    : RE Allocate trap buffer                    *
+ *                                                             *
+ * INPUT          : cmd_handle    -  trap_handle               *
+ *                  incr          -  increment value           *
+ *                  comp          -  diag component            *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK, ESA_FATAL - err               *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_realloc_trap_buffer(ESA_DIAG_COMP_typ           comp,
+                               TSS_TRAP_BUF_rec_typ        *trap_handle,
+                               int                          incr,
+                               CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                               CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   ESA_RC                 rc = ESA_OK;
+   TSS_TRAP_DATA_typ    * tmp;
+   static char            func[]="TSS_realloc_trap_buffer";
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func);
+
+   ESA_DIAG_printf(comp, 5,"incr=%d", incr );
+
+   if ( (trap_handle->used_entries + incr) GE
+         trap_handle->allocated_entries  ) {
+
+    /*
+     *  RE Allocate trap data buffer
+     */
+
+     if ( incr EQ 1 )
+        trap_handle->allocated_entries +=
+                                   trap_handle->max_expected_entries;
+     else
+        trap_handle->allocated_entries += incr;
+
+
+     ESA_DIAG_printf(comp,5, "trap buffer entries=%d",
+                     trap_handle->allocated_entries);
+
+     tmp = trap_handle->trap_data;
+     ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,       /*IS0358 & IS10027 */
+     "Before realloc trap data buf (%6X) bytes at address (%x) (%d,%s)",
+      sizeof(TSS_TRAP_DATA_typ)*trap_handle->allocated_entries,
+      trap_handle->trap_data, __LINE__, __FILE__ );
+     trap_handle->trap_data = (TSS_TRAP_DATA_typ *)realloc(
+                                trap_handle->trap_data,
+                                sizeof(TSS_TRAP_DATA_typ) *
+                                trap_handle->allocated_entries );
+
+     if (trap_handle->trap_data EQ NULL ) {
+         CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                    "trap data buffer",
+                    sizeof(TSS_TRAP_BUF_rec_typ) *
+                    trap_handle->allocated_entries );
+       ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,         /*IS0358*/
+       "realloc fails for trap(%x) * entries(%x) (%d,%s)",
+       sizeof(TSS_TRAP_BUF_rec_typ), trap_handle->allocated_entries,
+       __LINE__, __FILE__ );
+         rc = ESA_FATAL;
+         OS_MVS_btrace();
+         trap_handle->trap_data = tmp;
+         goto exit;
+     }
+
+     ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,                /*IS0358*/
+      "After realloc (%6X) bytes at address (%x) (%d,%s)", /*IS10027*/
+      sizeof(TSS_TRAP_DATA_typ)*trap_handle->allocated_entries,
+      trap_handle->trap_data, __LINE__, __FILE__ );
+     ESA_DIAG_printf(comp, 5,
+                   "re-allocated cmd buffer ptr=%x",
+                    trap_handle->trap_data);
+
+   } /* realloc trap data buffer */
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc;
+
+}     /* TSS_realloc_trap_buffer */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_free_trap_handle                       *
+ *                                                             *
+ * DESCRIPTION    : Free trap handle                           *
+ *                                                             *
+ * INPUT          : trap_handle   -  trap handle               *
+ *                  comp          -  diag component            *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ void TSS_free_trap_handle(ESA_DIAG_COMP_typ            comp,
+                           TSS_TRAP_BUF_rec_typ       **trap_handle,
+                           CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                           CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   static char           func[]="TSS_free_trap_handle";
+   TSS_TRAP_BUF_rec_typ *tmp_trap_handle = *trap_handle;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func);
+
+  /*
+   *  Free trap buffer
+   */
+
+   ESA_DIAG_printf(comp,5, "trap buffer ptr=%x",
+                   tmp_trap_handle->trap_data);
+
+   if (tmp_trap_handle->trap_data NE NULL )
+     {
+       ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,              /*IS0358*/
+        "Free address (%x) (%d,%s)",
+        tmp_trap_handle->trap_data, __LINE__, __FILE__ );
+       free(tmp_trap_handle->trap_data);
+     }
+
+  /*
+   *  Free trap handle
+   */
+
+   ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,                /*IS0358*/
+      "Free address (%x) (%d,%s)",
+      tmp_trap_handle, __LINE__, __FILE__ );
+   ESA_DIAG_printf(comp,5, "trap handle ptr=%x", tmp_trap_handle);
+
+   free(tmp_trap_handle);
+   *trap_handle = NULL;
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 5, func, ESA_OK);
+
+}      /* TSS_free_trap_handle */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_trap_buf_dmp                           *
+ *                                                             *
+ * DESCRIPTION    : Dump trap buffer                           *
+ *                                                             *
+ * INPUT          : trap_handle  - trap handle                 *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ void TSS_trap_buf_dump(ESA_DIAG_COMP_typ     comp,
+                        TSS_TRAP_BUF_rec_typ *trap_handle)
+ {
+
+   int                  i;
+   static char          func[]="TSS_trap_buf_dump";
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 0, func);
+
+   ESA_DIAG_printf(comp,0,
+           "trap handle: alloc entries=%d used=%d",
+            trap_handle->allocated_entries,
+            trap_handle->used_entries);
+
+   for (i=0; i LT trap_handle->used_entries; i++)
+       ESA_DIAG_printf(comp,0, "%s", trap_handle->trap_data[i].data);
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 0, func, ESA_OK);
+
+}     /* TSS_trap_buf_dmp  */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_trap_buf_sort                          *
+ *                                                             *
+ * DESCRIPTION    : Sort trap buffer                           *
+ *                                                             *
+ * INPUT          : trap_handle  - trap handle                 *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ void TSS_trap_buf_sort(ESA_DIAG_COMP_typ     comp,
+                        TSS_TRAP_BUF_rec_typ *trap_handle)
+ {
+
+   static char          func[]="TSS_trap_buf_sort";
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func);
+
+   ESA_DIAG_printf(comp,5,
+           "trap handle: alloc entries=%d used=%d",
+            trap_handle->allocated_entries,
+            trap_handle->used_entries);
+
+   qsort(trap_handle->trap_data,       /* sort area     */
+         trap_handle->used_entries,    /* num elements  */
+         sizeof(TSS_TRAP_DATA_typ),    /* element size  */
+         &TSS_trap_info_compare);      /* compare func  */
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 5, func, ESA_OK);
+
+}     /* TSS_trap_buf_sort */
+

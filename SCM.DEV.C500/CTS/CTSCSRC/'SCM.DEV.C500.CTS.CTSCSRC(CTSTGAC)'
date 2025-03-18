@@ -1,0 +1,1995 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Get resource ACL inforamtion (TSS)       *
+ *                                                             *
+ * File Name        : ctstgac.c                                *
+ *                                                             *
+ * Author           : Alexander Shvartsman                     *
+ *                                                             *
+ * Creation Date    : 19/01/97                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------- -------------------------------- *
+ * WS2321   AS       23/02/98 Extract APPLDATA, SCRIPTNAME,    *
+ *                            SCRIPTPARM for SYSMVIEW          *
+ * PS0252   Guy      13/04/98 Common code changes              *
+ * PS0388   AlexS    28/09/99 TSS 5.1 Support                  *
+ * PS0509   RamiK    17/06/02 TSS 5.2 Support                  *
+ * WS2530   RamiK    25/03/04 TSS 5.3, 5.4, 5.5 Support        *
+ * IS0357   YoniMa   15/08/06 TSS R8                           *
+ * BS10014  ShmuelK  25/11/08 Correctly interpret NEWPW record *
+ *                            9675 across CA-TSS versions;     *
+ *                            Here - this affects only the call*
+ *                            format to TSS_select_rec_desc    *
+ * IS10026  AvnerL   18/01/09 Drop support in TSS earlier 5.1. *
+ * IS10077  NuritY   05/09/12 Quotes in resource name.         *
+ * IS10092  NuritY   10/06/13 Copy from 3.2 for IS10077.       *
+ * SAS2IBMT SeligT   30/06/16 SAS/C to IBM C Conversion Project*
+ * IS10174  NuritY   15/01/18 Dynamic EXECOUT support.         *
+ * BS10099  SeligT   23/01/19 Ignore Records 0000 and 2022     *
+ *                            During TSS Target Aggregation -  *
+ *                            Just recompile to include the    *
+ *                            changes made in the CTSTRES CMAC *
+ *                            member                           *
+ * WS10082  MauriC   14/11/22 Recompile for new ADDINFO macros *
+ **************************************************************/
+
+ /*
+  *   Standard include files
+  */
+
+ #include   <globs.h>
+ #include   STDIO
+ #include   STDLIB
+ #include   STRING
+ /* SAS2IBMT #include  LCIO                                          */
+ #include   ERRNO                                         /* SAS2IBMT */
+
+ /*
+  *   ESA include files
+  */
+
+ #include   ESA_API
+ #include   ESA_DIAG
+ #include   ESA_CTSAMSG
+ #include   ESA_API_CODES
+ #include   API_ADDINFO
+ #include   API_AUTH
+
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_COMP
+ #include MVS_OS_MVS
+
+ /*
+  *   TSS include files
+  */
+
+ #include TSS
+
+ #define  INCLUDE_ACL_LINES_DESCRIPTION
+
+ #include TSS_XRES
+ #include TSS_CODES
+
+ static ESA_RC TSS_create_acl_info(ESA_DIAG_COMP_typ       comp,
+                              RES_PARAMS_rec_ptr           res_params,
+                              ADMIN_PARAMS_rec_typ       * admin_params,
+                              ERR_STRUCT_rec_typ         * err);
+
+ static ESA_RC TSS_do_acl_info(ESA_DIAG_COMP_typ       comp,
+                          TSS_GET_RES_HANDLE_typ     * get_handle,
+                          short                        max_aces,
+                          short                      * actual_num,
+                          HAVE_MORE_typ              * have_more,
+                          RES_PARAMS_rec_ptr           res_params,
+                          ACE_rec_typ                  ace[1],
+                          ADDINFO_rec_ptr              addinfo[1],
+                          ADMIN_PARAMS_rec_typ       * admin_params,
+                          ERR_STRUCT_rec_typ         * err);
+
+ static ESA_RC TSS_get_file_pos(ESA_DIAG_COMP_typ        comp,
+                            TSS_GET_RES_HANDLE_typ     * get_handle,
+                            FILE                       * file_out,
+                            CTSAMSG_DEST_TABLE_rec_typ * dest,
+                            CTSAMSG_HANDLE_rec_ptr       msgs);
+
+ static ESA_RC TSS_acl_output_to_addinfo(ESA_DIAG_COMP_typ comp,
+                             TSSCFILE_REC_typ         ** rec_desc_p,
+                             char                      * record,
+                             TSSCFILE_REC_typ          * tsscf_recs[1],
+                             TSS_GET_HANDLE_typ        * get_handle,
+                             FILE                      * file_out,
+                             int                       * rec_cnt,
+                             ADDINFO_rec_ptr             addinfo,
+                             ADDINFO_rec_ptr             laddinfo,
+                             TSS_GET_RES_HANDLE_typ    * rget_handle,
+                             CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                             CTSAMSG_HANDLE_rec_ptr      msgs);
+
+ static ESA_RC TSS_put_acl_info(ESA_DIAG_COMP_typ        comp,
+                            ACE_rec_typ                * ace,
+                            ADDINFO_rec_ptr              addinfo,
+                            ADDINFO_rec_ptr              laddinfo,
+                            ADMIN_PARAMS_rec_typ       * admin_params,
+                            ERR_STRUCT_rec_typ         * err);
+
+ static ESA_RC TSS_extract_res(ESA_DIAG_COMP_typ     comp,
+                        char                       * record,
+                        TSSCFILE_HANDLE_typ        * h_desc,
+                        TSSCFILE_REC_typ           * r_desc,
+                        TSSCFILE_DESCR_typ         * d_desc,
+                        char                       * key_val,
+                        ADDINFO_rec_ptr              addinfo,
+                        ADDINFO_rec_ptr              laddinfo,
+                        CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                        CTSAMSG_HANDLE_rec_ptr       msgs);
+
+ static void TSS_set_defaults(ADDINFO_rec_ptr              addinfo,
+                              CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                              CTSAMSG_HANDLE_rec_ptr       msgs);
+
+ static char component[] = "CTSTGAC";
+
+ static char internal2_msg_buf[400] = "";
+ static char pending_acid[TSS_USER_NAME_LEN     + 1] = "";
+ static char pending_rest[TSS_RESTYPE_NAME_LEN  + 1] = "";
+ static char pending_resn[TSS_RESOURCE_NAME_LEN + 1] = "";
+
+/****************************************************
+ * Procedure Name: gtrsacl
+ * Description   : Get one resource's ACL
+ * Input         : mode         - GET_FREE_HANDLE, other values ignored
+ *                 max_aces     - # of ACEs
+ *                 admin_params -
+ *                 res_params   - required resource
+ * Output        : actual_num   - # of ACEs returned
+ *                 have_more    - HAVE_MORE if more conns, else NO_MORE
+ *                 ace          - contains: user, group, attributes
+ *                 err          - error indication, message, etc.
+ * Input/Output  : addinfo      - array of max_aces pointers
+ *                                add.info per ACE, caller puts
+ *                                requested keywords,
+ *                                callee returns actual add.info, per
+ *                                ACE.
+ *                 handle       - NULL on first call, filled by callee,
+ *                                used by callee to keep track.
+ *                                Freed by caller.
+ * Return Value  : ESA_RC
+ * Side Effects  : Function may allocate memory, return pointer in
+ *                 *handle; Caller MUST free when done.
+ * Comments      : 1. Data is returned as pairs -
+ *                    ACE, addinfo (=permissions)
+ ****************************************************/
+
+ ESA_RC CTSGetResACL (GET_ACL_MODE            mode,
+                      short                   max_aces,
+                      short                 * actual_num,
+                      HAVE_MORE_typ         * have_more,
+                      void                 ** handle,
+                      RES_PARAMS_rec_ptr      res_params,
+            /*        ADDINFO_rec_typ      *  res_addinfo,  PS0252 */
+                      ACE_rec_typ             ace[1],
+                      ADDINFO_rec_ptr         addinfo[1],
+                      ADMIN_PARAMS_rec_typ  * admin_params,
+                      ERR_STRUCT_rec_typ    * err)
+  {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                      rc     = ESA_OK ;
+   CTSAMSG_HANDLE_rec_ptr      msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr  dest;
+   static                      char func[]="CTSGetResACL";
+   int                         i_dump;
+   void                      * aux_handle = NULL;
+   TSS_GET_RES_HANDLE_typ    * get_handle = NULL;
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GTRSACL,1,func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   *actual_num = 0 ;
+   *have_more  = NO_MORE;
+
+   ESA_DIAG_printf(ESA_COMP_GTRSACL,1, "mode=%d handle=%X max_aces=%d",
+                   mode, *handle , max_aces);
+
+  /*
+   *     Check mode parameter
+   */
+
+   if ( mode EQ GET_FREE_HANDLE_ACL ) {
+      *have_more =  NO_MORE;
+      goto exit ;
+   }
+
+  /*
+   *  Initialize res handle
+   */
+
+   rc = TSS_init_res_handle(ESA_COMP_GTRSACL, &get_handle, handle ,
+                            admin_params, err );
+   if ( rc NE ESA_OK )
+     goto exit ;
+
+  /*
+   *  First invoke Initialize res list
+   */
+
+   if ( get_handle->aux_handle EQ NULL ) {
+     /*
+      *  Create WHOHAS info (by TSSCFILE utility)
+      */
+
+      rc = TSS_create_acl_info(ESA_COMP_GTRSACL, res_params,
+                               admin_params, err);
+      ESA_DIAG_printf(ESA_COMP_GTRSACL, 1, "rc=%d", rc );
+      if ( rc NE ESA_OK )
+         goto exit ;
+
+     /*
+      *  Initialize aux res handle
+      */
+
+      rc = TSS_init_get_handle(ESA_COMP_GTRSACL, TSS_BREAK_BY_ERR,
+                               &(get_handle->aux_handle), &aux_handle,
+                               addinfo[0], admin_params, err );
+      if ( rc NE ESA_OK )
+         goto exit ;
+   }
+
+  /*
+   *  ACL info processing
+   */
+
+   rc = TSS_do_acl_info(ESA_COMP_GTRSACL, get_handle,
+                        max_aces, actual_num, have_more, res_params,
+                        ace, addinfo, admin_params, err);
+  /*
+   *  Finish
+   */
+
+   exit :;
+
+  /*
+   *    Diag ...
+   */
+
+   ESA_DIAG_printf(ESA_COMP_GTRSACL,1,
+                   "**** max_aces=%d actual num=%d",
+                   max_aces, *actual_num);
+
+   if ( ESA_DIAG_get_debug_level(ESA_COMP_GTRSACL) GE 1 ) {
+      for (i_dump=0; i_dump LT *actual_num; i_dump++) {
+        ESA_DIAG_printf(ESA_COMP_GTRSACL,0,
+         "resource=%s class=%s user=%s group=%s obj_type=%d attr=%d",
+                        res_params->resource,
+                        res_params->restype,
+                        ace[i_dump].user_name,
+                        ace[i_dump].ug_name,
+                        ace[i_dump].ace_type,
+                        ace[i_dump].ace_attrs);
+        if ( ESA_DIAG_get_debug_level(ESA_COMP_GTRSACL) GE 2 )
+             ADDINFO_dump(addinfo[i_dump],1);    /* was 0 */
+      }
+   }
+
+   ESA_DIAG_printf(ESA_COMP_GTRSACL,1,
+                   "Exiting with rc=%d actual num=%d Have_More=%d",
+                    rc, *actual_num, *have_more );
+
+   if ( (*have_more EQ NO_MORE) OR (rc NE ESA_OK) ) {
+    *have_more = NO_MORE;
+    if ( get_handle NE NULL ) {
+      if ( get_handle->aux_handle NE NULL ) {
+         aux_handle = get_handle->aux_handle;
+         TSS_free_get_handle(ESA_COMP_GTUSERS, &aux_handle, dest, msgs);
+      }
+      TSS_free_res_handle(ESA_COMP_GTRSACL, handle, dest, msgs);
+    }
+    *handle = NULL;
+   }
+
+   ESA_DIAG_exit(ESA_COMP_GTRSACL,1, func, rc );
+
+   return rc ;
+
+  }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_create_acl_info                        *
+ *                                                             *
+ * DESCRIPTION    : Create input for TSSCFILE utility, invoke  *
+ *                  for receive acl information                *
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  res_params- res parameters structure       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_create_acl_info(ESA_DIAG_COMP_typ       comp,
+                              RES_PARAMS_rec_ptr           res_params,
+                              ADMIN_PARAMS_rec_typ       * admin_params,
+                              ERR_STRUCT_rec_typ         * err)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                       rc = ESA_OK ;
+   static char                * main_cmd = " TSS WHOHAS %s(%s) ";
+   char                         cmd[MAX_TSS_API_ST];
+   CTSAMSG_DEST_TABLE_rec_typ * dest;
+   CTSAMSG_HANDLE_rec_typ     * msgs;
+   int                          logout_done = 0;
+   int                          nb;
+   char                         file_name[TSS_MAX_FILENAME_LEN + 10];
+   FILE                       * file_in = NULL ;
+   char                       ddn_with[MAX_FILENAME_LEN]; /* SAS2IBMT */
+   static char func[]="TSS_create_acl_info";
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(comp, 3, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   rc = CTSCRSS_set_authority( &logout_done,
+                               SET_TO_STARTED_TASK_AUTH,
+                               admin_params, err );
+   if ( rc NE ESA_OK )
+       goto exit;
+
+   /* IS10174
+   rc = OS_MVS_ddinfo(TSSCFILE_IN_DD , file_name , TRUE, dest, msgs);*/
+   rc = OS_MVS_ddinfo(TSSCFILE_IN_DD , file_name ,       /* IS10174 */
+                      TRUE, dest, msgs, 0);              /* IS10174 */
+
+   ESA_DIAG_printf(comp, 3,
+                  "OS_MVS_ddinfo rc=%d file name %s", rc, file_name);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+  /*
+   *  Open file for create input for TSSCFILE
+   */
+
+   strcpy(ddn_with,"DD:");                                /* SAS2IBMT */
+   strcat(ddn_with, TSSCFILE_IN_DD);                      /* SAS2IBMT */
+
+   /* SAS2IBMT
+   file_in = fopen(TSSCFILE_IN_DD , FILE_OPEN_WRITE_TEXT);           */
+   file_in = fopen(ddn_with, FILE_OPEN_WRITE_TEXT);       /* SAS2IBMT */
+   if ( ferror(file_in) OR (file_in EQ NULL) ) {
+       CTSAMSG_print(ERR_IO, msgs, NULL, dest, "fopen", TSSCFILE_IN_DD,
+                     strerror(errno) );
+       ESA_DIAG_printf(comp, 3,
+              "file %s error %s", TSSCFILE_IN_DD, strerror(errno));
+       rc = ESA_FATAL;
+       goto exit;
+   }
+
+  /*
+   *  Create input file for TSSCFILE utility
+   */
+
+   sprintf(cmd, main_cmd,
+           TSS_convert_restype(res_params->restype),
+           res_params->resource);
+
+   nb = fputs( cmd, file_in);
+
+   ESA_DIAG_printf(comp, 3, "written %d bytes, cmd=%s", nb, cmd);
+
+   if ( ferror(file_in) OR (nb EQ 0) ) {
+       CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                     "fputs", TSSCFILE_IN_DD, strerror(errno) );
+       ESA_DIAG_printf(comp, 3,
+                       "file %s error %s", TSSCFILE_IN_DD,
+                        strerror(errno));
+       rc = ESA_FATAL;
+       goto exit;
+   }
+
+   fclose(file_in);
+   file_in = NULL;
+
+   rc = TSS_cfile_activate(comp, dest, msgs );
+
+  /*
+   *   Finish
+   */
+
+   exit :;
+
+   if (file_in NE NULL)
+      fclose(file_in);
+
+   if (logout_done)
+     CTSCRSS_set_authority( &logout_done,
+                            RETURN_FROM_STARTED_TASK_AUTH,
+                            admin_params, err );
+
+   ESA_DIAG_exit(comp, 3, func, rc);
+
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_check_res                              *
+ *                                                             *
+ * DESCRIPTION    : Check obtained resource                    *
+ *                                                             *
+ * INPUT          : comp         - diag component              *
+ *                  addinfo      - ptr to addinfo              *
+ *                  res_params   - resource parameters struct  *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_check_res(ESA_DIAG_COMP_typ        comp,
+                             RES_PARAMS_rec_ptr       res_params,
+                             ADDINFO_rec_ptr          addinfo)
+{
+
+ static char func[]="TSS_check_res";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                       rc = ESA_ERR;
+ ONE_FIELD_rec_ptr            resn_pair;
+ ONE_FIELD_rec_ptr            rest_pair;
+
+/*
+ *  Initialize
+ */
+
+ ESA_DIAG_enter(comp, 3, func );
+
+ ESA_DIAG_printf(comp, 3, "Locate res_name=%s res_type=%s",
+                 res_params->resource, res_params->restype);
+
+/*
+ *  Check obtained resource
+ */
+
+ resn_pair = ADDINFO_search( "RES_NAME", TSS_ADDINFO_KWD_LEN,
+                             addinfo->pair,  addinfo->num_pairs );
+
+ rest_pair = ADDINFO_search( "RES_TYPE", TSS_ADDINFO_KWD_LEN,
+                             addinfo->pair,  addinfo->num_pairs );
+
+ ESA_DIAG_printf(comp, 3, "resn_pair=%x rest_pair=%x",
+                 rest_pair, rest_pair);
+
+ if ( resn_pair AND rest_pair ) {
+   ESA_DIAG_printf(comp, 3,
+                   "resn_pair->value=%d/%s rest_pair->value=%d/%s",
+                   strlen(resn_pair->value), resn_pair->value,
+                   strlen(rest_pair->value), rest_pair->value);
+
+   if ( (strcmp(resn_pair->value, res_params->resource) EQ 0 ) AND
+        (strcmp(rest_pair->value, res_params->restype ) EQ 0 )   )
+     rc = ESA_OK;
+
+ }
+
+ /*
+  *  Finish
+  */
+
+ exit : ;
+
+  ESA_DIAG_exit(comp, 3, func, rc);
+
+  return rc ;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_do_acl_info                            *
+ *                                                             *
+ * DESCRIPTION    : Create API acl info                        *
+ *                                                             *
+ * INPUT          : comp         - diag component              *
+ *                  get_handle   - get handle                  *
+ *                  res_params   - resource parameters struct  *
+ *                                                             *
+ * OUTPUT         : max_aces     - max returned acee           *
+ *                  actual_num   - actual num                  *
+ *                  have_more    - have more parameter         *
+ *                  ace          - ace area                    *
+ *                  addinfo      - addinfo area                *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_do_acl_info(ESA_DIAG_COMP_typ       comp,
+                          TSS_GET_RES_HANDLE_typ     * get_handle,
+                          short                        max_aces,
+                          short                      * actual_num,
+                          HAVE_MORE_typ              * have_more,
+                          RES_PARAMS_rec_ptr           res_params,
+                          ACE_rec_typ                  ace[1],
+                          ADDINFO_rec_ptr              addinfo[1],
+                          ADMIN_PARAMS_rec_typ       * admin_params,
+                          ERR_STRUCT_rec_typ         * err)
+{
+
+ static char func[]="TSS_do_acl_info";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                       rc       = ESA_OK ;
+ ESA_RC                       rc_a     = ESA_OK ;
+ ESA_RC                       rc_check = ESA_OK ;
+ TSSCFILE_REC_typ            *rec_desc = NULL;
+ TSSCFILE_REC_typ           **tsscf_recs;
+ TSS_GET_HANDLE_typ         * general_get_handle;
+ CTSAMSG_HANDLE_rec_typ     * msgs;
+ CTSAMSG_DEST_TABLE_rec_typ * dest;
+ ADDINFO_rec_ptr              laddinfo      = NULL;
+ ADDINFO_rec_ptr              waddinfo      = NULL;
+ FILE                       * file_out  = NULL;
+ char                         record[MAX_TSSCFILE_REC_LEN] = "";
+ char                         ddn_with[MAX_FILENAME_LEN]; /* SAS2IBMT */
+ int                          do_acl_info = 1;
+ int                          rec_cnt = 0;
+ int                          i = 0;
+ int                          rc_pos;
+ int                          res_found   = 0;
+ /*IS10026 char        t_rel[MAX_TSS_PARAM_LEN + 1] = ""; /*PS0388*/
+
+/*
+ *  Initialize
+ */
+
+ ESA_DIAG_enter(comp, 3, func );
+
+ msgs = admin_params->ctsamsg_handle;
+ dest = admin_params->ctsamsg_dest;
+
+ /*IS0357 tsscf_recs = tsscf_acl; /* TSSCFILE ACL recs description */
+ tsscf_recs = tsscf_acl_51; /* TSSCFILE default is 5.1 & +   IS0357 */
+
+ /*IS10026 tsscf_recs = tsscf_acl; /* TSSCFILE ACL recs description */
+ /*IS10026 - drop support in earlier than tss 5.1 versions
+ TSS_get_global_parameter(comp,  TSS_GLOBAL_RELEASE,  /*PS0388*
+                          t_rel, dest, msgs);         /*PS0388*
+ ESA_DIAG_printf(comp,5, "Parameter %s=%s",           /*PS0388*
+                 TSS_GLOBAL_RELEASE, t_rel);          /*PS0388*
+ if (strcmp(t_rel, "5.0") EQ 0)                       /*IS0357*
+    tsscf_recs = tsscf_acl;                           /*IS0357*
+ /* IS0357 support tss 5.0 and above.
+ if (strcmp(t_rel, "5.1") EQ 0)                        *PS0388*
+    tsscf_recs = tsscf_acl_51;                         *PS0388*
+ if (strcmp(t_rel, "5.2") EQ 0)                        *PS0509*
+    tsscf_recs = tsscf_acl_51;                         *PS0509*
+ if (strcmp(t_rel, "5.3") EQ 0)                        *WS2530*
+    tsscf_recs = tsscf_acl_51;                         *WS2530*
+ if (strcmp(t_rel, "5.4") EQ 0)                        *WS2530*
+    tsscf_recs = tsscf_acl_51;                         *WS2530*
+ if (strcmp(t_rel, "5.5") EQ 0)                        *WS2530*
+    tsscf_recs = tsscf_acl_51;                         *WS2530*
+                                                end of IS0357 */
+
+ general_get_handle = get_handle->aux_handle;
+ laddinfo           = general_get_handle->laddinfo;
+ waddinfo           = general_get_handle->waddinfo;
+
+/*
+ *   Open TSSCFILE utility output file
+ */
+
+ strcpy(ddn_with,"DD:");                                 /* SAS2IBMT */
+ strcat(ddn_with, TSSCFILE_OUT_DD);                      /* SAS2IBMT */
+
+ /*SAS2IBMA file_out = afopen(TSSCFILE_OUT_DD, FILE_OPEN_READ_BINARY,*/
+ /*
+ file_out = (FILE *) afopen(TSSCFILE_OUT_DD,FILE_OPEN_READ_BINARY,
+                   NULL_STRING, NULL_STRING);         SAS2IBMA SAS2IBMT */
+ file_out = fopen(ddn_with, FILE_OPEN_READ_BINARY_REC);
+                                                          /* SAS2IBMT */
+ if (file_out EQ NULL) {
+     CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                   "fopen", func, TSSCFILE_OUT_DD, strerror(errno));
+    rc = ESA_FATAL;
+    goto exit;
+ }
+
+/*
+ *   Reposition file if continue ACL processing
+ */
+
+ rc_pos = fsetpos( file_out, &(get_handle->file_pos));
+ if ( rc_pos NE 0) {
+    CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                 "set pos",component,
+                 TSSCFILE_OUT_DD, strerror(errno));
+    rc = ESA_FATAL ;
+    goto exit;
+ } /* reposition failed */
+
+ ADDINFO_empty( laddinfo );
+ ADDINFO_clear( waddinfo );
+
+ pending_acid[0] = NULL_CHAR;
+ pending_rest[0] = NULL_CHAR;
+ pending_resn[0] = NULL_CHAR;
+
+/*
+ *   Load information to addinfo
+ */
+
+ while ( do_acl_info ) {
+
+  /*
+   *  In case ACL's the following records have the
+   *  CFILE_BREAK attribute
+   *  --------------------------------------------
+   *  2007 - WHOHAS AUTH
+   *  2008 - WHOHAS ADMIN
+   */
+
+   rc_a = TSS_acl_output_to_addinfo(comp, &rec_desc, record, tsscf_recs,
+                                    general_get_handle, file_out,
+                                    &rec_cnt, waddinfo, laddinfo,
+                                    get_handle, dest, msgs);
+
+   ESA_DIAG_printf(comp, 5, "rc_a=%s get_handle->found_err=%d",
+                   ESA_rc2str(rc), general_get_handle->found_err);
+
+   if ( (rc_a EQ ESA_FATAL) OR
+        (rc_a EQ ESA_ERR  )  ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+   else  if ( rc_a EQ ESA_WARN)
+      rc = ESA_OK;
+
+   if (  general_get_handle->found_err  AND
+        (general_get_handle->err_action EQ TSS_BREAK_BY_ERR ) ) {
+      rc = ESA_FATAL;
+      *actual_num = 0;
+      goto exit;
+   }
+
+  /*
+   *  Put ACL info
+   */
+
+   if ( res_found ) {
+
+        ESA_DIAG_printf(comp, 5, "Put ACL i=%d", i);
+
+        ADDINFO_copy( addinfo[i], waddinfo);
+
+        TSS_set_defaults( addinfo[i], dest, msgs);
+
+        rc = TSS_put_acl_info(comp, &ace[i], addinfo[i], laddinfo,
+                              admin_params, err);
+        if ( rc NE ESA_OK )
+          goto exit;
+
+        i++;
+        *actual_num = i;
+        if (i EQ max_aces) { /* Max aces reached */
+          *have_more = HAVE_MORE;
+          goto exit;
+        }
+   }    /* obtained ACL information */
+
+   if (rc_a EQ ESA_EOF) {
+      rc = ESA_OK;
+      break;
+   }
+
+   rc_check = TSS_check_res(comp, res_params, laddinfo);
+
+   ESA_DIAG_printf(comp, 5, "rc_check=%s", ESA_rc2str(rc_check) );
+
+   if ( rc_check EQ ESA_OK ) /* ACL for requested resource */
+      res_found = 1;
+   else
+      res_found = 0;
+
+   ADDINFO_empty( laddinfo );
+   ADDINFO_clear( waddinfo );
+ }
+
+/*
+ *  Put last ACL
+ */
+
+ *have_more = NO_MORE;
+
+ /*
+  *  if ( res_found ) {
+  *      ESA_DIAG_printf(comp, 5, "Put Last ACL i=%d", i);
+  *      ADDINFO_copy( addinfo[i], waddinfo);
+  *      rc = TSS_put_acl_info(comp, &ace[i], addinfo[i], laddinfo,
+  *                            admin_params, err);
+  *      if ( rc NE ESA_OK )
+  *        goto exit;
+  *
+  *      i++;
+  *      *actual_num = i;
+  *  }
+  */
+
+ /*
+  *  Finish
+  */
+
+ exit : ;
+
+  pending_acid[0] = NULL_CHAR;
+  pending_rest[0] = NULL_CHAR;
+  pending_resn[0] = NULL_CHAR;
+
+  if (file_out NE NULL)
+     fclose(file_out);
+
+  ESA_DIAG_exit(comp, 3, func, rc);
+
+  return rc ;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : TSS_get_file_pos                          *
+ *                                                             *
+ * DESCRIPTION     : Get current position of TSO file          *
+ *                   for possibility close file in case not    *
+ *                   not enough place for output and after     *
+ *                   that continue.                            *
+ *                                                             *
+ * INPUT           : report_fp - ptr to file                   *
+ *                   report_handle - ptr to report_handle struc*
+ *                   dest     - ptr to msgs destination        *
+ *                   msgs     - ptr to msgs hedaer             *
+ *                                                             *
+ * OUTPUT          : current_position of TSO file              *
+ *                   previous_position of TSO file             *
+ *                                                             *
+ * RETURN VALUE    : ESA_OK, ESA_FATAL - i/o error             *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_get_file_pos(ESA_DIAG_COMP_typ        comp,
+                            TSS_GET_RES_HANDLE_typ     * get_handle,
+                            FILE                       * file_out,
+                            CTSAMSG_DEST_TABLE_rec_typ * dest,
+                            CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   /*
+    *    Variables
+    */
+
+    ESA_RC rc=ESA_OK ;
+    int rc_pos ;
+    static char func[]="TSS_get_file_pos";
+
+    ESA_DIAG_enter(comp,4, func );
+
+   /*
+    *    Get current position of file
+    */
+
+    rc_pos = fgetpos(file_out, &(get_handle->file_pos) );
+    if ( rc_pos NE 0 ) {
+       CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                     "fgetpos()","TSS get res ACL",
+                     TSSCFILE_OUT_DD, strerror(errno));
+       rc = ESA_FATAL ;
+    }
+
+   /*
+    *    Finish
+    */
+
+    ESA_DIAG_exit(comp,4, func, rc );
+    return rc ;
+
+ }
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_acl_output_to_addinfo                  *
+*                                                             *
+* DESCRIPTION    : Separate information reutrned from TSSCFILE*
+*                  and insert it to addinfo                   *
+*                                                             *
+* INPUT          : addinfo         - addinfo area             *
+*                  laddinfo        - local addinfo            *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+/**************************************************************/
+
+static ESA_RC TSS_acl_output_to_addinfo(ESA_DIAG_COMP_typ comp,
+                             TSSCFILE_REC_typ         ** rec_desc_p,
+                             char                      * record,
+                             TSSCFILE_REC_typ          * tsscf_recs[1],
+                             TSS_GET_HANDLE_typ        * get_handle,
+                             FILE                      * file_out,
+                             int                       * rec_cnt,
+                             ADDINFO_rec_ptr             addinfo,
+                             ADDINFO_rec_ptr             laddinfo,
+                             TSS_GET_RES_HANDLE_typ    * rget_handle,
+                             CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                             CTSAMSG_HANDLE_rec_ptr      msgs)
+{
+
+/*
+ *      Variables
+ */
+
+ ESA_RC                  rc = ESA_OK;
+ static                  char func[]="TSS_acl_output_to_addinfo";
+ int                     i;
+ int                     read_tsscfile_file = 1;
+ /* char                 record[MAX_TSSCFILE_REC_LEN] = ""; */
+ char                    record_id_1[5]               = "";
+ char                    record_id_2[3]               = "";
+ char                    record_id_1_prev[5]          = "";
+ char                    key[MAX_TSS_PARAM_LEN]       = "";
+ TSS_LST_FIELD_typ     * lst_handle;
+ TSSCFILE_DATA_EXT_typ * pfunc;
+ TSSCFILE_REC_typ      * rec_desc;
+ ONE_FIELD_rec_ptr       pair;
+
+/*
+ *      Initialize
+ */
+
+ ESA_DIAG_enter(comp, 3,func);
+
+ rec_desc    = *rec_desc_p;
+ *rec_desc_p = NULL;
+
+/*
+ * Continue processing
+ * But record parameter not empty
+ * Acoording break_record
+ */
+
+ if (rec_desc NE NULL) {
+   if ( rec_desc->pfunc NE NULL ) {
+     pfunc = (TSSCFILE_DATA_EXT_typ *)rec_desc->pfunc;
+
+     ESA_DIAG_printf(comp, 5,
+                    "Func ptr=%x rec_desc=%x resc-desc->vars=%x",
+                     pfunc, rec_desc, rec_desc->vars);
+
+     (pfunc)(comp, record, &(get_handle->list_buffer),
+                           rec_desc, rec_desc->vars, key, addinfo,
+                           laddinfo, dest, msgs);
+   }
+   else
+     TSS_extract_proc(comp, record,
+                      &(get_handle->list_buffer),
+                      rec_desc, rec_desc->vars,
+                      key, addinfo, laddinfo, dest, msgs);
+ }
+
+/*
+ *   read TSSCFILE
+ */
+
+ rc = TSS_get_file_pos(comp, rget_handle, file_out, dest, msgs) ;
+ if ( rc NE ESA_OK )  {
+    rc = ESA_FATAL;
+    goto exit ;
+ }
+/* SAS2IBMT afread(record, 1, MAX_TSSCFILE_REC_LEN, file_out);       */
+  fread(record, 1, MAX_TSSCFILE_REC_LEN, file_out);       /* SAS2IBMT */
+
+ while ( read_tsscfile_file )  {
+
+   /*   Handle EOF */
+
+    if ( feof(file_out) NE 0) {
+       rc = ESA_EOF;
+       goto exit;
+    }
+
+   /*   Handle errors */
+
+    if (ferror(file_out)) {
+       CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                     "fgets", func, TSSCFILE_OUT_DD, strerror(errno));
+        rc = ESA_FATAL;
+        goto exit;
+    }
+
+    (*rec_cnt)++;
+
+    /* Clear reserved garbage part of TSSCFILE record */
+
+    memset(record, ' ', TSSCFILE_RESERVED_LEN);
+    ESA_DIAG_printf(comp, 5, "%d.%s",
+                    *rec_cnt, record + TSSCFILE_RESERVED_LEN );
+
+   /*   Get RECORD ID  */
+
+    TSS_get_rec_id( comp, record, record_id_1, record_id_2 );
+    /*BS10014
+    rec_desc = TSS_select_rec_desc( comp, record_id_1, tsscf_recs);*/
+    rec_desc = TSS_select_rec_desc( comp, record_id_1, tsscf_recs,
+                                                       dest, msgs);
+    if ( rec_desc EQ NULL ) {
+       sprintf(internal2_msg_buf,
+        "'%s'.Resource=%s/%s.Unable to locate description of recid=%s",
+        pending_acid, pending_rest, pending_resn,
+        record_id_1);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                     "CTSTGAC", func, internal2_msg_buf,
+                     0, __LINE__);
+    }
+    else {
+
+    /*
+     *   Record descriptor router
+     */
+
+     if ( rec_desc->action EQ CFILE_BREAK ) {
+        *rec_desc_p = rec_desc;
+
+        if ( (strcmp(rec_desc->id1, "2007") EQ 0 ) OR
+             (strcmp(rec_desc->id1, "2008") EQ 0 )  )
+           TSS_extract_res(comp, record,
+                           &(get_handle->list_buffer),
+                           rec_desc, rec_desc->vars,
+                           key, addinfo, laddinfo, dest, msgs);
+        else
+           TSS_extract_proc(comp, record,
+                            &(get_handle->list_buffer),
+                            rec_desc, rec_desc->vars,
+                            key, addinfo, laddinfo, dest, msgs);
+
+        pending_acid[0] = NULL_CHAR;
+        pending_rest[0] = NULL_CHAR;
+        pending_resn[0] = NULL_CHAR;
+
+        pair = ADDINFO_search( "ACID", TSS_ADDINFO_KWD_LEN,
+                               laddinfo->pair, laddinfo->num_pairs );
+        if ( pair NE NULL )
+          strcpy(pending_acid, pair->value);
+
+        pair = ADDINFO_search( "RES_NAME", TSS_ADDINFO_KWD_LEN,
+                               laddinfo->pair, laddinfo->num_pairs );
+        if ( pair NE NULL )
+          strcpy(pending_resn, pair->value);
+
+        pair = ADDINFO_search( "RES_TYPE", TSS_ADDINFO_KWD_LEN,
+                               laddinfo->pair, laddinfo->num_pairs );
+        if ( pair NE NULL )
+          strcpy(pending_rest, pair->value);
+
+        ESA_DIAG_printf(comp, 5,
+                        "Pending acid=%s res_name=%s res_type=%s",
+                         pending_acid, pending_resn, pending_rest);
+        break;
+     }
+     else if ( rec_desc->action NE CFILE_SKIP )  {
+           if ( rec_desc->action EQ CFILE_ACCEPT ) {
+
+          /* Check record dependencies */
+
+          ESA_DIAG_printf(comp, 5, "1.Rec_id=%s Dep by %s Pending=%s",
+                          record_id_1, rec_desc->id1_dep,
+                          record_id_1_prev);
+
+          /* Rec dependence should be checked */
+
+          if ( strlen(rec_desc->id1_dep) GT 0 )
+             TSS_check_rec_dep( comp, record_id_1, record_id_1_prev,
+                                rec_desc->id1_dep, dest, msgs );
+          else
+             strcpy(record_id_1_prev, record_id_1);
+
+          ESA_DIAG_printf(comp, 5, "2.Rec_id=%s Dep by %s Pending=%s",
+                          record_id_1, rec_desc->id1_dep,
+                          record_id_1_prev);
+
+          /*  Rec processing function found */
+
+          if ( rec_desc->pfunc NE NULL ) {
+              pfunc = (TSSCFILE_DATA_EXT_typ *)rec_desc->pfunc;
+
+              ESA_DIAG_printf(comp, 5,
+                    "Func ptr=%x rec_desc=%x resc-desc->vars=%x",
+                     pfunc, rec_desc, rec_desc->vars);
+
+              rc = (pfunc)(comp, record, &(get_handle->list_buffer),
+                           rec_desc, rec_desc->vars, key, addinfo,
+                           laddinfo, dest, msgs);
+
+              if ( rc EQ ESA_WARN ) {
+                get_handle->found_err = 1;
+                rc = ESA_OK;
+              }
+
+              if ( rc EQ ESA_SKIP )
+                 rc = ESA_OK;
+
+              if ( rc NE ESA_OK )
+                goto exit;
+          }
+          else {
+              rc = TSS_extract_proc(comp, record,
+                                    &(get_handle->list_buffer),
+                                    rec_desc, rec_desc->vars,
+                                    key, addinfo, laddinfo, dest, msgs);
+
+              if ( rc EQ ESA_WARN ) {
+                get_handle->found_err = 1;
+                rc = ESA_OK;
+              }
+
+              if ( rc EQ ESA_SKIP )
+                 rc = ESA_OK;
+
+              if ( rc NE ESA_OK )
+                goto exit;
+          }
+      }
+      else if ( rec_desc->action EQ CFILE_MSG_OK )
+         CTSAMSG_print(TSS_OUTPUT_LINE, msgs, NULL, dest,
+                       &record[TSSCFILE_RESERVED_LEN] );
+      else if ( rec_desc->action EQ CFILE_MSG_WRN) {
+         CTSAMSG_print(TSS_OUTPUT_LINE, msgs, NULL, dest,
+                       &record[TSSCFILE_RESERVED_LEN] );
+         rc = ESA_WARN;
+         break;
+      }
+      else if ( rec_desc->action EQ CFILE_MSG_ERR) {
+         CTSAMSG_print(TSS_OUTPUT_LINE, msgs, NULL, dest,
+                       &record[TSSCFILE_RESERVED_LEN] );
+         rc = ESA_ERR;
+         break;
+      }
+      else if ( rec_desc->action EQ CFILE_MSG_FATAL) {
+         CTSAMSG_print(TSS_OUTPUT_LINE, msgs, NULL, dest,
+                       &record[TSSCFILE_RESERVED_LEN] );
+         rc = ESA_FATAL;
+         break;
+      }
+     }    /* rec action NE CFILE_SKIP */
+    }     /* Found line description */
+
+    /*  Get next record */
+
+    rc = TSS_get_file_pos(comp, rget_handle, file_out, dest, msgs) ;
+    if ( rc NE ESA_OK )  {
+       rc = ESA_FATAL;
+       goto exit ;
+    }
+
+/* SAS2IBMT afread(record, 1, MAX_TSSCFILE_REC_LEN, file_out);       */
+     fread(record, 1, MAX_TSSCFILE_REC_LEN, file_out);    /* SAS2IBMT */
+ }
+
+/*
+ *  Finish
+ */
+
+ exit : ;
+
+ if ( ESA_DIAG_get_debug_level(comp) GE 3 ) {
+    ADDINFO_dump(laddinfo,0);
+    for (i=0; i LT MAX_TSS_LIST_FIELDS; i++ ) {
+      if (get_handle->list_buffer.lst_f[i].vall NE NULL ) {
+        ESA_DIAG_printf (comp,0, "Field=%s",
+                         get_handle->list_buffer.lst_f[i].kwd);
+        lst_handle = get_handle->list_buffer.lst_f[i].vall;
+        TSS_lst_buf_dump(comp, lst_handle);
+      }
+    }
+ }
+
+ ESA_DIAG_exit(comp, 3, func, rc);
+
+ return rc ;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_set_defaults                           *
+*                                                             *
+* DESCRIPTION    : Set default values for some fields         *
+*                                                             *
+* INPUT          : addinfo         - addinfo area             *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+/**************************************************************/
+
+static void TSS_set_defaults(ADDINFO_rec_ptr              addinfo,
+                             CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                             CTSAMSG_HANDLE_rec_ptr       msgs)
+
+{
+
+ struct def_struct{
+   char  *field_name;
+   char  *field_default;
+ };
+
+ ONE_FIELD_rec_ptr            cpair;
+
+ struct def_struct    def_fields[] ={{ "DAYS" , "ALL"},
+                                     { "TIMES" , "ANY"},
+                                     { NULL, NULL }};
+
+ int i;
+
+ i = 0;
+
+ while (def_fields[i].field_name NE NULL) {
+   cpair = ADDINFO_search( def_fields[i].field_name,
+                          TSS_ADDINFO_KWD_LEN,
+                          addinfo->pair, addinfo->num_pairs );
+
+   if ( cpair NE NULL )
+     if ( cpair->vallen EQ 0 )
+       ADDINFO_updval ( def_fields[i].field_default,
+                       TSS_ADDINFO_VAL_LEN, cpair);
+   i++;
+ }
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_put_acl_info                           *
+*                                                             *
+* DESCRIPTION    : Put ace info (structure vars)              *
+*                                                             *
+* INPUT          : addinfo         - addinfo area             *
+*                  laddinfo        - local addinfo            *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : ace             - ptr to ace structure     *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+/**************************************************************/
+
+static ESA_RC TSS_put_acl_info(ESA_DIAG_COMP_typ         comp,
+                            ACE_rec_typ                * ace,
+                            ADDINFO_rec_ptr              addinfo,
+                            ADDINFO_rec_ptr              laddinfo,
+                            ADMIN_PARAMS_rec_typ       * admin_params,
+                            ERR_STRUCT_rec_typ         * err)
+{
+
+/*
+ *      Variables
+ */
+
+ ESA_RC                       rc = ESA_OK;
+ static                       char func[]="TSS_put_acl_info";
+ CTSAMSG_HANDLE_rec_typ     * msgs;
+ CTSAMSG_DEST_TABLE_rec_typ * dest;
+ char                         acid[MAX_TSS_PARAM_LEN + 1];
+ TSS_ACID_HEADER_rec_typ      acid_info;
+ ONE_FIELD_rec_ptr            pair;
+
+/*
+ *      Initialize
+ */
+
+ ESA_DIAG_enter(comp, 3,func);
+
+ msgs = admin_params->ctsamsg_handle;
+ dest = admin_params->ctsamsg_dest;
+
+ ace->user_name[0] = NULL_CHAR;
+ ace->ug_name[0]   = NULL_CHAR;
+ ace->oe_name[0]   = NULL_CHAR;
+ ace->ace_type     = ACE_TYPE_UNDEFINED ;
+ ace->ace_attrs    = ACE_ATTR_REGULAR ;
+
+ pair = ADDINFO_search( "ACID", TSS_ADDINFO_KWD_LEN,
+                        laddinfo->pair, laddinfo->num_pairs );
+ if ( pair EQ NULL ) {
+   sprintf(internal2_msg_buf,
+          "parameter %s not found",  "ACID" );
+   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                 "CTSTGAC", func, internal2_msg_buf,
+                 8, __LINE__);
+   rc = ESA_FATAL;
+   goto exit;
+ }
+
+/*
+ *   ACID type - WORLD
+ */
+
+ if ( strcmp( pair->value, "*ALL*") EQ 0 ) {
+    ace->ace_type = ACE_TYPE_WORLD;
+ }
+ else {
+   /*
+    *   Determine ACID type
+    */
+
+    strcpy(acid, pair->value);
+    rc = TSS_get_acid_header(comp, TSS_CMD_DEFAULT_MODE,
+                             acid, &acid_info, admin_params, err);
+    if ( rc NE ESA_OK )
+      goto exit;
+
+    TSS_put_to_addinfo(comp, "ACL_ACID",
+                       acid_info.acid, laddinfo, 1, dest, msgs );
+
+    TSS_put_to_addinfo(comp, "ACL_ACID_TYPE",
+                       acid_info.type, laddinfo, 1, dest, msgs );
+
+    /*
+     *   OE
+     */
+
+    if ( ( strcmp(acid_info.type, TSS_ZONE)       EQ 0 )  OR
+         ( strcmp(acid_info.type, TSS_DIVISION )  EQ 0 )  OR
+         ( strcmp(acid_info.type, TSS_DEPARTMENT) EQ 0 )   ) {
+       strcpy(ace->oe_name, acid);
+       ace->ace_type = ACE_TYPE_OE;
+    }
+
+    /*
+     *   Group
+     */
+
+    else if ( ( strcmp(acid_info.type, TSS_PROFILE) EQ 0 )  OR
+              ( strcmp(acid_info.type, TSS_GROUP  ) EQ 0 )   ) {
+       strcpy(ace->ug_name, acid);
+       ace->ace_type = ACE_TYPE_GROUP;
+    }
+
+    /*
+     *   User
+     */
+
+    else {
+       strcpy(ace->user_name, acid);
+       ace->ace_type = ACE_TYPE_USER;
+    }
+ }
+
+/*
+ *  Finish
+ */
+
+ exit : ;
+
+ ESA_DIAG_exit(comp, 3, func, rc);
+
+ return rc ;
+
+}
+
+ /*    Extract functions */
+
+ ESA_RC TSS_extract_2021 (ESA_DIAG_COMP_typ            comp,
+                          char                       * record,
+                          TSSCFILE_HANDLE_typ        * h_desc,
+                          TSSCFILE_REC_typ           * r_desc,
+                          TSSCFILE_DESCR_typ         * d_desc,
+                          char                       * key_val,
+                          ADDINFO_rec_ptr              addinfo,
+                          ADDINFO_rec_ptr              laddinfo,
+                          CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                          CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_extract_2021";
+   char                  * token;
+   char                    kwd[] = "ACCESS";
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+  /*
+   *  Extract data
+   */
+
+   record += TSSCFILE_RESERVED_LEN;
+   token = strtok(record, " \n");       /* Skip rec ID */
+   if ( NOT token )
+      goto exit;
+
+   token = strtok(NULL, " \n");
+   while (token) {
+      ESA_DIAG_printf(comp, 5, "Reglr: %s=%s", kwd, token);
+      TSS_put_to_addinfo(comp, kwd, token, addinfo, 0, dest, msgs );
+      token = strtok(NULL, " \n");
+   }
+
+   rc = ESA_SKIP;
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_extract_2014(ESA_DIAG_COMP_typ            comp,
+                         char                       * record,
+                         TSSCFILE_HANDLE_typ        * h_desc,
+                         TSSCFILE_REC_typ           * r_desc,
+                         TSSCFILE_DESCR_typ         * d_desc,
+                         char                       * key_val,
+                         ADDINFO_rec_ptr              addinfo,
+                         ADDINFO_rec_ptr              laddinfo,
+                         CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                         CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_extract_2014";
+   int                     i;
+   TSSCFILE_DESCR_typ    * data = &d_desc[0];
+   char                    main_cmd[] = "PRIVPGM";
+   char                    str_name[MAX_TSS_PARAM_LEN];
+   char                    str_flag[MAX_TSS_PARAM_LEN];
+   char                    val[MAX_TSS_PARAM_LEN];
+   char                    name[MAX_TSS_PARAM_LEN] = "";
+   char                    flag[MAX_TSS_PARAM_LEN] = "";
+   char                    value[TSS_ADDINFO_VAL_LEN + 1] = "";
+   /* WS10082N - no need to change the length of value because  */
+   /*            it will not contain a value longer than 1K.    */
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   ESA_DIAG_printf(comp, 5, "main_cmd=%s", main_cmd );
+
+   strcpy(str_name, main_cmd);
+   strcat(str_name, ".NAME");
+   strcpy(str_flag, main_cmd);
+   strcat(str_flag, ".FLAG");
+
+  /*
+   *  Extract data
+   */
+
+   for (i=0; data = &d_desc[i], data->addinfo_k; i++) {
+
+      ESA_DIAG_printf(comp, 5, "data=%x keyword=%s pos=%d len=%d",
+                      data, data->addinfo_k,
+                      data->pos, data->len);
+
+      memcpy(val, record + data->pos - 1, data->len);
+      val[data->len] = NULL_CHAR;
+      TSS_strip_val(val, ' ', TSS_STRIP_BOTH);
+
+      ESA_DIAG_printf(comp, 5,
+                      "%d.%s data pos=%d data len=%d value=(%d)%s",
+                      i, data->addinfo_k, data->pos, data->len,
+                      strlen(val), val );
+
+      if ( strcmp(data->addinfo_k, str_name) EQ 0 ) {
+         strcpy(name, val);
+         flag[0] = NULL_CHAR;
+         continue;
+      }
+      else  if ( strcmp(data->addinfo_k, str_flag) EQ 0 ) {
+         strcpy(flag, val);
+         if ( strlen(name) EQ 0 ) {
+           flag[0] = NULL_CHAR;
+           continue;
+         }
+
+         if ( strlen(flag) EQ 0 )
+            strcpy( value, name);
+         else
+            sprintf( value, "%s(%s)", name, flag );
+        /*
+         * Put to addinfo
+         */
+
+         ESA_DIAG_printf(comp, 5, "Reglr: %s=%s", main_cmd, value );
+         TSS_put_to_addinfo(comp, main_cmd, value, addinfo,
+                            0, dest, msgs );
+         name[0] = NULL_CHAR;
+         flag[0] = NULL_CHAR;
+      }
+      else {
+         sprintf(internal2_msg_buf,
+                 "'%s/%s/%s'.Unsupported keyword=%s",
+                 pending_acid, pending_rest, pending_resn,
+                 data->addinfo_k);
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                       component, func, internal2_msg_buf,
+                       0, __LINE__);
+      }
+   }      /* vars loop */
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_extract_2017(ESA_DIAG_COMP_typ            comp,
+                         char                       * record,
+                         TSSCFILE_HANDLE_typ        * h_desc,
+                         TSSCFILE_REC_typ           * r_desc,
+                         TSSCFILE_DESCR_typ         * d_desc,
+                         char                       * key_val,
+                         ADDINFO_rec_ptr              addinfo,
+                         ADDINFO_rec_ptr              laddinfo,
+                         CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                         CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_extract_2017";
+   int                     i;
+   TSSCFILE_DESCR_typ    * data = &d_desc[0];
+   char                    main_cmd[] = "VMUSER";
+   char                    str_name[MAX_TSS_PARAM_LEN];
+   char                    str_flag[MAX_TSS_PARAM_LEN];
+   char                    val[MAX_TSS_PARAM_LEN];
+   char                    name[MAX_TSS_PARAM_LEN] = "";
+   char                    flag[MAX_TSS_PARAM_LEN] = "";
+   char                    value[TSS_ADDINFO_VAL_LEN + 1] = "";
+   /* WS10082N - no need to change the length of value because  */
+   /*            it will not contain a value longer than 1K.    */
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   ESA_DIAG_printf(comp, 5, "main_cmd=%s", main_cmd );
+
+   strcpy(str_name, main_cmd);
+   strcat(str_name, ".NAME");
+   strcpy(str_flag, main_cmd);
+   strcat(str_flag, ".FLAG");
+
+  /*
+   *  Extract data
+   */
+
+   for (i=0; data = &d_desc[i], data->addinfo_k; i++) {
+
+      memcpy(val, record + data->pos - 1, data->len);
+      val[data->len] = NULL_CHAR;
+      TSS_strip_val(val, ' ', TSS_STRIP_BOTH);
+
+      ESA_DIAG_printf(comp, 5,
+                      "%d.%s data pos=%d data len=%d value=(%d)%s",
+                      i, data->addinfo_k, data->pos, data->len,
+                      strlen(val), val );
+
+      if ( strcmp(data->addinfo_k, str_name) EQ 0 ) {
+         strcpy(name, val);
+         flag[0] = NULL_CHAR;
+         continue;
+      }
+      else  if ( strcmp(data->addinfo_k, str_flag) EQ 0 ) {
+         strcpy(flag, val);
+         if ( strlen(name) EQ 0 ) {
+           flag[0] = NULL_CHAR;
+           continue;
+         }
+
+         if ( strlen(flag) EQ 0 )
+            strcpy(value, name);
+         else
+            sprintf(value, "%s(%s)", name, flag );
+
+        /*
+         * Put to addinfo
+         */
+
+         ESA_DIAG_printf(comp, 5, "Reglr: %s=%s", main_cmd, value );
+         TSS_put_to_addinfo(comp, main_cmd, value, addinfo,
+                            0, dest, msgs );
+         name[0] = NULL_CHAR;
+         flag[0] = NULL_CHAR;
+      }
+      else {
+         sprintf(internal2_msg_buf,
+                 "'%s/%s/%s'.Unsupported keyword=%s",
+                 pending_acid, pending_rest, pending_resn,
+                 data->addinfo_k);
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                       component, func, internal2_msg_buf,
+                       0, __LINE__);
+      }
+   }      /* vars loop */
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_extract_4011r(ESA_DIAG_COMP_typ            comp,
+                          char                       * record,
+                          TSSCFILE_HANDLE_typ        * h_desc,
+                          TSSCFILE_REC_typ           * r_desc,
+                          TSSCFILE_DESCR_typ         * d_desc,
+                          char                       * key_val,
+                          ADDINFO_rec_ptr              addinfo,
+                          ADDINFO_rec_ptr              laddinfo,
+                          CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                          CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_extract_4011r";
+   char                  * wrk;
+   char                  * token;
+   char                    acid[MAX_TSS_PARAM_LEN];
+   char                    kwd[TSS_ADDINFO_KWD_LEN + 1] = "";
+   /* WS10082N char        val[TSS_ADDINFO_VAL_LEN + 1] = ""; */
+   char                    val[ADDINFO_16K_VAL_LEN+1] = ""; /*WS10082N*/
+   ONE_FIELD_rec_ptr       pair;
+   int                     i;                              /* WS2321 */
+   struct kwd_t {                                          /* WS2321 */
+       char     *kwd_in;       /* kwd from 4011 record */  /* WS2321 */
+       char     *kwd_out;      /* addinfo kwd          */  /* WS2321 */
+   } ;                                                     /* WS2321 */
+                                                           /* WS2321 */
+   static struct kwd_t  kwd_table[] = {                    /* WS2321 */
+                   { "SCRIPTN"   ,   "SCRIPTNAME" },       /* WS2321 */
+                   { "SCRIPTP"   ,   "SCRIPTPARM" },       /* WS2321 */
+                   { NULL        ,   NULL         }  };    /* WS2321 */
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+  /*
+   *  Check. For error messages
+   */
+
+   pair = ADDINFO_search( CFILE_REC_0001, TSS_ADDINFO_KWD_LEN,
+                          laddinfo->pair, laddinfo->num_pairs );
+   if ( pair NE NULL ) {
+     if ( pair->vallen GT 0 ) {
+        memcpy(acid, record + TSSCFILE_ACID_POS, TSSCFILE_ACID_LEN);
+        acid[TSSCFILE_ACID_LEN] = NULL_CHAR;
+        TSS_strip_val(acid, ' '   , TSS_STRIP_BOTH);
+        TSS_strip_val(acid, '\0'  , TSS_STRIP_BOTH);
+        ESA_DIAG_printf(comp, 5, "acid=%d/%s", strlen(acid), acid);
+
+       /*
+        *  Try to found acid in rec 0001
+        *  If not found - this record error message
+        */
+
+        wrk = NULL;
+        if ( strlen(acid) GT 0 )
+           wrk = strstr(pair->value, acid);
+        if ( NOT wrk ) {
+           wrk = strchr(record + TSSCFILE_INFO_POS , '\n');
+           if ( wrk )
+             *wrk = NULL_CHAR;
+
+           /* Remove trailing blanks from the end of a line */
+
+           TSS_strip_val( (record + TSSCFILE_INFO_POS),
+                          ' ', TSS_STRIP_RIGHT );
+
+           CTSAMSG_print(TSS_OUTPUT_LINE, msgs, NULL, dest,
+                         pair->value);
+           CTSAMSG_print(TSS_OUTPUT_LINE, msgs, NULL, dest,
+                         record + TSSCFILE_INFO_POS);
+           ADDINFO_updval("", TSS_ADDINFO_VAL_LEN, pair);
+           rc = ESA_WARN;
+           goto exit;
+        }    /* acid not found */
+     } /* Record 0001 has the value */
+     else {       /* continue errors records */
+       wrk = strchr(record + TSSCFILE_INFO_POS , '\n');
+       if ( wrk )
+         *wrk = NULL_CHAR;
+       CTSAMSG_print(TSS_OUTPUT_LINE, msgs, NULL, dest,
+                     record + TSSCFILE_INFO_POS);
+       rc = ESA_WARN;
+       goto exit;
+     }            /* continue errors records */
+   }     /* Record 0001 found */
+
+   /* WS2321 */
+
+  /*
+   *  Extract data
+   */
+
+   token = strtok(record, " \n");  /* Skip service bytes */
+   if ( NOT token )
+      goto exit;
+
+   token = strtok(NULL, "=");      /* Skip RECID         */
+   if ( NOT token )
+      goto exit;
+
+   strcpy(kwd, token );            /* Obtained keyword   */
+   TSS_strip_val(kwd, ' ', TSS_STRIP_BOTH);
+   ESA_DIAG_printf(comp, 5, "1.keyword=%s", kwd);
+
+   /*
+    *   Convert keyword
+    */
+
+   for (i=0; kwd_table[i].kwd_in; i++ ) {
+      if (strcmp(kwd, kwd_table[i].kwd_in) EQ 0) {
+         strcpy(kwd, kwd_table[i].kwd_out);
+         break;
+      }
+   }
+
+   ESA_DIAG_printf(comp, 5, "2.keyword=%s", kwd);
+
+   token = strtok(NULL, "\n");    /* Set end of string */
+   if ( NOT token )
+     goto exit;
+
+   strcpy(val, token );            /* Obtained value */
+   TSS_strip_val(val, ' ', TSS_STRIP_BOTH);
+   ESA_DIAG_printf(comp, 5, "(%d)%s=(%d)%s",
+                   strlen(kwd), kwd,  strlen(val), val);
+
+   ESA_DIAG_printf(comp, 5, "Reglr: %s=%s", kwd, val);
+   TSS_strip_val(val, '0', TSS_STRIP_LEFT);
+   ESA_DIAG_printf(comp, 5, "Reglr: %s=%s", kwd, val);
+
+   TSS_put_to_addinfo(comp, kwd, val, addinfo, 0, dest, msgs );
+   rc = ESA_SKIP;
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_fix_res_name(ESA_DIAG_COMP_typ          comp,
+                       char                       * rname,
+                       TSSCFILE_HANDLE_typ        * h_desc,
+                       TSSCFILE_REC_typ           * r_desc,
+                       TSSCFILE_DESCR_typ         * d_desc,
+                       char                       * key_val,
+                       ADDINFO_rec_ptr              addinfo,
+                       ADDINFO_rec_ptr              laddinfo,
+                       CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                       CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_fix_res_name";
+   char                   *wptr;
+   char                   *rptr;
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   if ( strlen(rname) EQ 0 )
+    goto exit;
+
+   /*  IS10077 - start */
+   rptr = rname;
+   if (rptr[0] EQ QUOTE_CHAR)
+   {
+     wptr = strchr(++rptr, QUOTE_CHAR);   /* Look for ending quote */
+     if (wptr NE NULL)
+       rptr = wptr;
+     else
+       rptr = rname;
+   }
+   /*  wptr = strchr(rname, ' ');   */
+   wptr = strchr(rptr, ' ');
+   /*  IS10077 - end  */
+   if ( wptr )
+     *wptr = NULL_CHAR;
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ static ESA_RC TSS_extract_res(ESA_DIAG_COMP_typ     comp,
+                        char                       * record,
+                        TSSCFILE_HANDLE_typ        * h_desc,
+                        TSSCFILE_REC_typ           * r_desc,
+                        TSSCFILE_DESCR_typ         * d_desc,
+                        char                       * key_val,
+                        ADDINFO_rec_ptr              addinfo,
+                        ADDINFO_rec_ptr              laddinfo,
+                        CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                        CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_extract_res";
+   int                     i;
+   TSSCFILE_DESCR_typ    * data = &d_desc[0];
+   TSSCFILE_DATA_EXT_typ * cfunc;
+   char                    val[MAX_TSS_PARAM_LEN];
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+  /*
+   *  Extract data
+   *  Put only fields : "RES_TYPE"
+   *                    "RES_NAME"
+   */
+
+   for (i=0; data = &d_desc[i], data->addinfo_k; i++) {
+
+      memcpy(val, record + data->pos - 1, data->len);
+      val[data->len] = NULL_CHAR;
+      TSS_strip_val(val, ' ', TSS_STRIP_BOTH);
+
+      ESA_DIAG_printf(comp, 5,
+                      "%d.%s data pos=%d data len=%d value=(%d)%s",
+                      i, data->addinfo_k, data->pos, data->len,
+                      strlen(val), val );
+     /*
+      * Special conversion ?
+      */
+
+      if ( data->cfunc NE NULL ) {
+        cfunc = (TSSCFILE_DATA_EXT_typ *)data->cfunc;
+        rc = (cfunc)(comp, val, h_desc, r_desc, data, key_val,
+                     addinfo, laddinfo, dest, msgs);
+        if ( rc EQ ESA_SKIP ) {
+            rc = ESA_OK;
+            continue;
+        }
+        if ( rc NE ESA_OK )
+          goto exit;
+      }
+
+     /*
+      * Put to addinfo
+      */
+
+      if ( strlen(val) NE 0 ) {
+        if ( (strcmp( data->addinfo_k, "RES_TYPE" ) EQ 0 ) OR
+             (strcmp( data->addinfo_k, "RES_NAME" ) EQ 0 )  ) {
+          if ( data->dest EQ ADI_LOCAL ) {
+            ESA_DIAG_printf(comp,5,"Local: %s=%s",data->addinfo_k,val);
+            TSS_put_to_addinfo(comp,data->addinfo_k,val,laddinfo,
+                               1, dest, msgs );
+          }
+          else if ( data->dest EQ ADI_REGLR ) {
+            ESA_DIAG_printf(comp,5,"Reglr: %s=%s",data->addinfo_k,val);
+            TSS_put_to_addinfo(comp,data->addinfo_k,val,addinfo,
+                               0, dest, msgs );
+          }
+          else {
+             sprintf(internal2_msg_buf,
+              "Unable to determine destination of %k=%s.Destination=%d",
+              data->addinfo_k, val, data->dest );
+
+             ESA_DIAG_printf(comp, 5, "DEST_ERR:%s", internal2_msg_buf);
+             CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                           component, func, internal2_msg_buf,
+                           4, __LINE__);
+             rc = ESA_FATAL;
+             OS_MVS_btrace();
+             goto exit;
+          }
+        }    /* none EXPIRES field */
+      } /* has the value */
+   }      /* vars loop */
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_extract_2007(ESA_DIAG_COMP_typ            comp,
+                         char                       * record,
+                         TSSCFILE_HANDLE_typ        * h_desc,
+                         TSSCFILE_REC_typ           * r_desc,
+                         TSSCFILE_DESCR_typ         * d_desc,
+                         char                       * key_val,
+                         ADDINFO_rec_ptr              addinfo,
+                         ADDINFO_rec_ptr              laddinfo,
+                         CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                         CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_extract_2007";
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   rc = TSS_extract_proc(comp, record, h_desc, r_desc, d_desc, key_val,
+                         addinfo, laddinfo, dest, msgs);
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_extract_2008(ESA_DIAG_COMP_typ            comp,
+                         char                       * record,
+                         TSSCFILE_HANDLE_typ        * h_desc,
+                         TSSCFILE_REC_typ           * r_desc,
+                         TSSCFILE_DESCR_typ         * d_desc,
+                         char                       * key_val,
+                         ADDINFO_rec_ptr              addinfo,
+                         ADDINFO_rec_ptr              laddinfo,
+                         CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                         CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_extract_2008";
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   rc = TSS_extract_proc(comp, record, h_desc, r_desc, d_desc, key_val,
+                         addinfo, laddinfo, dest, msgs);
+
+   ESA_DIAG_printf(comp,5,"Reglr: %s=%s", "ACTION", "ADMIN");
+   TSS_put_to_addinfo(comp, "ACTION", "ADMIN",addinfo,
+                      0, dest, msgs );
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+

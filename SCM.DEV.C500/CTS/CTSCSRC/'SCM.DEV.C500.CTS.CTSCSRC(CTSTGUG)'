@@ -1,0 +1,1225 @@
+/**************************************************************
+*                                                             *
+* Title            : Get group information (TSS)              *
+*                                                             *
+* File Name        : ctstgug.c                                *
+*                                                             *
+* Author           : Alexander Shvartsman                     *
+*                                                             *
+* Creation Date    : 09/07/94                                 *
+*                                                             *
+* Description      :                                          *
+*                                                             *
+* Assumptions and                                             *
+*   Considerations :                                          *
+*                                                             *
+**************************************************************/
+
+/**************************************************************
+* Mod.Id   Who      When     Description                      *
+* -------- -------- -------  -------------------------------- *
+* BS2434   AS       26/10/00 Handling an empties NAME field   *
+*                                                             *
+* PS0495   RamiK    9/12/01  fixing index advancment in case  *
+*                            of download restart              *
+*                                                             *
+* IS0361   YoniMa   20/08/06 TSS upgrade for v3.2.03,include: *
+*                            IS0347 - Support external CFILE  *
+* IS10091  NuritY   06/06/13 ParentContainer for accounts and *
+*                            Groups + dynamic tsscfile records*
+*                            table (WS10034+WS10035+WS10036)  *
+* SAS2IBMT SeligT   30/06/16 SAS/C to IBM C Conversion Project*
+* IS10091A NuritY   15/09/16 Move ParentContainerName handling*
+*                            to TSS_get_parent_oe in CTSTSRV. *
+* BS10085  SeligT   09/04/18 Add VERBOSE to LIST command      *
+* IS10174  NuritY   15/01/18 Dynamic EXECOUT support.         *
+* WS10082  MauriC   14/11/22 Recompile for new ADDINFO macros *
+**************************************************************/
+
+ /*
+  *   Standard include files
+  */
+
+ #include   <globs.h>
+ #include   STDIO
+ #include   STDLIB
+ #include   STRING
+ /* #include   LCIO                                          SAS2IBMT */
+ #include   ERRNO                                         /* SAS2IBMT */
+
+ /*
+  *   ESA include files
+  */
+
+ #include   ESA_API
+ #include   ESA_DIAG
+ #include   ESA_CTSAMSG
+ #include   ESA_API_CODES
+ #include   API_ADDINFO
+ #include   API_AUTH
+
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_COMP
+ #include MVS_OS_MVS
+
+ /*
+  *   TSS include files
+  */
+
+ #include TSS
+ #include TSS_CODES
+
+ static char component[] = "CTSTGUG";
+
+ static ESA_RC TSS_locate_ug(ESA_DIAG_COMP_typ          comp,
+                          char                        * acid,
+                          char                        * acid_type,
+                          UG_PARAMS_rec_typ             ug_params[1],
+                          OBJ_EXISTS_typ                objs_exist[1],
+                          int                           max_ugs,
+                          int                         * found_ind,
+                          CTSAMSG_DEST_TABLE_rec_typ  * dest,
+                          CTSAMSG_HANDLE_rec_typ      * msgs);
+
+ static ESA_RC TSS_invoke_tsscfile_ug(ESA_DIAG_COMP_typ comp,
+                             TSS_TRAP_BUF_rec_typ     * acids_list,
+                             int /* PS0495 added * */ * i_from,
+                             int                      * i_max,
+                             UG_PARAMS_rec_typ          ug_params[1],
+                             OBJ_EXISTS_typ             objs_exist[1],
+                             int                        max_acids,
+                             HAVE_MORE_typ              * have_more,
+                             char                       * main_cmd,
+                             CTSAMSG_DEST_TABLE_rec_typ * dest,
+                             CTSAMSG_HANDLE_rec_typ     * msgs);
+
+ static ESA_RC TSS_do_ugs_list(ESA_DIAG_COMP_typ     comp,
+                          char                     * acid_type,
+                          TSS_TRAP_BUF_rec_typ     * ugs_list,
+                          TSS_GET_HANDLE_typ       * get_handle,
+                          short                      max_ugs,
+                          short                    * actual_num,
+                          HAVE_MORE_typ            * have_more,
+                          UG_PARAMS_rec_typ          ug_params[1],
+                          ADDINFO_rec_ptr            addinfo[1],
+                          OBJ_EXISTS_typ             objs_exist[1],
+                          ADMIN_PARAMS_rec_typ     * admin_params,
+                          ERR_STRUCT_rec_typ       * err);
+
+static ESA_RC TSS_put_ug_info(ESA_DIAG_COMP_typ      comp,
+                          UG_PARAMS_rec_typ        * ug_params,
+                          ADDINFO_rec_ptr            addinfo,
+                          ADDINFO_rec_ptr            laddinfo,
+ /*IS10091                CTSAMSG_DEST_TABLE_rec_typ  * dest,
+                          CTSAMSG_HANDLE_rec_typ      * msgs,
+  *IS10091*/              ADMIN_PARAMS_rec_typ        * admin_params);
+
+static ESA_RC TSS_get_many_acids_list(ESA_DIAG_COMP_typ   comp,
+                   TSS_TRAP_BUF_rec_typ           ** ugs_list,
+                   short                             num_ugs_in,
+                   UG_PARAMS_rec_typ                 ug_params_in[1],
+                   ADMIN_PARAMS_rec_typ            * admin_params,
+                   ERR_STRUCT_rec_typ              * err);
+
+/*********************************************************************
+*
+* Function      : CTSGetUgs
+*
+* Description   : Get one, two, many or all user groups
+*
+* Input         : mode         - ALL,
+*                                MANY (or one),
+*                                WILD (wildcard - not implemented).
+*                 max_ugs      - # of elements in ug_params & addinfo
+*                                arrays.
+*                 num_ugs_in   - # of elements in ug_params_in.
+*                 ug_params_in - array of num_ugs_in, filled with
+*                                ugs requested.
+*                 admin_params -
+*
+* Output        : actual_num   - # of ugs returned.
+*                 have_more    - HAVE_MORE if more ugs, else NO_MORE.
+*                 err          - error indication, message, etc.
+*                 objs_exist   - array of max_ugs:
+*                                OBJ_EXIST if ug exists, else
+*                                OBJ_NOT_EXIST.
+*                 ug_params    - array of max_ugs:
+*                                callee fills with groups returned.
+*
+* Input/Output  : addinfo      - array of max_ugs pointers:
+*                                add.info per group, Caller puts
+*                                requested keywords, callee returns
+*                                actual add.info.
+*                 handle       - NULL on first call, filled by callee,
+*                                used by callee to keep track.
+*                                Freed by caller.
+*
+* Return Value  : ESA_RC
+*
+* Side Effects  : Callee allocates handle; Caller MUST free when done.
+*
+* Comments      : Caller must reset I/O params to their initial values
+*                 when using subsequent calls (if HAVE_MORE).
+*
+* Scope         : Global
+*
+*********************************************************************/
+
+ESA_RC CTSGetUGs (GET_GROUP_MODE         mode,
+                  OE_typ                 oe,
+                  short                  max_ugs,
+                  short                * actual_num,
+                  HAVE_MORE_typ        * have_more,
+                  void                ** handle,
+                  short                  num_ugs_in,
+                  UG_PARAMS_rec_typ      ug_params_in[1],
+                  UG_PARAMS_rec_typ      ug_params[1],
+                  ADDINFO_rec_ptr        addinfo[1],
+                  OBJ_EXISTS_typ         objs_exist[1],
+                  ADMIN_PARAMS_rec_typ * admin_params,
+                  ERR_STRUCT_rec_typ   * err)
+{
+
+ static char func[]="CTSGetUGs";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                       rc = ESA_OK ;
+ OE_typ                       dummy_oe = "";
+ TSS_GET_HANDLE_typ         * get_handle = NULL;
+ TSS_TRAP_BUF_rec_typ       * ugs_list = NULL;
+ CTSAMSG_HANDLE_rec_typ     * msgs;
+ CTSAMSG_DEST_TABLE_rec_typ * dest;
+ int                          i_dump;
+ char                         root_name[MAX_TSS_PARAM_LEN + 1];
+ OE_typ                       entering_oe;
+ TSSCFILE_ERR_BEH_typ         err_action;
+ ONE_FIELD_rec_ptr            cpair;     /* BS2434 */
+ int                          i;         /* BS2434 */
+ static TSS_GET_TYPES_rec_typ get_types[] = {
+                       {  TSS_PROFILE,   '0'     } ,
+                       {  TSS_GROUP,     '0'     } ,
+                       {  NULL ,         '0'     }   };
+
+/*
+ *  Initialize
+ */
+
+ ESA_DIAG_enter(ESA_COMP_GETUGS, 1, func );
+
+ msgs = admin_params->ctsamsg_handle;
+ dest = admin_params->ctsamsg_dest;
+
+ *have_more = NO_MORE ;
+ *actual_num = 0 ;
+
+ ESA_DIAG_printf(ESA_COMP_GETUGS,1,
+                 "mode=%d handle=%X max_ugs=%d oe=%s",
+                 mode,*handle, max_ugs, oe);
+
+ /* IS10091 - start */
+ if ( ESA_DIAG_get_debug_level(ESA_COMP_GETUGS) GE 6 )
+ {
+  for (i=0; i LT num_ugs_in; i++)
+  {
+     ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+                     "input addinfo %d", i);
+     ADDINFO_dump(addinfo[0],1);
+  }
+ }
+ /* IS10091 - end */
+
+/*
+ *    Check if handle was passed, if no create it
+ */
+
+ if ( mode NE GET_FREE_HANDLE_GROUPS )
+ {
+    if ( mode EQ GET_MANY_GROUPS )
+      err_action = TSS_IGNORE_ERR;
+    else
+      err_action = TSS_BREAK_BY_ERR;
+    rc = TSS_init_get_handle( ESA_COMP_GETUGS, err_action,
+                              &get_handle, handle ,
+                              addinfo[0], admin_params, err );
+    if ( rc NE ESA_OK )
+       goto exit ;
+ }
+
+ /* IS10091 - start */
+ if ( ESA_DIAG_get_debug_level(ESA_COMP_GETUGS) GE 6 )
+ {
+   ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+                   "work addinfo after get handle");
+   ADDINFO_dump(get_handle->waddinfo,1);
+   ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+                   "local addinfo after get handle");
+   ADDINFO_dump(get_handle->laddinfo,1);
+ }
+ /* IS10091 - end */
+
+/*
+ *  Some 'Root' object related checks
+ *  Pay attention, the entering mode may be changed
+ */
+
+ strcpy(entering_oe, oe);
+ if ( TSS_use_root_object(ESA_COMP_GETUGS,root_name,dest,msgs) )
+ {
+   if ( mode EQ GET_SUBTREE_GROUPS )
+   {
+     if (strcmp(entering_oe, root_name) EQ 0)
+     {
+       mode = GET_ALL_GROUPS;
+       strcpy(entering_oe, "");
+     }
+   }
+ }
+
+/*
+ *    Execute according to mode
+ */
+
+ switch (mode)
+ {
+      case GET_FREE_HANDLE_GROUPS :
+
+         *have_more = NO_MORE ;
+         goto exit ;
+
+      case GET_ALL_GROUPS :
+
+         if ( NOT get_handle->acids_list )
+         {
+            rc=TSS_get_acids_list(ESA_COMP_GETUGS, TSS_GROUP,
+                                  &ugs_list, get_types,
+                                  dummy_oe, admin_params, err );
+            get_handle->acids_list = ugs_list;
+            if ( rc NE ESA_OK )
+               goto exit;
+           /*
+            *  Restart Download
+            */
+
+            if ( num_ugs_in EQ 1 )
+            {
+               ESA_DIAG_printf(ESA_COMP_GETUGS,1,
+                            "Restart aggregation from %s",
+                            ug_params_in[0].group);
+
+               CTSAMSG_print(ERR_3_STRINGS,                 /* PS0312 */
+                             msgs, NULL, dest,              /* PS0312 */
+                             "Restart Aggregation From",    /* PS0312 */
+                              ug_params_in[0].group);       /* PS0312 */
+
+               rc=TSS_select_acids_list_from(ESA_COMP_GETUGS,
+                                             ugs_list,
+                                             TSS_GROUP,
+                                             ug_params_in[0].group,
+                                             dest, msgs );
+               if ( rc NE ESA_OK )
+                  goto exit;
+            }
+         }
+         else
+            ugs_list = get_handle->acids_list;
+
+         rc=TSS_do_ugs_list(ESA_COMP_GETUGS, TSS_GROUP, ugs_list,
+                            get_handle, max_ugs,   actual_num,
+                            have_more,  ug_params, addinfo,
+                            objs_exist, admin_params, err);
+         break ;
+
+      case GET_MANY_GROUPS :
+
+         if ( NOT get_handle->acids_list )
+         {
+           rc=TSS_get_many_acids_list(ESA_COMP_GETUGS,
+                                      &ugs_list, num_ugs_in,
+                                      ug_params_in, admin_params,err);
+           get_handle->acids_list = ugs_list;
+           if ( rc NE ESA_OK )
+              goto exit;
+         }
+         else
+            ugs_list = get_handle->acids_list;
+
+         rc=TSS_do_ugs_list(ESA_COMP_GETUGS, TSS_GROUP, ugs_list,
+                            get_handle, max_ugs,   actual_num,
+                            have_more,  ug_params, addinfo,
+                            objs_exist, admin_params, err);
+
+         break ;
+
+      case GET_SUBTREE_GROUPS :
+
+         if ( NOT get_handle->acids_list )
+         {
+            rc=TSS_get_acids_list(ESA_COMP_GETUGS, TSS_GROUP,
+                                  &ugs_list, get_types,
+                                  entering_oe, admin_params, err );
+            get_handle->acids_list = ugs_list;
+            if ( rc NE ESA_OK )
+               goto exit;
+         }
+         else
+            ugs_list = get_handle->acids_list;
+
+         rc=TSS_do_ugs_list(ESA_COMP_GETUGS, TSS_GROUP, ugs_list,
+                            get_handle, max_ugs,   actual_num,
+                            have_more,  ug_params, addinfo,
+                            objs_exist, admin_params, err);
+         break ;
+
+      default :
+
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                       func, "Invalid mode", mode,__LINE__) ;
+         rc=ESA_FATAL;
+         goto exit ;
+
+ }
+
+/*
+ *  BS2434. Replace an empty NAME field to **UNDEFINED**
+ */
+
+ ESA_DIAG_printf(ESA_COMP_GETUGS,1,
+                 "Max_ugs=%d, actual_num=%d", max_ugs, *actual_num);
+
+ for (i=0; i LT *actual_num; i++)
+ {
+   if (objs_exist[i] EQ OBJ_EXIST )
+   {
+      cpair = ADDINFO_search("NAME", TSS_ADDINFO_KWD_LEN,
+                             addinfo[i]->pair,
+                             addinfo[i]->num_pairs );
+      if (cpair NE NULL)
+      {
+        if (cpair->vallen EQ 0)
+        {
+           ADDINFO_updval("**UNDEFINED**",
+                          TSS_ADDINFO_VAL_LEN, cpair);
+        }     /* Field is empty   */
+      }       /* NAME field found */
+   }          /* Obj exists       */
+ }            /* Actual num loop  */
+
+/*
+ *  Print diagnostic inforamtion
+ */
+
+ ESA_DIAG_printf(ESA_COMP_GETUGS,1,
+                 "Max_ugs=%d, actual_num=%d", max_ugs, *actual_num);
+
+ if ( ESA_DIAG_get_debug_level(ESA_COMP_GETUGS) GE 1 )
+ {
+    for (i_dump = 0; i_dump LT *actual_num; i_dump++)
+    {
+        ESA_DIAG_printf(ESA_COMP_GETUGS,0,
+            "%d. Group=%s exist=%d parent_oe=%s parent_group=%s",
+            i_dump,                                      /* IS10091 */
+            ug_params[i_dump].group, objs_exist[i_dump],
+            ug_params[i_dump].parent_oe,
+            ug_params[i_dump].parent_group);
+        if ( ( objs_exist[i_dump] EQ OBJ_EXIST ) AND
+             ( ESA_DIAG_get_debug_level(ESA_COMP_GETUGS) GE 2 ) )
+           ADDINFO_dump(addinfo[i_dump],0);
+    }
+ }
+
+/*
+ *  Finish
+ */
+
+ exit : ;
+
+/*
+ *  Return to caller
+ */
+
+ ESA_DIAG_printf(ESA_COMP_GETUGS, 1,
+                 "Exiting with rc = %d actual num=%d have_more=%d",
+                 rc,*actual_num,*have_more);
+/*
+ *  Cleanup
+ */
+
+ if ( (rc NE ESA_OK) OR (*have_more EQ NO_MORE) )
+ {
+    if ( *handle NE NULL )
+    {
+       TSS_free_get_handle( ESA_COMP_GETUGS, handle, dest, msgs);
+       *handle    = NULL;
+       get_handle = NULL;
+    }
+    *have_more = NO_MORE ;
+ }
+
+ ESA_DIAG_exit(ESA_COMP_GETUGS, 1, func, rc);
+
+ return rc ;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_invoke_tsscfile_ug                     *
+ *                                                             *
+ * DESCRIPTION    : Create input for TSSCFILE utility, invoke  *
+ *                  for receive ug parameters                  *
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  acids_list- acids list                     *
+ *                  i_from    - index from                     *
+ *                  i_max     - number of acids                *
+ *                  main_cmd  - main_cmd                       *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : i_max     - number of acids procced        *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_invoke_tsscfile_ug(ESA_DIAG_COMP_typ comp,
+                             TSS_TRAP_BUF_rec_typ     * acids_list,
+                             int /* PS0495 added * */ * i_from,
+                             int                      * i_max,
+                             UG_PARAMS_rec_typ          ug_params[1],
+                             OBJ_EXISTS_typ             objs_exist[1],
+                             int                        max_acids,
+                             HAVE_MORE_typ              * have_more,
+                             char                       * main_cmd,
+                             CTSAMSG_DEST_TABLE_rec_typ * dest,
+                             CTSAMSG_HANDLE_rec_typ     * msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                 rc = ESA_OK ;
+   char                   cmd[MAX_TSS_API_ST];
+   int                    i;
+   int                    actual_num = 0;
+   int                    nb;
+   char                   file_name[TSS_MAX_FILENAME_LEN + 10];
+   char                   ddn_with[MAX_FILENAME_LEN];     /* SAS2IBMT */
+   FILE                 * file_in = NULL ;
+   static char func[]="TSS_invoke_tsscfile_ug";
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(comp, 3, func);
+
+   /* IS10174
+   rc = OS_MVS_ddinfo(TSSCFILE_IN_DD , file_name , TRUE, dest, msgs); */
+   rc = OS_MVS_ddinfo(TSSCFILE_IN_DD , file_name ,       /* IS10174 */
+                      TRUE, dest, msgs, 0);              /* IS10174 */
+
+   ESA_DIAG_printf(comp, 3,
+                  "OS_MVS_ddinfo rc=%d file name %s", rc, file_name);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+  /*
+   *  Open file for create input for TSSCFILE
+   */
+
+   strcpy(ddn_with,"DD:");                                /* SAS2IBMT */
+   strcat(ddn_with, TSSCFILE_IN_DD);                      /* SAS2IBMT */
+
+   /* SAS2IBMT
+   file_in = fopen(TSSCFILE_IN_DD , FILE_OPEN_WRITE_TEXT);           */
+   file_in = fopen(ddn_with , FILE_OPEN_WRITE_TEXT);      /* SAS2IBMT */
+   if ( ferror(file_in) OR (file_in EQ NULL) )
+   {
+       CTSAMSG_print(ERR_IO, msgs, NULL, dest, "fopen", TSSCFILE_IN_DD,
+                     strerror(errno) );
+       ESA_DIAG_printf(comp, 3,
+              "file %s error %s", TSSCFILE_IN_DD, strerror(errno));
+       rc = ESA_FATAL;
+       goto exit;
+   }
+
+  /*
+   *  Create input file for TSSCFILE utility
+   */
+
+   ESA_DIAG_printf(comp, 3, "i_from=%d i_max=%d used_entries=%d",
+                   i_from, *i_max, acids_list->used_entries);
+
+   i=*i_from; /* PS0495 added * */
+   while ( (actual_num LT  max_acids              ) AND
+           (actual_num LT *i_max                  ) AND
+           (i          LT acids_list->used_entries)   )
+   {
+      if (acids_list->trap_data[i].used)
+      {
+         i++;
+         continue;
+      }
+
+     /*
+      *  Reset ug parameters
+      */
+
+      ug_params[actual_num].group[0]        = NULL_CHAR;
+      ug_params[actual_num].parent_oe[0]    = NULL_CHAR;
+      ug_params[actual_num].parent_group[0] = NULL_CHAR;
+      objs_exist [actual_num] = OBJ_NOT_EXIST;
+
+     /*
+      *  Attention ! The first symbol - sort symbol !
+      */
+      strcpy(ug_params[actual_num].group,
+                           &acids_list->trap_data[i].data[1]);
+
+     /*
+      *  The item may be does not exist
+      */
+
+      if (acids_list->trap_data[i].data[0] EQ TSS_GET_MANY_SKIP_ITEM)
+      {
+         i++;
+         continue;
+      }
+
+      sprintf(cmd, main_cmd, &acids_list->trap_data[i].data[1]);
+      nb = fputs( cmd, file_in);
+      i++;
+
+      ESA_DIAG_printf(comp, 3, "written %d bytes, cmd=%s", nb, cmd);
+
+      if ( ferror(file_in) OR (nb EQ 0) )
+      {
+          CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                        "fputs", TSSCFILE_IN_DD, strerror(errno) );
+          ESA_DIAG_printf(comp, 3,
+                          "file %s error %s", TSSCFILE_IN_DD,
+                           strerror(errno));
+          rc = ESA_FATAL;
+          goto exit;
+      }
+      actual_num++;
+   }
+
+   /* RRK PS0495 saving the current index in the acid array */
+
+   *i_from = i;  /* PS0495 added * to i_from */
+
+   ESA_DIAG_printf(comp, 3, "last index =%d", *i_from);
+
+   fclose(file_in);
+   file_in = NULL;
+
+  /*
+   * Handling end of processing
+   */
+
+   if (i EQ acids_list->used_entries)        /* Last set of list */
+   {
+      *have_more = NO_MORE;
+      *i_max = actual_num;
+   }
+   else if (actual_num EQ 0)             /* Empty set of list */
+   {
+      *have_more = NO_MORE;
+      *i_max     = 0;
+      goto exit;
+   }
+   else
+   {
+      *have_more = HAVE_MORE;            /* Waiting for next call */
+      *i_max = actual_num;
+   }
+
+   rc = TSS_cfile_activate(comp, dest, msgs );
+
+  /*
+   *   Finish
+   */
+
+   exit :;
+
+   if (file_in NE NULL)
+      fclose(file_in);
+
+   ESA_DIAG_exit(comp, 3, func, rc);
+
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_do_ugs_list                            *
+ *                                                             *
+ * DESCRIPTION    : acids list processing (get info)           *
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  acid_type - acid type                      *
+ *                  acids_list- acids list                     *
+ *                  get_handle- get handle                     *
+ *                  max_ugs - max groups                       *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : actual_num - actual num                    *
+ *                  have_more  - have more flag                *
+ *                  ug_params  - ug params                     *
+ *                  addinfo    - addinfo                       *
+ *                  obj_exist  - obj exist                     *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_do_ugs_list(ESA_DIAG_COMP_typ    comp,
+                            char                  * acid_type,
+                            TSS_TRAP_BUF_rec_typ  * ugs_list,
+                            TSS_GET_HANDLE_typ    * get_handle,
+                            short                   max_ugs,
+                            short                 * actual_num,
+                            HAVE_MORE_typ         * have_more,
+                            UG_PARAMS_rec_typ       ug_params[1],
+                            ADDINFO_rec_ptr         addinfo[1],
+                            OBJ_EXISTS_typ          objs_exist[1],
+                            ADMIN_PARAMS_rec_typ  * admin_params,
+                            ERR_STRUCT_rec_typ    * err)
+{
+
+ static char func[]="TSS_do_ugs_list";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                       rc   = ESA_OK ;
+ ESA_RC                       rc_a = ESA_OK ;
+ TSSCFILE_REC_typ           **tsscf_recs;
+ CTSAMSG_HANDLE_rec_typ     * msgs;
+ CTSAMSG_DEST_TABLE_rec_typ * dest;
+ ADDINFO_rec_ptr              laddinfo    = NULL;
+ ONE_FIELD_rec_ptr            pair;
+ /* IS10091A ONE_FIELD_rec_ptr            pair1;            *IS10091*/
+ ONE_FIELD_rec_ptr            pair_rec_0001;
+ ONE_FIELD_rec_typ            rec_0001;
+ /*rec_0001 is output of TSSCFILE so no risk it's GT 1024 WS10082A*/
+ FILE                       * file_out  = NULL;
+ char                         main_cmd[MAX_TSS_API_ST];
+ int                          do_ugs_info = 1;
+ int                          i;
+ int                          rec_cnt = 0;
+ int                          i_from;
+ int                          i_max     = max_ugs;
+ int                          max_acids = max_ugs;
+ int                          logout_done = 0;
+ /* IS10091 - start */
+ TSS_PARAMS_rec_typ * params_ptr = admin_params->apiinit_handle;
+ /* IS10091 - end   */
+
+ /*
+  *  Initialize
+  */
+
+  ESA_DIAG_enter(comp, 3, func );
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  /* IS10091 tsscf_recs = TSS_get_global_tssc_desc("GENERAL");     */
+  tsscf_recs = params_ptr->tsscf_rec_general;          /* IS10091  */
+  i_from = get_handle->list_ind;
+  ESA_DIAG_printf(comp, 3, "processing list from ind=%d", i_from);
+  rc = CTSCRSS_set_authority( &logout_done,
+                              SET_TO_STARTED_TASK_AUTH,
+                              admin_params, err );
+  if ( rc NE ESA_OK )
+      goto exit;
+
+  laddinfo = get_handle->laddinfo;
+
+  /* IS10091 - start */
+  if ( ESA_DIAG_get_debug_level(ESA_COMP_GETUGS) GE 6 )
+  {
+    ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+                "work addinfo at entry to do_users_list");
+    ADDINFO_dump(get_handle->waddinfo,1);
+    ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+               "local addinfo at entry to do_users_list");
+    ADDINFO_dump(get_handle->laddinfo,1);
+  }
+  /* IS10091 - end */
+  /* BS10085 Adding VERBOSE to LIST command
+  strcpy(main_cmd, " TSS LIST(%s) DATA(ALL) \n");                    */
+  strcpy(main_cmd, " TSS LIST(%s) DATA(ALL,VERBOSE) \n"); /* BS10085 */
+
+  /* PS0495 passing i_from by reference */
+  rc = TSS_invoke_tsscfile_ug(comp, ugs_list, &i_from, &i_max,
+                             ug_params, objs_exist, max_acids,
+                             have_more, main_cmd, dest, msgs);
+  if ( rc NE ESA_OK )
+     goto exit;
+
+ /*
+  *  Check End-of-list
+  */
+
+  if ( ( (*have_more) EQ NO_MORE ) AND (i_max EQ 0) )
+  {
+     rc = ESA_OK;
+     goto exit;
+  }
+
+  ESA_DIAG_printf(comp, 3, "procceed=%d", i_max);
+  /* RRK PS0495 saving the index from the ACID array */
+  get_handle->list_ind = i_from;
+
+  *actual_num = i_max;  /* actual_num == tsscfile created entries */
+
+ /*
+  *   Open TSSCFILE utility output file
+  */
+
+  /* IS0347 start */
+  rc = TSS_open_output_file(comp,admin_params,&file_out);
+  if ( rc NE ESA_OK )
+    goto exit;
+  /*
+  file_out = afopen(TSSCFILE_OUT_DD, FILE_OPEN_READ_BINARY,
+                    NULL_STRING, NULL_STRING);
+  if (file_out EQ NULL) BEGIN
+      CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                    "fopen", func, TSSCFILE_OUT_DD, strerror(errno));
+     rc = ESA_FATAL;
+     goto exit;
+  END
+  */
+  /* IS0347 end */
+
+  while ( do_ugs_info )
+  {
+   /*
+    *   Load information to addinfo
+    */
+
+    pair_rec_0001 = ADDINFO_search( CFILE_REC_0001, TSS_ADDINFO_KWD_LEN,
+                                 laddinfo->pair, laddinfo->num_pairs );
+    if ( pair_rec_0001 NE NULL )
+      memcpy( (char *)&rec_0001, (char *)pair_rec_0001,
+              sizeof(ONE_FIELD_rec_typ) );
+
+    ADDINFO_empty( laddinfo );
+    ADDINFO_clear( get_handle->waddinfo);
+
+    /* IS10091 - start */
+    if ( ESA_DIAG_get_debug_level(ESA_COMP_GETUGS) GE 6 )
+    {
+      ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+           "work addinfo before TSS_output_to_addinfo");
+      ADDINFO_dump(get_handle->waddinfo,1);
+      ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+           "local addinfo before TSS_output_to_addinfo");
+      ADDINFO_dump(get_handle->laddinfo,1);
+    }
+    /* IS10091 - end */
+
+    TSS_reset_list_buf(comp, &(get_handle->list_buffer));
+
+    if ( pair_rec_0001 NE NULL )
+       ADDINFO_insert(TYPE_1A, rec_0001.keyword, rec_0001.value,
+                      laddinfo,
+                      TSS_ADDINFO_KWD_LEN, TSS_ADDINFO_VAL_LEN, UNIQUE);
+
+    rc_a = TSS_output_to_addinfo(comp, tsscf_recs,
+                                 get_handle, file_out, &rec_cnt,
+                                 acid_type, get_handle->waddinfo,
+                                 laddinfo, dest, msgs);
+    /* IS10091 - start */
+    if ( ESA_DIAG_get_debug_level(ESA_COMP_GETUGS) GE 6 )
+    {
+      ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+              "work addinfo after TSS_output_to_addinfo");
+      ADDINFO_dump(get_handle->waddinfo,1);
+      ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+              "local addinfo after TSS_output_to_addinfo");
+      ADDINFO_dump(get_handle->laddinfo,1);
+    }
+    /* IS10091 - end */
+
+    if ( (rc_a EQ ESA_FATAL) OR
+         (rc_a EQ ESA_ERR  )  )
+    {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+    else  if ( rc_a EQ ESA_WARN)
+       rc = ESA_OK;
+
+    if (  get_handle->found_err AND
+         (get_handle->err_action EQ TSS_BREAK_BY_ERR ) )
+    {
+      rc = ESA_FATAL;
+      *actual_num = 0;
+      goto exit;
+    }
+
+    pair = ADDINFO_search( "ACID", TSS_ADDINFO_KWD_LEN,
+                           laddinfo->pair, laddinfo->num_pairs );
+    if ( pair NE NULL )
+    {
+       rc = TSS_locate_ug(comp, pair->value, acid_type,
+                            ug_params, objs_exist, i_max,
+                            &i, dest, msgs);
+       if ( rc NE ESA_OK )
+         goto exit;
+
+       ADDINFO_copy( addinfo[i], get_handle->waddinfo);
+       TSS_put_list_info(comp, &(get_handle->list_buffer),
+                         addinfo[i], dest, msgs );
+
+       /* IS10091 - start */
+       if ( ESA_DIAG_get_debug_level(ESA_COMP_GETUGS) GE 6 )
+       {
+         ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+                 "addinfo %d after TSS_put_list_info", i);
+         ADDINFO_dump(addinfo[i],1);
+       }
+       /* IS10091 - end */
+
+       rc = TSS_put_ug_info(comp, &ug_params[i],
+                            addinfo[i], laddinfo,
+       /*IS10091            dest,msgs */ admin_params); /*IS10091*/
+
+       /* IS10091 - start */
+       if ( ESA_DIAG_get_debug_level(ESA_COMP_GETUGS) GE 6 )
+       {
+         ESA_DIAG_printf(ESA_COMP_GETUGS, 6,
+                 "addinfo %d after TSS_put_ug_info", i);
+         ADDINFO_dump(addinfo[i],1);
+       }
+       /* IS10091 - end */
+
+       if ( rc NE ESA_OK )
+         goto exit;
+
+       TSS_set_empty_flags( comp, addinfo[i], dest, msgs );
+
+    }
+
+    if (rc_a EQ ESA_EOF)
+    {
+       rc = ESA_OK;
+       break;
+    }
+  }
+
+  /* IS10091A -
+   * Move the process below to TSS_get_parent_oe in CTSTSRV
+
+   * IS10091 start *
+  pair = ADDINFO_search("ParentContainerName",TSS_ADDINFO_KWD_LEN,
+                        addinfo[i]->pair, addinfo[i]->num_pairs );
+  ESA_DIAG_printf(comp, 5, "ParentContainerName=<%s>",pair->value);
+  if ( pair NE NULL )
+  {
+    pair1 = ADDINFO_search( "DEPT_NAME", TSS_ADDINFO_KWD_LEN,
+                             addinfo[i]->pair,addinfo[i]->num_pairs );
+    ESA_DIAG_printf(comp, 5, "DEPT_NAME=<%s> len=<%d>",
+                    pair1->value,pair1->vallen);
+    if (pair1->vallen EQ 0)
+     {
+      pair1 = ADDINFO_search( "DIV_NAME", TSS_ADDINFO_KWD_LEN,
+                              addinfo[0]->pair,addinfo[0]->num_pairs );
+      ESA_DIAG_printf(comp, 5, "DIV_NAME=<%s> len=<%d>",
+                    pair1->value,pair1->vallen);
+     }
+     if ( pair1->vallen EQ 0)
+      {
+       pair1 = ADDINFO_search( "ZONE_NAME", TSS_ADDINFO_KWD_LEN,
+                              addinfo[0]->pair,addinfo[0]->num_pairs );
+       ESA_DIAG_printf(comp, 5, "ZONE_NAME=<%s> len=<%d>",
+                    pair1->value,pair1->vallen);
+      }
+  }
+  if ( pair NE NULL AND pair1 NE NULL )
+  {
+   ADDINFO_addval(pair1->value, TSS_ADDINFO_VAL_LEN,
+                         ADDINFO_LIST_ENTRY, pair, dest, msgs );
+   ESA_DIAG_printf(comp, 5, "update keyword =<%s> and value=<%s>",
+                   pair->keyword,pair1->value);
+  }
+  * IS10091 end *
+ */
+
+ /*
+  *  Finish
+  */
+
+ exit : ;
+
+  if (file_out NE NULL)
+     fclose(file_out);
+
+  if (logout_done)
+    CTSCRSS_set_authority( &logout_done,
+                           RETURN_FROM_STARTED_TASK_AUTH,
+                           admin_params, err );
+
+  ESA_DIAG_exit(comp, 3, func, rc);
+
+  return rc ;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_locate_ug                              *
+*                                                             *
+* DESCRIPTION    : Search and set ug found parameters         *
+*                                                             *
+* INPUT          : acid            - acid val                 *
+*                  ug_params       - ug_params                *
+*                  obj_exist       - obj exist area           *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : i               - index of ug              *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+/**************************************************************/
+
+static ESA_RC TSS_locate_ug(ESA_DIAG_COMP_typ           comp,
+                          char                        * acid,
+                          char                        * acid_type,
+                          UG_PARAMS_rec_typ             ug_params[1],
+                          OBJ_EXISTS_typ                objs_exist[1],
+                          int                           max_ugs,
+                          int                         * found_ind,
+                          CTSAMSG_DEST_TABLE_rec_typ  * dest,
+                          CTSAMSG_HANDLE_rec_typ      * msgs)
+{
+
+ static char func[]="TSS_locate_ug";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC   rc = ESA_OK ;
+ int      i;
+
+/*
+ *  Initialize
+ */
+
+ ESA_DIAG_enter(comp, 5, func );
+
+ for (i=0; i LT max_ugs; i++ )
+ {
+    if ( strcmp(acid, ug_params[i].group) EQ 0 )
+    {
+      objs_exist [i] = OBJ_EXIST;
+      *found_ind = i;
+      ESA_DIAG_printf(comp, 5, "found %s=%s index=%d",
+                      acid_type, acid, i );
+      goto exit;
+    }
+ }
+
+ CTSAMSG_print(TSS_ERR_NO_ACID, msgs, NULL, dest,
+               acid_type, acid );
+ rc = ESA_ERR;
+
+/*
+ *  Finish
+ */
+
+ exit : ;
+
+ ESA_DIAG_exit(comp, 5, func, rc);
+
+ return rc ;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_put_ug_info                            *
+*                                                             *
+* DESCRIPTION    : Fill up the ug structure                   *
+*                                                             *
+* INPUT          : ug_params       - ug   param struct        *
+*                  addinfo         - addinfo area             *
+*                  laddinfo        - local addinfo area       *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+/**************************************************************/
+
+static ESA_RC TSS_put_ug_info(ESA_DIAG_COMP_typ         comp,
+                          UG_PARAMS_rec_typ           * ug_params,
+                          ADDINFO_rec_ptr               addinfo,
+                          ADDINFO_rec_ptr               laddinfo,
+ /*IS10091                CTSAMSG_DEST_TABLE_rec_typ  * dest,
+                          CTSAMSG_HANDLE_rec_typ      * msgs,
+  *IS10091*/              ADMIN_PARAMS_rec_typ        * admin_params)
+{
+
+ static char func[]="TSS_put_ug_info";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                rc = ESA_OK ;
+ char                  ug_type[MAX_TSS_PARAM_LEN];
+ CTSAMSG_HANDLE_rec_typ     * msgs;                      /*IS10091*/
+ CTSAMSG_DEST_TABLE_rec_typ * dest;                      /*IS10091*/
+
+/*
+ *  Initialize
+ */
+
+ ESA_DIAG_enter(comp, 3, func );
+ msgs = admin_params->ctsamsg_handle;                    /*IS10091*/
+ dest = admin_params->ctsamsg_dest;                      /*IS10091*/
+
+ rc = TSS_get_parent_oe( comp, TSS_UG_TYPE,
+                         ug_type, ug_params->parent_oe,
+                         addinfo, laddinfo, /* IS10091 dest, msgs ,*/
+                         admin_params);            /*IS10091*/
+ if ( rc NE ESA_OK )
+    goto exit;
+
+/*
+ *  Finish
+ */
+
+ exit : ;
+
+ ESA_DIAG_exit(comp, 3, func, rc);
+
+ return rc ;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_get_many_acids_list                    *
+*                                                             *
+* DESCRIPTION    : Create acids list from obtained ug    id   *
+*                                                             *
+* INPUT          : ug_params_in    - ug   param struct        *
+*                  num_ugs_in      - number of entered ugs    *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : ugs_list                                   *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+/**************************************************************/
+
+static ESA_RC TSS_get_many_acids_list(ESA_DIAG_COMP_typ   comp,
+                   TSS_TRAP_BUF_rec_typ           ** ugs_list,
+                   short                             num_ugs_in,
+                   UG_PARAMS_rec_typ                 ug_params_in[1],
+                   ADMIN_PARAMS_rec_typ            * admin_params,
+                   ERR_STRUCT_rec_typ              * err)
+{
+
+ static char func[]="TSS_get_many_acids_list";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                            rc = ESA_OK ;
+ TSS_TRAP_BUF_rec_typ            * tmp = NULL;
+ int                               i;
+ int                               buf_size = num_ugs_in + 2;
+ char                              acid[MAX_TSS_PARAM_LEN];
+ CTSAMSG_DEST_TABLE_rec_typ      * dest;
+ CTSAMSG_HANDLE_rec_typ          * msgs;
+
+ /*** For TSS_chk_acid ***/
+
+ char                    real_acid_type[TSS_ACID_TYPE_LEN+1]="";
+ OBJECT_TYPE_typ         real_obj_type = TYPE_IGNORE;
+
+/*
+ *  Initialize
+ */
+
+ ESA_DIAG_enter(comp, 3, func );
+
+ msgs = admin_params->ctsamsg_handle;
+ dest = admin_params->ctsamsg_dest;
+
+/*
+ *  Create buffer
+ */
+
+ rc = TSS_alloc_trap_handle (comp, buf_size, &tmp, dest, msgs );
+ if ( rc NE ESA_OK )
+   goto exit;
+
+ for (i=0; i LT num_ugs_in; i++ )
+ {
+   ESA_DIAG_printf(ESA_COMP_GETUGS,1,
+                   "%d.Group=%s", i, ug_params_in[i].group);
+
+
+   /***  Check group existance  ***/
+
+   rc = TSS_chk_acid(ESA_COMP_GETUGS,
+                     ug_params_in[i].group,
+                     TSS_GROUP, TYPE_GROUP,
+                     OBJ_EXIST, FALSE,
+                     real_acid_type, &real_obj_type,
+                     admin_params, err);
+   if (rc EQ ESA_OK)
+      strcpy(acid, "0");   /* Sort symbol */
+   else
+   {
+      acid[0] = TSS_GET_MANY_SKIP_ITEM;
+      acid[1] = NULL_CHAR;
+   }
+
+   strcat(acid, ug_params_in[i].group);
+   rc = TSS_save_output(comp,tmp, acid, dest, msgs);
+   if ( rc NE ESA_OK )
+     goto exit;
+ }
+
+ *ugs_list = tmp;
+
+/*
+ *  Finish
+ */
+
+ exit : ;
+
+ ESA_DIAG_exit(comp, 3, func, rc);
+
+ return rc ;
+
+}
+

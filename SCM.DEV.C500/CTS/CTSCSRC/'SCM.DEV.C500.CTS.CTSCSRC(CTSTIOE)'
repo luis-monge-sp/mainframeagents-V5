@@ -1,0 +1,290 @@
+/**************************************************************
+*                                                             *
+* Title            : Add oe information (TSS)                 *
+*                                                             *
+* File Name        : ctstioe.c                                *
+*                                                             *
+* Author           : Alexander Shvartsman                     *
+*                                                             *
+* Creation Date    : 19/01/97                                 *
+*                                                             *
+* Description      :                                          *
+*                                                             *
+* Assumptions and                                             *
+*   Considerations :                                          *
+*                                                             *
+**************************************************************/
+
+/**************************************************************
+* Mod.Id   Who      When     Description                      *
+* -------- -------- -------  -------------------------------- *
+* IS10020  AvnerL   01/05/14 Do not use NOPW in TSS AddUser   *
+* WS10082  MauriC   14/11/22 Recompile for new ADDINFO macros *
+**************************************************************/
+
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_API
+ #include ESA_API_CODES
+
+ #include MVS_CODES
+
+ #include MVS_ONLINE_INTERCEPTOR
+
+ #include API_ADDINFO
+
+ #include TSS
+
+ static char component[] = "CTSTIOE";
+ static char internal2_msg_buf[200] = "";
+
+/****************************************************
+ * Procedure Name: CTSAddOE
+ * Description   : Create new container
+ * Input         : container, addinfo_data, admin_params.
+ * Output        : None
+ * Input/Output  : None
+ * Return Value  : ESA_RC
+ ***************************************************/
+
+ ESA_RC CTSAddOE (OE_PARAMS_rec_typ    * oe_params,
+                  ADDINFO_rec_typ      * addinfo,
+                  ADMIN_PARAMS_rec_typ * admin_params,
+                  ERR_STRUCT_rec_typ   * err)
+
+
+{
+
+   static char                func[]="CTSAddOE";
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                     rc = ESA_OK;
+   int                        oe_added = 0;
+   CTSAMSG_HANDLE_rec_ptr     msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr dest;
+   ONE_FIELD_rec_ptr          cpair;
+   ADDINFO_rec_ptr            get_addinfo = NULL;
+   ADDINFO_rec_ptr            ess_addinfo = NULL;
+   TSS_CMD_HANDLE_typ        *cmd_handle  = NULL;
+   TSS_CMD_BUF_rec_typ        del_cmd = { 0, 0, "" };
+
+   static char                spec_symb[]=" ,();'";
+   char                      *spcsmb;
+
+  /*
+   *  Get OE parameters
+   */
+
+   TSS_RTT_rec_typ          * rtt;
+   short                      rtt_num_items;
+   OBJ_EXISTS_typ             obj_exist  = OBJ_NOT_EXIST;
+   HAVE_MORE_typ              have_more  = NO_MORE;
+   void                     * handle     = NULL;
+   short                      actual_num = 0;
+   OE_PARAMS_rec_typ          oes;
+   OE_typ                     oe = "";
+
+   /*** For TSS_chk_acid ***/
+
+   char                       real_acid_type[TSS_ACID_TYPE_LEN+1]="";
+   OBJECT_TYPE_typ            real_obj_type = TYPE_IGNORE;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_ADDOE, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+  /*
+   * Initialize global parameters
+   */
+
+   rc = TSS_global_init (ESA_COMP_ADDOE, admin_params, err);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   rtt = TSS_get_global_rtt();
+   rtt_num_items  = TSS_get_global_rtt_num_items();
+
+  /*
+   *   Verify oe name
+   */
+
+   spcsmb = strpbrk( oe_params->oe, spec_symb);
+   if ( spcsmb NE NULL ) {
+     CTSAMSG_print(ERR_INVALID_NAME, msgs, NULL, dest,
+                   TSS_CONTAINER, oe_params->oe);
+     rc = ESA_FATAL;
+     goto exit;
+   }
+
+  /*
+   *  Check oe existance
+   */
+
+   rc = TSS_chk_acid(ESA_COMP_ADDOE, oe_params->oe,
+                     TSS_CONTAINER, TYPE_CONTAINER,
+                     OBJ_NOT_EXIST, TRUE, real_acid_type,
+                     &real_obj_type, admin_params, err);
+   if (rc NE ESA_OK)
+      goto exit;
+
+  /*
+   *   Create command handle
+   */
+
+   rc = TSS_alloc_cmd_handle (ESA_COMP_ADDOE,
+                              MAX_TSS_CMD_OE_ENTRIES,
+                              &cmd_handle, dest, msgs );
+   if ( rc NE ESA_OK )
+      goto exit;
+
+  /*
+   *   Build internal addinfo
+   */
+
+   rc = ADDINFO_alloc(func, addinfo->num_pairs,
+                      &ess_addinfo, dest, msgs);
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   ADDINFO_copy( ess_addinfo, addinfo );
+
+  /*
+   *   Add OE processing
+   */
+
+   cpair=ADDINFO_search(TSS_OE_TYPE, TSS_ADDINFO_KWD_LEN,
+                        ess_addinfo->pair, ess_addinfo->num_pairs);
+   if ( cpair EQ NULL ) {
+       sprintf(internal2_msg_buf,
+               "parameter %s not found", TSS_OE_TYPE);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                     "CTSTIOE", func, internal2_msg_buf,
+                     8, __LINE__);
+       rc = ESA_FATAL;
+       goto exit;
+   }
+
+  /*
+   *  Create new container
+   */
+
+   rc = TSS_do_create(ESA_COMP_ADDOE,  cmd_handle,
+                      (USER_PARAMS_rec_typ *) oe_params, /*IS10020*/
+                      oe_params->oe,   oe_params->parent,
+                      cpair->value,    TYPE_CONTAINER,
+                      admin_params, err );
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   oe_added = 1;
+
+  /*
+   *   Prepare parameters to obtain oe info
+   */
+
+   rc = ADDINFO_alloc(func, rtt_num_items, &get_addinfo, dest, msgs);
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   rc = TSS_rtt_2_addinfo(ESA_COMP_ADDOE,rtt,get_addinfo,dest,msgs);
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *  Get oe information
+   */
+
+   strcpy(oes.oe, oe_params->oe);
+   rc = CTSGetOEs (GET_MANY_OES, oe, 1, &actual_num,
+                   &have_more, &handle,
+                   1, oe_params, &oes, &get_addinfo, &obj_exist,
+                   admin_params, err );
+
+   ESA_DIAG_printf(ESA_COMP_ADDOE, 1, "oe=%s rc=%d exists=%d",
+                    oes.oe, rc, obj_exist);
+
+   if ( (obj_exist EQ OBJ_NOT_EXIST) OR ( rc NE ESA_OK )) {
+       rc = ESA_FATAL;
+       goto exit;
+   }
+
+   rc = TSS_do_addinfo (ESA_COMP_ADDOE, cmd_handle, rtt,
+                        ess_addinfo, get_addinfo, dest, msgs);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   rc = TSS_do_cmd( ESA_COMP_ADDOE, (char *)oe_params->oe,
+                    TYPE_CONTAINER,  TSS_EVNT_ACTION_UPDATE,
+                    cmd_handle, admin_params);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+  /*
+   *   Finish
+   */
+
+ exit:;
+
+  /*
+   *   Add process failed, after some of opereations
+   *   Here we perform cleanup, and delete this poor oe
+   */
+
+   if ( ( rc NE ESA_OK ) AND oe_added ) {
+
+     /*
+      *   Build and issue DELOE command
+      */
+
+      sprintf(del_cmd.buffer, "DELETE(%s) ", oe_params->oe);
+      del_cmd.max_len = strlen(del_cmd.buffer);
+      del_cmd.use_len = strlen(del_cmd.buffer);
+
+      TSS_issue_cmd(ESA_COMP_DELOE, &del_cmd,
+                    oe_params->oe, TYPE_CONTAINER,
+                    TSS_EVNT_ACTION_DELETE, admin_params);
+   }
+
+   if (cmd_handle)
+      TSS_free_cmd_handle( ESA_COMP_ADDOE,
+                           &cmd_handle, dest, msgs);
+   if (get_addinfo)
+      ADDINFO_free(&get_addinfo);
+
+   if (ess_addinfo)
+      ADDINFO_free(&ess_addinfo);
+
+   ESA_DIAG_exit(ESA_COMP_ADDOE, 1, func, rc);
+
+   return rc;
+
+}

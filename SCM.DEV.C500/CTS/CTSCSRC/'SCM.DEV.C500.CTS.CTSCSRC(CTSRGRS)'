@@ -1,0 +1,4812 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Get resource information (RACF)          *
+ *                                                             *
+ * File Name        : ctsrgrs.c                                *
+ *                                                             *
+ * Author           : Alexander Shvartsman                     *
+ *                                                             *
+ * Creation Date    : 13/03/95                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * PS0231   Alex     24/12/97 New source                       *
+ * PS0238   Alex     16/02/98 New Resource names               *
+ * PS0280   Alex     16/06/98 No Resource returns when         *
+ *                            GENERIC=Y and no mask chars      *
+ * ws2421   Michael  06/09/01 resource enhancement -           *
+ *                            allow calling an AIT-like        *
+ *                            script.                          *
+ * IS0264   AmirH    17/05/04 ABEND S0C4 during Load Resources *
+ * WS2508   AmirH    14/09/04 Add VOLUME_LIST1 keyword as      *
+ *                            VOLUME_LIST extention            *
+ * WS2350   AmirH    23/09/04 Print the CTSASRCH messages      *
+ * BS2703   yonim    26/03/06 Support Multi subgroup keyword   *
+ * WS10004  AvnerL   05/06/07 Extend ICHEINTY & add SUBGROUP3  *
+ * BS10022  AvnerL   17/02/10 Load resources with len=1 as well*
+ * sas750   AvnerL   23/11/09 Clear SAS/C 7.5 warnings.        *
+ * IS10101  AvnerL   21/07/13 Fix Load Resource input parms.   *
+ * SAS2IBMT SeligT   30/06/16 SAS/C to IBM C Conversion Project*
+ * SAS2IBMN NuritY   09/08/16 SAS/C to IBM C Conversion:       *
+ *                            replace loadm, buildm, unloadm,  *
+ *                            OS_DYNAM_Load and OS_DYNAM_Delete*
+ *                            with calls to ctsaldm and ctsadlm*
+ * IS10174  NuritY   15/01/18 Dynamic EXECOUT support.         *
+ * IS10181  SeligT   06/06/19 Display Message When ADDINFO     *
+ *                            Value Is Too Large - No Change;  *
+ *                            Recompile Because of Larger      *
+ *                            RACF_OUTPUT_SIZE                 *
+ * IS10182  AvnerL   17/07/19 S0C4/S0C1 due to DIAG vsprintf   *
+ * WS10082  MauriC   29/11/22 Update per ADDINFO new structure *
+ *          AvnerL   05/12/22 Drop AIT                         *
+ **************************************************************/
+
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDIO
+ #include   STDLIB
+ #include   STRING
+ #include   ERRNO                                         /* SAS2IBMT */
+
+ /*
+  *   ESA include files
+  */
+
+ #include   ESA_API
+ #include   ESA_DIAG
+ #include   ESA_CTSAMSG
+ #include   ESA_API_CODES
+
+ /*
+  *   RACF include files
+  */
+
+ #include   MVS_COMP
+ #include   RACF_CODES
+ #include   API_ADDINFO
+ #include   RACF
+ #include   RACF_RES
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_CODES
+ #include MVS_COMP
+ /* SAS2IBMN #include MVS_OS_DYNAM */
+ #include MVS_OS_CLI
+ #include MVS_OS_MVS
+
+ static  char   component[] = "GETRES";
+
+ /***  Entry structure  ***/
+
+ typedef struct S_ENTRY    {
+    char                         eyecatcher[4];
+    char                         op_code[10];
+    int                          init_p;
+    RESOURCE_typ                 entry_name;
+    RACF_OUTPUT_LINE_rec_typ   * output;
+    ADDINFO_rec_ptr              laddinfo;
+    char                       * search_results;
+    char                      ** search_records;
+    int                          max_search_rec;
+    int                          current_search_rec;
+ } ENTRY_typ , *ENTRY_ptr ;
+
+ static  char * TVTOCVOL_cnvrt(char  * var);  /*TVTOCVOL convert func*/
+ static  SLIST_typ   tvtoc_info= { "INFO.TVTOC", 6 };
+ static  SKWDS_typ  spec_keywords[] = {
+    { "RESNAME",  TYPE_1A , NULL , NULL },
+    { "RESTYPE",  TYPE_1A , NULL , NULL },
+    { "TVTOCSEQ", TYPE_1B , &tvtoc_info , NULL },
+    { "TVTOCCRD", TYPE_1B , &tvtoc_info , NULL },
+    { "TVTOCIND", TYPE_1B , &tvtoc_info , NULL },
+    { "TVTOCDSN", TYPE_1B , &tvtoc_info , NULL },
+    { "TVTOCVOL", TYPE_1B , &tvtoc_info , TVTOCVOL_cnvrt},
+    { "TVTOCRDS", TYPE_1B , &tvtoc_info , NULL },
+    { "VOLUME_LIST", TYPE_1B , NULL , NULL }, /* Handle overflow WS2508*/
+    { NULL,       TYPE_1A , NULL , NULL } };
+
+/*
+ *   Assembler resource information extraction routine
+ */
+
+ /* SAS2IBMT typedef and prototype changed for IBM C
+ extern int ctsfgrs (char                     * option,
+                     char                     * entry_type,
+                     char                     * entry,
+                     int                      * generic_flag,
+                     char                     * volume,
+                     char                     * unit,
+                     RACF_OUTPUT_LINE_rec_typ * output,
+                     int                      * debug,
+                     int                      * rc_racf,
+                     int                      * reason_code,
+                     char                     * sep);                */
+ extern int ctsfgrs ();                                   /* SAS2IBMT */
+
+ typedef struct FLAG_S {   /* Fix flag fields table */
+      char   *field;
+      char   *value;
+ }  FLAG_FIELD_rec_typ, *FLAG_FIELD_rec_ptr;
+
+ static int debug=0; /* debug level for extractor*/
+
+ static ESA_RC check_handle(ENTRY_typ                  ** entry,
+                            void                       ** handle,
+                            CTSAMSG_DEST_TABLE_rec_typ  * dest,
+                            CTSAMSG_HANDLE_rec_typ      * msgs);
+
+ static ESA_RC do_it_get(ENTRY_typ                  * entry,
+                         RES_PARAMS_rec_typ         * res_params_in,
+                         int                          generic_flag,
+                         char                       * volume,
+                         char                       * unit,
+                         CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                         CTSAMSG_HANDLE_rec_ptr       msgs);
+
+ static ESA_RC do_it_put(int                         i,
+                         ENTRY_typ                  *entry,
+                         RES_PARAMS_rec_typ          res_params[1],
+                         ADDINFO_rec_ptr             addinfo[1],
+                         int                         generic_flag,
+                         char                      * volume,
+                         char                      * unit,
+                         CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                         CTSAMSG_HANDLE_rec_ptr      msgs);
+
+ static ESA_RC invoke_search(char                  * ddn,
+                        RES_PARAMS_rec_typ         * res_params,
+                        ADDINFO_rec_typ            * addinfo,
+                        int                        * select_mode,
+         /* IS10174 */  ADMIN_PARAMS_rec_typ       * admin_params);
+         /* IS10174     USER_typ                     admin_uname, */
+         /* IS10174     CTSAMSG_HANDLE_rec_typ     * msgs,     */
+         /* IS10174     CTSAMSG_DEST_TABLE_rec_typ * dest );    */
+
+ static ESA_RC get_search_result(char                       * ddname,
+                                 ENTRY_typ                  * entry,
+         /* IS10174 */           ADMIN_PARAMS_rec_typ * admin_params);
+         /* IS10174              CTSAMSG_HANDLE_rec_ptr       msgs,  */
+         /* IS10174              CTSAMSG_DEST_TABLE_rec_ptr   dest); */
+
+
+ static ESA_RC select_resource(RES_PARAMS_rec_typ       * res_params_in,
+                               ENTRY_typ                * entry,
+                               int                        put_msg,
+                               CTSAMSG_HANDLE_rec_ptr     msgs,
+                               CTSAMSG_DEST_TABLE_rec_ptr dest);
+
+ static ESA_RC get_resource_params(ENTRY_typ          * entry,
+                                 int                    rec_index,
+                                 RES_PARAMS_rec_typ   * res_params_in,
+                                 RES_PARAMS_rec_typ   * tmp_res_params,
+                                 int                  * generic_flag,
+                                 char                 * volume,
+                                 char                 * unit);
+
+ static FLAG_FIELD_rec_ptr is_flag_field(char            *field,
+                                      FLAG_FIELD_rec_typ flag_table[1]);
+
+ static void fix_flag_fields(ADDINFO_rec_ptr        addinfo,
+                             FLAG_FIELD_rec_typ     flag_table[1]);
+
+ static ESA_RC set_single_resource(RES_PARAMS_rec_typ   * res_params_in,
+                              ADDINFO_rec_typ           * addinfo_in,
+                              ENTRY_typ                 * entry,
+                              CTSAMSG_HANDLE_rec_ptr      msgs,
+                              CTSAMSG_DEST_TABLE_rec_ptr  dest);
+
+/***** Drop AIT defs *****                          *** WS10082 ***
+@*ws2421 start the following prototypes were added*@
+static ESA_RC CTSGetResAIT (GET_RESOURCE_MODE   mode,  @*ws2421*@
+               OE_typ                 oe,
+               short                  max_ress,
+               short                * actual_num,
+               HAVE_MORE_typ        * have_more,
+               void                ** handle,
+               RES_PARAMS_rec_typ   * res_params_in_ess,
+               ADDINFO_rec_typ      * addinfo_in,
+               RES_PARAMS_rec_typ     res_params[1],
+               ADDINFO_rec_typ      * addinfo_out[1],
+               ADMIN_PARAMS_rec_typ * admin_params,
+               ERR_STRUCT_rec_typ   * err);
+
+typedef enum {
+    ESAADI_LIST_MODE_NEW,
+    ESAADI_LIST_MODE_OLD
+} ESAADI_LIST_OPEN_MODE_typ;
+
+typedef struct {
+    ONE_FIELD_rec_typ        * pair_ptr;
+    ONE_FIELD_rec_typ          pair_cpy;
+    int                        offset;
+    int                        row_offset;
+    short                      max_list_length;
+    ESAADI_LIST_OPEN_MODE_typ  mode;
+} ESAADIL_LIST_HNDL_typ;
+
+static ESA_RC ESAADIL_list_open (
+                ONE_FIELD_rec_typ          *pair,
+                ESAADI_LIST_OPEN_MODE_typ   mode,
+                short                       max_list_length,
+                ESAADIL_LIST_HNDL_typ      *handle);
+
+static ESA_RC ESAADIL_list_append_entry (ESAADIL_LIST_HNDL_typ *handle);
+
+static ESA_RC ESAADIL_list_close (ESAADIL_LIST_HNDL_typ *handle);
+
+static ESA_RC ESAADIL_list_append_subfield (
+                ESAADIL_LIST_HNDL_typ * handle,
+                char                  * field);
+
+static char *Trim (char *string);
+static ESA_RC Strip_Value (char                  ** string,
+       char                   * value_type,
+       ADMIN_PARAMS_rec_typ   * admin_params);
+static ESA_RC Get_Delimiters (RSS_typ                 rss_name,
+              char                    delimiters[2],
+              ADMIN_PARAMS_rec_typ  * admin_params);
+static ESA_RC Write_Header (FILE                 * file_handle,
+              int                    write_login,
+              int                    write_user,
+              USER_PARAMS_rec_typ  * user_params,
+              ADMIN_PARAMS_rec_typ * admin_params);
+static void Build_Parm (char                  * keyword,
+            char                  * value,
+            char                  * string,
+            ADMIN_PARAMS_rec_typ   * admin_params);
+static int Parm_Valid (char * parm,
+       ADMIN_PARAMS_rec_typ   * admin_params);
+@* ws2421 end *@
+ * *** End of AIT defs removal ***                  *** WS10082 ***/
+/****************************************************
+ * Procedure Name: getres
+ * Description   : Get resource RSS info
+ * Input         : mode          - (only GET_FREE_HANDLE is supported)
+ *                 max_ress      - # of elements in res_params &
+ *                                addinfo_out arrays
+ *                 admin_params  -
+ *                 res_params_in - resource to retrieve
+ *                 addinfo_in    - additional retrieval parameters
+ * Output        : actual_num    - # of resources returned
+ *                 have_more     - HAVE_MORE if more resources
+ *                 res_params    - Returned resources
+ *                 err           - error indication, message, etc.
+ * Input/Output  : addinfo       - array of max_ress pointers:
+ *                                 add.info per resource, caller puts
+ *                                 requested keywords, callee returns
+ *                                 actual add.info, per resource.
+ *                 handle        - NULL on first call, filled by callee,
+ *                                 used by callee to keep track.
+ *                                 Freed by caller.
+ * Return Value  : ESA_RC
+ * Side Effects  : Function may allocate memory, return pointer in
+ *                 *handle; Caller MUST free when done.
+ * Comments      : 1. Data is returned as triplets -
+ *                    resource, add.info, objs_exist
+ ****************************************************/
+
+ ESA_RC CTSGetRes (GET_RESOURCE_MODE      mode,
+                   OE_typ                 oe,
+                   short                  max_ress,
+                   short                * actual_num,
+                   HAVE_MORE_typ        * have_more,
+                   void                ** handle,
+                   RES_PARAMS_rec_typ   * res_params_in_ess,
+                   ADDINFO_rec_typ      * addinfo_in_ess,
+                   RES_PARAMS_rec_typ     res_params[1],
+                   ADDINFO_rec_ptr        addinfo_out[1],
+                   ADMIN_PARAMS_rec_typ * admin_params,
+                   ERR_STRUCT_rec_typ   * err)
+  {
+
+  /*
+   *   Variables
+   */
+
+   static char                   func[]="CTSGetRes";
+   CTSAMSG_HANDLE_rec_ptr        msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr    dest;
+   ONE_FIELD_rec_typ           * cpair_type = NULL;
+   ONE_FIELD_rec_typ           * cpair_temp  = NULL;
+   ONE_FIELD_rec_typ           * cpair_tempi = NULL;
+   ADDINFO_rec_typ             * addinfo_in = NULL;
+   RES_PARAMS_rec_typ            res_params_in_tmp;
+   RES_PARAMS_rec_typ          * res_params_in = &res_params_in_tmp;
+   RES_PARAMS_rec_typ            tmp_res_params;
+   ESA_RC                        rc     = ESA_OK;
+   ESA_RC                        chk_rc = ESA_OK;
+   int                           select_mode = FALSE;
+   int                           i_dump;
+   int                           i, k;
+   int                           generic_flag;
+   char                          volume[7];
+   char                          unit[10];
+   ENTRY_typ                   * entry = NULL ;
+   char                 eoddn[9] = EXECOUT_DDNAME;       /* IS10174 */
+
+   char                 external_resource_prefix[6];  /* ws2421 */
+   ESA_RC               prm_rc=ESA_OK;                /* ws2421 */
+   #define EXTERNAL_RESOURCE_PREFIX "EXTERNAL_RESOURCE_PREFIX"
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GETRES,1,func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   ESA_DIAG_printf(ESA_COMP_GETRES,1, "mode=%d handle=%X max_ress=%d",
+                   mode, *handle , max_ress);
+
+  /*
+   * ws2421 : check if an external resource is being loaded
+   *          if it is, call an external script.
+   */
+
+  prm_rc = admin_params->cs_func.rssprm_get_opt_ptr(
+                   admin_params->rss_name,
+                   EXTERNAL_RESOURCE_PREFIX,
+                   sizeof(external_resource_prefix),
+                   external_resource_prefix,
+                   OPT_TRUE,
+                   OPT_FALSE);
+
+  ESA_DIAG_printf(ESA_COMP_GETRES,1,                        /* IS0264 */
+   "prm_rc=%d, rssname=%s, restype=%s",
+    prm_rc, admin_params->rss_name, res_params_in_ess->restype);
+
+  if (prm_rc NE ESA_OK) goto RACF_resource;
+
+  /* Prefix value found -> Print DIAG with it's value          IS0264 */
+  ESA_DIAG_printf(ESA_COMP_GETRES,1,
+     "prefix=%s, prefix len=%d",
+     external_resource_prefix, strlen(external_resource_prefix));
+
+  if (strncmp(res_params_in_ess->restype,
+              external_resource_prefix,
+              strlen(external_resource_prefix)) EQ 0)
+
+  {      /* call CTSGetResAIT to support script call */
+  /* WS10082 - removed -
+     rc = CTSGetResAIT           (mode,
+                                  oe,
+                                  max_ress,
+                                  actual_num,
+                                  have_more,
+                                  handle,
+                                  res_params_in_ess,
+                                  addinfo_in_ess,
+                                  res_params,
+                                  addinfo_out,
+                                  admin_params,
+                                  err);
+     WS10082 - removed -        */
+
+     goto exit;
+ }/* ws2421 */
+
+  RACF_resource:
+
+  ESA_DIAG_printf(ESA_COMP_GETRES,1,"RACF_resource"); /*IS10101*/
+  /*
+   *  Build addinfo_res from resource name
+   */
+
+   rc = RCFRES_build_res_addinfo(res_params_in_ess, res_params_in,
+                                 &addinfo_in, dest, msgs);
+   if (rc NE ESA_OK)
+     goto exit;
+
+   /** Start of Temporary !!! **/
+
+   cpair_type = ADDINFO_search("GET.TYPE", RCF_ADDINFO_KWD_LEN,
+                               addinfo_in_ess->pair,
+                               addinfo_in_ess->num_pairs );
+   if (cpair_type NE NULL) {
+      if ( strcmp("ID", cpair_type->value) EQ 0) /* IS10101 */
+       select_mode = TRUE;   /* GetSingle */
+      else                                       /* IS10101 */
+       select_mode = FALSE;   /* GetMany */
+
+       ADDINFO_insert(TYPE_1A, "GET.TYPE", cpair_type->value,
+                      addinfo_in,
+                      RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN, UNIQUE);
+  }
+   else
+       select_mode = TRUE;   /* GetSingle */
+   ESA_DIAG_printf(ESA_COMP_GETRES,2,                    /*IS10101*/
+                   "select_mode=<%x> (1=TRUE=Get_Single)",select_mode);
+
+/*IS10101 cpair_temp = ADDINFO_search("GENERIC", RCF_ADDINFO_KWD_LEN, */
+   cpair_temp = ADDINFO_search("GET.GENERIC",          /*IS10101*/
+                               RCF_ADDINFO_KWD_LEN,
+                               addinfo_in_ess->pair,
+                               addinfo_in_ess->num_pairs );
+   if (cpair_temp NE NULL) {
+       ESA_DIAG_printf(ESA_COMP_GETRES,2,"GENERIC received");/*IS10101*/
+       cpair_tempi = ADDINFO_search("GENERIC", RCF_ADDINFO_KWD_LEN,
+                                     addinfo_in->pair,
+                                     addinfo_in->num_pairs );
+       if (cpair_tempi NE NULL)
+         ADDINFO_updval(cpair_temp->value,
+                        RCF_ADDINFO_VAL_LEN, cpair_tempi);
+       else
+         ADDINFO_insert(TYPE_1A, "GENERIC", cpair_temp->value,
+                      addinfo_in,
+                      RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN, UNIQUE);
+  }
+
+/*IS10101 cpair_temp = ADDINFO_search("VOLUME", RCF_ADDINFO_KWD_LEN, */
+   cpair_temp = ADDINFO_search("GET.VOLUME",             /*IS10101*/
+                               RCF_ADDINFO_KWD_LEN,
+                               addinfo_in_ess->pair,
+                               addinfo_in_ess->num_pairs );
+   if (cpair_temp NE NULL) {
+       ESA_DIAG_printf(ESA_COMP_GETRES,2,"VOLUME received");/*IS10101*/
+       cpair_tempi = ADDINFO_search("VOLUME", RCF_ADDINFO_KWD_LEN,
+                                     addinfo_in->pair,
+                                     addinfo_in->num_pairs );
+       if (cpair_tempi NE NULL)
+         ADDINFO_updval(cpair_temp->value,
+                        RCF_ADDINFO_VAL_LEN, cpair_tempi);
+       else
+       ADDINFO_insert(TYPE_1A, "VOLUME", cpair_temp->value,
+                      addinfo_in,
+                      RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN, UNIQUE);
+  }
+   /** end of Temporary !!! **/
+
+
+  *actual_num =  0;
+  *have_more  =  HAVE_MORE;
+
+  debug = ESA_DIAG_get_debug_level(ESA_COMP_GETRES);
+
+  /**  Check mode parameter  **/
+
+  if ( mode EQ GET_FREE_HANDLE_RESOURCES ) {
+    *have_more =  NO_MORE;
+    goto exit ;
+ }
+  else {
+    ESA_DIAG_printf(ESA_COMP_GETRES,2,"call check_handle"); /*IS10101*/
+    rc = check_handle( &entry, handle , dest , msgs) ;
+    if ( rc NE ESA_OK )
+       goto exit ;
+ }
+  ESA_DIAG_printf(ESA_COMP_GETRES,2,                       /*IS10101*/
+   "entry->init_p=<%x>", entry->init_p);
+
+  /***  Initialize resource list ***/
+
+  if ( entry->init_p ) {
+
+  if ( ESA_DIAG_get_debug_level(ESA_COMP_GETRES) GE 2 )   /*IS10101*/
+             ADDINFO_dump(addinfo_in,0);
+  if ( ESA_DIAG_get_debug_level(ESA_COMP_GETRES) GE 2 )   /*IS10101*/
+             ADDINFO_dump(addinfo_in_ess,0);
+    /*
+     * Validate Resource Class
+     */
+     ESA_DIAG_printf(ESA_COMP_GETRES,2,"init_p is true"); /*IS10101*/
+
+     chk_rc = RACF_chk_res_class(res_params_in_ess->restype,
+                                 OBJ_EXIST, TRUE, dest,msgs);
+     if ( chk_rc NE ESA_OK ) {
+        *have_more  = NO_MORE;
+        rc = ESA_FATAL;
+        goto exit;
+    }
+
+     entry->init_p = FALSE;
+     strcpy(entry->op_code, RACF_OPERATION_LOCATE);
+
+    /*
+     * Obtain profile list, by invoking RACF SEARCH cmd
+     * During RACF SEARCH cmd building, the function
+     * determines and returns select_mode.
+     * The select mode may be : TRUE  - 0nly entered resource
+     *                                  info should be returned
+     *                          FALSE - All obtained resources list
+     *                                  after SEARCH cmd should be
+     *                                  returned
+     */
+
+     if (NOT select_mode ) {       /* GetMany */
+        /* IS10174
+        rc = invoke_search("EXECOUT", res_params_in,  addinfo_in,
+                           admin_params->admin_uname, &select_mode,
+                           msgs, dest);                          */
+        rc = invoke_search(eoddn, res_params_in,         /* IS10174 */
+                           addinfo_in, &select_mode,     /* IS10174 */
+                           admin_params);                /* IS10174 */
+        if (rc NE ESA_OK) {
+          *have_more  = NO_MORE;
+          goto exit;
+       }
+
+        /** Load profile list **/
+
+        /* IS10174
+        rc = get_search_result("EXECOUT", entry, msgs, dest);
+                               msgs, dest);                    */
+        rc = get_search_result(eoddn, entry,             /* IS10174 */
+                               admin_params);            /* IS10174 */
+        if (rc EQ ESA_EOF) {
+          *have_more  = NO_MORE;
+          rc = ESA_OK;
+          goto exit;
+       }
+        else if (rc NE ESA_OK) {      /* Internal errors */
+          *have_more  = NO_MORE;
+          rc = ESA_FATAL;
+          goto exit;
+       }
+
+        /* Print total number of retrieved resources           WS2350 */
+        /* (counter was set by get_seach_result)                      */
+        CTSAMSG_print( RACF_RETRIEVED_RESOURCES, msgs,NULL,dest,
+                     entry->max_search_rec );
+
+    }            /* GetMany   */
+     else {      /* GetSingle */
+        rc = set_single_resource(res_params_in, addinfo_in,
+                                 entry, msgs, dest);
+        if (rc NE ESA_OK) {      /* Internal errors */
+          *have_more  = NO_MORE;
+          rc = ESA_FATAL;
+          goto exit;
+       }
+    }            /* GetSingle */
+
+     /** Select required resource **/
+
+     if (select_mode) {
+       rc = select_resource(res_params_in, entry, FALSE, msgs, dest);
+       if (rc NE ESA_OK) {        /* Resource not found,
+                                   * but it's O.K. Because it may
+                                   * happens after delete resource,
+                                   * due to hot path processing
+                                   * ------------------------------ */
+          *have_more  = NO_MORE;
+          rc = ESA_OK;
+          goto exit;
+      }
+    } /* Select resource */
+ }        /* Initialze resource list */
+
+ /*
+  *  Executing
+  */
+
+  ESA_DIAG_printf(ESA_COMP_GETRES,1,
+                  "Return result from index=%d max_index=%d",
+                  entry->current_search_rec, entry->max_search_rec);
+
+  /**  Loop on output res  **/
+
+  for (i = entry->current_search_rec;
+       ( (*actual_num) LT max_ress) AND (i LT entry->max_search_rec);
+                                    i++) {
+     /* Obtain resource parameters */
+
+     generic_flag = 0;
+     memset(volume, ' ', sizeof(volume) );
+     volume[sizeof(volume)-1] = NULL_CHAR;
+     memset(unit  , ' ', sizeof(unit) );
+     unit[sizeof(unit)-1] = NULL_CHAR;
+
+     get_resource_params(entry, i, res_params_in, &tmp_res_params,
+                         &generic_flag, volume, unit );
+
+     /* Extract resource info */
+
+     rc = do_it_get(entry, &tmp_res_params,
+                    generic_flag, volume, unit, dest, msgs);
+     if (rc NE ESA_OK) {
+         rc = ESA_FATAL;      /* Internal error */
+         *have_more = NO_MORE ;
+         break ;
+    }
+
+     k = (*actual_num);
+     rc = do_it_put(k, entry, res_params, addinfo_out,
+                    generic_flag, volume, unit, dest, msgs) ;
+     if ( rc EQ ESA_OK )
+       (*actual_num)++ ;
+     else {                   /* internal error */
+       rc = ESA_FATAL;
+       *have_more = NO_MORE ;
+       break ;
+    }
+ }/* Loop on resources */
+
+  /** Update current record index **/
+
+  entry->current_search_rec = i;
+
+  /**  Check reason of end-of loop  (main)  **/
+
+  if ( (*have_more) EQ HAVE_MORE ) {
+    if (i GE entry->max_search_rec)
+       *have_more = NO_MORE;
+ }
+
+  /*
+   *  Finish
+   */
+
+   exit :;
+
+   if ( (rc NE ESA_OK) OR ( *have_more EQ NO_MORE) ) {
+
+      *have_more =  NO_MORE;
+      entry = (ENTRY_typ *)(*handle);
+      if ( entry NE NULL ) {
+         ADDINFO_free( &(entry->laddinfo));   /* Local addinfo */
+         if (entry->output)
+           free(entry->output);               /* Extract area   */
+         if (entry->search_results)
+           free(entry->search_results);       /* Search results */
+         if (entry->search_records)
+           free(entry->search_records);  /* Ptrs to res records */
+         free(entry) ;                   /* Handle              */
+         *handle=NULL ;
+     }
+  }
+
+   /**  Diag ...  **/
+
+   ESA_DIAG_printf(ESA_COMP_GETRES,1,
+                   "max_ress=%d actual num=%d",
+                   max_ress, *actual_num);
+
+   if ( ESA_DIAG_get_debug_level(ESA_COMP_GETRES) GE 1 ) {
+      for (i_dump=0; i_dump LT *actual_num; i_dump++) {
+        ESA_DIAG_printf(ESA_COMP_GETRES,0,
+                        "resource=%s class=%s",
+                        res_params[i_dump].resource,
+                        res_params[i_dump].restype);
+        if ( ESA_DIAG_get_debug_level(ESA_COMP_GETRES) GE 2 )
+             ADDINFO_dump(addinfo_out[i_dump],0);
+     }
+  }
+
+   ESA_DIAG_printf(ESA_COMP_GETRES,1,
+                   "Exiting with rc=%d actual num=%d Have_More=%d",
+                    rc, *actual_num, *have_more );
+
+   ADDINFO_free(&addinfo_in);
+
+   ESA_DIAG_exit(ESA_COMP_GETRES,1, func, rc );
+
+   return rc ;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : check_handle                              *
+ *                                                             *
+ * DESCRIPTION     : Check handle parameter                    *
+ *                   1.If NULL allocate memory and create      *
+ *                     entry strycture                         *
+ *                   2.IF not equal NULL addr.entry=addr handle*
+ *                                                             *
+ * INPUT           : 1. handle    -  handle ptr                *
+ *                                                             *
+ * OUTPUT          : 1. entry     -  entry structure ptr       *
+ *                                                             *
+ * RETURN VALUE    : ESA_OK    - ok                            *
+ *                   ESA_FATAL - malloc() failed               *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC check_handle(ENTRY_typ                  ** entry,
+                            void                       ** handle,
+                            CTSAMSG_DEST_TABLE_rec_typ  * dest,
+                            CTSAMSG_HANDLE_rec_typ      * msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC rc_check = ESA_OK ;
+   int    size = 0;
+   static char func[]="check_handle";
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GETRES, 3, func);
+
+   /***   First time, obtain handle  ***/
+
+   size = sizeof(ENTRY_typ) ;
+   if ( *handle EQ NULL ) {
+      *handle = malloc(size);
+      if ( *handle EQ NULL ) {
+         CTSAMSG_print(ERR_MALLOC,msgs,NULL,dest,"RES HANDLE", size);
+         rc_check = ESA_FATAL ;
+         goto exit ;
+     }
+      *entry = *handle;
+
+      /**  Initialize entry structure variables  **/
+
+      memcpy( (*entry)->eyecatcher,  RESR_EYECATCHER ,4 );
+      (*entry)->laddinfo           = NULL;
+      (*entry)->output             = NULL;
+      (*entry)->init_p             = TRUE;
+      (*entry)->search_results     = NULL;
+      (*entry)->search_records     = NULL;
+      (*entry)->current_search_rec = 0;
+
+      /***   Create Local addinfo  ***/
+
+      rc_check = ADDINFO_alloc(component,
+                               50,
+                               &( (*entry)->laddinfo ),
+                               dest, msgs);
+
+      ESA_DIAG_printf(ESA_COMP_GETRES, 3,
+                      "laddinfo=%x", (*entry)->laddinfo);
+
+      if (rc_check NE ESA_OK) {
+          free(*handle);
+          *handle  = NULL;
+          rc_check = ESA_FATAL;
+          goto exit;
+     }
+
+      /***  Allocate output line buffer   ***/
+
+      (*entry)->output = (RACF_OUTPUT_LINE_rec_typ *)malloc(
+                          sizeof(RACF_OUTPUT_LINE_rec_typ) );
+      if ( (*entry)->output EQ NULL) {
+         CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                      "OUTPUT BUFFER",
+                      sizeof(RACF_OUTPUT_LINE_rec_typ) );
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                       component, func, "MALLOC EXTRACT AREA",
+                       8, __LINE__);
+         ADDINFO_free( &(*entry)->laddinfo);
+         free( *handle ) ;
+         *handle = NULL;
+         rc_check=ESA_FATAL ;
+         goto exit ;
+     }
+  }
+
+   /*** NO first time, move handle address to entry address  **/
+
+   else {
+        *entry = (ENTRY_typ *)(*handle);
+
+        /**  Eye catcher checking  **/
+
+        if ( memcmp( (*entry)->eyecatcher,
+                     RESR_EYECATCHER ,4 ) NE 0 ) {
+           CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                         component,func,
+                         "Invalid handle", 16,__LINE__);
+           rc_check=ESA_ERR;
+           goto exit ;
+       }
+  }
+
+  /*
+   *   Finish
+   */
+
+   exit :;
+
+   ESA_DIAG_exit(ESA_COMP_GETRES, 3, func, rc_check );
+
+   return rc_check ;
+
+}
+
+
+/**************************************************************
+*                                                             *
+* Subroutine name : do_it_get                                 *
+*                                                             *
+* DESCRIPTION     : Extract information from RACF database    *
+*                                                             *
+* INPUT           : 1. entry   - Entry name                   *
+*                                                             *
+* OUTPUT          : None                                      *
+*                                                             *
+* RETURN VALUE    : ESA_OK, ESA_ERR                           *
+*                                                             *
+**************************************************************/
+
+static ESA_RC do_it_get(ENTRY_typ                  * entry,
+                        RES_PARAMS_rec_typ         * res_params_in,
+                        int                          generic_flag,
+                        char                       * volume,
+                        char                       * unit,
+                        CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                        CTSAMSG_HANDLE_rec_ptr       msgs)
+{
+
+ /*
+  *   Variables
+  */
+
+  ESA_RC                       rc_doit = ESA_OK ;
+  RESOURCE_typ                 racf_entry;
+  RESOURCE_typ                 res_type;
+  RACF_OUTPUT_LINE_rec_typ   * output = entry->output;
+  RACF_FLAG_typ                locate_err_flag = RACF_NO;
+  static char                  func[]="do_it_get";
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_GETRES, 3, func);
+
+  /***   Get the info  **/
+
+  memset(racf_entry, ' ', sizeof(racf_entry)) ;
+  strcpy(racf_entry, entry->entry_name) ;
+  memset(res_type  , ' ', sizeof(res_type)) ;
+  strcpy(res_type  , res_params_in->restype);
+
+  output->max_len  = RACF_OUTPUT_SIZE;
+  output->used_len = 0 ;
+ /* SAS2IBMT typedef and prototype changed for IBM C
+  rc_doit = RACF_extract_res(&ctsfgrs, entry->op_code, res_type,     */
+  rc_doit = RACF_extract_res((ASM_RTN_TYP *) &ctsfgrs,    /* SAS2IBMT */
+                             entry->op_code, res_type,
+                             racf_entry, generic_flag, volume, unit,
+                             component, output, debug, locate_err_flag,
+                             dest, msgs );
+
+  racf_entry[sizeof(racf_entry)-1] = NULL_CHAR;
+
+  ESA_DIAG_printf(ESA_COMP_GETRES, 3,
+                  "Extracted res=%s/%s", res_type, racf_entry);
+  strcpy( entry->entry_name,racf_entry) ;
+
+ /*
+  *   Finish
+  */
+
+  exit : ;
+
+  ESA_DIAG_exit(ESA_COMP_GETRES, 3, func, rc_doit);
+
+  return rc_doit ;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : do_it_put                                 *
+ *                                                             *
+ * DESCRIPTION     : Put information to addinfo                *
+ *                                                             *
+ * INPUT           : 1. i       - Index of current entry name  *
+ *                   2. output  - Output area for extractor    *
+ *                   3. dest    - Message destination ptr      *
+ *                   4. msgs    - Message handle ptr           *
+ *                                                             *
+ *                                                             *
+ * OUTPUT          : 1. res_params - Res_params structure      *
+ *                   2. addinfo     - Addinfo                  *
+ *                                                             *
+ * RETURN VALUE    : addinfo_alloc rc (if failed), or:         *
+ *                   racf_extract rc                           *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC do_it_put(int                         i,
+                         ENTRY_typ                  *entry,
+                         RES_PARAMS_rec_typ          res_params[1],
+                         ADDINFO_rec_ptr             addinfo[1],
+                         int                         generic_flag,
+                         char                      * volume,
+                         char                      * unit,
+                         CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                         CTSAMSG_HANDLE_rec_ptr      msgs)
+ {
+
+ /*
+  *   Variables
+  */
+
+  ESA_RC                        rc_doit = ESA_OK ;
+  static char                   msg_buf[100];
+  static char                   func[]="do_it_put";
+  RACF_OUTPUT_LINE_rec_typ    * output = entry->output;
+  ONE_FIELD_rec_ptr             pair;
+
+  /*
+   *   Flag field table use for set flag fields
+   *   if ones not were defined during report processing
+   */
+
+   /* ----------------------------------------------------------*/
+   /*                Flag                     Default           */
+   /*                Field name               Flag value        */
+   /* ----------------------------------------------------------*/
+
+  static FLAG_FIELD_rec_typ flag_table[] = {
+                    {  "ERASE",               KWD_FLAG_OFF },
+                    {  "GENERIC",             KWD_FLAG_OFF },
+                    {  "SINGLEDSN",           KWD_FLAG_OFF },
+                    {  "TVTOC",               KWD_FLAG_OFF },
+                    {  "WARNING",             KWD_FLAG_OFF },
+                    {  "AUDIT.NONE",          KWD_FLAG_OFF },
+                    {  "GLOBALAUDIT.NONE",    KWD_FLAG_OFF },
+                    {  "NODLFDATA",           KWD_FLAG_ON  },
+                    {  "NOSESSION",           KWD_FLAG_ON  },
+                    {  "NOSTDATA",            KWD_FLAG_ON  },
+                    {  "SSIGNON.KEYENCRYPT",  KWD_FLAG_OFF },
+                    {  "SESSION.LOCK",        KWD_FLAG_OFF },
+                    {  "INFO.AUTOMATIC",      KWD_FLAG_OFF },
+                    {  "NOSVFMR",             KWD_FLAG_ON  },
+                    {  NULL } } ;
+
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_GETRES, 3, func );
+
+  /**  Load information to addinfo  **/
+
+  ESA_DIAG_printf(ESA_COMP_GETRES, 3,
+                  "i=%d laddinfo=%x addinfo(%d)=%x",
+                  i, entry->laddinfo, i, addinfo[i] );
+
+  tvtoc_info.init_list = FALSE;
+  ADDINFO_empty( entry->laddinfo );
+  ADDINFO_clear( addinfo[i] );
+  RACF_res_output_to_addinfo(output , addinfo[i] , entry->laddinfo,
+                             spec_keywords, dest, msgs );
+
+  strcpy(res_params[i].parent_oe, "");
+
+  /**  Handle special keyword - RESNAME  **/
+
+  pair = ADDINFO_search("RESNAME", RCF_ADDINFO_KWD_LEN,
+                        entry->laddinfo->pair,
+                        entry->laddinfo->num_pairs);
+  if (pair NE NULL) {
+     strcpy(res_params[i].resource, pair->value) ;
+
+     /* PS0238 */
+
+     RCFRES_set_resource_details(res_params[i].resource,
+                                 addinfo[i], dest, msgs);
+
+     ESA_DIAG_printf(ESA_COMP_GETRES, 3,
+                     "Put Res=%s", pair->value);
+ }
+  else {
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                   func, "RESNAME field not found", 0, __LINE__);
+     rc_doit = ESA_ERR;
+     goto exit;
+ }
+
+  /** Handle special keyword - RESTYPE  **/
+
+  pair = ADDINFO_search("RESTYPE", RCF_ADDINFO_KWD_LEN,
+                         entry->laddinfo->pair,
+                         entry->laddinfo->num_pairs);
+  if (pair NE NULL)
+     strcpy(res_params[i].restype, pair->value) ;
+  else {
+     sprintf(msg_buf,"RESTYPE field not found. RESNAME=%s",
+             res_params[i].resource);
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component, func,
+                   msg_buf, 0,__LINE__);
+     rc_doit = ESA_ERR;
+     goto exit;
+ }
+
+  /** Set empty flag fields **/
+
+  fix_flag_fields(addinfo[i], flag_table);
+
+ /*
+  *   Finish
+  */
+
+  exit : ;
+
+  ESA_DIAG_exit(ESA_COMP_GETRES, 3, func, rc_doit);
+
+  return rc_doit ;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : invoke_search                              *
+ *                                                             *
+ * DESCRIPTION    : list resource profiles                     *
+ *                                                             *
+ * INPUT          : 1) resource to be listed                   *
+ *                  2) additional info for list command        *
+ *                  3) admin_params                            *
+ *                                                             *
+ * OUTPUT         : 1) select_mode                             *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+ static ESA_RC invoke_search(char                  * ddn,
+                        RES_PARAMS_rec_typ         * res_params,
+                        ADDINFO_rec_typ            * addinfo,
+                        int                        * select_mode,
+         /* IS10174 */  ADMIN_PARAMS_rec_typ       * admin_params)
+         /* IS10174     USER_typ                     admin_uname, */
+         /* IS10174     CTSAMSG_HANDLE_rec_typ     * msgs,        */
+         /* IS10174     CTSAMSG_DEST_TABLE_rec_typ * dest )       */
+ {
+
+  /*
+   *   Varibales
+   */
+
+   ESA_RC                       rc = ESA_OK;
+   char                         cmd[MAX_API_ST];
+   static char                  func[]="invoke_search";
+   char                         err_msg[100];
+   ONE_FIELD_rec_typ          * cpair_type = NULL;
+   ONE_FIELD_rec_typ          * cpair_gen  = NULL;
+   ONE_FIELD_rec_typ          * cpair_vol  = NULL;
+   char                         srch_prefix[256] = NULL_STRING;
+   char                         srch_vol[80]     = NULL_STRING;
+   char                         srch_gen[80]     = NULL_STRING;
+   /* IS10174 char                       * ddnx;                    */
+   char                       * work;
+   int                          tso_rc;
+   CTSAMSG_HANDLE_rec_ptr       msgs;                    /* IS10174 */
+   CTSAMSG_DEST_TABLE_rec_ptr   dest;                    /* IS10174 */
+
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GETRES, 1, func);
+   msgs = admin_params->ctsamsg_handle;                  /* IS10174 */
+   dest = admin_params->ctsamsg_dest;                    /* IS10174 */
+
+  /*
+   *   Check obtained search criterias
+   */
+
+   cpair_type = ADDINFO_search("GET.TYPE", RCF_ADDINFO_KWD_LEN,
+                               addinfo->pair,
+                               addinfo->num_pairs );
+   cpair_gen  = ADDINFO_search("GET.GENERIC",RCF_ADDINFO_KWD_LEN,
+                               addinfo->pair,
+                               addinfo->num_pairs );
+   if ( cpair_gen EQ NULL )
+     cpair_gen  = ADDINFO_search("GENERIC",RCF_ADDINFO_KWD_LEN,
+                                 addinfo->pair,
+                                 addinfo->num_pairs );
+
+   cpair_vol  = ADDINFO_search("GET.VOLUME",RCF_ADDINFO_KWD_LEN,
+                               addinfo->pair,
+                               addinfo->num_pairs );
+   if ( cpair_vol EQ NULL )
+     cpair_vol  = ADDINFO_search("VOLUME",RCF_ADDINFO_KWD_LEN,
+                                 addinfo->pair,
+                                 addinfo->num_pairs );
+
+   ESA_DIAG_printf(ESA_COMP_GETRES, 1,
+                   "Resource class=%s name=%s",
+                    res_params->restype, res_params->resource);
+
+   if ( cpair_type )
+       ESA_DIAG_printf(ESA_COMP_GETRES, 1,
+                       "keyword=%s value=%s",
+                       cpair_type->keyword, cpair_type->value);
+   else
+       ESA_DIAG_printf(ESA_COMP_GETRES, 1, "GET.TYPE not found");
+
+   if ( cpair_gen )
+       ESA_DIAG_printf(ESA_COMP_GETRES, 1,
+                       "keyword=%s value=%s",
+                       cpair_gen->keyword, cpair_gen->value);
+   else
+       ESA_DIAG_printf(ESA_COMP_GETRES, 1, "GENERIC not found");
+
+   if ( cpair_vol )
+       ESA_DIAG_printf(ESA_COMP_GETRES, 1,
+                       "keyword=%s value=%s",
+                       cpair_vol->keyword, cpair_vol->value);
+   else
+       ESA_DIAG_printf(ESA_COMP_GETRES, 1, "VOLUME not found");
+
+   /***  Create search prefix   ***/
+
+   strcpy(srch_prefix, res_params->resource);
+   *select_mode = TRUE;
+
+   /***  Build additional parameters for search criterias ***/
+
+   if (cpair_type NE NULL) {
+
+      ESA_DIAG_printf(ESA_COMP_GETRES, 1,
+                     "GET.TYPE = %s", cpair_type->value );
+
+ /* ID is not supposed to be handled here , as it's
+  * select_mode = TRUE, which is Single.    IS10101  */
+      if ( strcmp("ID", cpair_type->value) EQ 0) {
+         strcpy(srch_prefix, res_params->resource);
+ /*      strcat(srch_prefix, "."); IS10101 no meaning to adding '.' */
+         ESA_DIAG_printf(ESA_COMP_GETRES, 1,              /* IS10101 */
+                     "GET.TYPE=ID in invoke_search !");
+ /*      *select_mode = FALSE;  IS10101 */
+         *select_mode = TRUE;   /* ID ==> GetGinsle      IS10101 */
+     }
+      else if ( strcmp("PREFIX",cpair_type->value) EQ 0) {
+         strcpy(srch_prefix, res_params->resource);
+         *select_mode = FALSE;
+     }
+      else {
+         sprintf(err_msg, "Invalid GET.TYPE=%s", cpair_type->value);
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                       component, func, err_msg, 8, __LINE__);
+         rc = ESA_FATAL;
+         goto exit;
+     }
+  }
+
+   /***  call search script  ***/
+
+   if (strlen(srch_prefix) GT 0 ) {
+
+       ESA_DIAG_printf(ESA_COMP_GETRES, 2,"srch_prefix len > 0");
+       /* set GENERIC search criteria */
+
+       if (cpair_gen) {
+          strcpy(srch_gen, cpair_gen->value);
+          if (strcmp(srch_gen, KWD_FLAG_ON) EQ 0)
+             strcpy(srch_gen, "GENERIC");
+          else
+             strcpy(srch_gen, "NOGENERIC");
+      }
+       else
+          strcpy(srch_gen,"ALL");
+      ESA_DIAG_printf(ESA_COMP_GETRES, 2,"srch_gen=<%s>",srch_gen);
+
+       /* set VOLUME search criteria */
+
+       if (cpair_vol) {
+          strcpy(srch_vol, "VOLUME(");
+          strcat(srch_vol, cpair_vol->value);
+          strcat(srch_vol, ")");
+      }
+       else
+          strcpy(srch_vol, "VOLUME");
+
+       /* IS10174
+       ddnx = ddn;
+       work = strstr( ddn, "DD:" );  * used to be DDN:       SAS2IBMT *
+       if ( work NE NULL )
+          ddnx = work + 3;           * used to be 4          SAS2IBMT *
+       */
+
+       sprintf(cmd,"%%CTSASRCH  %s %s %s %s %s %s ",
+               ddn, admin_params->admin_uname,          /* IS10174 */
+               res_params->restype, srch_prefix,         /* IS10174 */
+               srch_gen, srch_vol);
+       /* IS10174 ddnx, admin_uname, res_params->restype, srch_prefix,*/
+
+       ESA_DIAG_printf(ESA_COMP_GETRES, 1, "Command=%s",cmd);
+
+       /* IS10174
+       rc = ESA_CLI_exec_wait(ddn, cmd, &tso_rc, dest, msgs);    */
+       rc = ESA_CLI_exec_wait(ddn, cmd, &tso_rc,         /* IS10174 */
+                              admin_params);             /* IS10174 */
+
+       ESA_DIAG_printf(ESA_COMP_GETRES, 1,
+                       "rc=%d tso_rc=%d", rc, tso_rc);
+
+       if (rc EQ ESA_OK) {
+          if (tso_rc LE MAX_OK_RC_0)
+             rc = ESA_OK;
+          else if (tso_rc LT 8)
+             rc = ESA_ERR;
+          else rc = ESA_FATAL;
+      }
+       else rc = ESA_FATAL;
+  }
+
+  /*
+   *   Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(ESA_COMP_GETRES, 1, func , rc );
+
+   return rc;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : get_search_result                          *
+ *                                                             *
+ * DESCRIPTION    : Read and save RACF "SEARCH" command results*
+ *                                                             *
+ * ----------------------------------------------------------- *
+ *    Special handling is done for DATASET search to           *
+ *    handle volume listing. See sample command output:        *
+ *                                                             *
+ * >> SEARCH CLASS(DATASET) MASK(ADU.) VOLUME LIST             *
+ *                                                             *
+ *    ADU.QA.ASM                                               *
+ *    VOLUMES ON WHICH THIS DATA SET RESIDES ARE:              *
+ *     DEV300                                                  *
+ *                                                             *
+ *    ADU.QA.LINKCTL                                           *
+ *    VOLUMES ON WHICH THIS DATA SET RESIDES ARE:              *
+ *     DEV502                                                  *
+ *                                                             *
+ *    ADU.QA.MACLIB                                            *
+ *    VOLUMES ON WHICH THIS DATA SET RESIDES ARE:              *
+ *     DEV414                                                  *
+ *                                                             *
+ *    ADU.QPPDIST.DT970121.*.** (G)                            *
+ *    ADU.VPRV140.*.** (G)                                     *
+ *    ADU.V10.ASM (G)                                          *
+ *    ADU.V100DIST.*.** (G)                                    *
+ *    ADU.V100INST.*.** (G)                                    *
+ *    ADU.V110DIST.*.** (G)                                    *
+ *    ADU.V111DIST.*.** (G)                                    *
+ *    ...                                                      *
+ *                                                             *
+ * ----------------------------------------------------------- *
+ *                                                             *
+ * INPUT          : 1) ddname                                  *
+ *                  2) entry                                   *
+ *                  3) admin_params                            *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+ static ESA_RC get_search_result(char                    * ddname,
+                                 ENTRY_typ               * entry,
+         /* IS10174 */  ADMIN_PARAMS_rec_typ             * admin_params)
+         /* IS10174              CTSAMSG_HANDLE_rec_ptr       msgs, */
+         /* IS10174              CTSAMSG_DEST_TABLE_rec_ptr   dest) */
+ {
+
+  static char  func[] = "get_search_result";
+  ESA_RC       rc = ESA_OK;
+  FILE        *fp = NULL;
+  /*WS10082 char f_name [RCF_ADDINFO_VAL_LEN+1];                   */
+  char         f_name [44+1];                             /*WS10082*/
+  /*WS10082 char record [RCF_ADDINFO_VAL_LEN+1];                   */
+  char         record [ADDINFO_16K_VAL_LEN+1];            /*WS10082*/
+  char        *tmp;
+  /* WS2350 char        *txt1 = "NO ENTRIES MEET SEARCH CRITERIA"; */
+  char        *txt2 = "VOLUMES ON WHICH THIS DATA SET RESIDES ARE:";
+  char        *txt3 = "NO VOLUMES IN DATASET PROFILE";
+  char        *wrk;
+  int          len = 0;
+  int          i   = 0;
+  int          k   = 0;
+  int          volume_list = FALSE;
+  char         ddn_with_dd[12] = "DD:";               /* SAS2IBMN */
+  CTSAMSG_HANDLE_rec_ptr       msgs;                    /* IS10174 */
+  CTSAMSG_DEST_TABLE_rec_ptr   dest;                    /* IS10174 */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GETRES, 1, func);
+   msgs = admin_params->ctsamsg_handle;                  /* IS10174 */
+   dest = admin_params->ctsamsg_dest;                    /* IS10174 */
+
+   /* SAS2IBMN - start */
+   if (strncmp(ddname, ddn_with_dd, 3) EQ 0) /* ddname contains dd: ? */
+     strcpy(ddn_with_dd, ddname);         /* yes - use it.         */
+   else
+     strcat(ddn_with_dd, ddname);         /* no- add DD: to ddname */
+   /* SAS2IBMN - end   */
+
+   /**  Check file existance  **/
+
+   /* IS10174
+   rc = OS_MVS_ddinfo( ddname, f_name, TRUE, dest, msgs);   */
+   rc = OS_MVS_ddinfo( ddname, f_name, TRUE,             /* IS10174 */
+                       dest, msgs, 0);                   /* IS10174 */
+   if ( rc NE ESA_OK )
+     goto exit;
+
+   /* SAS2IBMT fp = fopen(ddname, FILE_OPEN_READ_TEXT);              */
+   fp = fopen(ddn_with_dd, FILE_OPEN_READ_TEXT);          /* SAS2IBMT */
+
+   ESA_DIAG_printf(ESA_COMP_GETRES, 1, "fp(open)=%x", fp);
+
+   /**  Handle error  **/
+
+   if ( fp EQ NULL) {
+     CTSAMSG_print(ERR_FILE, msgs, NULL, dest, "open",component, ddname,
+                   strerror(errno));
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+   /**  Calculate amount of area and number of records **/
+
+   while (fgets( record, sizeof(record), fp) ) {
+      if ( ferror(fp) ) {       /**  Handle error  **/
+         CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                       "fgets", ddname, strerror(errno) );
+         rc = ESA_FATAL;
+         goto exit;
+      }
+
+      ESA_DIAG_printf(ESA_COMP_GETRES, 3, "message=%s cmp=%d sz=%d",
+        record,
+        strncmp( record, RACF_SCRIPT_OUTMSG_TAG,
+                 RACF_SCRIPT_OUTMSG_TAG_LEN ),
+        RACF_SCRIPT_OUTMSG_TAG_LEN );
+
+      /* Print output messages WS2350 */
+      if ( strncmp( record, RACF_SCRIPT_OUTMSG_TAG,
+                    RACF_SCRIPT_OUTMSG_TAG_LEN ) EQ 0 ) {
+         CTSAMSG_print( RACF_OUTPUT_LINE, msgs, NULL, dest,
+            record + RACF_SCRIPT_OUTMSG_TAG_LEN );
+         continue;                 /* Do not count message line */
+      }
+      len +=  strlen(record) + 2; /* 1- NULL_CHAR, 1 - Reserved */
+      i++;
+   } /* end while fgets loop */
+
+   fclose(fp);
+   fp = NULL;
+
+   ESA_DIAG_printf(ESA_COMP_GETRES, 1, "Total len=%d Records=%d",len,i);
+
+   /**  Allocate area for search file and ptrs to records **/
+
+   /**  Allocate area for search file **/
+
+   if ( i GT 0 ) {
+      entry->search_results = (char *) malloc(len);
+      if ( NOT entry->search_results ) {
+         CTSAMSG_print (ERR_MALLOC, msgs, NULL, dest,
+                        "Search result records area", len );
+         rc = ESA_FATAL;
+         goto exit;
+     }
+   }
+   else { /* No resource/s where found WS2350 */
+       rc = ESA_EOF;
+       goto exit;
+   }
+
+   /**  Allocate area for ptrs to records **/
+
+   entry->search_records = (char **) malloc(i * sizeof(char *));
+   if ( NOT entry->search_records ) {
+      CTSAMSG_print (ERR_MALLOC, msgs, NULL, dest,
+                 "Search result records ptrs area", i * sizeof(char *));
+      rc = ESA_FATAL;
+      goto exit;
+  }
+
+   /**  Read search results file  **/
+
+   /* SAS2IBMT fp = fopen(ddname, FILE_OPEN_READ_TEXT);              */
+   fp = fopen(ddn_with_dd, FILE_OPEN_READ_TEXT);          /* SAS2IBMT */
+
+   ESA_DIAG_printf(ESA_COMP_GETRES, 1, "fp(open)=%x", fp);
+
+   /**  Handle error  **/
+
+   if ( fp EQ NULL) {
+     CTSAMSG_print(ERR_FILE, msgs, NULL, dest, "open",component, ddname,
+                   strerror(errno));
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+   /** Read and record processing **/
+
+   i   = 0;
+   while (fgets( record, sizeof(record), fp) ) {
+
+    if ( ferror(fp) ) {       /**  Handle error  **/
+       CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                     "fgets", ddname, strerror(errno) );
+       rc = ESA_FATAL;
+       goto exit;
+   }
+
+    RCFRES_strip_val(record, '\n', 'R'); /* Remove newl */
+    RCFRES_strip_val(record, ' ' , 'R'); /* Remove blanks */
+    ESA_DIAG_printf(ESA_COMP_GETRES, 3,
+                    "i=%d volume_list=%d rec=%d/%s",
+                    i, volume_list, strlen(record), record);
+
+    /* Ignore output messages WS2350 */
+    if ( strncmp( record, RACF_SCRIPT_OUTMSG_TAG,
+                  RACF_SCRIPT_OUTMSG_TAG_LEN ) EQ 0 ) {
+       continue;
+    }
+
+    /** Test record **/
+    /* WS2350
+    wrk = strstr(record, txt1);  * "NO ENTRIES MEET SEARCH CRITERIA" *
+    if (wrk) {
+       CTSAMSG_print(RACF_OUTPUT_LINE, msgs, NULL, dest, record);
+       rc = ESA_EOF;
+       goto exit;
+   }*/
+
+    wrk = strstr(record, txt2);
+                   /* "VOLUMES ON WHICH THIS DATA SET RESIDES ARE:" */
+    if (wrk AND (i EQ 0) ) {
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, "Unexpected 'VOLUME' line", 4, __LINE__);
+       rc = ESA_ERR;
+       goto exit;
+   }
+    else if (wrk) {         /* We expect a volume list */
+      volume_list = TRUE;
+      continue;
+   }
+
+    wrk = strstr(record, txt3); /* "NO VOLUMES IN DATASET PROFILE" */
+    if (wrk) {              /* No volume list exists in profile */
+      volume_list = FALSE;
+      continue;
+   }
+
+ /*BS10022 if ((strlen(record) LE 1) ) {         *end of volume list */
+    if ( (strlen(record) LT 1) ) {       /*end of volume list BS10022*/
+      volume_list = FALSE;
+      continue;
+   }
+
+   /*
+    *   Volume list handling.
+    *   Append volume list to record with profile name
+    */
+
+    if (volume_list) {
+      tmp = entry->search_records[i-1]; /* Ptr to profile record */
+      strcat(tmp, " ");                 /* Append   */
+      strcat(tmp, record);              /* volume   */
+      continue;
+   }
+
+   /*
+    *  Save info in compressed form.
+    */
+
+    /*  Determine ptr to saved info. */
+
+    if (i EQ 0)     /* For first record, ptr=addr of allocated area */
+     tmp = entry->search_results;
+    else            /* For others ptr=previous ptr + length of rec  */
+     tmp = entry->search_records[i-1]         +
+           strlen(entry->search_records[i-1]) + 1;
+
+    /*  Save info. */
+
+    strcpy(tmp, record);               /* Move record        */
+    entry->search_records[i] = tmp;    /* Save ptr to record */
+    i++;
+  }
+
+   fclose(fp);
+   fp = NULL;
+
+   entry->max_search_rec = i;   /* Max built records */
+
+   /** The loop below only for diag purpose **/
+
+   for(k=0; k LT i; k++) {
+      tmp = entry->search_records[k];
+      ESA_DIAG_printf(ESA_COMP_GETRES, 3,
+                      "k=%d rec=%X/%s", k, tmp, tmp);
+  }
+
+  /*
+   *   Finish
+   */
+
+   exit:;
+
+   if (fp)
+      fclose(fp);
+
+   ESA_DIAG_exit(ESA_COMP_GETRES, 1, func , rc );
+
+   return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : get_resource_params                       *
+*                                                             *
+* DESCRIPTION     : Determine additional parameter for entire *
+*                   resource                                  *
+*                   GENERIC, VOLUME, UNIT                     *
+*                                                             *
+* INPUT           : 1. entry         -  entry struct addr     *
+*                   2. i             -  current search record *
+*                   3. res_params_in -  resource params       *
+*                                                             *
+* OUTPUT          : 1. generic_flag  -  GENERIC param         *
+*                   2. volume        -  VOLUME  param         *
+*                   3. unit          -  UNIT    param         *
+*                   4. tmp_res_params-  UNIT    param         *
+*                                                             *
+* RETURN VALUE    : ESA_OK, ESA_ERR                           *
+*                                                             *
+**************************************************************/
+
+static ESA_RC get_resource_params(ENTRY_typ           * entry,
+                                 int                    rec_index,
+                                 RES_PARAMS_rec_typ   * res_params_in,
+                                 RES_PARAMS_rec_typ   * tmp_res_params,
+                                 int                  * generic_flag,
+                                 char                 * volume,
+                                 char                 * unit)
+{
+
+ /*
+  *   Variables
+  */
+
+  static  char  func[] = "get_resource_params";
+  char          record [RCF_ADDINFO_VAL_LEN+1];
+  char         *tmp;
+  char         *token;
+  int           i = rec_index;
+  int           extract_res_name = TRUE;
+  ESA_RC        rc = ESA_OK;
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_GETRES, 3, func);
+
+  strcpy(tmp_res_params->restype,  res_params_in->restype );
+  strcpy(tmp_res_params->resource, res_params_in->resource);
+
+  memset(entry->entry_name, ' ', sizeof(entry->entry_name)) ;
+
+  tmp = entry->search_records[i];
+  strcpy(record, tmp);
+  token = strtok(record, " ");
+  while (token) {
+
+     /** First token always resname **/
+
+     if (extract_res_name) {
+        strcpy(entry->entry_name, token);
+        extract_res_name = FALSE;
+    }
+     else {
+
+        /*
+         * None first token maybe :
+         * (G) - sign that resource is generic resource
+         * (T) - sign that resource is TAPE profile
+         * otherwise is volume
+         */
+
+        if (strcmp(token, "(G)") EQ 0 )       /* Generic profile  */
+          *generic_flag = 1;                  /* Set generic flag */
+        else if (strcmp(token, "(T)") EQ 0 )  /* TAPE profile     */
+          ;                                   /* Skip             */
+        else {      /* Get only first volume from list */
+          if (strlen(token) LE 6)
+             memcpy(volume, token, strlen(token));
+          else
+             rc = ESA_ERR;
+          break;
+       }
+    }
+     token = strtok(NULL, " ");  /* Get next token */
+ }
+
+  ESA_DIAG_printf(ESA_COMP_GETRES, 3,
+                  "%s/%s generic=%d volume=%s",
+                  tmp_res_params->restype, entry->entry_name,
+                  (*generic_flag), volume);
+
+ /*
+  *   Finish
+  */
+
+  exit : ;
+
+  ESA_DIAG_exit(ESA_COMP_GETRES, 3, func, rc);
+
+  return rc;
+}
+
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : is_flag_field                             *
+ *                                                             *
+ * DESCRIPTION     : Check flag/no field                       *
+ *                                                             *
+ * INPUT           : field          - field name               *
+ *                                                             *
+ * OUTPUT          : none                                      *
+ * RETURN VALUE    : NULL    - field not flag field            *
+ *                   Not NULL- ptr to field description in     *
+ *                             the flag field                  *
+ **************************************************************/
+
+ static FLAG_FIELD_rec_ptr is_flag_field(char            *field,
+                                       FLAG_FIELD_rec_typ flag_table[1])
+ {
+
+   int                     i;
+   FLAG_FIELD_rec_ptr rc = NULL;
+   static char func[]="is_flag_field";
+
+   ESA_DIAG_enter(ESA_COMP_GETRES, 10, func);
+
+   /** Search entered field in flag fields table **/
+
+   i=0;
+   while ( flag_table[i].field)  {
+
+     ESA_DIAG_printf(ESA_COMP_GETRES, 10,
+                     "i=%d flag_var(i)=%s-%s keyword=%s",
+                     i,flag_table[i].field,
+                     flag_table[i].value, field);
+
+     /** Field found in flag table. Return **/
+
+     if ( strcmp(flag_table[i].field, field) EQ 0 ) {
+        rc = &(flag_table[i]);
+        break;
+    }
+     i++;
+  }       /* Flag variables loop  */
+
+   ESA_DIAG_printf(ESA_COMP_GETRES, 10, "Returned ptr=%X", rc);
+
+  /*
+   *   Finish
+   */
+
+   exit :;
+
+   ESA_DIAG_exit(ESA_COMP_GETRES, 10, func, ESA_OK);
+
+   return rc;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : fix_flag_fields                           *
+ *                                                             *
+ * DESCRIPTION     : set empty flag fields                     *
+ *                                                             *
+ * INPUT           : addinfo        - addinfo                  *
+ *                   flag_var       - list of flag var         *
+ *                                                             *
+ * OUTPUT          : none                                      *
+ * RETURN VALUE    : none                                      *
+ *                                                             *
+ **************************************************************/
+
+ static void fix_flag_fields(ADDINFO_rec_ptr        addinfo,
+                             FLAG_FIELD_rec_typ     flag_table[1])
+ {
+
+   ONE_FIELD_rec_ptr           f_ptr;
+   int                         i;
+   FLAG_FIELD_rec_ptr          field_ptr;
+   static char func[]="fix_flag_fields";
+
+   ESA_DIAG_enter(ESA_COMP_GETRES, 10, func);
+
+   f_ptr = addinfo->pair;
+   i = 0;
+
+   /* addinfo pairs */
+
+   while ( i LT addinfo->num_pairs) {
+
+     /**  Flag field ?  **/
+
+     field_ptr = is_flag_field( f_ptr->keyword, flag_table) ;
+     if ( field_ptr ) {
+
+         ESA_DIAG_printf(ESA_COMP_GETRES, 10,
+                         "flag field=%s value=(%d)%s",
+                         f_ptr->keyword, f_ptr->vallen, f_ptr->value);
+
+         /*   Field without value. Set the default */
+
+         if ( f_ptr->vallen EQ 0 )
+            ADDINFO_updval( field_ptr->value,
+                            RCF_ADDINFO_VAL_LEN,
+                            f_ptr );
+    } /* flag field detected */
+
+     f_ptr++;    /* We handle only short fields in this loop WS10082N*/
+     i++;
+  }       /* Addinfo pairs loop */
+
+  /*
+   *   Finish
+   */
+
+   exit :;
+
+   ESA_DIAG_exit(ESA_COMP_GETRES, 10, func, ESA_OK);
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TVTOCVOL_cnvrt                             *
+*                                                             *
+* DESCRIPTION    : TVTOCVOL field convert function            *
+*                  Separate list of volumes with add ","      *
+*                  RACF returns volume list in concatenated   *
+*                  form of volumes, where profile resides.    *
+*                  Each element of 6 chars.                   *
+*                                                             *
+* INPUT          : list_desc - list description table         *
+*                                                             *
+* OUTPUT         : list_value- list value                     *
+*                                                             *
+* RETURN VALUE   : ESA_OK                                     *
+*                                                             *
+**************************************************************/
+static char  * TVTOCVOL_cnvrt(char  * var)
+{
+   static char  field[RCF_ADDINFO_VAL_LEN + 1];
+   char         volser[7];
+   char        *wptr;
+   char        *bptr;
+   int          len;
+
+   /** Initialize **/
+
+   strcpy(field, var);
+
+   /** If volume list contains only one volser, do nothing **/
+
+   len = strlen(field);
+   if (len LE 6)
+     goto exit;
+
+   wptr = var;
+   strcpy(field, "");
+   /* sas750 for (len; len; len -= 6, wptr += 6) BEGIN */
+   for (; len; len -= 6, wptr += 6) {                      /*sas750*/
+     memcpy(volser, wptr, 6);     /* Get volume value            */
+     volser[6] = NULL_CHAR;       /* Set Null termination char   */
+     bptr = strchr(volser, ' ');  /* Remove blanks               */
+     if (bptr)
+       *bptr = NULL_CHAR;
+     strcat(field, volser);       /* Append volser               */
+     strcat(field, ",");          /* Append volser separator (,) */
+  }
+
+   /** Remove last comma separator **/
+
+   len = strlen(field);
+   if (len GT 0)
+    field[len-1] = NULL_CHAR;
+
+   exit :;
+    return field;
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : select_resource                           *
+*                                                             *
+* DESCRIPTION     : From obtained list of resources after     *
+*                   invoking 'SEARCH" script select only one  *
+*                   required resource                         *
+*                                                             *
+* INPUT           : 1. entry         -  entry struct addr     *
+*                   3. res_params_in -  resource params       *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_OK, ESA_ERR                           *
+*                                                             *
+**************************************************************/
+
+static ESA_RC select_resource(RES_PARAMS_rec_typ        * res_params_in,
+                              ENTRY_typ                 * entry,
+                              int                         put_msg,
+                              CTSAMSG_HANDLE_rec_ptr      msgs,
+                              CTSAMSG_DEST_TABLE_rec_ptr  dest)
+{
+
+ /*
+  *   Variables
+  */
+
+  static  char  func[] = "select_resource";
+  char          err_msg[500];
+  char          record [RCF_ADDINFO_VAL_LEN+1];
+  char         *token;
+  int           i;
+  int           found = FALSE;
+  ESA_RC        rc = ESA_OK;
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_GETRES, 3, func);
+
+  for (i = 0; i LT entry->max_search_rec; i++ ) {
+     strcpy(record,  entry->search_records[i] );
+
+     ESA_DIAG_printf(ESA_COMP_GETRES,3, "%d.record=%s", i, record);
+
+     token = strtok(record, " ");
+     if (token) {       /* The first token always resname */
+
+        ESA_DIAG_printf(ESA_COMP_GETRES,3,
+                        "token=%s res=%s",
+                         token, res_params_in->resource);
+
+        if (strcmp(token, res_params_in->resource) EQ 0 ) {
+          found = TRUE;                    /* Resource found     */
+          entry->current_search_rec = i;   /* To prevent to work */
+          entry->max_search_rec     = i+1; /* With others        */
+
+          ESA_DIAG_printf(ESA_COMP_GETRES, 3,
+                          "Resource selected(%d):%s/%s", i,
+                          res_params_in->restype, token);
+          break;
+       } /* Reasource found              */
+    }        /* Obtained none NULL token */
+ }           /* Resources loop           */
+
+  if ( NOT found ) {       /* Resource not found */
+    if ( put_msg )  {
+       sprintf(err_msg, "Resource %s/%s not found",
+               res_params_in->restype, res_params_in->resource);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                     component, func, err_msg, 8, __LINE__);
+   }
+    rc = ESA_FATAL;
+    goto exit;
+ }
+
+ /*
+  *   Finish
+  */
+
+  exit : ;
+
+  ESA_DIAG_exit(ESA_COMP_GETRES, 3, func, rc);
+
+  return rc;
+}
+
+
+/**************************************************************
+*                                                             *
+* Subroutine name : set_single_resource                       *
+*                                                             *
+* DESCRIPTION     : Set Single Resource parameters for        *
+*                   get processing                            *
+*                                                             *
+* INPUT           : 1. entry         -  entry struct addr     *
+*                   3. res_params_in -  resource params       *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_OK, ESA_ERR                           *
+*                                                             *
+**************************************************************/
+
+static ESA_RC set_single_resource(RES_PARAMS_rec_typ    * res_params_in,
+                              ADDINFO_rec_typ           * addinfo_in,
+                              ENTRY_typ                 * entry,
+                              CTSAMSG_HANDLE_rec_ptr      msgs,
+                              CTSAMSG_DEST_TABLE_rec_ptr  dest)
+{
+
+ /*
+  *   Variables
+  */
+
+  static  char                  func[] = "set_single_resource";
+  ONE_FIELD_rec_typ           * pair   = NULL;
+  char                        * tmp;
+  int                           len;
+  int                           g_added = FALSE;  /* ps0280 */
+  char                          record [RCF_ADDINFO_VAL_LEN+1];
+  ESA_RC                        rc = ESA_OK;
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_GETRES, 3, func);
+
+  ESA_DIAG_printf(ESA_COMP_GETRES,3,
+                  "resource=%s/%s",
+                   res_params_in->restype, res_params_in->resource);
+
+  /** Build "SEARCH" record **/
+
+  strcpy(record, res_params_in->resource);
+
+  /*
+   * ps0280. For none DATASET resource class, add
+   * (G) parameter in case resource name includes
+   * mask chars and class belongs to generic class
+   * resources.
+   */
+
+  if (strcmp(res_params_in->restype,"DATASET") NE 0)  {      /*ps0280*/
+    if (RACF_is_generic_class(res_params_in->restype,        /*ps0280*/
+                              dest, msgs ) EQ ESA_OK) {      /*ps0280*/
+      tmp = strpbrk(res_params_in->resource, "%*&");         /*ps0280*/
+      if (tmp)                                               /*ps0280*/
+        strcat(record, " (G)");                              /*ps0280*/
+   }                                                         /*ps0280*/
+ }                                                           /*ps0280*/
+  else {                                                     /*ps0280*/
+   pair = ADDINFO_search("GENERIC", RCF_ADDINFO_KWD_LEN,
+                        addinfo_in->pair,
+                        addinfo_in->num_pairs);
+   if (pair NE NULL) {
+      if ( strcmp(pair->value,KWD_FLAG_ON) EQ 0 ) {
+        strcat(record, " (G)");
+        g_added = TRUE;                                    /* ps0280 */
+     }
+  }
+
+  /*
+   * ps0280. For DATASET resource class, add
+   * (G) parameter in case resource name includes
+   * mask chars and this parameter has not been added
+   * by GENERIC=Y parameter
+   */
+
+   if ( NOT (g_added) )  {                                   /*ps0280*/
+     tmp = strpbrk(res_params_in->resource, "%*&");          /*ps0280*/
+     if (tmp)                                                /*ps0280*/
+       strcat(record, " (G)");                               /*ps0280*/
+  }                                                          /*ps0280*/
+ }                                                           /*ps0280*/
+
+  pair = ADDINFO_search("VOLUME", RCF_ADDINFO_KWD_LEN,
+                        addinfo_in->pair,
+                        addinfo_in->num_pairs);
+  if (pair NE NULL) {
+    if ( pair->vallen GT 0) {
+        strcat(record, " ");
+        strcat(record, pair->value);
+   }
+ }
+
+  ESA_DIAG_printf(ESA_COMP_GETRES,3,
+                  "record=%s", record);
+
+  /**  Allocate area for search file and ptrs to records **/
+
+  len = strlen(record) + 2;
+
+  /**  Allocate area for search file **/
+
+  entry->search_results = (char *) malloc(len);
+  if ( NOT entry->search_results ) {
+      CTSAMSG_print (ERR_MALLOC, msgs, NULL, dest,
+                     "Search result records area", len );
+      rc = ESA_FATAL;
+      goto exit;
+ }
+
+  /**  Allocate area for ptrs to records **/
+
+  entry->search_records = (char **) malloc(sizeof(char *));
+  if ( NOT entry->search_records ) {
+      CTSAMSG_print (ERR_MALLOC, msgs, NULL, dest,
+                 "Search result records ptrs area", sizeof(char *));
+      rc = ESA_FATAL;
+      goto exit;
+ }
+
+  /**  Save info about single resource **/
+
+  tmp = entry->search_results;  /* Record ptr */
+
+  /*  Save info. */
+
+  strcpy(tmp, record);               /* Move record        */
+  entry->search_records[0] = tmp;    /* Save ptr to record */
+  entry->max_search_rec    = 1;
+
+ /*
+  *   Finish
+  */
+
+  exit : ;
+
+  ESA_DIAG_exit(ESA_COMP_GETRES, 3, func, rc);
+
+  return rc;
+}
+
+ /* ******* Drop AIT *******                **** WS10082 ***
+  * ************************                ****************
+ @*
+  * Below is coded adapted from AIT for Windows 3.1.01
+  *@
+
+ @*ws2421 start of member resapi *@
+@****************************************************
+ * Title           : Resource & ACL API (get, add, update, delete)
+ * File Name       : resapi.c
+ * Author          : Guy Shavitt
+ * Creation Date   : 25@11@1997
+ * Description     :
+ *****************************************************@
+
+@****************************************************
+ * Mod.ID       Who     When       Description
+ * --------------------------------------------------
+ *
+ ****************************************************@
+#include "platgen.h"
+@* ws2421
+#include "globs.h"
+#include "platgenie.h"    check what is required???
+#include "pltcomp.h"
+
+#include <stdlib.h>
+#include <stdio.h>
+#include <string.h>
+
+
+#include "esaapi.h"
+#include "apicode.h"
+#include "esadiag.h"
+#include "esaadi.h"
+*@
+@* ws2421 static char component[] = "RESAPI";*@
+
+static ESA_RC Get_Res_List (RESOURCE_typ                resource,
+       RESTYPE_typ                 restype,
+       Get_Op_Handle_typ         * my_handle,
+       ADMIN_PARAMS_rec_typ      * admin_params);
+
+static int Get_One_Res (Get_List_Mode           mode,
+       RESTYPE_typ             restype,
+        Get_Op_Handle_typ     * my_handle,
+        RES_PARAMS_rec_ptr      res_params,
+                         ADDINFO_rec_ptr         addinfo,
+                         ADMIN_PARAMS_rec_typ  * admin_params);
+
+static int Get_Res_Info (FILE                  * curr_file,
+       RESTYPE_typ             restype,
+                      Get_Op_Handle_typ     * my_handle,
+       RES_PARAMS_rec_ptr      res_params,
+             ADDINFO_rec_ptr         addinfo,
+          ADMIN_PARAMS_rec_typ  * admin_params);
+
+static int Get_Res (RESOURCE_typ            curr_res,
+     RESTYPE_typ             restype,
+     Get_Op_Handle_typ     * my_handle,
+     RES_PARAMS_rec_ptr      res_params,
+     ADDINFO_rec_ptr         addinfo,
+     ADMIN_PARAMS_rec_typ  * admin_params);
+
+@*ws2421 static int Get_ACE (Get_Op_Handle_typ * my_handle,
+     RES_PARAMS_rec_ptr      res_params,
+     ACE_rec_typ           * ace,
+     ADDINFO_rec_ptr         addinfo,
+     ADMIN_PARAMS_rec_typ  * admin_params);
+*@
+static ESA_RC Write_Res_Params (FILE                   * file_handle,
+           RES_PARAMS_rec_typ     * res_params,
+        Write_Res_Params_Mode    mode,
+           ADMIN_PARAMS_rec_typ   * admin_params);
+@*ws2421
+static ESA_RC Write_ACE_Params (FILE                   * file_handle,
+           ACE_rec_typ            * ace,
+           ADMIN_PARAMS_rec_typ   * admin_params);
+
+static ESA_RC Write_ACE_Pos (FILE                   * file_handle,
+           ACE_POS_typ              pos,
+        ADMIN_PARAMS_rec_typ   * admin_params);
+ *@
+@*ws2421 static ESA_RC Check_ACE_Attr (char *,
+               ACE_ATTR_typ *,
+               ADMIN_PARAMS_rec_typ *);
+
+static ESA_RC Check_ACE_Type (char *,
+               ACE_TYPE_typ *,
+               ADMIN_PARAMS_rec_typ *);  *@
+
+@****************************************************
+ * Procedure Name: CTSGetResAIT
+ *
+ * Description   : Get resource RSS info
+ *
+ * Input         : mode          - GET_FREE_HANDLE, otherwise ignored
+ *                 max_ress      - # of elements in res_params &
+ *                                 addinfo_out arrays
+ *                 admin_params
+ *                 res_params_in - resource to retrieve
+ *                 addinfo_in    - additional retrieval parameters
+ *
+ * Output        : actual_num    - # of resources returned
+ *                 have_more     - HAVE_MORE if more resources
+ *                 res_params    - Returned resources
+ *                 err           - error indication, message, etc.
+ *
+ * Input@Output  : addinfo       - array of max_ress pointers:
+ *                                 add.info per resource, caller puts
+ *                                 requested keywords, callee returns
+ *                                 actual add.info, per resource.
+ *                 handle        - NULL on first call, filled by callee,
+ *                                 used by callee to keep track.
+ *
+ * Return Value  : ESA_RC
+ *
+ * Side Effects  : The function may allocate memory for internal usage
+ *                 and return pointer to it in *handle.
+ *                 Memory will be freed when function returns
+ *                 have_more==NO_MORE.
+ *                 If caller stop calling the function before NO_MORE,
+ *                 he MUST call the function with mode=GET_FREE_HANDLE
+ *                 to free the memory.
+ ****************************************************@
+
+static ESA_RC CTSGetResAIT (GET_RESOURCE_MODE   mode,  @*ws2421*@
+               OE_typ                 oe,
+               short                  max_ress,
+               short                * actual_num,
+               HAVE_MORE_typ        * have_more,
+               void                ** handle,
+               RES_PARAMS_rec_typ   * res_params_in,
+               ADDINFO_rec_typ      * addinfo_in,
+               RES_PARAMS_rec_typ     res_params[1],
+               ADDINFO_rec_typ      * addinfo_out[1],
+               ADMIN_PARAMS_rec_typ * admin_params,
+               ERR_STRUCT_rec_typ   * err)
+
+{
+  static char * function = "CTSGetResAIT";
+
+  ESA_RC                        rc = ESA_OK;
+  CTSAMSG_HANDLE_rec_ptr        msgs;
+  CTSAMSG_DEST_TABLE_rec_ptr    dest;
+  Get_Op_Handle_typ           * my_handle;
+  RSS_typ                       rss_name;
+  USER_typ                      admin;
+  int                           get_res_rc, iterate;
+
+  admin_params->cs_func.DIAG_enter_ptr (
+               ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  @* By default we return one resource, with more to come *@
+  *actual_num = 1;
+  *have_more = HAVE_MORE;
+
+  @* If it's not a FREE_HANDLE call and the handle is NULL, create it *@
+  if ( (*handle EQ NULL) AND (mode NE GET_FREE_HANDLE_RESOURCES) )
+  {
+    @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+    ESA_DIAG_printf(                                   @*IS10182*@
+                     ESA_COMP_GETRES, DEBUG_IMPORTANT,
+                  "First time. Allocate handle");
+
+    *handle = (void *) malloc (sizeof(Get_Op_Handle_typ));
+
+    if (*handle EQ NULL)
+    {
+      CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                    "Get Res Handle", sizeof(Get_Op_Handle_typ));
+      rc = ESA_FATAL;
+   goto exit;
+ }
+
+ my_handle = (Get_Op_Handle_typ *) *handle;
+
+ @* Initialize the handle *@
+ my_handle -> got_list = FALSE;
+    my_handle -> reached_end = FALSE;
+ strcpy (my_handle -> oe, "");
+ strcpy (my_handle -> filename, "");
+@*    strcpy (my_handle -> script, "");*@
+  }
+
+  my_handle = (Get_Op_Handle_typ *) *handle;
+
+  @* Get rss name and admin name from admin_params *@
+  strcpy (rss_name, admin_params -> rss_name);
+  strcpy (admin, admin_params -> admin_uname);
+
+  @* Check processing mode *@
+  if (mode EQ GET_FREE_HANDLE_RESOURCES)
+  {
+    @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+    ESA_DIAG_printf(                                 @*IS10182*@
+                     ESA_COMP_GETRES, DEBUG_IMPORTANT,
+                  "mode=GET_FREE_HANDLE_RES");
+    *have_more = NO_MORE;
+ goto exit;
+  }
+  else
+  {
+    @* Did we send the last resource in the list last time ? *@
+ if (my_handle -> reached_end)
+ {
+      @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+      ESA_DIAG_printf(                                  @*IS10182*@
+                     ESA_COMP_GETRES, DEBUG_IMPORTANT,
+                  "reached end- last res was sent last time");
+   *actual_num = 0;
+   *have_more = NO_MORE;
+ @*ws2421 P3270_Delete_File (my_handle -> filename, admin_params);*@
+   goto exit;
+ }
+
+ @* Did we already get the res list for current transaction ?   *@
+ if (NOT my_handle -> got_list)
+ {
+   rc = Get_Res_List (res_params_in -> resource,
+       res_params_in -> restype,
+       my_handle,
+       admin_params);
+
+   if (rc NE ESA_OK)
+   {
+ @* ws2421 P3270_Delete_File (my_handle -> filename, admin_params); *@
+     @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+     ESA_DIAG_printf(                                   @*IS10182*@
+                         ESA_COMP_GETRES, DEBUG_IMPORTANT,
+                   "Get_Res_List failed rc=%d", rc);
+     goto exit;
+   }
+
+   my_handle -> got_list = TRUE;
+
+   get_res_rc = Get_One_Res (GET_LIST_FIRST,
+        res_params_in -> restype,
+           my_handle,
+        &(res_params[0]),
+           addinfo_out[0],
+        admin_params);
+
+   iterate = TRUE;
+
+   while (iterate)
+   {
+     switch (get_res_rc)
+  {
+    case GET_OP_OK:
+
+            @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+            ESA_DIAG_printf(                          @*IS10182*@
+                     ESA_COMP_GETRES, DEBUG_IMPORTANT,
+                  "After Get_one_res - GET_OP_OK");
+      *actual_num = 1;
+      *have_more = HAVE_MORE;
+      rc = ESA_OK;
+   iterate = FALSE;
+            break;
+
+    case GET_OP_EOF:
+
+            @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+            ESA_DIAG_printf(                         @*IS10182*@
+                     ESA_COMP_GETRES, DEBUG_IMPORTANT,
+                  "After Get_one_res - GET_OP_EOF");
+      *actual_num = 0;
+      *have_more = NO_MORE;
+  @*ws2421 P3270_Delete_File (my_handle -> filename, admin_params); *@
+      rc = ESA_OK;
+   iterate = FALSE;
+      break;
+
+    default:
+            @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+            ESA_DIAG_printf(                          @*IS10182*@
+                     ESA_COMP_GETRES, DEBUG_IMPORTANT,
+                  "After Get_one_res - default");
+      rc = ESA_OK;
+   iterate = TRUE;
+         get_res_rc = Get_One_Res (GET_LIST_NEXT,
+           res_params_in -> restype,
+              my_handle,
+           &(res_params[0]),
+           addinfo_out[0],
+           admin_params);
+      break;
+  }
+   } @* while *@
+    }  @*endif got list *@
+    else
+ {
+   iterate = TRUE;
+
+   while (iterate)
+   {
+     get_res_rc = Get_One_Res (GET_LIST_NEXT,
+          res_params_in -> restype,
+          my_handle,
+          &(res_params[0]),
+          addinfo_out[0],
+          admin_params);
+
+     switch (get_res_rc)
+  {
+    case GET_OP_OK:
+
+            @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+            ESA_DIAG_printf(                         @*IS10182*@
+                     ESA_COMP_GETRES, DEBUG_IMPORTANT,
+                  "After Get_one_res next - GET_OP_OK");
+      *actual_num = 1;
+      *have_more = HAVE_MORE;
+      rc = ESA_OK;
+      iterate = FALSE;
+            break;
+
+    case GET_OP_EOF:
+
+            @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+            ESA_DIAG_printf(                         @*IS10182*@
+                     ESA_COMP_GETRES, DEBUG_IMPORTANT,
+                  "After Get_one_res next - GET_OP_EOF");
+      *actual_num = 0;
+      *have_more = NO_MORE;
+   @*ws2421 P3270_Delete_File (my_handle -> filename, admin_params);*@
+      rc = ESA_OK;
+      iterate = FALSE;
+      break;
+
+    default:
+            @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+            ESA_DIAG_printf(                          @*IS10182*@
+                     ESA_COMP_GETRES, DEBUG_IMPORTANT,
+                  "After Get_one_res next - default");
+      iterate = TRUE;
+      break;
+  }
+   } @* while *@
+ }
+  }
+
+  exit:
+
+  @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+  ESA_DIAG_printf(                                  @*IS10182*@
+                     ESA_COMP_GETRES, DEBUG_IMPORTANT,
+                  "Exiting with have_more = (%d)",*have_more);
+
+  if ( (rc NE ESA_OK) OR (*have_more EQ NO_MORE) )
+  {
+    if ( *handle NE NULL )
+ {
+ @*ws2421 P3270_Delete_File (my_handle -> filename, admin_params); *@
+
+   free (my_handle);
+      *handle = NULL;
+ }
+
+ *have_more = NO_MORE;
+  }
+
+  @*IS10182 admin_params->cs_func.DIAG_exit_ptr (*@
+  ESA_DIAG_exit(                                   @*IS10182*@
+              ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function, rc);
+
+  return rc;
+
+}  @* CTSGetResAIT *@
+
+
+
+@****************************************************
+ * Procedure Name: Get_Res_List
+ *
+ * Description   : Call script to return list of all resources
+ *
+ * Input         : get_op_handle
+ *                 admin_params
+ *
+ * Return Value  : ESA_RC
+ ****************************************************@
+
+static ESA_RC Get_Res_List (RESOURCE_typ                resource,
+       RESTYPE_typ                 restype,
+       Get_Op_Handle_typ         * my_handle,
+       ADMIN_PARAMS_rec_typ      * admin_params)
+{
+
+  static char * function = "Get_Res_List";
+
+  ESA_RC                        rc = ESA_OK;
+  CTSAMSG_HANDLE_rec_ptr        msgs;
+  CTSAMSG_DEST_TABLE_rec_ptr    dest;
+  Parm_typ                    * out_parms = NULL;
+  int                           num_parms, script_rc;
+
+  admin_params->cs_func.DIAG_enter_ptr (
+                ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  num_parms = 2;
+  out_parms = (Parm_typ *) malloc (sizeof(Parm_typ) * num_parms);
+
+  if (out_parms EQ NULL)
+    goto malloc_failed;
+
+  strcpy (out_parms[0], resource);
+  strcpy (out_parms[1], restype);
+
+  @* Execute the script                         *@
+        rc = P3270_Execute_Script ('L',
+                          num_parms,
+              0,
+            out_parms,
+        NULL,
+                          SN_RESLIST,            @* script name *@
+        my_handle -> filename,
+        TRUE,                       @* Write login data = YES   *@
+        &script_rc,
+           admin_params);
+
+
+  if (rc EQ ESA_OK)
+  {
+ switch (script_rc)
+ {
+   case SCRIPT_RC_OK:
+        break;
+
+   case SCRIPT_RC_WARN:
+        my_handle -> reached_end = TRUE;
+  break;
+
+   case SCRIPT_RC_FATAL:
+  rc = ESA_FATAL;
+  break;
+
+   default:
+  rc = ESA_FATAL;
+  break;
+ }
+  }
+
+  goto exit;
+
+  malloc_failed:
+
+  CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                "Parms structure", (sizeof(Parm_typ) * num_parms));
+
+  exit:
+
+  if (out_parms NE NULL)            @* BSAN101304 *@
+     free(out_parms);
+
+  admin_params->cs_func.DIAG_exit_ptr (
+                 ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function, rc);
+
+  return rc;
+
+} @* Get_Res_List *@
+
+@****************************************************
+ * Procedure Name: Get_One_Res
+ *
+ * Description   : Get one resource from res list
+ *
+ * Input         : mode - FIRST or NEXT
+ *       resource type
+ *                 get_op_handle
+ *                 res_params
+ *       addinfo
+ *                 admin_params
+ *
+ * Return Value  : GET_OP_OK        (0) - Ok
+ *                 GET_OP_EOF       (4) - No more resources
+ *                 GET_OP_ERROR     (8) - Error
+ ****************************************************@
+
+ static int Get_One_Res (Get_List_Mode           mode,
+       RESTYPE_typ             restype,
+        Get_Op_Handle_typ     * my_handle,
+        RES_PARAMS_rec_ptr      res_params,
+                         ADDINFO_rec_ptr         addinfo,
+                         ADMIN_PARAMS_rec_typ  * admin_params)
+{
+
+  static char * function = "Get_One_Res";
+
+  int                           rc = GET_OP_OK;
+  FILE                        * curr_file;
+  CTSAMSG_HANDLE_rec_ptr        msgs;
+  CTSAMSG_DEST_TABLE_rec_ptr    dest;
+
+  admin_params->cs_func.DIAG_enter_ptr (
+                ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+  ESA_DIAG_printf(                                   @*IS10182*@
+                   ESA_COMP_GETRES, DEBUG_NORMAL,
+                "mode=%d", mode);
+
+  if (my_handle -> reached_end)
+  {
+    rc = GET_OP_EOF;
+ goto exit;
+  }
+
+  if (my_handle -> filename[0] EQ NULL_CHAR)
+  {
+    CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,function,
+                  "Missing filename", 16,__LINE__);
+ rc = GET_OP_ERROR;
+ goto exit;
+  }
+
+  @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+  ESA_DIAG_printf(                                 @*IS10182*@
+                   ESA_COMP_GETRES, DEBUG_NORMAL,
+                "filename=(%s)", my_handle -> filename);
+
+  curr_file = P3270_Open_Read_File (my_handle -> filename,
+                                 admin_params);
+
+  if (curr_file EQ NULL)
+  {
+    CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,function,
+                  "Error opening file", 16,__LINE__);
+    rc = GET_OP_ERROR;
+ goto exit;
+  }
+
+  @* Select operating mode *@
+  switch (mode)
+  {
+
+    case GET_LIST_FIRST:
+
+   @*IS10182admin_params->cs_func.DIAG_printf_ptr (*@
+   ESA_DIAG_printf(                                  @*IS10182*@
+                       ESA_COMP_GETRES, DEBUG_NORMAL,
+                 "get_list_first");
+   break;
+
+ case GET_LIST_NEXT:
+
+      rc = fsetpos (curr_file, &(my_handle -> file_pos));
+
+   if (rc NE 0)
+   {
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component, function,
+                      "Error setting file position", mode,__LINE__) ;
+     rc = GET_OP_ERROR;
+     goto close_file;
+   }
+
+   break;
+
+ default:
+   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component, function,
+                    "Invalid mode", mode,__LINE__) ;
+   rc = GET_OP_ERROR;
+   goto exit;
+  }
+
+  rc = Get_Res_Info (curr_file,
+      restype,
+                  my_handle,
+              res_params,
+         addinfo,
+      admin_params);
+
+  close_file:
+
+  fclose (curr_file);
+
+  exit:
+
+  admin_params->cs_func.DIAG_exit_ptr (
+                  ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function, rc);
+
+  return rc;
+
+} @* Get_One_Res *@
+
+@****************************************************
+ * Procedure Name: Get_Res_Info
+ *
+ * Description   : Get resource info from res list
+ *
+ * Input         : file pointer
+ *       resource type
+ *                 get_op_handle
+ *                 res_params
+ *                 addinfo
+ *                 admin_params
+ *
+ * Return Value  : GET_OP_OK        (0) - Ok
+ *                 GET_OP_EOF       (4) - No more resources
+ *                 GET_OP_ERROR     (8) - Error
+ ****************************************************@
+
+static int Get_Res_Info (FILE                  * curr_file,
+       RESTYPE_typ             restype,
+                      Get_Op_Handle_typ     * my_handle,
+       RES_PARAMS_rec_ptr      res_params,
+             ADDINFO_rec_ptr         addinfo,
+          ADMIN_PARAMS_rec_typ  * admin_params)
+{
+
+  static char * function = "Get_Res_Info";
+
+  int                           rc = GET_OP_NOT_FOUND;
+  CTSAMSG_HANDLE_rec_ptr        msgs;
+  CTSAMSG_DEST_TABLE_rec_ptr    dest;
+  Parm_typ                      curr_record;
+  USER_typ                      curr_res;
+  char                          msg[256]="";
+  int                           lrc;
+
+  admin_params->cs_func.DIAG_enter_ptr (
+                ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  @* Loop until we get an existing resource, eof or an error *@
+  while (rc EQ GET_OP_NOT_FOUND)
+  {
+    if (my_handle -> reached_end)
+ {
+   @*IS10182admin_params->cs_func.DIAG_printf_ptr (*@
+   ESA_DIAG_printf(                                @*IS10182*@
+                       ESA_COMP_GETRES, DEBUG_NORMAL,
+                 "End-of-file reached. Close file");
+   fclose (curr_file);
+      rc = GET_OP_EOF;
+   break;
+ }
+
+    @* Read resource from res list file *@
+    fscanf (curr_file, "%s\n", curr_record);
+
+    @* Have we reached the end of the res list ? *@
+    if (feof (curr_file))
+      my_handle -> reached_end = TRUE;
+
+    @* Save the file position *@
+    lrc = fgetpos (curr_file, &(my_handle -> file_pos));
+
+    if (lrc NE 0)
+ {
+      CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,function,
+                    "Get File Position failed", 16,__LINE__);
+      rc = GET_OP_ERROR;
+   break;
+ }
+
+ if (strstr (curr_record, "NO_RESOURCES_MATCHING") NE NULL)
+ {
+   my_handle -> reached_end = TRUE;
+   rc = GET_OP_EOF;
+   break;
+ }
+
+    @* Get the current resource *@
+    strcpy (curr_res, curr_record);
+
+    rc = Get_Res (curr_res,
+      restype,
+               my_handle,
+            res_params,
+         addinfo,
+         admin_params);
+
+ if (rc EQ GET_OP_ERROR)
+ {
+   sprintf (msg, "Get Res failed for resource(%s)", curr_res);
+   CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,function,
+                    msg, 16,__LINE__);
+ }
+
+  } @* while loop *@
+
+  admin_params->cs_func.DIAG_exit_ptr (
+                ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function, rc);
+
+  return rc;
+
+} @* Get_Res_Info *@
+
+@****************************************************
+ * Procedure Name: Get_Res
+ *
+ * Description   : Get one resource data
+ *
+ * Input         : resource name
+ *       resource type
+ *                 get_op_handle
+ *                 res_params
+ *                 addinfo
+ *                 admin_params
+ *
+ * Return Value  : GET_OP_OK          (0) - Ok
+ *                 GET_OP_NOT_FOUND   (2) - Resource not found
+ *                 GET_OP_ERROR       (8) - Error
+ ****************************************************@
+
+static int Get_Res (RESOURCE_typ            curr_res,
+     RESTYPE_typ             restype,
+     Get_Op_Handle_typ     * my_handle,
+     RES_PARAMS_rec_ptr      res_params,
+     ADDINFO_rec_ptr         addinfo,
+     ADMIN_PARAMS_rec_typ  * admin_params)
+
+{
+
+  static char * function = "Get_Res";
+
+  int                           rc = GET_OP_OK;
+  ESA_RC                        arc;
+  CTSAMSG_HANDLE_rec_ptr        msgs;
+  CTSAMSG_DEST_TABLE_rec_ptr    dest;
+  FILE                        * res_file = NULL;
+  Filename_typ                  input_filename;
+  Parm_typ                      curr_record;
+  Parm_typ                      out_parms[4];
+  char                        * newline;
+  char                          keyword [MAX_RSS_ADDINFO_KWD_LEN+1];
+  char                          value [MAX_RSS_ADDINFO_VAL_LEN+1];
+  @*ws2421 int                 new_res = FALSE, got_res = FALSE;*@
+  int       got_res_params, script_rc;
+
+  admin_params->cs_func.DIAG_enter_ptr (
+              ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  @* Copy resource name and type to res params *@
+  if (res_params NE NULL)
+  {
+    strcpy (res_params -> resource, curr_res);
+ strcpy (res_params -> restype, restype);
+  }
+
+
+  @* Set the parameters to GETRES *@
+  strcpy (out_parms[0], curr_res);
+  strcpy (out_parms[1], restype);
+
+  @* Execute the script *@
+        arc = P3270_Execute_Script ('G',
+                           2,                       @* num params *@
+                0,
+             out_parms,
+         NULL,
+                           SN_GETRES,               @* script name *@
+         input_filename,
+         TRUE,                    @* Write login data = YES   *@
+         &script_rc,
+            admin_params);
+
+
+  if (arc NE ESA_OK)
+  {
+ @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+ ESA_DIAG_printf(                                @*IS10182*@
+                     ESA_COMP_GETRES, DEBUG_IMPORTANT,
+               "Bad rc from Execute_Script");
+    rc = GET_OP_ERROR;
+ goto exit;
+  }
+
+  switch (script_rc)
+  {
+    case SCRIPT_RC_OK:
+      break;
+
+ case SCRIPT_RC_WARN:
+      rc = GET_OP_NOT_FOUND;
+   goto exit;
+
+    case SCRIPT_RC_FATAL:
+   rc = GET_OP_ERROR;
+   goto exit;
+
+ default:
+   rc = GET_OP_ERROR;
+   goto exit;
+  }
+
+  @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+  ESA_DIAG_printf(                                 @*IS10182*@
+                   ESA_COMP_GETRES, DEBUG_NORMAL,
+                "Opening resinfo input file (%s)", input_filename);
+
+  @* Open the resource data input file *@
+  res_file = P3270_Open_Read_File (input_filename,
+                                admin_params);
+
+  if (res_file EQ NULL)
+  {
+    CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,function,
+                  "Error opening file", 16,__LINE__);
+    rc = GET_OP_ERROR;
+ goto exit;
+  }
+
+  strcpy (curr_record, " ");
+
+  if (feof (res_file))
+    @*IS10182admin_params->cs_func.DIAG_printf_ptr (*@
+    ESA_DIAG_printf(                                 @*IS10182*@
+                     ESA_COMP_GETRES, DEBUG_NORMAL,
+                  "End of file occured !!!");
+
+  got_res_params = FALSE;
+
+  @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+  ESA_DIAG_printf(                                 @*IS10182*@
+                   ESA_COMP_GETRES, DEBUG_NORMAL,
+                "Handle reading of res_params");
+
+  @* Read the res params *@
+  while (NOT got_res_params)
+  {
+ fscanf (res_file, "%s\n", curr_record);
+
+ newline = strchr (curr_record, '\n');
+
+ if (newline NE NULL)
+   *newline = NULL_CHAR;
+
+ @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+ ESA_DIAG_printf(                                    @*IS10182*@
+                     ESA_COMP_GETRES, DEBUG_NORMAL,
+               "record=*%s*", curr_record);
+
+ @* Did we reach end of RES_PARAMS ? *@
+ if (strcmp (curr_record, "RES_PARAMS_END") EQ 0)
+ {
+   got_res_params = TRUE;
+   break;
+ }
+
+    arc = Get_Keyword_Value (curr_record,
+                       keyword,
+           value,
+           admin_params);
+
+    if (arc NE ESA_OK)
+    {
+      rc = GET_OP_ERROR;
+   goto exit;
+ }
+
+ @* Handle PARENT OE *@
+ if (strcmp (keyword, "PARENTOE") EQ 0)
+ {
+   if (res_params NE NULL)
+     strcpy (res_params -> parent_oe, value);
+   continue;
+ }
+  }
+
+  @* Read the addinfo *@
+  arc = P3270_Get_Addinfo (res_file,
+         addinfo,
+         admin_params);
+
+  if (arc NE ESA_OK)
+    rc = GET_OP_ERROR;
+
+  exit:
+
+  if (res_file NE NULL)
+  {
+    clearerr (res_file);
+
+    fclose (res_file);
+  }
+
+  @* ws2421 P3270_Delete_File (input_filename,
+                     admin_params);  *@
+
+  admin_params->cs_func.DIAG_exit_ptr (
+                ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function, rc);
+
+  return rc;
+
+} @* Get_Res *@
+
+@****************************************************
+ * Procedure Name : Write_Res_Params
+ *
+ * Description    : Write res_params data to file
+ *
+ * Input          : file handle
+ *                  res params
+ *                  write params mode
+ *                  admin params
+ *
+ * Output         : None
+ *
+ * Return Value   : ESA_RC
+ ***************************************************@
+
+static ESA_RC Write_Res_Params (FILE                   * file_handle,
+           RES_PARAMS_rec_typ     * res_params,
+        Write_Res_Params_Mode    mode,
+           ADMIN_PARAMS_rec_typ   * admin_params)
+{
+
+  static char * function = "Write_Res_Params";
+
+  ESA_RC                        rc = ESA_OK;
+  CTSAMSG_HANDLE_rec_ptr        msgs;
+  CTSAMSG_DEST_TABLE_rec_ptr    dest;
+  Parm_typ                      full_parm;
+  char                          parm_value[2];
+
+  admin_params->cs_func.DIAG_enter_ptr (
+                ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  parm_value [1] = NULL_CHAR;
+
+  if (mode EQ WRITE_ALL_PARAMS)
+  {
+    @* Write resource name *@
+    Build_Parm ("RESNAME", res_params -> resource, full_parm, admin_params);
+    fprintf (file_handle, "%s\n", full_parm);
+
+    @* Write resource type *@
+    Build_Parm ("RESTYPE", res_params -> restype, full_parm, admin_params);
+    fprintf (file_handle, "%s\n", full_parm);
+  }
+
+  @* Write PARENT OE *@
+  Build_Parm ("PARENTOE", res_params -> parent_oe, full_parm, admin_params);
+  fprintf (file_handle, "%s\n", full_parm);
+
+  fprintf (file_handle, "RES_PARAMS_END\n");
+
+
+  admin_params->cs_func.DIAG_exit_ptr (
+               ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function, rc);
+
+  return rc;
+
+} @* Write_Res_Params *@
+
+@* ========================ws2421 == from scrproc.c =============*@
+@****************************************************
+ * Procedure Name: P3270_Execute_Script
+ *
+ * Description   : Write parms, execute script, read parms
+ *
+ * Input         : component-unique file identifier
+ *                 num of input parms
+ *                 num of output parms
+ *                 input parms array
+ *                 output parms array
+ *                 script name
+ *                 admin params
+ *
+ * Output        : output parms array
+ *                 script output filename
+ *                 script completion code
+ *
+ * Return Value  : ESA_RC
+ ****************************************************@
+
+static ESA_RC P3270_Execute_Script (char                    unique_id,
+        int                     num_in_parms,
+        int               num_out_parms,
+        Parm_typ                input_parms[],
+        Parm_typ                output_parms[],
+        Filename_typ            script,
+        Filename_typ            filename,
+        int                     write_login,
+        int             * script_rc,
+        ADMIN_PARAMS_rec_typ  * admin_params)
+
+{
+
+  static char * function = "P3270_Execute_Script";
+
+  @*ws2421 typedef void *HANDLE;              *@             @*ws2421*@
+   char                         cmd[MAX_API_ST];      @*ws2421 IS0264*@
+   int                          tso_rc;               @*ws2421*@
+  ESA_RC                        rc = ESA_OK;
+  CTSAMSG_DEST_TABLE_rec_typ  * dest;
+  CTSAMSG_HANDLE_rec_typ      * msgs;
+  FILE                        * msg_file_handle;
+  RSS_typ                       rss_name;
+  USER_typ                      admin;
+  Filename_typ                  input_file="", output_file="";
+  Filename_typ     done_file="", msg_file="";
+  Filename_typ                  script_file="";
+  @*ws2421 Path_typ  shell_name=""; *@
+  Parm_typ                      done_record[1], msg_record;
+  @*ws2421 HANDLE                    lock_ptr = NULL; *@
+  @*ws2421 char                      unique_in[2], unique_out[2];*@
+  @*ws2421 char               unique_done[2], unique_msg[2];*@
+  char                        * newline;
+  @*ws2421 char               parm_get[201], num_char[7]; *@
+  @*ws2421 char               full_dir[201];
+  int                parm_len; *@
+  @*ws2421 int              sys_rc = 0, wait_unit, max_wait; *@
+  @*ws2421 int                   file_exists, count_time, counter; *@
+
+  #define SCRIPT_DIR           "SCRIPT_DIR"
+  #define SCRIPT_NAME_LEN      MAX_FILENAME_LEN
+  typedef char SCRIPT_NAME_typ [SCRIPT_NAME_LEN + 1];
+  SCRIPT_NAME_typ              script_dir;
+  char                         eoddn[9] = EXECOUT_DDNAME; @* IS10174 *@
+
+  @* IS10174 - remove the definitions below
+  #ifdef UNIX
+  int                 wait_unit_unix;
+  int          k,pid,status;
+  #endif
+
+  #ifdef WINNT
+  int                 close_ok;
+  #endif
+  *@
+
+  admin_params->cs_func.DIAG_enter_ptr (
+                  ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+  ESA_DIAG_printf(                                  @*IS10182*@
+                   ESA_COMP_GETRES, DEBUG_NORMAL,
+                   "execute script=(%s)", script);
+  @*ws2421*@
+  @* Do we have script wait parms in RSSPARM ? if not, use defaults *@
+  @*
+  rc = admin_params -> cs_func.rssprm_get_opt_ptr(
+                                 "ALL_RSS",
+                              "SCRIPT_WAIT_UNIT",
+                                 sizeof(parm_get),
+                                 parm_get,
+                  OPT_TRUE,
+               OPT_TRUE);
+
+  if (rc NE ESA_OK)
+    wait_unit = P3270_WAIT_UNIT;
+  else
+  {
+    parm_len = strlen(parm_get);
+    memset(num_char, ' ', sizeof(num_char)-1 );
+    num_char[sizeof(num_char)-1] = NULL_CHAR;
+    memcpy(num_char, parm_get, parm_len);
+
+    Trim (num_char);
+ wait_unit = atoi (num_char);
+
+  }
+
+  admin_params->cs_func.DIAG_printf_ptr (
+                     ESA_COMP_GETRES, DEBUG_NORMAL, "wait unit(%d)", wait_unit);
+
+  rc = admin_params -> cs_func.rssprm_get_opt_ptr(
+                             "ALL_RSS",
+                             "SCRIPT_MAX_WAIT",
+                              sizeof(parm_get),
+                              parm_get,
+               OPT_TRUE,
+             OPT_TRUE);
+
+  if (rc NE ESA_OK)
+    max_wait = P3270_MAX_WAIT_TIME;
+  else
+  {
+    parm_len = strlen(parm_get);
+    memset(num_char, ' ', sizeof(num_char)-1 );
+    num_char[sizeof(num_char)-1] = NULL_CHAR;
+    memcpy(num_char, parm_get, parm_len);
+
+    Trim (num_char);
+ max_wait = atoi (num_char);
+  }
+
+  admin_params->cs_func.DIAG_printf_ptr (
+                   ESA_COMP_GETRES, DEBUG_NORMAL, "wait unit(%d) max wait(%d)",
+       wait_unit, max_wait);
+
+  @* Get scripts work dir from RSSPARM *@
+  @*ws2421*@
+  @*
+  rc = rsstprm_get (admin_params->rss_type,
+                    SCRIPT_SHELL,
+                    sizeof(parm_get),
+               parm_get,
+                    admin_params);
+
+  if (rc NE ESA_OK)
+  {
+    CTSAMSG_print (P3270_MISSING_RSSTPARM, admin_params->ctsamsg_handle,
+             NULL, admin_params->ctsamsg_dest,
+                   SCRIPT_SHELL, admin_params -> rss_type);
+
+    rc = ESA_FATAL;
+    goto exit;
+  }
+
+  @* convert variables in name *@
+  @*ws2421*@
+  @*
+  rc = rsstprm_format_filename  (parm_get,
+                              sizeof(full_dir),
+                                 full_dir,
+         admin_params);
+  if (rc NE ESA_OK)
+    goto exit;
+
+  parm_len = strlen(full_dir);
+  memset(shell_name, ' ', sizeof(Filename_typ)-1 );
+  shell_name[sizeof(Filename_typ)-1] = NULL_CHAR;
+  memcpy(shell_name, full_dir, parm_len);
+
+  Trim (shell_name);
+
+  rc = Lock_Script (&lock_ptr, admin_params);
+
+  if (rc NE ESA_OK)
+    goto exit;
+
+  admin_params->cs_func.DIAG_printf_ptr (
+                   ESA_COMP_GETRES, DEBUG_NORMAL,
+                "Script Lock handle(%X)",  lock_ptr);
+  *@
+  strcpy (rss_name, admin_params -> rss_name);
+  strcpy (admin, admin_params -> admin_uname);
+
+
+  @*ws2421*@
+  @*
+  unique_in   [0] = unique_id;
+  unique_in   [1] = 'I';
+  unique_out  [0] = unique_id;
+  unique_out  [1] = 'O';
+  unique_done [0] = unique_id;
+  unique_done [1] = 'D';
+  unique_msg  [0] = unique_id;
+  unique_msg  [1] = 'M';
+  @* Generate unique filenames *@
+  @* P3270_Generate_Filename(&input_file, unique_in);
+     P3270_Generate_Filename(&output_file, unique_out);
+     P3270_Generate_Filename(&done_file, unique_done);
+     P3270_Generate_Filename(&msg_file, unique_msg);
+  *@
+
+  @*ws2421 the next lines *@
+  if (unique_id EQ 'G')
+     strcpy (output_file, "AITOUT");
+  else   @* L    *@
+     strcpy (output_file, "AITLIST");
+  strcpy (input_file, "AITIN");
+  strcpy (done_file, "AITDONE");
+  strcpy (msg_file, "AITMSG");
+
+  strcpy (filename, output_file);
+
+  @* Delete existing files (if any) *@
+  @* ws2421 no delete
+  admin_params->cs_func.DIAG_printf_ptr (
+                   ESA_COMP_GETRES, DEBUG_NORMAL,
+                "deleting files in(%s) out(%s) done(%s) msg(%s)",
+       input_file, output_file, done_file, msg_file);
+
+  P3270_Delete_File (input_file,  admin_params);
+  P3270_Delete_File (output_file, admin_params);
+  P3270_Delete_File (done_file,   admin_params);
+  P3270_Delete_File (msg_file,    admin_params);
+
+  admin_params->cs_func.DIAG_printf_ptr (
+                   ESA_COMP_GETRES, DEBUG_NORMAL,
+                   "Shell name=(%s)", shell_name);
+  ws2421 *@
+@*  if (num_in_parms NE 0)                           no params *@
+
+    @* Write parms to script input file *@
+    rc = P3270_Write_File(input_file,
+        num_in_parms,
+        input_parms,
+        write_login,
+        admin_params);
+
+    if (rc NE ESA_OK)
+ {
+      CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component, function,
+                    "Error while writing parms to script", 16, __LINE__ );
+      rc = ESA_FATAL;
+      goto free_the_lock;
+ }
+  @*ws2421
+  rc = Build_Script_Name (script, script_file, admin_params);
+  if (rc NE ESA_OK)
+      goto free_the_lock;
+  *@
+
+  @* Flush all file buffers before script execution *@
+@*
+#ifdef WINNT
+  _flushall ();
+#endif
+
+ @*
+  * Get the script_dir from RSSPARM
+  *@
+
+ rc = admin_params->cs_func.rssprm_get_opt_ptr (
+           rss_name,
+           SCRIPT_DIR,
+           SCRIPT_NAME_LEN,
+           (char *) script_dir,
+           OPT_TRUE,
+           OPT_FALSE);
+
+ if (rc NE ESA_OK)
+ {
+    script_dir[0] = '\0';
+    rc = ESA_OK;
+ }
+  @* Run the script *@
+  @* ws2421 exec script start *@
+  @* IS10174
+       sprintf(cmd,"%%CTSAAIT %s(%s) %s %s %s %s ",                 *@
+       sprintf(cmd,"%%CTSAAIT %s(%s) %s %s %s %s %s ",   @* IS10174 *@
+               script_dir,  @*ws2421*@
+               script,      @*ws2421*@
+               eoddn,                                    @* IS10174 *@
+               input_file,
+               output_file,
+               done_file,
+               msg_file);
+
+       ESA_DIAG_printf(ESA_COMP_GETRES, 1, "Script Command=%s",cmd);
+
+       @* IS10174
+       rc = ESA_CLI_exec_wait("EXECOUT", cmd, &tso_rc, dest, msgs); *@
+       rc = ESA_CLI_exec_wait(eoddn, cmd,                @* IS10174 *@
+                              &tso_rc, admin_params);    @* IS10174 *@
+
+       ESA_DIAG_printf(ESA_COMP_GETRES, 1,
+                       "rc=%d tso_rc=%d", rc, tso_rc);
+
+       if (rc EQ ESA_OK) {
+          if (tso_rc LE MAX_OK_RC_0)
+             rc = ESA_OK;
+          else if (tso_rc LT 8)
+             rc = ESA_ERR;
+          else rc = ESA_FATAL;
+      }
+       else rc = ESA_FATAL;
+  @* ws2421 exec script end *@
+  @*
+#ifdef WINNT
+  sys_rc = _spawnl ( _P_NOWAIT,
+                    shell_name,
+                    "a",
+                    script_file,
+              input_file,
+              output_file,
+              done_file,
+              msg_file,
+                 NULL);
+#endif
+#ifdef UNIX
+  admin_params->cs_func.DIAG_printf_ptr (
+              ESA_COMP_GETRES, DEBUG_IMPORTANT,
+        "shell(%s) script(%s) input(%s) output(%s) done(%s) msg (%s)",
+              shell_name,script_file,input_file,output_file,done_file,msg_file);
+
+  if(!(pid=fork()))
+  {
+    sys_rc = execl(shell_name,
+                   "a",
+                   script_file,
+                   input_file,
+                   output_file,
+                   done_file,
+                   msg_file,
+                   NULL);
+  admin_params->cs_func.DIAG_printf_ptr (
+       ESA_COMP_GETRES, DEBUG_IMPORTANT,"execl returned (%d)",sys_rc);
+ }
+else
+{
+    k=waitpid (pid, &status, 0);
+    if(k < 0)
+      ESA_DIAG_printf (ESA_COMP_GETRES, 0,
+           " Wait for parent procces failed !!!");
+
+}
+#endif
+
+  if (sys_rc EQ -1)
+  {
+    CTSAMSG_print (ERR_INTERNAL2, msgs, NULL, dest, component, function,
+                   "Error while running script", errno, __LINE__ );
+ admin_params->cs_func.DIAG_printf_ptr (
+                     ESA_COMP_GETRES, DEBUG_IMPORTANT,
+               "Script Error script=(%s) desc=(%s)",
+                     script_file, strerror(errno));
+    rc = ESA_FATAL;
+    goto free_the_lock;
+  }
+
+  file_exists = FALSE;
+
+  count_time = 0;
+
+  @* Wait for script completion *@
+  @*
+  while (NOT file_exists AND count_time LT max_wait)
+  {
+#if WINNT
+    Sleep (wait_unit);
+#endif
+#if UNIX
+    wait_unit_unix = wait_unit@1000;
+    sleep(wait_unit_unix);
+#endif
+ admin_params->cs_func.DIAG_printf_ptr (
+                     ESA_COMP_GETRES, DEBUG_NORMAL,
+               "Waiting for file (%s) from script (%s)",
+                     done_file, script_file);
+ file_exists = P3270_File_Exists (done_file, admin_params);
+ count_time++;
+  }
+#if WINNT
+                                                         @* BSAM102477*@
+  @* free the process handle *@
+  @*
+  close_ok =  CloseHandle((HANDLE) sys_rc) ;
+  if (NOT close_ok)
+     ESA_DIAG_printf (ESA_COMP_GETRES, 0,
+                  "Close handle sys_rc failed !!!");
+
+#endif
+
+  P3270_Delete_File (input_file, admin_params);
+
+  if (NOT file_exists)
+  {
+    P3270_Delete_File (output_file, admin_params);
+ P3270_Delete_File (msg_file,    admin_params);
+
+ CTSAMSG_print (P3270_SCRIPT_TIMEOUT, msgs, NULL, dest,
+       rss_name, admin, script);
+ admin_params->cs_func.DIAG_printf_ptr (
+                     ESA_COMP_GETRES, DEBUG_IMPORTANT,
+               "Script done file does not exist. script (%s) file(%s)",
+      script_file, done_file);
+    rc = ESA_FATAL;
+    goto free_the_lock;
+  }
+
+  @* ---------- sync file was created - Get script rc from sync file -------- *@
+ @*ws2421*@
+ if (rc NE ESA_OK) goto free_the_lock;
+
+ @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+ ESA_DIAG_printf(                                    @*IS10182*@
+                    ESA_COMP_GETRES, DEBUG_IMPORTANT,
+              "Detected script completion (%s)", script_file);
+
+ rc = P3270_Read_File (done_file,
+                    1,
+        done_record,
+        admin_params);
+
+ if (rc NE ESA_OK)
+ {
+   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component, function,
+              "Error while reading rc of script", 16, __LINE__ );
+   rc = ESA_FATAL;
+   goto free_the_lock;
+ }
+ @*
+    rc = P3270_Delete_File (done_file, admin_params);
+
+ counter = 0;
+
+ while (rc NE ESA_OK AND counter LT 30)
+ {
+#ifdef WINNT
+   Sleep(1000);
+#endif
+#ifdef UNIX
+      sleep(1);
+#endif
+   counter++;
+   rc = P3270_Delete_File (done_file, admin_params);
+ }
+*@
+
+ *script_rc = atoi(done_record[0]);
+
+    @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+    ESA_DIAG_printf(                               @*IS10182*@
+                     ESA_COMP_GETRES, DEBUG_IMPORTANT,
+               "Script (%s) return code=(%d)", script_file, *script_rc);
+
+  @* ------------- print messages (if any) from msg file ----------------- *@
+
+ msg_file_handle = P3270_Open_Read_File (msg_file, admin_params);
+
+ if (msg_file_handle NE NULL)
+ {
+      fgets (msg_record, sizeof(Parm_typ), msg_file_handle);
+
+   while (NOT feof(msg_file_handle))
+   {
+     newline = strchr (msg_record, '\n');
+
+     if (newline NE NULL)
+       *newline = NULL_CHAR;
+
+     CTSAMSG_print (P3270_SCRIPT_MSG, msgs, NULL, dest, msg_record);
+
+     fgets (msg_record, sizeof(Parm_typ), msg_file_handle);
+   }
+
+   fclose (msg_file_handle);
+
+    @*ws2421 P3270_Delete_File (msg_file, admin_params); *@
+ }
+
+
+   @* ---------- Process output file -------------------------------- *@
+   @* Were we asked to read the script output parameters ?            *@
+
+ if ((num_out_parms GT 0) AND (*script_rc EQ 0))
+ {
+   @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+   ESA_DIAG_printf(                                @*IS10182*@
+                       ESA_COMP_GETRES, DEBUG_NORMAL,
+                 "Reading parms back");
+
+   rc = P3270_Read_File (output_file,
+                      num_out_parms,
+            output_parms,
+          admin_params);
+      @*
+      P3270_Delete_File (output_file, admin_params);
+      *@
+   if (rc NE ESA_OK)
+   {
+        CTSAMSG_print (ERR_INTERNAL2, msgs, NULL, dest, component, function,
+                       "Error while reading data from script", 16, __LINE__ );
+        rc = ESA_FATAL;
+        goto free_the_lock;
+   }
+ }
+
+  free_the_lock:
+  @*
+  Free_Script (&lock_ptr, admin_params);
+  *@
+  exit:
+
+  admin_params->cs_func.DIAG_exit_ptr (
+                  ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function, rc);
+
+  return rc;
+
+} @* P3270_Execute_Script *@
+
+@* ws2421 from PARMPROC *@
+
+@****************************************************
+ * Procedure Name: P3270_Read_File
+ *
+ * Description   : Read parms from file
+ *
+ * Input         : filename
+ *                 num parms
+ *                 admin params
+ *
+ * Output   : parms array
+ *
+ * Return Value  : ESA_RC
+ ****************************************************@
+
+static ESA_RC P3270_Read_File (Filename_typ           filename,
+      int        num_parms,
+      Parm_typ      parms[1],
+      ADMIN_PARAMS_rec_typ * admin_params)
+{
+
+  static char * function = "P3270_Read_File";
+
+  ESA_RC                        rc = ESA_OK;
+  FILE                        * curr_file;
+  Path_typ                      parm_file_full_name;
+  int                           i, lrc;
+  char                        * newline;
+  char                        ddn_with[MAX_FILENAME_LEN]; @* SAS2IBMT *@
+
+  admin_params->cs_func.DIAG_enter_ptr (
+                ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function);
+
+
+@*ws2421 rc = P3270_Parm_File_Full_Name (filename, parm_file_full_name,
+                                  admin_params);
+
+  if (rc NE ESA_OK)
+    goto exit;
+ *@
+ @*ws2421*@ strcpy(parm_file_full_name,filename);
+
+  @* Open the file *@
+
+  strcpy(ddn_with,"DD:");                                 @* SAS2IBMT *@
+  strcat(ddn_with, parm_file_full_name);                  @* SAS2IBMT *@
+
+  @* SAS2IBMT
+  curr_file = fopen (parm_file_full_name, FILE_OPEN_FOR_READ);       *@
+  curr_file = fopen (ddn_with, FILE_OPEN_FOR_READ);       @* SAS2IBMT *@
+
+  if (curr_file EQ NULL)
+  {
+    CTSAMSG_print (P3270_ERROR_OPEN_FILE, admin_params->ctsamsg_handle,
+             NULL, admin_params->ctsamsg_dest, parm_file_full_name);
+
+    @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+    ESA_DIAG_printf(                              @*IS10182*@
+                     ESA_COMP_GETRES, DEBUG_IMPORTANT,
+      "Error opening file %s msg=%s id=%d",
+      parm_file_full_name, strerror(errno), errno);
+ rc = ESA_FATAL;
+ goto exit;
+  }
+
+  for (i=0; i LT num_parms; i++)
+  {
+    fgets (parms[i], sizeof(Parm_typ), curr_file);
+
+ newline = strchr (parms[i], '\n');
+
+ if (newline NE NULL)
+   *newline = NULL_CHAR;
+
+ @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+ ESA_DIAG_printf(                                @*IS10182*@
+                  ESA_COMP_GETRES, DEBUG_NORMAL,
+                  "Parm (%d)=(%s)", i+1, parms[i]);
+  }
+
+  clearerr (curr_file);
+
+  lrc = fclose (curr_file);
+
+  @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+  ESA_DIAG_printf(                             @*IS10182*@
+               ESA_COMP_GETRES, DEBUG_NORMAL,
+               "Read_File Close file rc=(%d)", lrc);
+
+  exit:
+
+  admin_params->cs_func.DIAG_exit_ptr (
+               ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function, rc);
+
+  return rc;
+
+} @* P3270_Read_File *@
+
+@****************************************************
+ * Procedure Name: P3270_Write_File
+ *
+ * Description   : Write parms to file
+ *
+ * Input         : filename
+ *                 num parms
+ *                 parms array
+ *                 write login data or not
+ *                 admin_params
+ *
+ * Return Value  : ESA_RC
+ ****************************************************@
+
+static ESA_RC P3270_Write_File (Filename_typ           filename,
+       int                    num_parms,
+       Parm_typ               parms[],
+          int                    write_login,
+          ADMIN_PARAMS_rec_typ * admin_params)
+{
+
+  static char * function = "P3270_Write_File";
+
+  ESA_RC                        rc = ESA_OK;
+  FILE                        * curr_file;
+  Path_typ                      parm_file_full_name;
+  int                           i, lrc;
+  char                        ddn_with[MAX_FILENAME_LEN]; @* SAS2IBMT *@
+
+  admin_params->cs_func.DIAG_enter_ptr (
+                  ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function);
+  @*ws2421
+  rc = P3270_Parm_File_Full_Name (filename, parm_file_full_name,
+                                  admin_params);
+
+  if (rc NE ESA_OK)
+    goto exit;
+  *@
+ @*ws2421*@ strcpy(parm_file_full_name,filename);
+
+  @* Open the file *@
+
+  strcpy(ddn_with,"DD:");                                 @* SAS2IBMT *@
+  strcat(ddn_with, parm_file_full_name);                  @* SAS2IBMT *@
+
+  @* SAS2IBMT
+  curr_file = fopen (parm_file_full_name, FILE_CREAT);               *@
+  curr_file = fopen (ddn_with, FILE_CREAT);               @* SAS2IBMT *@
+
+  if (curr_file EQ NULL)
+  {
+    CTSAMSG_print (P3270_ERROR_OPEN_FILE, admin_params->ctsamsg_handle,
+             NULL, admin_params->ctsamsg_dest, parm_file_full_name);
+
+    @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+    ESA_DIAG_printf(                           @*IS10182*@
+                     ESA_COMP_GETRES, DEBUG_IMPORTANT,
+      "Error opening file %s msg=%s id=%d",
+      parm_file_full_name, strerror(errno), errno);
+ rc = ESA_FATAL;
+ goto exit;
+  }
+
+  @* ::::::::: Ayelet - add admin_params :::::::::::::::::: *@
+  @* Write common data to file *@
+  rc = Write_Header (curr_file,
+                  write_login,               @* write login data *@
+                  FALSE,                    @* no user data     *@
+                  NULL,
+      admin_params);
+
+  if (rc NE ESA_OK)
+  {
+    rc = ESA_FATAL;
+ goto exit;
+  }
+
+  for (i=0; i LT num_parms; i++)
+  {
+ @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+ ESA_DIAG_printf(                                @*IS10182*@
+                 ESA_COMP_GETRES, DEBUG_NORMAL,
+                 "Parm %d = (%s)", i+1, parms[i]);
+
+    fprintf(curr_file, "%s\n", parms[i]);
+  }
+
+  lrc = fclose (curr_file);
+
+  @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+  ESA_DIAG_printf(                              @*IS10182*@
+                     ESA_COMP_GETRES, DEBUG_NORMAL,
+                     "Write_File Close file rc=(%d)", lrc);
+
+  exit:
+
+  @*IS10182 admin_params->cs_func.DIAG_exit_ptr (*@
+  ESA_DIAG_exit(                                   @*IS10182*@
+             ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function, rc);
+
+  return rc;
+
+} @* P3270_Write_File *@
+
+@****************************************************
+ * Procedure Name: P3270_Open_Read_File
+ *
+ * Description   : Open a file for read
+ *
+ * Input         : filename
+ *                 admin params
+ *
+ * Return Value  : file pointer
+ ****************************************************@
+
+static FILE * P3270_Open_Read_File (Filename_typ            filename,
+        ADMIN_PARAMS_rec_typ  * admin_params)
+{
+
+  static char * function = "P3270_Open_Read_File";
+
+  @*ws2421 ESA_RC                    rc; *@
+  FILE                        * curr_file;
+  Path_typ                      parm_file_full_name;
+  char                        ddn_with[MAX_FILENAME_LEN]; @* SAS2IBMT *@
+
+  admin_params->cs_func.DIAG_enter_ptr (
+                  ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function);
+ @*ws2421
+  rc = P3270_Parm_File_Full_Name (filename, parm_file_full_name,
+                                  admin_params);
+
+  if (rc NE ESA_OK)
+ goto exit;
+ *@
+ @*ws2421*@ strcpy(parm_file_full_name,filename);
+
+  @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+  ESA_DIAG_printf(                            @*IS10182*@
+                   ESA_COMP_GETRES, DEBUG_NORMAL, "open_for_read (%s)",
+                parm_file_full_name);
+
+  @* Open the file *@
+
+  strcpy(ddn_with,"DD:");                                 @* SAS2IBMT *@
+  strcat(ddn_with, parm_file_full_name);                  @* SAS2IBMT *@
+
+  @* SAS2IBMT
+  curr_file = fopen (parm_file_full_name, FILE_OPEN_FOR_READ);       *@
+  curr_file = fopen (ddn_with, FILE_OPEN_FOR_READ);       @* SAS2IBMT *@
+
+  exit:
+
+  admin_params->cs_func.DIAG_exit_ptr (
+               ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function, ESA_OK);
+
+  return curr_file;
+
+}
+@****************************************************
+ * Procedure Name: Get_Keyword_Value
+ *
+ * Description   : Get keyword and value
+ *
+ * Input         : string
+ *                 admin params
+ *
+ * Output        : keyword
+ *                 value
+ *
+ * Return Value  : ESA_RC
+ ****************************************************@
+
+static ESA_RC Get_Keyword_Value (char                  * string,
+           char                  * keyword,
+        char                  * value,
+           ADMIN_PARAMS_rec_typ  * admin_params)
+{
+
+  static char * function = "Get_Keyword_Value";
+
+  ESA_RC                        rc = ESA_OK;
+  CTSAMSG_DEST_TABLE_rec_typ  * dest;
+  CTSAMSG_HANDLE_rec_typ      * msgs;
+  char                        * end_pos, * start_pos;
+  char                          delimiters[2];
+
+  admin_params->cs_func.DIAG_enter_ptr (
+                    ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  rc = Get_Delimiters (admin_params -> rss_name,
+        delimiters,
+        admin_params);
+  if (rc NE ESA_OK)
+     goto exit;
+
+  end_pos = strchr (string, delimiters[0]);
+
+  if (end_pos EQ NULL)
+  {
+    CTSAMSG_print(P3270_INVALID_DATA, msgs, NULL, dest,
+                  "KEYWORD DATA",
+      string );
+
+    rc = ESA_FATAL;
+ goto exit;
+  }
+
+  *end_pos = NULL_CHAR;
+
+  @* Copy the keyword *@
+  strcpy (keyword, string);
+
+  start_pos = end_pos + 1;
+
+  end_pos = strchr (start_pos, delimiters[1]);
+
+  if (end_pos EQ NULL)
+  {
+    CTSAMSG_print(P3270_INVALID_DATA, msgs, NULL, dest,
+                  "KEYWORD DATA",
+      string );
+
+    rc = ESA_FATAL;
+ goto exit;
+  }
+
+  *end_pos = NULL_CHAR;
+
+  if (*start_pos NE NULL_CHAR)
+    strcpy (value, start_pos);
+  else
+ *value = NULL_CHAR;
+
+  exit:
+
+  admin_params->cs_func.DIAG_exit_ptr (
+               ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function, rc);
+
+  return rc;
+ } @* Get_Keyword_Value *@
+@****************************************************
+ * Procedure Name: P3270_Get_Addinfo
+ *
+ * Description   : Get addinfo from script parm file
+ *
+ * Input         : file handle
+ *                 admin params
+ *
+ * Output        : addinfo
+ *
+ * Return Value  : ESA_RC
+ ****************************************************@
+
+static ESA_RC P3270_Get_Addinfo (FILE                   * curr_file,
+        ADDINFO_rec_ptr          addinfo,
+        ADMIN_PARAMS_rec_typ   * admin_params)
+{
+
+  static char * function = "P3270_Get_Addinfo";
+
+  ESA_RC                        rc = ESA_OK;
+  CTSAMSG_DEST_TABLE_rec_typ  * dest;
+  CTSAMSG_HANDLE_rec_typ      * msgs;
+  Keyword_Record_Type           curr_keyword_type;
+  ONE_FIELD_rec_ptr             pair;
+  ESAADIL_LIST_HNDL_typ         list_handle;
+  Parm_typ                      curr_record;
+  char                          keyword [MAX_RSS_ADDINFO_KWD_LEN+1];
+  char                          value [MAX_RSS_ADDINFO_VAL_LEN+1];
+  char                        * newline, * str_to_strip;
+  int       read_type = TRUE, read_keyword = TRUE; @*ws2421, i = 0;*@
+  int       skip_keyword = FALSE;
+
+  admin_params->cs_func.DIAG_enter_ptr (
+                 ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  @* Read the ADDINFO data *@
+  @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+  ESA_DIAG_printf(                               @*IS10182*@
+                   ESA_COMP_GETRES, DEBUG_NORMAL,
+                "Handle reading of ADDINFO");
+
+  while (NOT feof(curr_file))
+  {
+ @* Read next record or exit if we reached end-of-file (BSAM102399) *@
+ if (fgets (curr_record, sizeof(Parm_typ), curr_file) EQ NULL)
+   goto exit;
+
+ @* fgets (curr_record, sizeof(Parm_typ), curr_file); *@ @* BSAM102377 *@
+ @* fscanf (curr_file, "%s\n", curr_record); *@
+
+ newline = strchr (curr_record, '\n');
+
+ if (newline NE NULL)
+   *newline = NULL_CHAR;
+
+ @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+ ESA_DIAG_printf(                                    @*IS10182*@
+                     ESA_COMP_GETRES, DEBUG_NORMAL,
+               "record=*%s*", curr_record);
+
+ @* Read the type of the next keyword *@
+ if (read_type)
+ {
+   @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+   ESA_DIAG_printf(                                   @*IS10182*@
+                       ESA_COMP_GETRES, DEBUG_NORMAL,
+                 "Read keyword type");
+
+   read_type = FALSE;
+
+   rc = Get_Keyword_Value (curr_record,
+                        keyword,
+         value,
+         admin_params);
+
+   if (rc NE ESA_OK)
+  goto exit;
+
+   if (strcmp (keyword, "TYPE") NE 0)
+   {
+        CTSAMSG_print(P3270_KEYWORD_EXPECTED, msgs, NULL, dest,
+                      "TYPE",
+          keyword );
+
+     rc = ESA_FATAL;
+  goto exit;
+   }
+
+   if (value[0] EQ 'R')
+     curr_keyword_type = REGULAR_KEYWORD;
+   else if (value[0] EQ 'S')
+  curr_keyword_type = SUBFIELD_KEYWORD;
+   else
+   {
+        CTSAMSG_print(P3270_INVALID_DATA, msgs, NULL, dest,
+                      "KEYWORD TYPE",
+          value );
+
+     rc = ESA_FATAL;
+  goto exit;
+   }
+
+   continue;
+ }
+
+ @* Handle a regular keyword *@
+ if (curr_keyword_type EQ REGULAR_KEYWORD)
+ {
+   @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+   ESA_DIAG_printf(                                  @*IS10182*@
+                       ESA_COMP_GETRES, DEBUG_NORMAL,
+                 "Read a regular keyword");
+
+   read_type = TRUE;
+
+   rc = Get_Keyword_Value (curr_record,
+                        keyword,
+              value,
+         admin_params);
+
+   if (rc NE ESA_OK)
+  goto exit;
+
+   @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+   ESA_DIAG_printf(                                @*IS10182*@
+                       ESA_COMP_GETRES, DEBUG_IMPORTANT,
+                 "keyword=(%s) value=(%s)",
+        keyword,
+        value);
+
+   @* Should this keyword be returned ? *@
+      pair = ADDINFO_search (keyword,
+                             P3270_MAX_ADDINFO_KWD_LEN,
+                             addinfo->pair,
+                             addinfo->num_pairs);
+
+   if (pair NE NULL)
+   {
+     rc = ADDINFO_addval (value,
+                       P3270_MAX_ADDINFO_VAL_LEN,
+        ADDINFO_LIST_HEX_SEP1_CHAR,
+        pair,
+        dest,
+        msgs);
+
+     if (rc NE ESA_OK)
+  {
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component, function,
+                        "ADDINFO_addval failed",16, __LINE__) ;
+       rc = ESA_FATAL;
+    goto exit;
+  }
+   }
+
+   continue;
+ }
+
+    @* Handle a subfield keyword *@
+    if (curr_keyword_type EQ SUBFIELD_KEYWORD)
+ {
+      @* Read the keyword *@
+   if (read_keyword)
+   {
+  strcpy (keyword, curr_record);
+  Trim (keyword);
+     read_keyword = FALSE;
+  skip_keyword = FALSE;
+
+  @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+  ESA_DIAG_printf(                                @*IS10182*@
+                         ESA_COMP_GETRES, DEBUG_NORMAL,
+                "Subfield keyword=(%s)",
+       keyword);
+
+  @* Do we need to return the ADDINFO data ? *@
+        pair = ADDINFO_search (keyword,
+                               P3270_MAX_ADDINFO_KWD_LEN,
+                               addinfo->pair,
+                               addinfo->num_pairs);
+
+     if (pair EQ NULL)
+  {
+    @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+    ESA_DIAG_printf(                            @*IS10182*@
+                           ESA_COMP_GETRES, DEBUG_NORMAL,
+                  "Keyword not found. Skipping it");
+       skip_keyword = TRUE;
+  }
+  else
+  {
+    rc = ESAADIL_list_open (pair,
+                         ESAADI_LIST_MODE_NEW,
+          P3270_MAX_ADDINFO_VAL_LEN,
+          &list_handle);
+
+          if (rc NE ESA_OK)
+    {
+            CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,function,
+                          "ADDINFO List Open failed", 16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+    }
+
+          rc = ESAADIL_list_append_entry (&list_handle);
+
+    if (rc NE ESA_OK)
+    {
+            CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,function,
+                          "ADDINFO List Append Entry failed", 16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+    }
+  }
+
+  continue;
+   }
+
+   @* Handle a new entry *@
+   if (strcmp (curr_record, "*ENTRY*") EQ 0)
+   {
+  if (NOT skip_keyword)
+  {
+          rc = ESAADIL_list_append_entry (&list_handle);
+
+       if (rc NE ESA_OK)
+    {
+            CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,function,
+                          "ADDINFO List Append Entry failed", 16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+    }
+        }
+  continue;
+   }
+
+   @* Handle end of ADDINFO keyword *@
+   else if (strcmp (curr_record, "*END*") EQ 0)
+   {
+  @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+  ESA_DIAG_printf(                                     @*IS10182*@
+                         ESA_COMP_GETRES, DEBUG_NORMAL,
+                "Reached end of ADDINFO keyword");
+
+  if (NOT skip_keyword)
+       ESAADIL_list_close (&list_handle);
+
+  read_type = TRUE;
+        read_keyword = TRUE;
+
+  continue;
+   }
+
+   @* Handle a value *@
+   else
+   {
+  str_to_strip = curr_record;
+
+     rc = Strip_Value (&str_to_strip,
+                 "LIST KEYWORD VALUE",
+                 admin_params);
+
+     if (rc NE ESA_OK)
+  {
+    rc = ESA_FATAL;
+    goto exit;
+  }
+
+  @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+  ESA_DIAG_printf(                                @*IS10182*@
+                         ESA_COMP_GETRES, DEBUG_NORMAL,
+                "Subfield value=(%s)",
+       str_to_strip);
+
+  if (NOT skip_keyword)
+  {
+       rc = ESAADIL_list_append_subfield (&list_handle,
+               str_to_strip);
+    if (rc NE ESA_OK)
+    {
+            CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,function,
+                          "ADDINFO List Append Subfield failed", 16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+    }
+        }
+  continue;
+   }
+ }
+  }
+
+  exit:
+
+  admin_params->cs_func.DIAG_exit_ptr (
+                    ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function, rc);
+
+  return rc;
+
+} @* P3270_Get_Addinfo *@
+@*ws2421 part of esaadil.c *@
+@****************************************************************
+ *                                                              *
+ * PROCEDURE NAME : ESAADIL_list_open                          *
+ *                                                              *
+ * DESCRIPTION    : Opens addinfo list, positions current row   *
+ *      pointer befor the first record. So, to go *
+ *                  to the first one, the                       *
+ *                  ESAADIL_list_go_next_entry                  *
+ *      has to be called after open   *
+ * INPUT          : *pair   -  ptr to the addinfo list field    *
+ *                  mode    -  ESAADI_LIST_MODE_NEW |           *
+ *                             ESAADI_LIST_MODE_OLD             *
+ *                                                              *
+ * OUTPUT         : *handle -  handle structure ptr  *
+ *                                                              *
+ * RETURN VALUE   : ESA_OK if successful ESS_ERR or FATAL if not*
+ *                                                              *
+ ***************************************************************@
+
+static ESA_RC ESAADIL_list_open (ONE_FIELD_rec_typ         *pair,
+                          ESAADI_LIST_OPEN_MODE_typ  mode,
+                          short                      max_list_length,
+                          ESAADIL_LIST_HNDL_typ     *handle )
+{
+    ESA_RC  rc = ESA_FATAL;
+
+    if (pair NE NULL)
+    {
+ handle->pair_ptr  = pair;
+ handle->offset   = -1;
+ handle->mode  = mode;
+ handle->row_offset = -1;
+ handle->max_list_length = max_list_length;
+ switch (mode)
+ {
+     case ESAADI_LIST_MODE_NEW:
+      rc = ESA_OK;
+      handle->pair_cpy   = *pair;
+      handle->pair_cpy.vallen  = 0;
+      handle->pair_cpy.value[0]  = NULL_CHAR;
+      break;
+
+     case ESAADI_LIST_MODE_OLD:
+      rc = ESA_OK;
+      break;
+     }
+    }
+    return rc;
+}
+
+@****************************************************************
+*                                                              *
+* PROCEDURE NAME : ESAADIL_list_append_entry                    *
+*                                                              *
+* DESCRIPTION    : adds new row to the end of the list opened      *
+*     in ESAADI_LIST_MODE_NEW mode   *
+*                                                              *
+* INPUT          : *handle - handle structure ptr *
+*                                                              *
+* OUTPUT         : NONE                              *
+*                                                              *
+* RETURN VALUE   : ESA_OK if successful ESS_ERR or FATAL if not *
+*                                                              *
+*****************************************************************@
+
+static ESA_RC ESAADIL_list_append_entry (ESAADIL_LIST_HNDL_typ *handle)
+{
+    ESA_RC    rc = ESA_FATAL;
+    ONE_FIELD_rec_typ  *pair_ptr;
+
+    if (handle->pair_ptr EQ NULL) return ESA_FATAL;
+
+    if ( handle->mode EQ ESAADI_LIST_MODE_NEW )
+    {
+     rc = ESA_EOF;
+        pair_ptr = &(handle->pair_cpy);
+
+ if ( pair_ptr->vallen+1 < handle->max_list_length)
+ {
+     rc = ESA_OK;
+     if( handle->offset GE 0 ) @* not the first *@
+     {
+     @* add row separator before*@
+             pair_ptr->value [pair_ptr->vallen] =  ADDINFO_LIST_ENTRY;
+      pair_ptr->vallen++;
+     }
+     handle->offset = pair_ptr->vallen;
+     pair_ptr->value [pair_ptr->vallen] = NULL_CHAR;
+     handle->row_offset = -1;  @* start of the row *@
+ }
+    }
+    return rc;
+}
+
+@****************************************************************
+*                                                              *
+* PROCEDURE NAME : ESAADIL_list_append_subfield   *
+*                                                              *
+* DESCRIPTION    : positions on the next row in list opend     *
+*     in ESAADI_LIST_MODE_OLD mode   *
+*                                                              *
+* INPUT          : *handle  -   handle structure ptr  *
+*     *field  string containing the value *
+*     size   the significan data length *
+    (w@o null terminator)  *
+*                                                              *
+* RETURN VALUE   : ESA_OK if successful ESS_ERR or FATAL if not *
+*                                                              *
+*****************************************************************@
+
+static ESA_RC ESAADIL_list_append_subfield
+                                     (ESAADIL_LIST_HNDL_typ *handle,
+                                     char                  *field )
+{
+    ESA_RC   rc = ESA_FATAL;
+    char    *value;
+    int  size;
+
+    if (handle->pair_ptr EQ NULL) return ESA_FATAL;
+
+    if (handle->mode EQ ESAADI_LIST_MODE_NEW)
+    {
+     if (handle->offset GE 0)  @* new row was issued before *@
+     {
+         rc = ESA_EOF;
+         value = handle->pair_cpy.value + handle->offset;
+         @*
+            strip leading and trailing blanks
+         *@
+         while (field[0] EQ ' ') field++;
+         size = strlen (field);
+         while (size > 0 AND field [size-1] EQ ' ') size--;
+
+            if (handle->offset + handle->row_offset + size + 1 <
+                handle->max_list_length)
+     {
+  if (handle->row_offset GE 0) @* new field was issued before *@
+  {
+     @* insert field separator before *@
+     value [handle->row_offset] = ADDINFO_LIST_SUBFIELD;
+  }
+
+  handle->row_offset++;
+  strncpy (value+handle->row_offset, field, size);
+  handle->row_offset += size;
+  value [handle->row_offset] = NULL_CHAR;
+  handle->pair_cpy.vallen = handle->offset + handle->row_offset;
+  rc = ESA_OK;
+     }
+     else  @* no space left, remove whole last entry *@
+     {
+         if (handle->offset GE 0) @* new field was issued before *@
+         {
+             if (handle->offset)
+                        handle->offset--; @* not the first entry *@
+             value [handle->offset] = NULL_CHAR;
+             handle->pair_cpy.vallen = handle->offset;
+         }
+     }
+ }
+    }
+    return rc;
+}
+
+@****************************************************************
+ *                                                              *
+ * PROCEDURE NAME : ESAADIL_list_close                           *
+ *                                                              *
+ * DESCRIPTION    : Closes addinfo list,    *
+ *      calculates value length if open in NEW mode *
+ *      sets handle->pair_ptr to NULL, so the handle*
+ *      can not be used without ESAADIL_list_open *
+ * INPUT          : *handle     -  handle structure ptr         *
+ *                                                              *
+ * OUTPUT         : none                                        *
+ *                                                              *
+ * RETURN VALUE   : ESA_OK if successful ESS_ERR or FATAL if not*
+ *                                                              *
+ ***************************************************************@
+
+static ESA_RC ESAADIL_list_close (ESAADIL_LIST_HNDL_typ *handle)
+{
+    ESA_RC  rc = ESA_OK;
+
+    if (handle->pair_ptr EQ NULL) return ESA_FATAL;
+
+    switch (handle->mode)
+    {
+ case ESAADI_LIST_MODE_NEW:
+ @*
+     handle->pair_cpy.vallen = 0;
+            if (handle->offset GT 0)
+                handle->pair_cpy.vallen = handle->offset;
+            if (handle->row_offset GT 0)
+                handle->pair_cpy.vallen += handle->row_offset;
+  *@
+     handle->pair_cpy.value [handle->pair_cpy.vallen] = NULL_CHAR;
+     *(handle->pair_ptr) = handle->pair_cpy;
+     break;
+
+ case ESAADI_LIST_MODE_OLD:
+     break;
+    }
+
+    handle->pair_ptr = NULL;
+    return rc;
+}
+@*ws2421 from parmproc *@
+
+@****************************************************
+ * Procedure Name: Build_Parm
+ *
+ * Description   : Build parameter to file
+ *
+ * Input         : keyword
+ *                 value
+ *                 delimiters
+ *
+ * Output        : string
+ *
+ * Return Value  : None
+ ****************************************************@
+
+static void Build_Parm (char                  * keyword,
+     char                  * value,
+     char                  * string,
+    ADMIN_PARAMS_rec_typ   * admin_params)
+{
+
+  char delim1[2];
+  char delim2[2];
+  char delimiters[2];
+  ESA_RC  rc = ESA_OK;
+
+    @* Get delimiters per rss-name *@
+  rc = Get_Delimiters (admin_params -> rss_name,
+                  delimiters,
+         admin_params);
+
+  delim1[0] = delimiters[0];
+  delim1[1] = NULL_CHAR;
+
+  delim2[0] = delimiters[1];
+  delim2[1] = NULL_CHAR;
+
+  strcpy (string, keyword);
+  strcat (string, delim1);
+  strcat (string, value);
+  strcat (string, delim2);
+
+} @* Build_Parm *@
+
+@****************************************************
+ * Procedure Name : Write_Header
+ *
+ * Description    : Write to begining of file
+ *                  1. All admin params
+ *                  2. If requested - logon data
+ *                  3. If requested - userid to file
+ *
+ * Input          : file handle
+ *                  int - write login data?
+ *                  int - write user params?
+ *                  user params
+ *                  admin params
+ *
+ * Output         : None
+ *
+ * Return Value   : ESA_RC
+ ***************************************************@
+
+static ESA_RC Write_Header (FILE                 * file_handle,
+      int                    write_login,
+      int                    write_user,
+      USER_PARAMS_rec_typ  * user_params,
+      ADMIN_PARAMS_rec_typ * admin_params)
+{
+
+  static char * function = "Write_Header";
+
+  ESA_RC                        rc = ESA_OK;
+  CTSAMSG_HANDLE_rec_ptr        msgs;
+  CTSAMSG_DEST_TABLE_rec_ptr    dest;
+
+  admin_params->cs_func.DIAG_enter_ptr (
+                ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+  ESA_DIAG_printf(                                   @*IS10182*@
+                   ESA_COMP_RSS_LOGIN, DEBUG_NORMAL,
+                "login - handle(%x)",  admin_params -> login_handle);
+
+  if (write_login)
+      if (admin_params -> login_handle NE NULL)
+         @*IS10182 admin_params->cs_func.DIAG_printf_ptr (*@
+         ESA_DIAG_printf(                            @*IS10182*@
+                   ESA_COMP_RSS_LOGIN, DEBUG_NORMAL,
+                "login - got len(%d) data(%s)",
+         strlen(admin_params -> login_handle), admin_params -> login_handle);
+
+  @* Ayelet :::::::::::::::::::::: *@
+  @* Write admin_param info to the file *@
+  fprintf (file_handle, "%s\n", admin_params -> admin_gname );
+  fprintf (file_handle, "%s\n", admin_params -> admin_passwd);
+  fprintf (file_handle, "%s\n", admin_params -> admin_uname);
+  fprintf (file_handle, "%s\n", admin_params -> def_admin);
+  fprintf (file_handle, "%s\n", admin_params -> def_admin_passwd);
+  fprintf (file_handle, "%s\n", admin_params -> program_name);
+  fprintf (file_handle, "%s\n", admin_params -> rss_name);
+  fprintf (file_handle, "%s\n", admin_params -> rss_type);
+  fprintf (file_handle, "%s\n", admin_params -> rss_version);
+
+  @* Write login info to the file *@
+  if (write_login)
+  {
+    if (admin_params -> login_handle NE NULL)
+        fprintf (file_handle, "%s\n", admin_params -> login_handle);
+    else
+        fprintf (file_handle, "\n");     @* no handle - write empty line *@
+  }
+
+  @* Do we have to write the userid too ? *@
+  if (write_user)
+  {
+    @* Check validity of userid *@
+    if (NOT Parm_Valid (user_params -> user, admin_params))
+ {
+      CTSAMSG_print (P3270_INVALID_PARM, msgs, NULL, dest,
+                     user_params -> user, "USER" );
+   rc = ESA_FATAL;
+      goto exit;
+ }
+
+    @* Write the userid to the file *@
+    fprintf (file_handle, "%s\n", user_params -> user);
+  }
+
+  exit:
+
+  admin_params->cs_func.DIAG_exit_ptr (
+             ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function, rc);
+
+  return rc;
+
+} @* Write_Header *@
+
+@****************************************************
+ * Procedure Name: Get_Delimiters
+ *
+ * Description   : Get RSS's delimiters from RSSPARM
+ *
+ * Input         : rss name
+ *                 admin params
+ *
+ * Output        : delimiters
+ *
+ * Return Value  : ESA_RC
+ ****************************************************@
+
+static ESA_RC Get_Delimiters (RSS_typ                 rss_name,
+         char                    delimiters[2],
+         ADMIN_PARAMS_rec_typ  * admin_params)
+{
+
+  static char * function = "Get_Delimiters";
+
+  ESA_RC                        rc = ESA_OK;
+  CTSAMSG_DEST_TABLE_rec_typ  * dest;
+  CTSAMSG_HANDLE_rec_typ      * msgs;
+  @*
+  char                          parm_get[201];
+  int                           parm_len;
+  *@
+
+  admin_params->cs_func.DIAG_enter_ptr (
+                  ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  @* Get scripts work dir from RSSPARM *@
+  @*ws2421 start
+  rc = rsstprm_get (admin_params->rss_type,
+                 SCRIPT_DELIMITERS_PARM, @* keyword to look for
+                    sizeof(parm_get),    @* max length
+         parm_get,                       @* reply here
+     admin_params);
+
+  if (rc NE ESA_OK)
+  {
+    CTSAMSG_print (P3270_MISSING_RSSTPARM, admin_params->ctsamsg_handle,
+             NULL, admin_params->ctsamsg_dest,
+                   SCRIPT_DELIMITERS_PARM, admin_params -> rss_type);
+
+    rc = ESA_FATAL;
+    goto exit;
+  }
+
+  admin_params->cs_func.DIAG_printf_ptr (
+                   ESA_COMP_GETRES, DEBUG_NORMAL,
+                   "delimiters=(%s)", parm_get );
+
+  parm_len = strlen(parm_get);
+
+  if (parm_len NE 2)
+  {
+    CTSAMSG_print(P3270_INVALID_RSSPARM, msgs, NULL, dest,
+      parm_get,
+      SCRIPT_DELIMITERS_PARM,
+                  admin_params -> rss_name);
+
+    rc = ESA_FATAL;
+    goto exit;
+  }
+
+  if (parm_get[0] EQ ' ' OR parm_get[1] EQ ' ')
+  {
+    CTSAMSG_print(P3270_INVALID_RSSPARM, msgs, NULL, dest,
+                  parm_get,
+      SCRIPT_DELIMITERS_PARM,
+            admin_params -> rss_name);
+
+    rc = ESA_FATAL;
+    goto exit;
+  }
+
+  delimiters[0] = parm_get[0];
+  delimiters[1] = parm_get[1];
+  ws2421 end *@
+  delimiters[0] = '(';
+  delimiters[1] = ')';
+  rc = ESA_OK;
+  exit:
+
+  admin_params->cs_func.DIAG_exit_ptr (
+                 ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function, rc);
+
+  return rc;
+
+} @* Get_Delimiters *@
+
+@****************************************************
+ * Procedure Name: Trim
+ *
+ * Description   : Remove string's trailing blanks
+ *
+ * Input         : string
+ *
+ * Return Value  : trimmed string
+ ****************************************************@
+
+static char *Trim (char *string)
+{
+   int i;
+
+   for (i = strlen(string)-1; i GE 0; i--)
+     if (string[i] EQ ' ')
+       string[i]=NULL_CHAR;
+     else
+       break;
+
+   return string;
+
+} @* Trim *@
+
+@****************************************************
+ * Procedure Name: Strip_Value
+ *
+ * Description   : Remove delimiters from string
+ *
+ * Input         : string
+ *                 value type (for error message)
+ *                 admin params
+ *
+ * Output        : Stripped value
+ *
+ * Return Value  : ESA_RC
+ ****************************************************@
+
+static ESA_RC Strip_Value (char                  ** string,
+     char                   * value_type,
+     ADMIN_PARAMS_rec_typ   * admin_params)
+{
+
+  static char * function = "Strip_Value";
+
+  ESA_RC                        rc = ESA_OK;
+  CTSAMSG_DEST_TABLE_rec_typ  * dest;
+  CTSAMSG_HANDLE_rec_typ      * msgs;
+  char                        * end_pos, * start_pos;
+  char delimiters[2];
+
+
+  admin_params->cs_func.DIAG_enter_ptr (
+                ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  @* Get delimiters per rss-name *@
+  rc = Get_Delimiters (admin_params -> rss_name,
+                  delimiters,
+         admin_params);
+  if (rc NE ESA_OK)
+   goto exit;
+
+  start_pos = strchr (*string, delimiters[0]);
+
+  if (start_pos EQ NULL)
+  {
+    CTSAMSG_print(P3270_INVALID_DATA, msgs, NULL, dest,
+                  value_type,
+      *string );
+
+    rc = ESA_FATAL;
+ goto exit;
+  }
+
+  start_pos++;
+
+  end_pos = strchr (start_pos, delimiters[1]);
+
+  if (end_pos EQ NULL)
+  {
+    CTSAMSG_print(P3270_INVALID_DATA, msgs, NULL, dest,
+                  value_type,
+      *string );
+
+    rc = ESA_FATAL;
+ goto exit;
+  }
+
+  *end_pos = NULL_CHAR;
+
+  *string = start_pos;
+
+  exit:
+
+  admin_params->cs_func.DIAG_exit_ptr (
+                ESA_COMP_GETRES, DIAG_ENTER_LEVEL, function, rc);
+
+  return rc;
+
+} @* Strip_Value *@
+
+@****************************************************
+ * Procedure Name : Parm_Valid
+ *
+ * Description    : Check for validity of parm
+ *
+ * Input          : Parm
+ *
+ * Output         : None
+ *
+ * Return Value   : TRUE or FALSE
+ ***************************************************@
+
+static int Parm_Valid (char * parm,
+    ADMIN_PARAMS_rec_typ   * admin_params)
+{
+
+  int i;
+  char delimiters[2];
+  ESA_RC                        rc = ESA_OK;
+
+  @* Get delimiters per rss-name *@
+  rc = Get_Delimiters (admin_params -> rss_name,
+                  delimiters,
+         admin_params);
+  if (rc NE ESA_OK)
+   return FALSE;
+
+  if ( (strchr (parm, ',') NE NULL) OR
+    (strchr (parm, ';') NE NULL) OR
+    (strchr (parm, delimiters[0]) NE NULL) OR
+    (strchr (parm, delimiters[1]) NE NULL) )
+    return FALSE;
+
+  Trim (parm);
+
+  @* Stop at first non-blank char *@
+  for (i=0; i LT (int)strlen(parm); i++)
+    if (parm[i] NE ' ')
+   break;
+
+  if (i LT (int)strlen(parm))
+    for (; i LT (int)strlen(parm); i++)
+   if (parm[i] EQ ' ')
+     return FALSE;
+
+  return TRUE;
+
+} @* Parm_Valid *@
+ ******** end of AIT removal ********                 WS10082 */
+

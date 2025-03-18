@@ -1,0 +1,2238 @@
+/**************************************************************
+*                                                             *
+* Title            : Get user information (TSS)               *
+*                                                             *
+* File Name        : ctstgus.c                                *
+*                                                             *
+* Author           : Alexander Shvartsman                     *
+*                                                             *
+* Creation Date    : 01/07/94                                 *
+*                                                             *
+* Description      :                                          *
+*                                                             *
+* Assumptions and                                             *
+*   Considerations :                                          *
+*                                                             *
+**************************************************************/
+
+/**************************************************************
+* Mod.Id   Who      When     Description                      *
+* -------- -------- -------- -------------------------------- *
+* PS0268   GS(Alex) 13/05/98 Fix download with prefixes       *
+* PS0312   Alex     16/09/98 GetAll By Containers support     *
+* PS0376   Alex     23/03/99 Ignore bypassed containers       *
+* BS2386    -"-       -"-          -"-                        *
+* ps0380   AS       06/05/99 Restart download from deleted    *
+*                            acid ( take a next acid)         *
+* PS0387   AS       04/08/99 Add connection checksum to user  *
+*                            details                          *
+* ps0395   As       17/11/99 Cache  Connections               *
+* BS2431   As       06/09/00 Get Many returns wrong actual_num*
+* BS2432   AlexS    13/09/00 Supress "acid does not exist"    *
+*                            messages                         *
+* BS2434   AS       26/10/00 Handling an empties NAME field   *
+*                                                             *
+* PS0495   RamiK    7/11/01  fixing index advancment in case  *
+*                            of download restart and bypass   *
+*                           use of TSSCACHE in case of restart*
+* BS2518   RamiK    25/03/02 correct download cancel\restart  *
+*                            fix and return use for TSSCACHE  *
+* ws2483   RamiK    18/06/02 add support for extended suspend *
+* BS2590   BellaP   16/03/03 global sync/download is failed   *
+*                          when users are deleted and added on*
+*                          native platform during this running*
+*                         (when acids list contains existing  *
+*                          and non-existing users, and non-   *
+*                          existing users sorted between      *
+*                        existing users in alphabetical order)*
+* IS0357   AvnerL   15/08/06 Recompile with updated CTSTF51   *
+* IS0361   YoniMa   20/08/06 TSS upgrade for v3.2.03,include: *
+*                            IS0347 - Support external CFILE  *
+* WS10009  MeirS    18/10/07 Support RU_LOCKED & RU_SUSPENDED.*
+* WS10022  AvnerL   14/01/09 Add LINUX support & drop VAX&PC. *
+* IS10091  NuritY   06/06/13 ParentContainer for accounts and *
+*                            Groups + dynamic tsscfile records*
+*                            table (WS10034+WS10036)          *
+* SAS2IBMT SeligT   30/06/16 SAS/C to IBM C Conversion Project*
+* IS10091A NuritY   15/09/16 Move ParentContainerName handling*
+*                            to TSS_get_parent_oe in CTSTSRV. *
+* CIQ#6    SeligT   08/05/17 Account Aggr includes Conns      *
+* BS10080  AvnerL   08/02/18 UpperCase R0600-TSSCACHE-compile *
+* BS10085  SeligT   09/04/18 Add VERBOSE to LIST command      *
+* IS10174  NuritY   15/01/18 Dynamic EXECOUT support.         *
+* IS10181  SeligT   03/06/19 Display Message When ADDINFO     *
+*                            Value Is Too Large               *
+* WS10082  MauriC   14/11/22 Recompile for new ADDINFO macros *
+**************************************************************/
+
+ /*
+  *   Standard include files
+  */
+
+ #include   <globs.h>
+ #include   STDIO
+ #include   STDLIB
+ #include   STRING
+ /* #include   LCIO                                          SAS2IBMT */
+ #include   ERRNO                                         /* SAS2IBMT */
+
+ /*
+  *   ESA include files
+  */
+
+ #include   ESA_API
+ #include   ESA_DIAG
+ #include   ESA_CTSAMSG
+ #include   ESA_API_CODES
+ #include   API_ADDINFO
+ #include   API_AUTH
+
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_COMP
+ #include MVS_OS_MVS
+
+ /*
+  *   TSS include files
+  */
+
+ #include TSS
+ #include TSS_CODES
+
+ static char component[] = "CTSTGUS";
+
+ static ESA_RC TSS_locate_user(ESA_DIAG_COMP_typ        comp,
+                          char                        * acid,
+                          char                        * acid_type,
+                          USER_PARAMS_rec_typ           user_params[1],
+                          OBJ_EXISTS_typ                objs_exist[1],
+                          int                           max_users,
+                          int                         * found_ind,
+                          CTSAMSG_DEST_TABLE_rec_typ  * dest,
+                          CTSAMSG_HANDLE_rec_typ      * msgs);
+
+ static ESA_RC TSS_invoke_tsscfile_u(ESA_DIAG_COMP_typ  comp,
+                             TSS_TRAP_BUF_rec_typ     * acids_list,
+                             int /* PS0495 added * */ * i_from,
+                             int                      * i_max,
+                             USER_PARAMS_rec_typ        user_params[1],
+                             OBJ_EXISTS_typ             objs_exist[1],
+                             int                        max_acids,
+                             HAVE_MORE_typ              * have_more,
+                             char                       * main_cmd,
+                             CTSAMSG_DEST_TABLE_rec_typ * dest,
+                             CTSAMSG_HANDLE_rec_typ     * msgs);
+
+ static ESA_RC TSS_do_users_list(ESA_DIAG_COMP_typ   comp,
+ /*bs2590*/               GET_USER_MODE              mode,
+ /*bs2590*/               short                      num_users_in,
+                          char                     * acid_type,
+                          TSS_TRAP_BUF_rec_typ     * users_list,
+                          TSS_GET_HANDLE_typ       * get_handle,
+                          short                      max_users,
+                          short                    * actual_num,
+                          HAVE_MORE_typ            * have_more,
+                          USER_PARAMS_rec_typ        user_params[1],
+                          ADDINFO_rec_ptr            addinfo[1],
+                          OBJ_EXISTS_typ             objs_exist[1],
+                          ADMIN_PARAMS_rec_typ     * admin_params,
+                          ERR_STRUCT_rec_typ       * err);
+
+static ESA_RC TSS_put_user_info(ESA_DIAG_COMP_typ    comp,
+                          USER_PARAMS_rec_typ      * user_params,
+                          ADDINFO_rec_ptr            addinfo,
+                          ADDINFO_rec_ptr            laddinfo,
+            /* WS10009 */ ADMIN_PARAMS_rec_typ        * admin_params,
+                          CTSAMSG_DEST_TABLE_rec_typ  * dest,
+                          CTSAMSG_HANDLE_rec_typ      * msgs);
+
+static ESA_RC TSS_get_many_acids_list(ESA_DIAG_COMP_typ   comp,
+                   TSS_TRAP_BUF_rec_typ           ** users_list,
+                   short                             num_users_in,
+                   USER_PARAMS_rec_typ               user_params_in[1],
+                   ADMIN_PARAMS_rec_typ            * admin_params,
+                   ERR_STRUCT_rec_typ              * err);
+
+static ESA_RC TSS_select_wild_users_list(ESA_DIAG_COMP_typ   comp,
+                   TSS_TRAP_BUF_rec_typ            * users_list,
+                   short                             num_users_in,
+                   USER_PARAMS_rec_typ               user_params_in[1],
+                   CTSAMSG_DEST_TABLE_rec_typ      * dest,
+                   CTSAMSG_HANDLE_rec_typ          * msgs);
+
+
+/* PS0387 */
+
+/* CIQ#6 This routine does nothing so was removed
+static void TSS_set_conn_checksum(ADDINFO_rec_ptr  addinfo);         */
+/* CIQ#6 This routine does nothing so was removed
+static void TSS_calculate_checksum(char *in, char *checksum);        */
+
+static char internal2_msg_buf[200];
+
+
+/****************************************************
+ * Procedure Name: CTSGetUsers
+ * Description   : Get one, two, many or all users
+ * Input         : mode         - ALL,
+ *                                MANY (or one),
+ *                                WILD (wildcard - currently
+ *                                unimplemented)
+ *                 max_users    - # of elements in user_params,
+ *                                objs_exist and addinfo arrays
+ *                 num_users_in - # of elements in user_params_in
+ *                 user_params_in- array of num_users_in, filled with
+ *                                users requested.
+ *                 admin_params -
+ * Output        : actual_num   - # of users returned
+ *                 have_more    - HAVE_MORE if more users, else NO_MORE
+ *                 err          - error indication, message, etc.
+ *                 objs_exist   - array of max_users:
+ *                                OBJ_EXIST if user exists, else
+ *                                OBJ_NOT_EXIST.
+ *                 user_params  - array of max_users:
+ *                                callee fills with users returned
+ *  Input/Output : addinfo      - array of max_users pointers:
+ *                                add.info per user, Caller puts
+ *                                requested keywords, callee returns
+ *                                actual add.info.
+ *                 handle       - NULL on first call, filled by callee,
+ *                                used by callee to keep track.
+ *                                Freed by caller.
+ * Return Value  : ESA_RC
+ * Side Effects  : Function may allocate memory, return pointer in
+ *                 *handle; Caller MUST free when done.
+ * Comments      : Caller must reset I/O params to their initial values
+ *                 when using subsequent calls (if HAVE_MORE).
+ ****************************************************/
+
+ ESA_RC CTSGetUsers (GET_USER_MODE         mode,
+                     OE_typ                oe,
+                     short                 max_users,
+                     short               * actual_num,
+                     HAVE_MORE_typ       * have_more,
+                     void               ** handle,
+                     short                 num_users_in,
+                     USER_PARAMS_rec_typ   user_params_in[1],
+                     USER_PARAMS_rec_typ   user_params[1],
+                     ADDINFO_rec_ptr       addinfo[1],
+                     OBJ_EXISTS_typ        objs_exist[1],
+                     ADMIN_PARAMS_rec_typ * admin_params,
+                     ERR_STRUCT_rec_typ   * err,
+                     char                   get_conn)       /* CIQ#6 */
+{
+
+ static char func[]="CTSGetUsers";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                       rc = ESA_OK ;
+ OE_typ                       dummy_oe = "";
+ TSS_GET_HANDLE_typ         * get_handle = NULL;
+ TSS_TRAP_BUF_rec_typ       * users_list = NULL;
+ TSS_TRAP_BUF_rec_typ       * oes_list   = NULL;          /* PS0312 */
+ TSS_ACID_HEADER_rec_typ      acid_info;                  /* PS0312 */
+ char                         val[MAX_TSS_PARAM_LEN + 1]; /* PS0312 */
+ int                          get_users_list = FALSE;     /* PS0312 */
+ char                         get_types_ind;              /* PS0312 */
+ int                          i_tmp;                      /* PS0312 */
+ int                          download_from = FALSE;      /* PS0312 */
+ OE_typ                       tmp_oe = "";                /* PS0312 */
+ char                         tmp_oe_tp[MAX_TSS_PARAM_LEN + 1];
+ CTSAMSG_HANDLE_rec_typ     * msgs;
+ CTSAMSG_DEST_TABLE_rec_typ * dest;
+ char                         root_name[MAX_TSS_PARAM_LEN + 1];
+ char                         get_all_mode[MAX_TSS_PARAM_LEN + 1]= "";
+ char                         get_all_cmode[MAX_TSS_PARAM_LEN + 1]= "";
+ OE_typ                       entering_oe;
+ int                          i_dump;
+ static int                   this_is_a_restart = FALSE;
+ /*static int                   cache_file_marked = FALSE; bs2518 */
+ static int                   download_end = FALSE;
+ /* char      restart_marker[]=TSS_CACHE_RESTART_MARKER; bs2518 */
+ int                          ddinfo_rc = 0;
+ TSSCFILE_ERR_BEH_typ         err_action;
+ ONE_FIELD_rec_ptr            cpair;                       /* BS2434 */
+ int                          i;                           /* BS2434 */
+ static TSS_GET_TYPES_rec_typ get_types[] = {
+                       {  TSS_USER,   '0'     } ,
+                       {  TSS_DCA,    '0'     } ,
+                       {  TSS_VCA,    '0'     } ,
+                       {  TSS_ZCA,    '0'     } ,
+                       {  TSS_SCA,    '0'     } ,
+                       {  TSS_LSCA,   '0'     } ,
+                       {  NULL ,      '0'     }   };
+
+ /* PS0312 */
+ static TSS_GET_TYPES_rec_typ    oe_get_types[] = {
+                       /*                   '0' - Reserved for Root */
+                       {  TSS_ZONE,         '1'   } ,
+                       {  TSS_DIVISION,     '2'   } ,
+                       {  TSS_DEPARTMENT,   '3'   } ,
+                       {  NULL ,            '0'   } };
+
+ static TSS_GET_TYPES_rec_typ  get_types_for_root   []  = {
+                       {  TSS_SCA,    '0'     } ,
+                       {  TSS_LSCA,   '0'     } ,
+                       {  NULL ,      '0'     }   };
+ static TSS_GET_TYPES_rec_typ  get_types_for_zone   []  = {
+                       {  TSS_ZCA,    '0'     } ,
+                       {  NULL ,      '0'     }   };
+ static TSS_GET_TYPES_rec_typ  get_types_for_div    []  = {
+                       {  TSS_VCA,    '0'     } ,
+                       {  NULL ,      '0'     }   };
+ static TSS_GET_TYPES_rec_typ  get_types_for_dept   []  = {
+                       {  TSS_USER,   '0'     } ,
+                       {  TSS_DCA,    '0'     } ,
+                       {  NULL ,      '0'     }   };
+
+/*
+ *  Initialize
+ */
+
+ ESA_DIAG_enter(ESA_COMP_GTUSERS, 1, func );
+
+ msgs = admin_params->ctsamsg_handle;
+ dest = admin_params->ctsamsg_dest;
+
+ *have_more = NO_MORE ;
+ *actual_num = 0 ;
+
+ ESA_DIAG_printf(ESA_COMP_GTUSERS,1,
+                 "mode=%d handle=%X max_users=%d oe=%s",
+                  mode, *handle , max_users, oe);
+
+ /* IS10091 - start */
+ if ( ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 6 )
+ {
+  for (i=0; i LT num_users_in; i++)
+  {
+     ESA_DIAG_printf(ESA_COMP_GTUSERS, 6,
+                     "input addinfo %d", i);
+     /* IS10181 Change this statement from addinfo[0] to addinfo[i]
+     ADDINFO_dump(addinfo[0],1);                                    */
+     ADDINFO_dump(addinfo[i],1);                         /* IS10181 */
+  }
+ }
+ /* IS10091 - end   */
+
+/*
+ *    Check if handle was passed, if no create it
+ */
+
+ if ( mode NE GET_FREE_HANDLE_USERS ) {
+    if ( mode EQ GET_MANY_USERS )
+      err_action = TSS_IGNORE_ERR;
+    else
+      err_action = TSS_BREAK_BY_ERR;
+    rc = TSS_init_get_handle( ESA_COMP_GTUSERS, err_action,
+                              &get_handle, handle ,
+                              addinfo[0], admin_params, err );
+    if ( rc NE ESA_OK )
+       goto exit ;
+ }
+
+ /* IS10091 - start */
+ /* IS10181 Add an if clause to this single if clause to avoid
+            an s0C4 abend when addressing the uninitialized
+            get_handle pointer.
+ if ( ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 6 )             */
+ if ( ( ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 6 ) AND /* IS10181 */
+      ( mode NE GET_FREE_HANDLE_USERS ) )                     /* IS10181 */
+ {
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 6,
+                   "work addinfo after get handle");
+   ADDINFO_dump(get_handle->waddinfo,1);
+   ESA_DIAG_printf(ESA_COMP_GTUSERS, 6,
+                   "local addinfo after get handle");
+   ADDINFO_dump(get_handle->laddinfo,1);
+ }
+ /* IS10091 - end   */
+
+/*
+ *  Some 'Root' object related checks
+ *  Pay attention, the entering mode may be changed
+ */
+
+ strcpy(entering_oe, oe);
+ if ( TSS_use_root_object(ESA_COMP_GTUSERS ,root_name,dest,msgs) ) {
+   if ( mode EQ GET_SUBTREE_USERS )  {
+     if (strcmp(entering_oe, root_name) EQ 0) {
+       mode = GET_ALL_USERS;
+       strcpy(entering_oe, "");
+     }
+   }
+ }
+
+/*
+ *    Execute according to mode
+ */
+
+ switch (mode) {
+
+      case GET_FREE_HANDLE_USERS :
+
+         *have_more = NO_MORE ;
+         download_end = TRUE;
+         goto exit ;
+
+      case GET_ALL_USERS  :
+
+       /* Start of PS0395                                           */
+       /* the use of TSSCACHE is indicated by the existance of      */
+       /* the DD card TSSCACHE.                                     */
+   /*  if (this_is_a_restart) {        /* ps0495  / comment by bs2518*/
+   /*    strcpy(get_all_cmode, "");    /* ps0495  / comment by bs2518*/
+   /*  }                               /* ps0495  / comment by bs2518*/
+   /*  else {                          /* ps0495  / comment by bs2518*/
+       rc = OS_MVS_ddinfo (R0600_DD_NAME,
+                           get_all_cmode, FALSE,         /* IS10174 */
+                           dest, msgs, 0);               /* IS10174 */
+             /* IS10174    get_all_cmode, FALSE, dest, msgs);  */
+       if ( rc NE ESA_OK) /* DD not found */
+          strcpy(get_all_cmode, "");
+       else
+          strcpy(get_all_cmode, TSS_STANDARD_MODE2);
+   /*  }    comment by bs2518*/
+       ESA_DIAG_printf(ESA_COMP_GTUSERS,2,
+                       "get_all_cmode=%s", get_all_cmode);
+       /* End   of PS0395 */
+
+       /* Start of PS0312 */
+       rc= admin_params->
+                    cs_func.rssprm_get_opt_ptr(admin_params->rss_name,
+                    TSS_GET_ALL_USER_MODE,
+                    sizeof(get_all_mode) - 1,
+                    get_all_mode, OPT_TRUE, OPT_TRUE);
+
+       if ( (rc EQ ESA_OK) AND
+            (strcmp(get_all_mode, TSS_STANDARD_MODE) EQ 0 ) ) {
+       /* End of PS0312 */
+
+         if ( NOT get_handle->acids_list ) {
+
+            /* Start of PS0395 */
+            ESA_DIAG_printf(ESA_COMP_GTUSERS,1,
+                            "get_all_cmode=%s", get_all_cmode);
+            if (strcmp(get_all_cmode, TSS_STANDARD_MODE2) EQ 0) {
+               if ( num_users_in EQ 0 ) { /* Initial */ /*BS2518*/
+                 this_is_a_restart = FALSE;                 /*BS2518*/
+                 /* SAS2IBMT
+                 get_handle->r0600 = fopen(R0600_DD, "w");
+                 get_handle->r0600 = fopen(R0600_DD, "w,recfm=*");   */
+                 get_handle->r0600 = fopen(R0600_DD, "wb,recfm=*");
+                                                         /* SAS2IBMT */
+                 if (get_handle->r0600 NE NULL) {
+                   fclose(get_handle->r0600);
+                   get_handle->r0600 = NULL;
+                 }
+               }
+               else {                                       /*BS2518*/
+                 this_is_a_restart = TRUE;                  /*BS2518*/
+               }                                            /*BS2518*/
+               /* SAS2IBMT
+               get_handle->r0600 = fopen(R0600_DD, "a");
+               get_handle->r0600 = fopen(R0600_DD, "a,recfm=*");     */
+               get_handle->r0600 = fopen(R0600_DD, "ab,recfm=*");
+                                                         /* SAS2IBMT */
+            }
+            /* End   of PS0395 */
+
+            rc=TSS_get_acids_list(ESA_COMP_GTUSERS, TSS_USER,
+                                  &users_list, get_types,
+                                  dummy_oe, admin_params, err );
+            get_handle->acids_list = users_list;
+            if ( rc NE ESA_OK )
+               goto exit;
+
+            /*  Restart Download  */
+
+            if ( num_users_in EQ 1 ) {
+
+               ESA_DIAG_printf(ESA_COMP_GTUSERS,1,
+                          "Restart aggregation from %s",
+                          user_params_in[0].user);
+
+               CTSAMSG_print(ERR_3_STRINGS,                 /* PS0312 */
+                      msgs, NULL, dest,                     /* PS0312 */
+                      "Restart aggregation From",           /* PS0312 */
+                              user_params_in[0].user, "");  /* PS0312 */
+
+               /* BS2518 - commented entire section
+               /* PS0495
+                if this is a restart, we erase the old records in the
+                cache file and enter a new record containing a restart
+                marker. this is to signal the Get_Connections function
+                that a restart was done in the Get_User function
+               if (NOT this_is_a_restart) {
+                 this_is_a_restart = TRUE;
+                 strcpy(get_all_cmode, "");
+                 /* checking if TSSCACHE dd card exists
+                 if (NOT cache_file_marked) {
+                    rc = OS_MVS_ddinfo (R0600_DD_NAME,
+                              get_all_cmode, FALSE, dest, msgs);
+                    if ( rc EQ ESA_OK) {
+                    /* opening TSSCACHE file for write & erasing
+                    old records
+                       if (get_handle->r0600 NE NULL) {
+                         fclose(get_handle->r0600);
+                         get_handle->r0600 = NULL;
+                       }
+                       get_handle->r0600 = fopen(R0600_DD, "w");
+                       if ( ferror(get_handle->r0600) OR
+                            (get_handle->r0600 EQ NULL) ) {
+                          CTSAMSG_print(ERR_IO, msgs, NULL,
+                             dest, "fopen",
+                             R0600_DD_NAME, strerror(errno) );
+                          ESA_DIAG_printf(ESA_COMP_GTUSERS , 1,
+                             "file %s error %s",R0600_DD_NAME,
+                             strerror(errno));
+                          rc = ESA_FATAL;
+                          goto exit;
+                       }
+                       fprintf(get_handle->r0600, "%s\n",
+                          restart_marker);
+                       if ( ferror(get_handle->r0600) ) {
+                          CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                                        "fputs", R0600_DD,
+                          strerror(errno) );
+                          rc = ESA_FATAL;
+                          goto exit;
+                       }
+                       fclose(get_handle->r0600);
+                       get_handle->r0600 = NULL;
+                       cache_file_marked = TRUE;
+                       ESA_DIAG_printf(ESA_COMP_GTUSERS,2,
+                          "TSSCACHE file marked as restarted");
+                    }
+                 }
+               }
+               /* end of ps0495 */
+               rc=TSS_select_acids_list_from(ESA_COMP_GTUSERS,
+                                             users_list,
+                                             TSS_USER,
+                                             user_params_in[0].user,
+                                             dest, msgs );
+               if ( rc NE ESA_OK )
+                  goto exit;
+            }
+         }       /* Get User ALL. First invoke */
+         else
+            users_list = get_handle->acids_list;
+
+         rc=TSS_do_users_list(ESA_COMP_GTUSERS,
+                              mode, num_users_in,        /*bs2590*/
+                              TSS_USER, users_list,
+                              get_handle, max_users,   actual_num,
+                              have_more,  user_params, addinfo,
+                              objs_exist, admin_params, err);
+       }    /* Standard mode */        /* PS0312 */
+
+       /* Start of PS0312 */
+       /* None Standard mode, by Containers */
+       else {
+         rc = ESA_OK;   /* Reset return code after rssprm_get_opt */
+         if ( NOT get_handle->oe_acids_list ) {
+
+            /* Start of PS0395 */
+            ESA_DIAG_printf(ESA_COMP_GTUSERS,2,
+                            "get_all_cmode=%s", get_all_cmode);
+            if (strcmp(get_all_cmode, TSS_STANDARD_MODE2) EQ 0) {
+              if ( num_users_in EQ 0 ) { /* Initial */ /*BS2518*/
+                this_is_a_restart = FALSE;                 /*BS2518*/
+                /* SAS2IBMT
+                get_handle->r0600 = fopen(R0600_DD, "w");
+                get_handle->r0600 = fopen(R0600_DD, "w,recfm=*");    */
+                get_handle->r0600 = fopen(R0600_DD, "wb,recfm=*");
+                                                         /* SAS2IBMT */
+                if (get_handle->r0600 NE NULL) {
+                  fclose(get_handle->r0600);
+                  get_handle->r0600 = NULL;
+                }
+              }
+              else {                                       /*BS2518*/
+                this_is_a_restart = TRUE;                  /*BS2518*/
+              }                                            /*BS2518*/
+              /* SAS2IBMT
+              get_handle->r0600 = fopen(R0600_DD, "a");
+              get_handle->r0600 = fopen(R0600_DD, "a,recfm=*");      */
+              get_handle->r0600 = fopen(R0600_DD, "ab,recfm=*");
+                                                         /* SAS2IBMT */
+            }
+            /* End   of PS0395 */
+
+            /* Get Containers List */
+
+            rc=TSS_get_acids_list(ESA_COMP_GTUSERS, TSS_CONTAINER,
+                                  &oes_list, oe_get_types,
+                                  dummy_oe, admin_params, err );
+            get_handle->oe_acids_list = oes_list;
+            if ( rc NE ESA_OK )
+               goto exit;
+
+            /*  Add Root Container */
+
+            TSS_use_root_object(ESA_COMP_GTUSERS, root_name,dest,msgs);
+            sprintf(val, "%c%s", '0', root_name);
+            rc = TSS_save_output(ESA_COMP_GTUSERS,
+                                 oes_list, val, dest, msgs );
+            if ( rc NE ESA_OK )
+             goto exit;
+
+            TSS_trap_buf_sort(ESA_COMP_GTUSERS, oes_list);
+
+            if (ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 4) {
+               ESA_DIAG_printf (ESA_COMP_GTUSERS, 0 , "Oes List");
+               TSS_trap_buf_dump(ESA_COMP_GTUSERS, oes_list);
+            }
+
+            /*  Restart Download. Select Container  */
+
+            if ( num_users_in EQ 1 ) {
+
+               ESA_DIAG_printf(ESA_COMP_GTUSERS,1,
+                               "Restart Aggregation from %s",
+                               user_params_in[0].user);
+               /* BS2518 - commenting part that marks the cache file
+               /* PS0495
+                if this is a restart, we erase the old records in the
+                cache file and enter a new record containing a restart
+                marker. this is to signal the Get_Connections function
+                that a restart was done in the Get_User function
+               if (NOT this_is_a_restart) {
+                 this_is_a_restart = TRUE;
+                 strcpy(get_all_cmode, "");
+                 /* checking if TSSCACHE dd card exists
+                 if (NOT cache_file_marked) {
+                    rc = OS_MVS_ddinfo (R0600_DD_NAME,
+                              get_all_cmode, FALSE, dest, msgs);
+                    if ( rc EQ ESA_OK) {
+                    /* opening TSSCACHE file for write & erasing
+                    old records
+                       if (get_handle->r0600 NE NULL) {
+                         fclose(get_handle->r0600);
+                         get_handle->r0600 = NULL;
+                       }
+                       get_handle->r0600 = fopen(R0600_DD, "w");
+                       if ( ferror(get_handle->r0600) OR
+                            (get_handle->r0600 EQ NULL) ) {
+                          CTSAMSG_print(ERR_IO, msgs, NULL,
+                             dest, "fopen",
+                             R0600_DD_NAME, strerror(errno) );
+                          ESA_DIAG_printf(ESA_COMP_GTUSERS , 1,
+                             "file %s error %s",R0600_DD_NAME,
+                             strerror(errno));
+                          rc = ESA_FATAL;
+                          goto exit;
+                       }
+                       fprintf(get_handle->r0600, "%s\n",
+                          restart_marker);
+                       if ( ferror(get_handle->r0600) ) {
+                          CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                                        "fputs", R0600_DD,
+                          strerror(errno) );
+                          rc = ESA_FATAL;
+                          goto exit;
+                       }
+                       fclose(get_handle->r0600);
+                       get_handle->r0600 = NULL;
+                       cache_file_marked = TRUE;
+                       ESA_DIAG_printf(ESA_COMP_GTUSERS,2,
+                          "TSSCACHE file marked as restarted");
+                    }
+                 }
+               }
+               /* end of ps0495 */
+
+               TSS_get_acid_header(ESA_COMP_GTUSERS,
+                                   TSS_CMD_WEAK_QUIET_MODE,
+                                   user_params_in[0].user,
+                                   &acid_info,
+                                   admin_params, err);
+
+               ESA_DIAG_printf(ESA_COMP_GTUSERS, 2,
+                               "ACID=%s",      acid_info.acid);
+               ESA_DIAG_printf(ESA_COMP_GTUSERS, 2,
+                               "ACID_TYPE=%s", acid_info.type);
+               ESA_DIAG_printf(ESA_COMP_GTUSERS, 2,
+                               "DEPT_ACID=%s", acid_info.dept_acid);
+               ESA_DIAG_printf(ESA_COMP_GTUSERS, 2,
+                                "DIV_ACID=%s",  acid_info.div_acid);
+               ESA_DIAG_printf(ESA_COMP_GTUSERS, 2,
+                                "ZONE_ACID=%s", acid_info.zone_acid);
+
+               strcpy(tmp_oe,    "");
+               strcpy(tmp_oe_tp, "");
+               download_from = TRUE;
+               if (strcmp(acid_info.type, TSS_ZCA) EQ 0) {
+                   strcpy(tmp_oe, acid_info.zone_acid);
+                   strcpy(tmp_oe_tp, TSS_ZONE);
+               }
+               else if (strcmp(acid_info.type, TSS_VCA) EQ 0) {
+                   strcpy(tmp_oe, acid_info.div_acid);
+                   strcpy(tmp_oe_tp, TSS_DIVISION);
+               }
+               else if (strcmp(acid_info.type, TSS_DCA) EQ 0) {
+                   strcpy(tmp_oe, acid_info.dept_acid);
+                   strcpy(tmp_oe_tp, TSS_DEPARTMENT);
+               }
+               else if (strcmp(acid_info.type, TSS_USER) EQ 0) {
+                   strcpy(tmp_oe, acid_info.dept_acid);
+                   strcpy(tmp_oe_tp, TSS_DEPARTMENT);
+               }
+               else { /* From the top - Root */
+                   TSS_use_root_object(ESA_COMP_GTUG2UC,
+                                       root_name,dest,msgs);
+                   strcpy(tmp_oe, root_name);
+                   strcpy(tmp_oe_tp, TSS_ROOT_TYPE);
+               }
+
+               ESA_DIAG_printf(ESA_COMP_GTUSERS, 2,
+                  "Restart Aggregation from Container=%d/%s",
+                  strlen(tmp_oe), tmp_oe);
+
+               CTSAMSG_print(ERR_3_STRINGS,                 /* PS0312 */
+                             msgs, NULL, dest,              /* PS0312 */
+                             "Restart Aggregation From Container",
+                              tmp_oe_tp, tmp_oe);           /* PS0312 */
+
+               CTSAMSG_print(ERR_3_STRINGS,                 /* PS0312 */
+                             msgs, NULL, dest,              /* PS0312 */
+                             "Restart Aggregation From",  /* PS0312 */
+                              user_params_in[0].user, "");  /* PS0312 */
+
+               if (strlen(tmp_oe) GT 0) {
+                   rc=TSS_select_acids_list_from(ESA_COMP_GTUSERS,
+                                                 oes_list,
+                                                 TSS_CONTAINER,
+                                                 tmp_oe,
+                                                 dest, msgs );
+                   if ( rc NE ESA_OK )
+                     goto exit;
+               }
+            }    /* Restart Download */
+         }            /* Get OE   ALL. First invoke */
+         else {       /* Continue processing        */
+            oes_list   = get_handle->oe_acids_list;
+            users_list = get_handle->acids_list;
+         }            /* Continue processing        */
+
+         ESA_DIAG_printf(ESA_COMP_GTUSERS, 2,
+                         "Get_ALL: oes_list=%X users_list=%X",
+                          oes_list, users_list);
+
+         if ( NOT users_list )  /* First invoke        */
+           get_users_list = TRUE;
+         else {                 /* Continue processing */
+
+           /* If No more Users, get next Container */
+
+           ESA_DIAG_printf(ESA_COMP_GTUSERS, 2,
+              "get_handle->list_ind=%d users_list->used_entries=%d",
+               get_handle->list_ind, users_list->used_entries);
+
+           if (get_handle->list_ind GE users_list->used_entries) {
+            get_handle->oe_list_ind++;
+
+            /* If No more Containers and No more Users, all done */
+
+            if (get_handle->oe_list_ind GE oes_list->used_entries) {
+                *have_more  = NO_MORE;
+                *actual_num = 0;
+                goto exit;
+            }
+            get_users_list = TRUE;
+           } /* Get New Container Entry */
+         }     /* Continue Processing     */
+
+         /* Ensure that current Container information is really */
+         /* need to be procceeded. For continue download some   */
+         /* Containers may be skipped by this step              */
+
+         if (download_from AND get_users_list) {
+           for (i_tmp = get_handle->oe_list_ind;
+                (i_tmp LT oes_list->used_entries) AND
+                (oes_list->trap_data[i_tmp].used)     ;
+                i_tmp++) ;
+         }
+         else
+           i_tmp = get_handle->oe_list_ind;
+
+         ESA_DIAG_printf(ESA_COMP_GTUSERS, 2,
+                        "1.get_users_list=%d oe_list_ind=%d/%c/%s",
+                         get_users_list,
+                         get_handle->oe_list_ind,
+                         oes_list->trap_data[i_tmp].data[0],
+                         &(oes_list->trap_data[i_tmp].data[1]) );
+
+         get_handle->oe_list_ind = i_tmp;
+
+         /* If No more Containers and No more Users, all done */
+         if (get_handle->oe_list_ind GE oes_list->used_entries) {
+             *have_more  = NO_MORE;
+             *actual_num = 0;
+             goto exit;
+         }
+
+         /* oes_list->trap_data[i_tmp].used = TRUE;  PS0376 */
+         if (get_users_list) {
+
+           get_handle->oe_list_ind--;
+
+           do {         /* Perform this loop, while will be obtained */
+                        /* At least one user for get processing      */
+
+             get_next_oe : ;                                 /*ps0376*/
+
+             get_handle->oe_list_ind++;
+             i_tmp = get_handle->oe_list_ind;
+
+             /* If No more Containers and No more Users, all done */
+            if (get_handle->oe_list_ind GE oes_list->used_entries) {
+                *have_more  = NO_MORE;
+                *actual_num = 0;
+                goto exit;
+             }
+
+             /* Ignore if bypassed by GetContainers List */  /*ps0376*/
+                                                             /*ps0376*/
+             if (oes_list->trap_data[i_tmp].used)            /*ps0376*/
+                goto get_next_oe;                            /*ps0376*/
+             oes_list->trap_data[i_tmp].used = TRUE;         /*ps0376*/
+
+             /* Free/Reset Old user's list , if exists */
+
+             if ( get_handle->acids_list NE NULL ) {
+               users_list =  get_handle->acids_list;
+              /*
+               * TSS_free_trap_handle(ESA_COMP_GTUSERS,
+               *                      &users_list, dest, msgs);
+               * get_handle->acids_list = NULL;
+               */
+               users_list->used_entries = 0;
+               get_handle->list_ind     = 0;
+             }
+
+             get_types_ind  =  oes_list->trap_data[i_tmp].data[0];
+             strcpy(tmp_oe, &(oes_list->trap_data[i_tmp].data[1]) );
+
+             ESA_DIAG_printf(ESA_COMP_GTUSERS, 2,
+                        "2.get_users_list=%d oe_list_ind=%d/%c/%s",
+                         get_users_list,
+                         get_handle->oe_list_ind,
+                         oes_list->trap_data[i_tmp].data[0],
+                         &(oes_list->trap_data[i_tmp].data[1]) );
+
+
+             switch (get_types_ind) {
+              case '0' :
+                rc=TSS_get_acids_list(ESA_COMP_GTUSERS, TSS_USER,
+                               &users_list,
+                               get_types_for_root,
+                               tmp_oe, admin_params, err );
+                break;
+              case '1' :
+                rc=TSS_get_acids_list(ESA_COMP_GTUSERS, TSS_USER,
+                               &users_list,
+                               get_types_for_zone,
+                               tmp_oe, admin_params, err );
+                break;
+              case '2' :
+                rc=TSS_get_acids_list(ESA_COMP_GTUSERS, TSS_USER,
+                               &users_list,
+                               get_types_for_div,
+                               tmp_oe, admin_params, err );
+                break;
+              case '3' :
+                rc=TSS_get_acids_list(ESA_COMP_GTUSERS, TSS_USER,
+                               &users_list,
+                               get_types_for_dept,
+                               tmp_oe, admin_params, err );
+                break;
+              default :
+                CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                              component, func, "Invalid get_types_ind",
+                              get_types_ind,__LINE__) ;
+                rc = ESA_FATAL;
+             } /* switch (get_types_ind) */
+
+             if (rc NE ESA_OK)
+                goto exit;
+
+             get_handle->acids_list = users_list;
+
+             ESA_DIAG_printf(ESA_COMP_GTUSERS, 2,
+                             "users_list->used_entries=%d",
+                              users_list->used_entries);
+
+           } while (NOT users_list->used_entries);
+
+           /*  For Continue Download , select user from */
+
+           if (download_from) {
+             rc=TSS_select_acids_list_from(ESA_COMP_GTUSERS,
+                                        users_list,
+                                        TSS_USER,
+                                        user_params_in[0].user,
+                                        dest, msgs );
+             if ( rc NE ESA_OK )
+                goto exit;
+           }
+         }    /* Get new user's list */
+         else
+            users_list = get_handle->acids_list;
+
+         rc=TSS_do_users_list(ESA_COMP_GTUSERS,
+                             mode, num_users_in,        /*bs2590*/
+                             TSS_USER, users_list,
+                              get_handle, max_users,   actual_num,
+                              have_more,  user_params, addinfo,
+                              objs_exist, admin_params, err);
+         if ( (*have_more) EQ NO_MORE )
+           get_handle->list_ind = users_list->used_entries;
+
+         *have_more = HAVE_MORE;
+       }     /* None Standard Download */
+       /* End of PS0312 */
+
+       break ;
+
+      case GET_MANY_USERS :
+
+         if ( NOT get_handle->acids_list ) {
+           rc=TSS_get_many_acids_list(ESA_COMP_GTUSERS,
+                                      &users_list, num_users_in,
+                                      user_params_in,admin_params,err);
+           get_handle->acids_list = users_list;
+           if ( rc NE ESA_OK )
+              goto exit;
+         }
+         else
+            users_list = get_handle->acids_list;
+
+         rc=TSS_do_users_list(ESA_COMP_GTUSERS,
+                              mode, num_users_in,        /*bs2590*/
+                              TSS_USER, users_list,
+                              get_handle, max_users,   actual_num,
+                              have_more,  user_params, addinfo,
+                              objs_exist, admin_params, err);
+
+         if (rc EQ ESA_OK)               /* BS2431 */
+           (*actual_num) = num_users_in; /* BS2431 */
+
+         break ;
+
+      case GET_WILD_USERS :
+
+         if ( NOT get_handle->acids_list ) {
+            rc=TSS_get_acids_list(ESA_COMP_GTUSERS,TSS_USER,
+                                  &users_list, get_types,
+                                  dummy_oe, admin_params, err );
+            get_handle->acids_list = users_list;
+            if ( rc NE ESA_OK )
+               goto exit;
+
+            rc=TSS_select_wild_users_list(ESA_COMP_GTUSERS,
+                                          users_list, num_users_in,
+                                          user_params_in, dest, msgs );
+            if ( rc NE ESA_OK )
+               goto exit;
+         }
+         else
+            users_list = get_handle->acids_list;
+
+         rc=TSS_do_users_list(ESA_COMP_GTUSERS,
+                              mode, num_users_in,        /*bs2590*/
+                              TSS_USER, users_list,
+                              get_handle, max_users,   actual_num,
+                              have_more,  user_params, addinfo,
+                              objs_exist, admin_params, err);
+         break ;
+
+      case GET_SUBTREE_USERS :
+
+         if ( NOT get_handle->acids_list ) {
+            rc=TSS_get_acids_list(ESA_COMP_GTUSERS, TSS_USER,
+                                  &users_list, get_types,
+                                  entering_oe, admin_params, err );
+            get_handle->acids_list = users_list;
+            if ( rc NE ESA_OK )
+               goto exit;
+         }
+         else
+            users_list = get_handle->acids_list;
+
+         rc=TSS_do_users_list(ESA_COMP_GTUSERS,
+                              mode, num_users_in,        /*bs2590*/
+                              TSS_USER, users_list,
+                              get_handle, max_users,   actual_num,
+                              have_more,  user_params, addinfo,
+                              objs_exist, admin_params, err);
+         break ;
+
+      default :
+
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                       func, "Invalid mode", mode,__LINE__) ;
+         rc=ESA_FATAL;
+         goto exit ;
+
+ }
+
+/*
+ *  BS2434. Replace an empty NAME field to **UNDEFINED**
+ */
+
+ ESA_DIAG_printf(ESA_COMP_GTUSERS,2,
+                 "Max_users=%d actual num=%d", max_users, *actual_num);
+
+ for (i=0; i LT *actual_num; i++) {
+   if (objs_exist[i] EQ OBJ_EXIST ) {
+
+      /* NAME field handling */
+
+      cpair = ADDINFO_search("NAME", TSS_ADDINFO_KWD_LEN,
+                             addinfo[i]->pair,
+                             addinfo[i]->num_pairs );
+      if (cpair NE NULL) {
+        if (cpair->vallen EQ 0) {
+           ADDINFO_updval("**UNDEFINED**",
+                          TSS_ADDINFO_VAL_LEN, cpair);
+        }     /* Field is empty   */
+      }       /* NAME field found */
+
+      /* DCEKEY field handling */
+
+      cpair = ADDINFO_search("DCEKEY", TSS_ADDINFO_KWD_LEN,
+                             addinfo[i]->pair,
+                             addinfo[i]->num_pairs );
+      if (cpair NE NULL) { /* None Display field */
+        ADDINFO_updval("", TSS_ADDINFO_VAL_LEN, cpair);
+      }       /* DCEKEY fld found    */
+   }          /* Obj exists          */
+ }            /* Actual num loop     */
+
+/*
+ *  Print diagnostic information
+ */
+
+ ESA_DIAG_printf(ESA_COMP_GTUSERS,2,
+                 "Max_users=%d actual num=%d", max_users, *actual_num);
+
+ if ( ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 4 ) {
+    for (i_dump=0; i_dump LT *actual_num; i_dump++) {
+      ESA_DIAG_printf(ESA_COMP_GTUSERS,0,
+        "%d. User=%s exist=%d parent=%s rev_status=%d user_admin=%d "
+        "def_group=%s def_ug_action=%d",
+                      i_dump,                             /* IS10091 */
+                      user_params[i_dump].user,
+                      objs_exist[i_dump],
+                      user_params[i_dump].parent_oe,
+                      user_params[i_dump].rev_status,
+                      user_params[i_dump].user_admin,
+                      user_params[i_dump].def_group,
+                      user_params[i_dump].def_ug_action);
+      if ( ( objs_exist[i_dump] EQ OBJ_EXIST ) AND
+           ( ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 4 ) )
+         ADDINFO_dump(addinfo[i_dump],0);
+    }
+ }
+
+/*
+ *  Finish
+ */
+
+ exit : ;
+
+/*
+ *  Return to caller
+ */
+
+ ESA_DIAG_printf(ESA_COMP_GTUSERS, 1,
+                 "Exiting with rc = %d actual num=%d have_more=%d",
+                 rc,*actual_num,*have_more);
+
+/*
+ *  Cleanup
+ */
+
+ if ( (rc NE ESA_OK) OR (*have_more EQ NO_MORE) ) {
+    if ( *handle NE NULL ) {
+       /*ps0495 - add support for bs2481
+        * If cache is used, free the cache handle (R0600)
+        */
+       if   (this_is_a_restart) {                    /* ps0495 */
+             this_is_a_restart = FALSE;
+       }
+       else {
+          ddinfo_rc = OS_MVS_ddinfo (R0600_DD_NAME,  /* bs2481 */
+                              get_all_cmode, FALSE,      /* IS10174 */
+                              dest, msgs, 0);            /* IS10174 */
+                   /* IS10174 get_all_cmode, FALSE, dest, msgs); */
+          if  (ddinfo_rc EQ ESA_OK  )  {             /* BS2481 */
+             if (get_handle NE NULL) {               /* ps0495 */
+                if (get_handle->r0600 NE NULL) { /* ps0395 */
+                  fclose(get_handle->r0600);         /* ps0395 */
+                  get_handle->r0600 = NULL;          /* ps0395 */
+                }                                    /* ps0395 */
+             }                                       /* ps4395 */
+          }                                          /* bs2481 */
+       }                                             /* ps0495 */
+       TSS_free_get_handle( ESA_COMP_GTUSERS, handle, dest, msgs);
+       *handle    = NULL;
+       get_handle = NULL;
+    }
+    *have_more = NO_MORE ;
+ }
+
+ ESA_DIAG_exit(ESA_COMP_GTUSERS, 1, func, rc);
+
+ return rc ;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_invoke_tsscfile_u                      *
+ *                                                             *
+ * DESCRIPTION    : Create input for TSSCFILE utility, invoke  *
+ *                  for receive user parameters                *
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  acids_list- acids list                     *
+ *                  i_from    - index from                     *
+ *                  i_max     - number of acids                *
+ *                  main_cmd  - main_cmd                       *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : i_max     - number of acids procced        *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_invoke_tsscfile_u(ESA_DIAG_COMP_typ  comp,
+                             TSS_TRAP_BUF_rec_typ     * acids_list,
+                             int /* PS0495 added * */ * i_from,
+                             int                      * i_max,
+                             USER_PARAMS_rec_typ        user_params[1],
+                             OBJ_EXISTS_typ             objs_exist[1],
+                             int                        max_acids,
+                             HAVE_MORE_typ              * have_more,
+                             char                       * main_cmd,
+                             CTSAMSG_DEST_TABLE_rec_typ * dest,
+                             CTSAMSG_HANDLE_rec_typ     * msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                 rc = ESA_OK ;
+   char                   cmd[MAX_TSS_API_ST];
+   int                    i;
+   int                    actual_num   = 0;
+   int                    added_uncond = 0;  /* BS2431 */
+   int                    nb;
+   char                   file_name[TSS_MAX_FILENAME_LEN + 10];
+   char                   ddn_with[MAX_FILENAME_LEN];     /* SAS2IBMT */
+   FILE                 * file_in = NULL ;
+   static char func[]="TSS_invoke_tsscfile_u";
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(comp, 3, func);
+
+   /* IS10174
+   rc = OS_MVS_ddinfo(TSSCFILE_IN_DD , file_name , TRUE, dest, msgs);*/
+   rc = OS_MVS_ddinfo(TSSCFILE_IN_DD , file_name ,       /* IS10174 */
+                      TRUE, dest, msgs, 0);              /* IS10174 */
+
+   ESA_DIAG_printf(comp, 2,
+                  "OS_MVS_ddinfo rc=%d file name %s", rc, file_name);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+  /*
+   *  Open file for create input for TSSCFILE
+   */
+
+   strcpy(ddn_with,"DD:");                                /* SAS2IBMT */
+   strcat(ddn_with, TSSCFILE_IN_DD);                      /* SAS2IBMT */
+
+   /* SAS2IBMT
+   file_in = fopen(TSSCFILE_IN_DD , FILE_OPEN_WRITE_TEXT);           */
+   file_in = fopen(ddn_with , FILE_OPEN_WRITE_TEXT);      /* SAS2IBMT */
+   if ( ferror(file_in) OR (file_in EQ NULL) ) {
+       CTSAMSG_print(ERR_IO, msgs, NULL, dest, "fopen", TSSCFILE_IN_DD,
+                     strerror(errno) );
+       ESA_DIAG_printf(comp, 2,
+              "file %s error %s", TSSCFILE_IN_DD, strerror(errno));
+       rc = ESA_FATAL;
+       goto exit;
+   }
+
+  /*
+   *  Create input file for TSSCFILE utility
+   */
+
+   ESA_DIAG_printf(comp, 2, "i_from=%d i_max=%d used_entries=%d",
+   /*PS0495*/      *i_from, *i_max, acids_list->used_entries);
+
+   i=*i_from; /*PS0495*/
+   while ( (actual_num LT  max_acids              ) AND
+           (actual_num LT *i_max                  ) AND
+           (i          LT acids_list->used_entries)   ) {
+
+      if (acids_list->trap_data[i].used) {
+         i++;
+         continue;
+      }
+
+     /*
+      *  Reset user parameters
+      */
+
+      user_params[actual_num].user[0]       = NULL_CHAR;
+      user_params[actual_num].passwd_life   = PASS_LIFE_IGNORED;
+      user_params[actual_num].def_ug_action = OLD_DEF_UG_ACT_IGNORED;
+      user_params[actual_num].def_group[0]  = NULL_CHAR;
+      user_params[actual_num].parent_oe[0]  = NULL_CHAR;
+      user_params[actual_num].rev_status    = USER_STAT_ACTIVE;
+      user_params[actual_num].user_admin    = USER_ADM_NONE;
+      objs_exist [actual_num] = OBJ_NOT_EXIST;
+
+     /*
+      *  Attention ! The first symbol - sort symbol !
+      */
+      strcpy(user_params[actual_num].user,
+                           &acids_list->trap_data[i].data[1]);
+
+     /*
+      *  The item may be does not exist
+      */
+
+      if (acids_list->trap_data[i].data[0] EQ TSS_GET_MANY_SKIP_ITEM)
+      {
+         acids_list->trap_data[i].used = TRUE;
+         i++;
+         continue;
+      }
+
+     /*
+      *  The item does not exist , but return it by GET_MANY
+      *  BS2431
+      */
+
+      if (acids_list->trap_data[i].data[0] EQ TSS_GET_MANY_ACC_UNCOND)
+      {
+         actual_num++;
+         added_uncond++;
+         acids_list->trap_data[i].used = TRUE;
+         i++;
+         continue;
+      }
+
+      acids_list->trap_data[i].used = TRUE;               /* PS0268 */
+
+      sprintf(cmd, main_cmd, &acids_list->trap_data[i].data[1]);
+      nb = fputs( cmd, file_in);
+      i++;
+
+      ESA_DIAG_printf(comp, 2, "written %d bytes, cmd=%s", nb, cmd);
+
+      if ( ferror(file_in) OR (nb EQ 0) ) {
+          CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                        "fputs", TSSCFILE_IN_DD, strerror(errno) );
+          ESA_DIAG_printf(comp, 1,
+                          "file %s error %s", TSSCFILE_IN_DD,
+                           strerror(errno));
+          rc = ESA_FATAL;
+          goto exit;
+      }
+      actual_num++;
+   }
+   /* PS0495 saving the current index in the acid array */
+
+   *i_from = i;  /* PS0495 added * to i_from */
+
+   ESA_DIAG_printf(comp, 2, "last index =%d", *i_from);
+
+   fclose(file_in);
+   file_in = NULL;
+
+  /*
+   * Handling end of processing
+   */
+
+   ESA_DIAG_printf(comp, 2,
+                   "i=%d entries=%d actual_num=%d added_uncond=%d",
+                   i, acids_list->used_entries,
+                   actual_num, added_uncond);
+
+   actual_num -= added_uncond; /* BS2431 */
+   if (i EQ acids_list->used_entries) {      /* Last set of list */
+      *have_more = NO_MORE;
+      *i_max = actual_num;
+      if (actual_num EQ 0)     /* BS2432 */
+        goto exit;             /* BS2432 */
+   }
+   else if (actual_num EQ 0)  {          /* Empty set of list */
+      *have_more = NO_MORE;
+      *i_max     = 0;
+      goto exit;
+   }
+   else {
+      *have_more = HAVE_MORE;            /* Waiting for next call */
+      *i_max = actual_num;
+   }
+
+   rc = TSS_cfile_activate(comp, dest, msgs );
+
+  /*
+   *   Finish
+   */
+
+   exit :;
+
+   if (file_in NE NULL)
+      fclose(file_in);
+
+   ESA_DIAG_exit(comp, 3, func, rc);
+
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_do_users_list                          *
+ *                                                             *
+ * DESCRIPTION    : acids list processing (get info)           *
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  mode      - ALL,               *bs2590*    *
+ *                              MANY (or one),                 *
+ *                              WILD (wildcard - currently     *
+ *                              unimplemented)                 *
+ *                  num_users_in - num of users    *bs2590*    *
+ *                  acid_type - acid type                      *
+ *                  acids_list- acids list                     *
+ *                  get_handle- get handle                     *
+ *                  max_users - max users                      *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : actual_num - actual num                    *
+ *                  have_more  - have more flag                *
+ *                  user_params- user params                   *
+ *                  addinfo    - addinfo                       *
+ *                  obj_exist  - obj exist                     *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_do_users_list(ESA_DIAG_COMP_typ  comp,
+                            GET_USER_MODE           mode, /*bs2550*/
+ /*bs2590*/                 short                   num_users_in,
+                            char                  * acid_type,
+                            TSS_TRAP_BUF_rec_typ  * users_list,
+                            TSS_GET_HANDLE_typ    * get_handle,
+                            short                   max_users,
+                            short                 * actual_num,
+                            HAVE_MORE_typ         * have_more,
+                            USER_PARAMS_rec_typ     user_params[1],
+                            ADDINFO_rec_ptr         addinfo[1],
+                            OBJ_EXISTS_typ          objs_exist[1],
+                            ADMIN_PARAMS_rec_typ  * admin_params,
+                            ERR_STRUCT_rec_typ    * err)
+{
+
+ static char func[]="TSS_do_users_list";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                       rc   = ESA_OK ;
+ ESA_RC                       rc_a = ESA_OK ;
+ TSSCFILE_REC_typ           **tsscf_recs;
+ CTSAMSG_HANDLE_rec_typ     * msgs;
+ CTSAMSG_DEST_TABLE_rec_typ * dest;
+ ADDINFO_rec_ptr              laddinfo    = NULL;
+ ONE_FIELD_rec_ptr            pair;
+ /* IS10091A ONE_FIELD_rec_ptr            pair1;            /*IS10091*/
+ ONE_FIELD_rec_ptr            pair_rec_0001;
+ ONE_FIELD_rec_typ            rec_0001;
+ FILE                       * file_out  = NULL;
+ char                         main_cmd[MAX_TSS_API_ST];
+ int                          do_users_info = 1;
+ int                          i;
+ int                          rec_cnt = 0;
+ int                          i_from;
+ int                          i_max     = max_users;
+ int                          max_acids = max_users;
+ int                          logout_done = 0;
+ /* IS10091 - start */
+ TSS_PARAMS_rec_typ * params_ptr = admin_params->apiinit_handle;
+ /* IS10091 - end   */
+
+ /*
+  *  Initialize
+  */
+
+  ESA_DIAG_enter(comp, 3, func );
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  /* IS10091 tsscf_recs = TSS_get_global_tssc_desc("GENERAL");     */
+  tsscf_recs = params_ptr->tsscf_rec_general;          /* IS10091  */
+  i_from = get_handle->list_ind;
+  ESA_DIAG_printf(comp, 2, "processing list from ind=%d", i_from);
+  rc = CTSCRSS_set_authority( &logout_done,
+                              SET_TO_STARTED_TASK_AUTH,
+                              admin_params, err );
+  if ( rc NE ESA_OK )
+      goto exit;
+
+  laddinfo = get_handle->laddinfo;
+
+  /* IS10091 - start */
+  if ( ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 6 )
+  {
+    ESA_DIAG_printf(ESA_COMP_GTUSERS, 6,
+                "work addinfo at entry to do_users_list");
+    ADDINFO_dump(get_handle->waddinfo,1);
+    ESA_DIAG_printf(ESA_COMP_GTUSERS, 6,
+               "local addinfo at entry to do_users_list");
+    ADDINFO_dump(get_handle->laddinfo,1);
+  }
+  /* IS10091 - end   */
+
+  /* BS10085 Adding VERBOSE to LIST command
+  strcpy(main_cmd, " TSS LIST(%s) DATA(ALL,PASSWORD) \n");           */
+  strcpy(main_cmd, " TSS LIST(%s) DATA(ALL,PASSWORD,VERBOSE) \n"); /*BS10085*/
+
+  /* PS0495 passing i_from by reference */
+  rc = TSS_invoke_tsscfile_u(comp, users_list, &i_from, &i_max,
+                             user_params, objs_exist, max_acids,
+                             have_more, main_cmd, dest, msgs);
+  if ( rc NE ESA_OK )
+     goto exit;
+
+ /*
+  *  Check End-of-list
+  */
+
+  ESA_DIAG_printf(comp, 2,
+                  "have_more=%d i_max=%d",
+                  (*have_more), i_max);
+
+  if ( ( (*have_more) EQ NO_MORE ) AND (i_max EQ 0) ) {
+     rc = ESA_OK;
+     goto exit;
+  }
+
+  ESA_DIAG_printf(comp, 2, "procceed=%d", i_max);
+  /* PS0495 saving the index from the ACID array */
+  get_handle->list_ind = i_from;
+
+  *actual_num = i_max;  /* actual_num == tsscfile created entries */
+
+ /*
+  *   Open TSSCFILE utility output file
+  */
+
+ /* IS0347 start */
+  rc = TSS_open_output_file(comp,admin_params,&file_out);
+  if ( rc NE ESA_OK )
+    goto exit;
+  /*
+  file_out = afopen(TSSCFILE_OUT_DD, FILE_OPEN_READ_BINARY,
+                    NULL_STRING, NULL_STRING);
+  if (file_out EQ NULL) {
+      CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                    "fopen", func, TSSCFILE_OUT_DD, strerror(errno));
+     rc = ESA_FATAL;
+     goto exit;
+  }
+  */
+  /* IS0347 end */
+
+  while ( do_users_info ) {
+
+   /*
+    *   Load information to addinfo
+    */
+
+    pair_rec_0001 = ADDINFO_search( CFILE_REC_0001, TSS_ADDINFO_KWD_LEN,
+                                 laddinfo->pair, laddinfo->num_pairs );
+    if ( pair_rec_0001 NE NULL )
+      memcpy( (char *)&rec_0001, (char *)pair_rec_0001,
+              sizeof(ONE_FIELD_rec_typ) );
+
+    ADDINFO_empty( laddinfo );
+    ADDINFO_clear( get_handle->waddinfo);
+    TSS_reset_list_buf(comp, &(get_handle->list_buffer));
+
+    /* IS10091 - start */
+    if ( ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 1 )
+    {
+      ESA_DIAG_printf(ESA_COMP_GTUSERS, 1,
+              "work addinfo before TSS_output_to_addinfo");
+      ADDINFO_dump(get_handle->waddinfo,1);
+      ESA_DIAG_printf(ESA_COMP_GTUSERS, 1,
+              "local addinfo before TSS_output_to_addinfo");
+      ADDINFO_dump(get_handle->laddinfo,1);
+    }
+    /* IS10091 - end   */
+
+    if ( pair_rec_0001 NE NULL )
+       ADDINFO_insert(TYPE_1A, rec_0001.keyword, rec_0001.value,
+                      laddinfo,
+                      TSS_ADDINFO_KWD_LEN, TSS_ADDINFO_VAL_LEN, UNIQUE);
+
+    rc_a = TSS_output_to_addinfo(comp, tsscf_recs,
+                                 get_handle, file_out, &rec_cnt,
+                                 acid_type, get_handle->waddinfo,
+                                 laddinfo, dest, msgs);
+
+    /* IS10091 - start */
+    if ( ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 6 )
+    {
+      ESA_DIAG_printf(ESA_COMP_GTUSERS, 6,
+              "work addinfo after TSS_output_to_addinfo");
+      ADDINFO_dump(get_handle->waddinfo,1);
+      ESA_DIAG_printf(ESA_COMP_GTUSERS, 6,
+              "local addinfo after TSS_output_to_addinfo");
+      ADDINFO_dump(get_handle->laddinfo,1);
+    }
+    /* IS10091 - end   */
+
+    if ( (rc_a EQ ESA_FATAL) OR
+         (rc_a EQ ESA_ERR  )  ) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+    else  if ( rc_a EQ ESA_WARN)
+       rc = ESA_OK;
+
+    if (  get_handle->found_err AND
+         (get_handle->err_action EQ TSS_BREAK_BY_ERR ) ) {
+      rc = ESA_FATAL;
+      *actual_num = 0;
+      goto exit;
+    }
+
+    pair = ADDINFO_search( "ACID", TSS_ADDINFO_KWD_LEN,
+                           laddinfo->pair, laddinfo->num_pairs );
+    if ( pair NE NULL ) {
+
+        /* bs2590 - begin */
+        if ( mode EQ GET_MANY_USERS )
+           i_max = num_users_in;
+        /* bs2590 - end */
+
+       rc = TSS_locate_user(comp, pair->value, acid_type,
+                            user_params, objs_exist, i_max,
+                            &i, dest, msgs);
+       if ( rc NE ESA_OK )
+         goto exit;
+
+       ADDINFO_copy( addinfo[i], get_handle->waddinfo);
+       TSS_put_list_info(comp, &(get_handle->list_buffer),
+                         addinfo[i], dest, msgs );
+
+       /* IS10091 - start */
+       if ( ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 6 )
+       {
+         ESA_DIAG_printf(ESA_COMP_GTUSERS, 6,
+                 "addinfo %d after TSS_put_list_info", i);
+         ADDINFO_dump(addinfo[i],1);
+       }
+       /* IS10091 - end  */
+
+       rc = TSS_put_user_info(comp, &user_params[i],
+                              addinfo[i], laddinfo,
+                              admin_params,             /* WS10009 */
+                              dest, msgs);
+
+       /* IS10091 - start */
+       if ( ESA_DIAG_get_debug_level(ESA_COMP_GTUSERS) GE 6 )
+       {
+         ESA_DIAG_printf(ESA_COMP_GTUSERS, 6,
+                 "addinfo %d after TSS_put_user_info", i);
+         ADDINFO_dump(addinfo[i],1);
+       }
+       /* IS10091 - end  */
+
+
+       if ( rc NE ESA_OK )
+         goto exit;
+
+       TSS_set_empty_flags( comp, addinfo[i], dest, msgs );
+
+    }    /* ACID found */
+
+    if (rc_a EQ ESA_EOF) {
+       rc = ESA_OK;
+       break;
+    }
+  }
+
+  /* IS10091A -
+   * Move the process below to TSS_get_parent_oe in CTSTSRV
+
+   * IS10091 start *
+  pair = ADDINFO_search("ParentContainerName",TSS_ADDINFO_KWD_LEN,
+                        addinfo[i]->pair, addinfo[i]->num_pairs );
+  ESA_DIAG_printf(comp, 5, "ParentContainerName=<%s>",pair->value);
+  if ( pair NE NULL )
+  {
+    pair1 = ADDINFO_search( "DEPT_NAME", TSS_ADDINFO_KWD_LEN,
+                             addinfo[i]->pair,addinfo[i]->num_pairs );
+    ESA_DIAG_printf(comp, 5, "DEPT_NAME=<%s> len=<%d>",
+                    pair1->value,pair1->vallen);
+    if (pair1->vallen EQ 0)
+     {
+      pair1 = ADDINFO_search( "DIV_NAME", TSS_ADDINFO_KWD_LEN,
+                              addinfo[0]->pair,addinfo[0]->num_pairs );
+      ESA_DIAG_printf(comp, 5, "DIV_NAME=<%s> len=<%d>",
+                    pair1->value,pair1->vallen);
+     }
+     if ( pair1->vallen EQ 0)
+      {
+       pair1 = ADDINFO_search( "ZONE_NAME", TSS_ADDINFO_KWD_LEN,
+                              addinfo[0]->pair,addinfo[0]->num_pairs );
+       ESA_DIAG_printf(comp, 5, "ZONE_NAME=<%s> len=<%d>",
+                    pair1->value,pair1->vallen);
+      }
+  }
+  if ( pair NE NULL AND pair1 NE NULL )
+  {
+   ADDINFO_addval(pair1->value, TSS_ADDINFO_VAL_LEN,
+                         ADDINFO_LIST_ENTRY, pair, dest, msgs );
+   ESA_DIAG_printf(comp, 5, "update keyword =<%s> and value=<%s>",
+                   pair->keyword,pair1->value);
+  }
+   * IS10091 end *
+  */
+
+ /*
+  *  Finish
+  */
+
+ exit : ;
+
+  if (file_out NE NULL)
+     fclose(file_out);
+
+  if (logout_done)
+    CTSCRSS_set_authority( &logout_done,
+                           RETURN_FROM_STARTED_TASK_AUTH,
+                           admin_params, err );
+
+  ESA_DIAG_exit(comp, 3, func, rc);
+
+  return rc ;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_locate_user                            *
+*                                                             *
+* DESCRIPTION    : Search and set user found parameters       *
+*                                                             *
+* INPUT          : acid            - acid val                 *
+*                  user_params     - user_params              *
+*                  obj_exist       - obj exist area           *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : i               - index of user            *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+/**************************************************************/
+
+static ESA_RC TSS_locate_user(ESA_DIAG_COMP_typ         comp,
+                          char                        * acid,
+                          char                        * acid_type,
+                          USER_PARAMS_rec_typ           user_params[1],
+                          OBJ_EXISTS_typ                objs_exist[1],
+                          int                           max_users,
+                          int                         * found_ind,
+                          CTSAMSG_DEST_TABLE_rec_typ  * dest,
+                          CTSAMSG_HANDLE_rec_typ      * msgs)
+{
+
+ static char func[]="TSS_locate_user";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC   rc = ESA_OK ;
+ int      i;
+
+/*
+ *  Initialize
+ */
+
+ ESA_DIAG_enter(comp, 5, func );
+
+ for (i=0; i LT max_users; i++ ) {
+    if ( strcmp(acid, user_params[i].user) EQ 0 ) {
+      objs_exist [i] = OBJ_EXIST;
+      *found_ind = i;
+      ESA_DIAG_printf(comp, 5, "found %s=%s index=%d",
+                      acid_type, acid, i );
+      goto exit;
+    }
+ }
+
+ CTSAMSG_print(TSS_ERR_NO_ACID, msgs, NULL, dest,
+               acid_type, acid );
+ rc = ESA_ERR;
+
+/*
+ *  Finish
+ */
+
+ exit : ;
+
+ ESA_DIAG_exit(comp, 5, func, rc);
+
+ return rc ;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_put_user_info                          *
+*                                                             *
+* DESCRIPTION    : Fill up the user structure                 *
+*                                                             *
+* INPUT          : user_params     - user param struct        *
+*                  addinfo         - addinfo area             *
+*                  laddinfo        - local addinfo area       *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+/**************************************************************/
+
+static ESA_RC TSS_put_user_info(ESA_DIAG_COMP_typ       comp,
+                          USER_PARAMS_rec_typ         * user_params,
+                          ADDINFO_rec_ptr               addinfo,
+                          ADDINFO_rec_ptr               laddinfo,
+            /* WS10009 */ ADMIN_PARAMS_rec_typ        * admin_params,
+                          CTSAMSG_DEST_TABLE_rec_typ  * dest,
+                          CTSAMSG_HANDLE_rec_typ      * msgs)
+{
+
+ static char func[]="TSS_put_user_info";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                rc = ESA_OK ;
+ char                  user_type[MAX_TSS_PARAM_LEN];
+ ONE_FIELD_rec_ptr     pair;                           /* WS10009 */
+ TSS_PARAMS_rec_typ * params_ptr = NULL;               /* WS10009 */
+ ONE_FIELD_rec_ptr     suspend_pair;
+ ONE_FIELD_rec_ptr     esuspend_pair;                  /* ws2483 */
+ ONE_FIELD_rec_ptr     suspend_type_pair;
+ char                  suspend_type_value[MAX_TSS_PARAM_LEN] = "";
+
+/*
+ *  Initialize
+ */
+
+ ESA_DIAG_enter(comp, 2, func );
+
+ rc = TSS_get_parent_oe( comp, TSS_USER_TYPE,
+                         user_type, user_params->parent_oe,
+                         addinfo, laddinfo, /*IS10091 dest, msgs );*/
+                         admin_params); /*IS10091*/
+ if ( rc NE ESA_OK )
+    goto exit;
+
+ suspend_pair = ADDINFO_search( "SUSPEND", TSS_ADDINFO_KWD_LEN,
+                                laddinfo->pair, laddinfo->num_pairs );
+ if ( suspend_pair NE NULL ) {
+   if (strcmp(suspend_pair->value, KWD_FLAG_ON ) EQ 0 ) {
+       user_params->rev_status = USER_STAT_REVOKED;
+       strcpy( suspend_type_value, "SUSPEND");
+   }
+ }
+ /* start of WS2483 */
+ esuspend_pair = ADDINFO_search( "ASUSPEND", TSS_ADDINFO_KWD_LEN,
+                                 laddinfo->pair,laddinfo->num_pairs);
+ if ( esuspend_pair NE NULL ) {
+   if (strcmp(esuspend_pair->value, KWD_FLAG_ON ) EQ 0 ) {
+       user_params->rev_status = USER_STAT_REVOKED;
+       strcpy( suspend_type_value, "ASUSPEND");
+   }
+ }
+
+ esuspend_pair = ADDINFO_search( "XSUSPEND", TSS_ADDINFO_KWD_LEN,
+                                 laddinfo->pair,laddinfo->num_pairs);
+ if ( esuspend_pair NE NULL ) {
+   if (strcmp(esuspend_pair->value, KWD_FLAG_ON ) EQ 0 ) {
+       user_params->rev_status = USER_STAT_REVOKED;
+       strcpy( suspend_type_value, "XSUSPEND");
+   }
+ }
+
+ esuspend_pair = ADDINFO_search( "VSUSPEND", TSS_ADDINFO_KWD_LEN,
+                                 laddinfo->pair,laddinfo->num_pairs);
+ if ( esuspend_pair NE NULL ) {
+   if (strcmp(esuspend_pair->value, KWD_FLAG_ON ) EQ 0 ) {
+       user_params->rev_status = USER_STAT_REVOKED;
+       strcpy( suspend_type_value, "VSUSPEND");
+   }
+ }
+
+ esuspend_pair = ADDINFO_search( "PSUSPEND", TSS_ADDINFO_KWD_LEN,
+                                 laddinfo->pair,laddinfo->num_pairs);
+ if ( esuspend_pair NE NULL ) {
+   if (strcmp(esuspend_pair->value, KWD_FLAG_ON ) EQ 0 ) {
+       user_params->rev_status = USER_STAT_REVOKED;
+       strcpy( suspend_type_value, "PSUSPEND");
+   }
+ }
+ /* end of WS2483 */
+
+ /* WS10009                                start */
+ pair = ADDINFO_search( "RU_LOCKED",TSS_ADDINFO_KWD_LEN,
+                        addinfo->pair, addinfo->num_pairs);
+
+ ESA_DIAG_printf(comp, 3,"Pair RU_LOCKED = %x",pair);
+ params_ptr = admin_params->apiinit_handle;
+
+if ( pair NE NULL )          /* RU_LOCKED is found */
+   {
+   ESA_DIAG_printf(ESA_COMP_UPDUSER, 3,"suspend_type_value = %s"        ,
+                  suspend_type_value);
+   /* match RSSPARM's LOCKED_TYPES with suspend type value in TSS */
+   if ((strcmp(suspend_type_value, "PSUSPEND") EQ 0 AND
+        params_ptr->rssparm_REVOKE_TYPES['P'] == 'L') OR
+       (strcmp(suspend_type_value, "VSUSPEND") EQ 0 AND
+        params_ptr->rssparm_REVOKE_TYPES['V'] == 'L') OR
+       (strcmp(suspend_type_value, "XSUSPEND") EQ 0 AND
+        params_ptr->rssparm_REVOKE_TYPES['X'] == 'L') OR
+       (strcmp(suspend_type_value, "ASUSPEND") EQ 0 AND
+        params_ptr->rssparm_REVOKE_TYPES['A'] == 'L'))
+    {
+     ADDINFO_updval(KWD_FLAG_ON, TSS_ADDINFO_KWD_LEN,pair );
+     ESA_DIAG_printf(comp, 3,
+                     "RU_LOCKED is set to Y");
+    }
+   else
+    {
+     ADDINFO_updval(KWD_FLAG_OFF, TSS_ADDINFO_KWD_LEN,pair );
+     ESA_DIAG_printf(comp, 3,"RU_LOCKED is set to N");
+    }
+  }
+
+pair = ADDINFO_search( "RU_SUSPENDED", TSS_ADDINFO_KWD_LEN,
+                     addinfo->pair,addinfo->num_pairs);
+ ESA_DIAG_printf(comp, 3,
+                 "Pair RU_SUSPENED = %x",pair);
+
+ if ( pair NE NULL )
+   {                  /* if RU_SUSPENDED is found set RU_SUSPENDED */
+    if ((user_params->rev_status EQ 1) AND     /*1=USER_STAT_REVOKED) */
+   /* match RSSPARM's SUSPENDED_TYPES with suspend type value in TSS */
+      ((strcmp(suspend_type_value, "PSUSPEND") EQ 0 AND
+        params_ptr->rssparm_REVOKE_TYPES['P'] == 'S') OR
+       (strcmp(suspend_type_value, "VSUSPEND") EQ 0 AND
+        params_ptr->rssparm_REVOKE_TYPES['V'] == 'S') OR
+       (strcmp(suspend_type_value, "XSUSPEND") EQ 0 AND
+        params_ptr->rssparm_REVOKE_TYPES['X'] == 'S') OR
+       (strcmp(suspend_type_value, "ASUSPEND") EQ 0 AND
+        params_ptr->rssparm_REVOKE_TYPES['A'] == 'S')))
+      {
+       ADDINFO_updval(KWD_FLAG_ON, TSS_ADDINFO_KWD_LEN,pair );
+       ESA_DIAG_printf(comp, 3,
+                  "RU_SUSPENDED is set to Y");
+      }
+     else
+      {
+       ADDINFO_updval(KWD_FLAG_OFF, TSS_ADDINFO_KWD_LEN,pair );
+       ESA_DIAG_printf(comp, 3,
+                  "RU_SUSPENDED is set to N");
+      }
+   } /* } RU_SUSPENDED is found */
+
+   if (user_params->rev_status EQ 1)
+    ESA_DIAG_printf(comp, 3,
+           "Suspension status is %s. User Status is 'REVOKED'",
+           suspend_type_value);
+   else if (user_params->rev_status EQ 2)
+    ESA_DIAG_printf(comp, 3,
+           "No Suspension Status. User Status is 'ACTIVE'");
+
+/* WS10009 end */
+ suspend_type_pair = ADDINFO_search("INFO.SUSPEND_TYPE",
+                                    TSS_ADDINFO_KWD_LEN,
+                                    addinfo->pair, addinfo->num_pairs);
+ if ( suspend_type_pair NE NULL ) {
+   ESA_DIAG_printf(comp, 3, "%s=%s",
+                   suspend_type_pair->keyword, suspend_type_value);
+   ADDINFO_updval(suspend_type_value, TSS_ADDINFO_VAL_LEN,
+                  suspend_type_pair );
+ }
+
+ ESA_DIAG_printf(comp, 3, "%s=%s", TSS_USER_TYPE, user_type);
+
+ if ((strcmp(user_type, TSS_DCA)  EQ 0 )    OR
+     (strcmp(user_type, TSS_VCA)  EQ 0 )    OR
+     (strcmp(user_type, TSS_ZCA)  EQ 0 )    OR
+     (strcmp(user_type, TSS_SCA)  EQ 0 )    OR
+     (strcmp(user_type, TSS_LSCA) EQ 0 )    OR
+     (strcmp(user_type, TSS_MSCA) EQ 0 )     )
+   user_params->user_admin = USER_ADM_ADMIN;
+
+/* CIQ#6 This routine does nothing so was removed
+ TSS_set_conn_checksum(addinfo);     // PS0387 */
+
+/*
+ *  Finish
+ */
+
+ exit : ;
+
+ ESA_DIAG_exit(comp, 2, func, rc);
+
+ return rc ;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_get_many_acids_list                    *
+*                                                             *
+* DESCRIPTION    : Create acids list from obtained users id   *
+*                                                             *
+* INPUT          : user_params_in  - user param struct        *
+*                  num_users_in    - number of entered users  *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : users_list                                 *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+/**************************************************************/
+
+static ESA_RC TSS_get_many_acids_list(ESA_DIAG_COMP_typ   comp,
+                   TSS_TRAP_BUF_rec_typ           ** users_list,
+                   short                             num_users_in,
+                   USER_PARAMS_rec_typ               user_params_in[1],
+                   ADMIN_PARAMS_rec_typ            * admin_params,
+                   ERR_STRUCT_rec_typ              * err)
+{
+
+ static char func[]="TSS_get_many_acids_list";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                            rc = ESA_OK ;
+ TSS_TRAP_BUF_rec_typ            * tmp;
+ int                               i;
+ int                               buf_size = num_users_in + 2;
+ char                              acid[MAX_TSS_PARAM_LEN];
+ CTSAMSG_DEST_TABLE_rec_typ      * dest;
+ CTSAMSG_HANDLE_rec_typ          * msgs;
+
+ /*** For TSS_chk_acid ***/
+
+ char                    real_acid_type[TSS_ACID_TYPE_LEN+1]="";
+ OBJECT_TYPE_typ         real_obj_type = TYPE_IGNORE;
+
+/*
+ *  Initialize
+ */
+
+ ESA_DIAG_enter(comp, 2, func );
+
+ msgs = admin_params->ctsamsg_handle;
+ dest = admin_params->ctsamsg_dest;
+
+/*
+ *  Create buffer
+ */
+
+ rc = TSS_alloc_trap_handle (comp, buf_size, &tmp, dest, msgs );
+ if ( rc NE ESA_OK )
+   goto exit;
+
+ for (i=0; i LT num_users_in; i++ ) {
+
+   ESA_DIAG_printf(ESA_COMP_GTUSERS,3,
+                   "%d.User=%s", i, user_params_in[i].user);
+
+   /***  Check user existance  ***/
+
+   rc = TSS_chk_acid(ESA_COMP_GTUSERS,
+                     user_params_in[i].user,
+                     TSS_USER, TYPE_USER,
+                     OBJ_EXIST, FALSE,
+                     real_acid_type, &real_obj_type,
+                     admin_params, err);
+   if (rc EQ ESA_OK)
+      strcpy(acid, "0");   /* Sort symbol */
+   else {
+      /* BS2431 acid[0] = TSS_GET_MANY_SKIP_ITEM; */
+      acid[0] = TSS_GET_MANY_ACC_UNCOND; /* BS2431 */
+      acid[1] = NULL_CHAR;
+   }
+
+   strcat(acid, user_params_in[i].user);
+   rc = TSS_save_output(comp,tmp, acid, dest, msgs);
+   if ( rc NE ESA_OK )
+     goto exit;
+ }
+
+ *users_list = tmp;
+
+/*
+ *  Finish
+ */
+
+ exit : ;
+
+ ESA_DIAG_exit(comp, 2, func, rc);
+
+ return rc ;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_select_wild_acids_list                 *
+*                                                             *
+* DESCRIPTION    : Select users according obtained wild card  *
+*                                                             *
+* INPUT          : user_params_in  - user param struct        *
+*                  num_users_in    - number of entered users  *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : users_list                                 *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+/**************************************************************/
+
+static ESA_RC TSS_select_wild_users_list(ESA_DIAG_COMP_typ   comp,
+                   TSS_TRAP_BUF_rec_typ            * users_list,
+                   short                             num_users_in,
+                   USER_PARAMS_rec_typ               user_params_in[1],
+                   CTSAMSG_DEST_TABLE_rec_typ      * dest,
+                   CTSAMSG_HANDLE_rec_typ          * msgs)
+{
+
+ static char func[]="TSS_select_wild_users_list";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                  rc = ESA_OK ;
+ int                     i, j;
+
+/*
+ *  Initialize
+ */
+
+ ESA_DIAG_enter(comp, 2, func );
+
+ ESA_DIAG_printf(comp, 2,
+                 "trap handle: alloc entries=%d used=%d",
+                  users_list->allocated_entries,
+                  users_list->used_entries);
+
+ /*
+  * Entire user's list
+  */
+
+  for (i=0; i LT users_list->used_entries; i++) {
+
+    /* Ignore if bypassed by TSS_get_acids_list */  /*ps0376*/
+                                                    /*ps0376*/
+     if ( users_list->trap_data[i].used ) {         /*ps0376*/
+        users_list->trap_data[i].used = TSS_GET_MANY_SKIP_ITEM;
+        continue;                                   /*ps0376*/
+     }
+
+    /* Wild card's list */
+
+    for (j=0; j LT num_users_in; j++ ) {
+       ESA_DIAG_printf(comp, 8, "Wild:%d.%s   user.acid=%d.%s",
+                       j, user_params_in[j].user,
+                       i, users_list->trap_data[i].data);
+
+      /*
+       *  User's ACID match to wild card
+       *  Attention ! The first symbol - sort symbol !
+       */
+
+       if (memcmp( &users_list->trap_data[i].data[1],
+                   user_params_in[j].user,
+                   strlen(user_params_in[j].user) ) EQ 0 ) {
+          users_list->trap_data[i].used = TRUE;
+          break;
+       }
+    }    /*  for (j=0; j LT num_users_in; j++ ) */
+  }      /* for (i=0; i LT users_list->used_entries; i++) */
+
+ /*
+  * When user's acid matches some of wild card , set flag
+  *      to NOT USED (YET) for further processing
+  * When user's acid does not matched any of wild card , set flag
+  *      to USED (ALREADY) for further processing
+  */
+
+  j = 0;
+  for (i=0; i LT users_list->used_entries; i++) {
+    if ( users_list->trap_data[i].used EQ TSS_GET_MANY_SKIP_ITEM)
+      users_list->trap_data[i].used = TRUE;  /* ps0376 */
+    else if ( users_list->trap_data[i].used ) {
+      users_list->trap_data[i].used = FALSE; /* Take for process */
+      j++;
+    }
+    else
+      users_list->trap_data[i].used = TRUE;  /* Remove from process */
+  }
+
+ /*
+  * Wild card list is empty
+  */
+
+  if ( j EQ 0 ) {
+    for (j=0; j LT num_users_in; j++ )
+      CTSAMSG_print(TSS_ERR_NO_ACID, msgs, NULL, dest,
+                    "USER Wildcard", user_params_in[j].user);
+    rc = ESA_ERR;
+  }
+
+ /*
+  *  Finish
+  */
+
+ exit : ;
+
+ ESA_DIAG_exit(comp, 2, func, rc);
+
+ return rc ;
+
+}
+
+/* CIQ#6 This routine does nothing so was removed
+// PS0387 //
+***************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_set_conn_checksum                      *
+*                                                             *
+* DESCRIPTION    : Set checksum  CONN_CHK field               *
+*                                                             *
+* INPUT          : addinfo         - addinfo                  *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+***************************************************************
+
+static void TSS_set_conn_checksum(ADDINFO_rec_ptr         addinfo)
+{
+
+ static char func[]="TSS_set_conn_checksum";
+ ESA_DIAG_COMP_typ   comp = ESA_COMP_GTUSERS;
+ char                checksum[TSS_ADDINFO_VAL_LEN + 1];
+ ONE_FIELD_rec_ptr   pair;
+
+//
+ *  Initialize
+ //
+
+ ESA_DIAG_enter(comp, 2, func );
+
+ pair = ADDINFO_search( "CONN_CHK",
+                        TSS_ADDINFO_KWD_LEN,
+                        addinfo->pair, addinfo->num_pairs );
+ if ( pair EQ NULL )
+  goto exit;
+
+// CIQ#6 This routine does nothing so was removed
+ TSS_calculate_checksum(pair->value, checksum);
+
+ ADDINFO_updval(checksum, TSS_ADDINFO_VAL_LEN, pair);                //
+
+ exit :;
+
+ //
+  *  Finish
+  //
+
+ ESA_DIAG_exit(comp, 2, func, ESA_OK);
+
+}                                                                    */
+
+/* CIQ#6 This routine does nothing so was removed
+***************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_calculate_checksum                     *
+*                                                             *
+* DESCRIPTION    : Calculate checksum                         *
+*                                                             *
+* INPUT          : in        - input string                   *
+*                                                             *
+* OUTPUT         : checksum  - checksum                       *
+*                                                             *
+* RETURN VALUE   : none                                       *
+*                                                             *
+***************************************************************
+
+static void TSS_calculate_checksum (char      *in,
+                                    char      *checksum)
+{
+
+ static char func[]="TSS_calculate_checksum";
+ ESA_DIAG_COMP_typ   comp = ESA_COMP_GTUSERS;
+
+//
+ *  Initialize
+ //
+
+ ESA_DIAG_enter(comp, 3, func );
+
+ strcpy(checksum, in);
+
+ //
+  *  Finish
+  //
+
+ ESA_DIAG_exit(comp, 3, func, ESA_OK);
+
+}                                                                    */

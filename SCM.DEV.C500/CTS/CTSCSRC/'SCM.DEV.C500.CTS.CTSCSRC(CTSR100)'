@@ -1,0 +1,1940 @@
+/****************************************************************
+*                                                               *
+* Title            : Functions to manipulate RACF IRRUT100      *
+*                    utility.                                   *
+*                                                               *
+* File Name        : ctsr100.c                                  *
+*                                                               *
+* Author           : Doron Cohen                                *
+*                    Alexander Shvartsman                       *
+*                                                               *
+* Creation Date    : 29-Mar-94                                  *
+*                                                               *
+* Description      : IRRUT100 driver functions                  *
+*                                                               *
+* Assumptions and                                               *
+*   Considerations : 1) Caller is APF authorized                *
+*                    2) The following ddcards are set to        *
+*                       temporary datasets :                    *
+*                                                               *
+*                       * SYSUT1                                *
+*                       * SYSPRINT                              *
+*                       * SYSIN                                 *
+*                                                               *
+*                    3) gtut100 can analyze only output created *
+*                       by irrut100 for a single id (user/grp)  *
+*****************************************************************
+* ws2411 change release to Release as done in platform.h        *
+* bs2545 03.09.02 bp a)The GENERIC parameter is not valid for   *
+*                    for RACF command RALT;                     *
+*                    b)if no REPLACE information is given,      *
+*                  obsolete information remains in RACF Profile *
+* bs2546 01.10.02 bp  if a user is deleted twice,               *
+*                     allocation of workfile fails due          *
+*                     dsname-timestamp is duplicate.            *
+* WS10054  SeligT   08/08/16 Add ENQ/DEQ SYSTEMS RNL Parameter  *
+* IS10139  SeligT   28/08/16 Update OS Functions for Agents     *
+* SAS2IBMT SeligT   30/06/16 SAS/C to IBM C Conversion Project  *
+* SAS2IBMN NuritY   10/10/16 SAS/C to IBM C Conversion:         *
+*                            1. Replace access() with fopen and *
+*                               fgets.                          *
+*                            2. Take product name and release   *
+*                               from ESAVER definitions.        *
+*                               The name of the variable was    *
+*                               changed from Release to release *
+*                               (change not marked).            *
+* BS10076  SeligT   11/12/17 Organize Connector Locking         *
+*                            Functions and Structures           *
+* IS10174  NuritY   15/01/18 Dynamic EXECOUT support.           *
+* BS10101  AvnerL   16/07/19 Redo BS10084 as dropped by execout.*
+* WS10078KG KailasP 04/05/20 Compile due to change in           *
+*                            SA_AGENT_VERSION                   *
+* WS10079K KailasP  31/12/20 Compile due to change in           *
+*                            SA_AGENT_VERSION                   *
+* WS10080  KailasP  09/07/21 Support MSGSIZE Greater than 32K   *
+*                            ***only for compile***             *
+* BS10143  LuisM    10/29/24 Resolve S0C4 abend when incorrectly*
+*                            processing a digital certificate   *
+*                            for delayed delete processing.     *
+*                            Found that the combination of ??)
+*                            in the call to pcmd() was causing
+*                            a trigraph of "]" to be inserted.
+****************************************************************/
+
+ #include "globs.h"
+
+/*
+ *     standard include files
+ */
+
+ #include STRING
+ #include STDLIB
+ #include STDIO
+ #include STDARG
+ #include TIME
+ #include FCNTL
+/* SAS2IBMT #include OS                                              */
+ #include ERRNO                                           /* SAS2IBMT */
+
+/*
+ *     ESA include files
+ */
+
+ #include ESA_DIAG
+ #include ESA_API
+ #include ESA_CTSAMSG
+ #include ESA_CS_OS
+ #include ESA_API_CODES
+
+ #include MVS_CODES                                       /* BS10101 */
+ #include MVS_OS_DYNAM                                    /* BS10101 */
+
+ #include MVS_OS_MVS
+ #include MVS_COMP
+
+ /* IS10139 #include <CTSCSRV.h>                             WS10054 */
+ #include RACF_CODES
+ #include API_ADDINFO
+ #include RACF
+ #include RACF_UT100
+
+ /*
+  * Handle errors macro for handling ioerr request file
+  * see subroutine : UT100_write_request
+  */
+
+ #define  HANDLE_REQ_FILE_IOERR(a)                           \
+   if ( ferror(file_rq) ) {                                  \
+       CTSAMSG_print(ERR_IO,                                 \
+                     msg_params.ctsamsg_handle,              \
+                     NULL,                                   \
+                     msg_params.ctsamsg_dest,                \
+                     a, FILE_RQ, strerror(errno) );          \
+       ESA_DIAG_printf(PLT_COMP_API_UT100, 1,                \
+          "file %s error %s", FILE_RQ, strerror(errno));     \
+       rc = ESA_FATAL;                                       \
+       goto exit;                                            \
+   }
+
+ static   char component[]="UT100";
+ /* BS10076
+ #define LOCK_INTERVAL 600 // Seconds = 10 minutes           WS10054 */
+
+/*
+ *     Internal Functions
+ */
+
+ static int    parse_line(short line_id, char       * line);
+
+ static ESA_RC handle_line(short                         line_id,
+                           RACF_DELETE_OPTIONS_rec_typ * opts,
+                           CTSAMSG_DEST_TABLE_rec_typ  * dest,
+                           CTSAMSG_HANDLE_rec_typ      * msgs  );
+
+ static void   handle_arg(int arg_id, char * arg);
+
+ static char * get_generic_string (char * str);
+
+ static void   pcmd(int comment, char *format, ...);
+
+ static ESA_RC write_rexx_header(RACF_DELETE_OPTIONS_rec_typ   * opts,
+                                 CTSAMSG_DEST_TABLE_rec_typ    * dest,
+                                 CTSAMSG_HANDLE_rec_typ        * msgs);
+
+ static void write_rexx_bottom(RACF_DELETE_OPTIONS_rec_typ   * opts,
+                               CTSAMSG_DEST_TABLE_rec_typ    * dest,
+                               CTSAMSG_HANDLE_rec_typ        * msgs);
+
+/*
+ *     Files
+ */
+
+ static FILE *fw, *fr;
+ static racf_cmd_counter;
+ char        fnr[MAX_FILENAME_LEN+1] = NULL_STRING;
+
+/*
+ *     Input lines format string
+ */
+
+ static char *in[] = {
+    ""         , /* x'00' -                                      */
+    "%s"       , /* x'01' - Beginning of chain                   */
+    ""         , /* x'02' - Group name exists                    */
+    "%s"       , /* x'03' - In subgroup list                     */
+    "%s"       , /* x'04' - Superior group of                    */
+    "%s"       , /* x'05' - Owner of group                       */
+    "%s"       , /* x'06' - In access list of group              */
+    ""         , /* x'07' - User entry exists                    */
+    "%s"       , /* x'08' - Owner of user                        */
+    "%s"       , /* x'09' - Default group of user                */
+    "%s"       , /* x'0a' - Connect group for user               */
+    "%s %s"    , /* x'0b' - First qualifier of dsn               */
+    "%s %s"    , /* x'0c' - Owner of dataset profile             */
+    "%s %s"    , /* x'0d' - In standard access list of dataset   */
+    "%s %s"    , /* x'0e' - Create group of dataset              */
+    "%s %s %s" , /* x'0f' - Owner of resource                    */
+    "%s %s %s" , /* x'10' - In standrd access list of resource   */
+    "%s"       , /* x'11' - Owner of connect profile             */
+    "%s %s"    , /* x'12' - In notify field of dataset           */
+    "%s %s %s" , /* x'13' - In notify field of resource          */
+    "%s %s"    , /* x'14' - In conditional access list of dataset*/
+    "%s %s %s" , /* x'15' - In conditional access list of res    */
+    "%s %s"    , /* x'16' - Reswoner of a profile                */
+
+    "" };
+
+ static char   arg1[MAX_ARG_LEN];
+ static char   arg2[MAX_ARG_LEN];
+ static char   arg3[MAX_ARG_LEN];
+ static char   arg4[MAX_ARG_LEN];
+
+ static RACF_UT100_ID_typ racf_id;
+ static int               racf_id_type;
+ static char              hilvl_str[sizeof(racf_id)+1];
+ static int               hilvl_len;
+ static RACF_FLAG_typ     hilvl_flag;
+ extern  int ctsaatc();                                   /* BS10101 */
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : UT100_activate                             *
+*                                                             *
+* DESCRIPTION    : Activate IRRUT100 to scan the RACF database*
+*                  for occurances of required id              *
+*                                                             *
+* INPUT          : id   - user/group id  to be located        *
+*                  dest - destination table for meesages      *
+*                  msgs - messages buffer                     *
+*                                                             *
+* OUTPUT         : None                                       *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+**************************************************************/
+
+ESA_RC UT100_activate (RACF_UT100_ID_typ            id[1],
+                       int                          id_cnt,
+                       CTSAMSG_DEST_TABLE_rec_typ * dest,
+                       CTSAMSG_HANDLE_rec_typ     * msgs )
+{
+
+ /*
+  *   Variables
+  */
+
+  ESA_RC          rc;
+  int             ut100_rc;
+  FILE          * fi;
+  int             i;
+  char            fni[] = UT100_INPUT_DDCARD;
+  static  char    func[]= "UT100_activate";
+  int             load_rc = 0;                            /* BS10101 */
+  ASM_RTN_TYP   * api_ptr;                                /* BS10101 */
+  int             debug_level = 0;                        /* BS10101 */
+  int             att_rc = 0;                             /* BS10101 */
+  int             task_rs = 0;                            /* BS10101 */
+  char            task_abend = ' ';                       /* BS10101 */
+  char            parm_type = 'P'; /* parm type is P(rogram) BS10101 */
+  char            s0 = 'N';        /* szero = no             BS10101 */
+  char            internal2_msg_buf[200] = "";            /* BS10101 */
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(PLT_COMP_API_UT100, 1, func );
+
+ /*
+  *   Prepare IRRUT100 input
+  */
+
+  fi = fopen(fni,FILE_OPEN_WRITE_TEXT);
+  if (fi EQ NULL) {
+     CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                   "open","UT100 INPUT",fni, strerror(errno));
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+  ESA_DIAG_printf(PLT_COMP_API_UT100, 1, "id_cnt=%d",id_cnt);
+
+  for ( i=0; i LT id_cnt ; i++) {
+     ESA_DIAG_printf(PLT_COMP_API_UT100, 1, "ID=%s",id[i]);
+     fputs( id[i],fi);
+     putc(NEWLINE, fi );
+     if (ferror(fi)) {
+        CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                      "put","UT100 INPUT",fni,strerror(errno));
+        fclose(fi);
+        rc = ESA_FATAL;
+        goto exit;
+     }
+  }
+  fclose(fi);
+
+ /*
+  *   Activate IRRUT100
+  */
+
+  CTSAMSG_print(RACF_UT100_STARTED, msgs, NULL, dest);
+
+  /* SAS2IBMT ut100_rc = system("pgm:irrut100");                     */
+  /* BS10101 changing 'system' call (LINK) to ctsaatc call (ATTACH)
+             because IRRUT100 does not release acquired storage. A
+             LINK means we own the storage. An ATTACH means that
+             the storage is released after the DETACH.
+  ut100_rc = system("pgm=irrut100");                      // SAS2IBMT //
+  ESA_DIAG_printf(PLT_COMP_API_UT100, 1, "IRRUT100 rc = %d",ut100_rc);*/
+
+  /* * * * * * * * BS10101 start * * * * * * * */
+  load_rc = (*(ASM_RTN_TYP *)&ctsaldm)              /* load ctsaatc  */
+             ("CTSAATC ", "       ", &api_ptr);
+  if (load_rc EQ 0) {
+     debug_level = ESA_DIAG_get_debug_level(PLT_COMP_API_UT100);
+     if (debug_level GT 1)
+        debug_level = 1;
+     att_rc = (*api_ptr)("IRRUT100", &parm_type, NULL,
+                         &s0, debug_level, &ut100_rc,
+                         &task_rs, &task_abend);
+     ESA_DIAG_printf(PLT_COMP_API_UT100, 3,
+                     "ATTACH:   rc = %d", att_rc);
+     ESA_DIAG_printf(PLT_COMP_API_UT100, 3,
+                     "IRRUT100: rc = %d (%8X) / %d (%8X) / %c",
+                     ut100_rc, ut100_rc, task_rs, task_rs, task_abend);
+     CTSAMSG_print(RACF_UT100_ENDED, msgs, NULL, dest, ut100_rc);
+
+     switch (att_rc)
+     {
+       case 0:
+          if (ut100_rc EQ 0)
+             rc = ESA_OK ;
+          else {
+             CTSAMSG_print(RACF_UT100_ENDED_ERROR, msgs, NULL, dest);
+             rc = ESA_ERR ;
+          }
+          break;
+       case 4:
+       case 8:
+       case 12:
+       case 16:
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                        component, func,
+                        "CTSAATCH failed with an error return code",
+                        att_rc, __LINE__);
+          rc = ESA_FATAL;
+          break;
+       case 20:
+          sprintf(internal2_msg_buf,
+                  "IRRUT100 abended:  abend code %c%.8X-%.8X",
+                  task_abend, ut100_rc, task_rs);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                        component, func, internal2_msg_buf,
+                        12, __LINE__);
+          rc = ESA_FATAL;
+          break;
+       default:
+          sprintf(internal2_msg_buf,
+                  "CTSAATC unknown rc: %d (%c / %.8X / %.8X)",
+                  att_rc, task_abend, ut100_rc, task_rs);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                        component, func, internal2_msg_buf,
+                        12, __LINE__);
+          rc = ESA_FATAL;
+          break;
+     }
+     load_rc = (*(ASM_RTN_TYP *)&ctsadlm)("CTSAATC ");     /* delete */
+       if (load_rc NE 0)
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                 component, func,
+                 "Delete of CTSAATC failed", 4, __LINE__);
+  }
+  else {
+     CTSAMSG_print(DYNAMIC_LOAD_FAILED, msgs, NULL, dest,
+                   "CTSAATC");
+     rc = ESA_FATAL;
+  }
+  /* * * * * * * * BS10101 end * * * * * * * */
+
+  /* BS10101 The following lines were moved above.  They are all
+             still in the code but before and inside the 'switch'
+             statement / block.
+  CTSAMSG_print(RACF_UT100_ENDED, msgs, NULL, dest, ut100_rc);
+
+  if (ut100_rc EQ 0)
+     rc = ESA_OK ;
+  else {
+     CTSAMSG_print(RACF_UT100_ENDED_ERROR, msgs, NULL, dest);
+     rc = ESA_ERR ;
+  }                                           BS10101 end            */
+
+ /*
+  *   Done
+  */
+
+  exit :
+
+  ESA_DIAG_exit(PLT_COMP_API_UT100, 1 , func , rc );
+
+  return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : UT100_analyze                              *
+*                                                             *
+* DESCRIPTION    : Analyze irrut100 results and produce       *
+*                  cleanup commands buffer                    *
+*                                                             *
+* INPUT          : None                                       *
+*                                                             *
+* OUTPUT         : None                                       *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+**************************************************************/
+
+ESA_RC UT100_analyze (RACF_DELETE_OPTIONS_rec_typ   * opts,
+                      CTSAMSG_DEST_TABLE_rec_typ    * dest,
+                      CTSAMSG_HANDLE_rec_typ        * msgs  )
+{
+
+ /*
+  *   Variables
+  */
+
+  ESA_RC                  rc = ESA_ERR;
+  RACF_UT100_WORK_rec_typ line;
+  char                    fnw[100] = UT100_WORK_DDCARD;
+  int                     nargs;
+  short                   line_id;
+  int                     i;
+
+  static char func[]="UT100_analyze";
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(PLT_COMP_API_UT100, 1, func);
+
+ /*
+  *   Setup cleanup file name
+  */
+
+  if (strlen(opts->cmdfile) GT 0) {
+     /* SAS2IBMT sprintf(fnr, "dsn:%s", opts->cmdfile);              */
+     strcpy(fnr,"//'");                                   /* SAS2IBMT */
+     strcat(fnr, opts->cmdfile );                         /* SAS2IBMT */
+     strcat(fnr,"'");                                     /* SAS2IBMT */
+  }
+  else {
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, "UT100",
+                   func, "UT100 CMDFILE", 16, __LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+  ESA_DIAG_printf(PLT_COMP_API_UT100, 1,
+                  "Results file name is %s", fnr);
+
+ /*
+  *   Setup work file
+  */
+
+  if (strlen(opts->wrkfile) GT 0) {
+     /* SAS2IBMT sprintf(fnw, "dsn:%s", opts->wrkfile);              */
+     strcpy(fnw,"//'");                                   /* SAS2IBMT */
+     strcat(fnw, opts->wrkfile );                         /* SAS2IBMT */
+     strcat(fnw,"'");                                     /* SAS2IBMT */
+  }
+
+  ESA_DIAG_printf(PLT_COMP_API_UT100, 1,
+                  "Work file name is %s", fnw);
+
+ /*
+  *   Read IRRUT100 output file and create results file
+  */
+
+  fw = fopen( fnw, FILE_OPEN_READ_BINARY);
+  if (fw EQ NULL) {
+     CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                   "open","UT100 XREF",fnw, strerror(errno));
+     rc = ESA_FATAL ;
+     goto exit;
+  }
+
+  fr = fopen( fnr, FILE_OPEN_WRITE_TEXT);
+  if (fr EQ NULL) {
+     CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                   "open","UT100 CLEANUP",fnr,strerror(errno));
+     goto exit;
+  }
+
+  racf_cmd_counter = 0 ;
+  rc = write_rexx_header(opts, dest, msgs );
+  if ( rc NE ESA_OK ) {
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+ /*
+  *   Analyze output
+  */
+
+  strcpy(racf_id,NULL_STRING);
+  strcpy(hilvl_str,NULL_STRING);
+  hilvl_len = 0;
+  hilvl_flag = RACF_NO;
+  fread(&line,sizeof(line),1,fw);
+
+  while (feof(fw) EQ 0) {
+
+    /*
+     *     Handle Errors
+     */
+
+     if (ferror(fw)) {
+        CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                      "get","RACF XREF",fnw,strerror(errno));
+        rc = ESA_FATAL;
+        goto exit;
+     }
+
+    /*
+     *     Make data a string
+     */
+
+     for ( i = sizeof(line.data) - 1; line.data[i-1] EQ BLANK; i--)
+         line.data[i]= NULL_CHAR;
+     ESA_DIAG_printf(PLT_COMP_API_UT100, 3,
+                     "Obtained line: %c %s", line.type[0], line.data);
+
+    /*
+     *     Handle Non empty line
+     */
+
+     line_id = line.type[0];
+     ESA_DIAG_printf(PLT_COMP_API_UT100, 3, "Line id = %d", line_id);
+
+     nargs = parse_line(line_id, line.data); /* Parse output line  */
+     rc = handle_line(line_id, opts, dest, msgs);
+     if (rc NE ESA_OK) {
+        rc = ESA_FATAL;
+        goto exit;
+     }
+
+    /*
+     *     Next line
+     */
+
+     fread(&line,sizeof(line),1,fw);
+
+  } /* loop on lines */
+
+ /*
+  *   Termination
+  */
+
+  exit: ;
+
+  /*
+   *    Put REXX bottom lines
+   */
+
+  if ( rc EQ ESA_OK )
+     write_rexx_bottom(opts, dest, msgs);
+
+  /* Issue warning message that user datasets exists */
+
+  if ((hilvl_flag EQ RACF_YES) AND (opts->dsnforce EQ RACF_NO)) {
+     if (racf_id_type EQ 2)
+        CTSAMSG_print(RACF_GRPDS,   msgs, NULL, dest, racf_id);
+     else CTSAMSG_print(RACF_USERDS, msgs, NULL, dest, racf_id);
+  }
+
+  /* close files */
+
+  if (fw NE NULL)
+     fclose(fw);
+  if (fr NE NULL)
+     fclose(fr);
+
+  /* Cleanup commands stored message */
+
+  if (strlen(opts->cmdfile) GT 0)
+     CTSAMSG_print(RACF_CMDS_STORED, msgs, NULL, dest, racf_id, fnr);
+
+  /* Finish  */
+
+  ESA_DIAG_exit(PLT_COMP_API_UT100, 1 , func, rc );
+
+  return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : UT100_execute_file                         *
+*                                                             *
+* DESCRIPTION    : Execute cleanup commands generated by      *
+*                  gtut100 .                                  *
+*                                                             *
+* INPUT          : None                                       *
+*                                                             *
+* OUTPUT         : None                                       *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+**************************************************************/
+
+ESA_RC UT100_execute_file (RACF_DELETE_OPTIONS_rec_typ  * opts,
+           /* IS10174 */   ADMIN_PARAMS_rec_typ         * admin_params)
+           /* IS10174      CTSAMSG_DEST_TABLE_rec_typ    * dest,   */
+           /* IS10174      CTSAMSG_HANDLE_rec_typ        * msgs  )   */
+{
+
+ /*
+  *   Variables
+  */
+
+  static char func[]="UT100_execute_file";
+  ESA_RC rc, out_rc;
+  short  out_len;
+  char   out_buffer[8192];
+  int    coff,clen;
+  int    tso_rc;
+  char   exec_cmd[100];
+  char   eoddn[9] = EXECOUT_DDNAME;                      /* IS10174 */
+  CTSAMSG_HANDLE_rec_typ      * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ  * dest;
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(PLT_COMP_API_UT100, 1, func);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+ /*
+  *   Definition file for execute
+  */
+
+  if (strlen(opts->cmdfile) EQ 0)  {
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, "UT100",
+                   func, "UT100 CMDFILE", 16, __LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+  ESA_DIAG_printf(PLT_COMP_API_UT100, 1,
+                  "Command file name is %s", opts->cmdfile);
+
+ /*
+  *   Call file executor
+  */
+
+  /* IS10174
+  sprintf(exec_cmd, "CTSAFIL %s", opts->cmdfile);
+  rc = ESA_CLI_exec_wait(EXECOUT_DDNAME,
+                         exec_cmd, &tso_rc, dest, msgs);    */
+  sprintf(exec_cmd, "CTSAFIL %s %s",                     /* IS10174 */
+          eoddn, opts->cmdfile);                         /* IS10174 */
+  rc = ESA_CLI_exec_wait(eoddn, exec_cmd, &tso_rc,       /* IS10174 */
+                         admin_params);                  /* IS10174 */
+  ESA_DIAG_printf(PLT_COMP_API_UT100, 1, "Executor rc=%d Shell rc=%d",
+                  rc, tso_rc);
+  if (rc EQ ESA_OK) {
+     if (tso_rc LT 4)
+        rc = ESA_OK;
+     else if (tso_rc LT 8)
+        rc = ESA_ERR;
+     else rc = ESA_FATAL;
+  }
+  else rc = ESA_FATAL;
+
+  if (rc NE ESA_OK)
+     CTSAMSG_print(RACF_CLEAN_EXEC_FAILED, msgs, NULL, dest, opts->id);
+
+ /*
+  *   Obtain output and send it to message destinations
+  */
+
+  out_len =  sizeof(out_buffer);
+  /* IS10174
+  out_rc = ESA_CLI_get_output(EXECOUT_DDNAME,
+                              out_buffer, &out_len, dest, msgs ); */
+  out_rc = ESA_CLI_get_output(eoddn,                     /* IS10174 */
+                              out_buffer, &out_len,      /* IS10174 */
+                              admin_params);             /* IS10174 */
+
+  ESA_DIAG_printf(PLT_COMP_API_UT100, 1,
+                  "Shell Output rc=%d",out_rc);
+
+ /*
+  *    Issue output messages
+  */
+
+  if (out_rc EQ ESA_OK) {
+     for (coff = 0; coff LT out_len; coff += clen ) {
+
+         clen = strlen(out_buffer+coff) + 1;
+
+         /* suppress newline markers */
+         if ( (clen GT 2) AND (out_buffer[coff+clen-2] EQ '\n') )
+            out_buffer[coff+clen-2] = NULL_CHAR;
+
+         CTSAMSG_print(RACF_OUTPUT_LINE,   msgs, NULL, dest,
+                       out_buffer + coff );
+     }
+  }
+  else {
+     CTSAMSG_print(RACF_OUTPUT_ERR,   msgs, NULL, dest);
+     rc = ESA_ERR;
+  }
+
+ /*
+  *    Finish
+  */
+
+  exit:;
+
+  ESA_DIAG_exit(PLT_COMP_API_UT100, 1, func, rc);
+
+  return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : UT100_allocate                             *
+*                                                             *
+* DESCRIPTION    : allocate cleanup commands file             *
+*                                                             *
+* INPUT          : request   "DELUSER", "DELGROUP"            *
+*                  objid     userid/ group-name               *
+*                                                             *
+* OUTPUT         : file_name  dsname                          *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+**************************************************************/
+
+ESA_RC UT100_allocate(char                 * request,
+                      char                 * objid,
+                      ADMIN_PARAMS_rec_typ * admin_params,
+                      char                 * file_name,
+                      time_t                 crttime)
+ {
+
+  static char                   func[]="UT100_allocate";
+  static int                    mcount = 100;          /*bs2546*/
+
+ /*
+  *     Variables
+  */
+
+  CTSAMSG_HANDLE_rec_typ      * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ  * dest;
+  char                          command[100];
+  ESA_RC                        rc, rc_free ;
+  int                           tso_rc;
+  struct  tm                  * tm_ptr;
+  size_t                        nchar;
+  char                          date_str[10];
+  char                          time_str[10];
+  char                          eoddn[9] = "";           /* IS10174 */
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter( PLT_COMP_API_UT100 , 5, func);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  *file_name = NULL_CHAR;
+
+  tm_ptr = localtime(&crttime);   /* convert date time to tm struct*/
+  nchar  = strftime(date_str, sizeof(date_str), "%y%j", tm_ptr);
+  nchar  = strftime(time_str, sizeof(time_str), "%H%M%S", tm_ptr);
+
+ /*
+  *  Invoke REXX:allocate new file
+  */
+
+  ESA_DIAG_printf(PLT_COMP_API_UT100,5,
+   "ddcard=%s admin=%s delrequest=%s id=%s date=%s time=%s mcount=%d",
+            UT100_CLEANUP_DDCARD,
+            admin_params->admin_uname,
+            request, objid , date_str, time_str, mcount );
+                                                 /* bs2546*/
+  if(mcount < 1000) mcount++;                    /* bs2546*/
+  else mcount = 100;                             /* bs2546*/
+
+
+/*bs2546 sprintf(command, "%%CTSALLC  %s  %s %s %s %s %s ",
+                UT100_CLEANUP_DDCARD, admin_params->admin_uname,
+                request, objid , date_str, time_str );  */
+
+  sprintf(command, "%%CTSALLC  %s  %s %s %s %s %s M%3d",  /* bs2546*/
+                UT100_CLEANUP_DDCARD, admin_params->admin_uname,
+                request, objid , date_str, time_str, mcount );
+
+  ESA_DIAG_printf(PLT_COMP_API_UT100,5, "command = %s", command);
+
+  strcpy(eoddn, EXECOUT_DDNAME);                         /* IS10174 */
+  /* IS10174
+  rc = ESA_CLI_exec_wait(EXECOUT_DDNAME, command, &tso_rc, dest, msgs);
+  */
+  rc = ESA_CLI_exec_wait(eoddn, command, &tso_rc,        /* IS10174 */
+                         admin_params);                  /* IS10174 */
+  if (rc EQ ESA_OK) {
+    if (tso_rc LT 4)
+      rc = ESA_OK;
+    else if (tso_rc LT 8)
+      rc = ESA_ERR;
+    else rc = ESA_FATAL;
+  }
+     else rc = ESA_FATAL;
+
+  ESA_DIAG_printf(PLT_COMP_API_UT100,5,
+                  "ESA_CLI_exec_wait rc=%d TSO rc=%d", rc,tso_rc);
+
+  if ( rc NE ESA_OK ) {
+     CTSAMSG_print(RACF_CLEAN_ALLOC_FAILED, msgs, NULL, dest,
+                   UT100_CLEANUP_DDCARD);
+     rc = ESA_FATAL ;
+  }
+
+ /*
+  *  Obtain dsname from ddname
+  */
+
+  else {
+
+   rc = OS_MVS_ddinfo(UT100_CLEANUP_DDCARD, file_name , TRUE,
+                      dest, msgs, 0);                    /* IS10174 */
+           /* IS10174 dest, msgs);  */
+
+   ESA_DIAG_printf(PLT_COMP_API_UT100, 1,
+                   "OS_MVS_ddinfo rc=%d file name %s",
+                   rc, file_name);
+
+   if ( rc NE ESA_OK )
+      rc=ESA_FATAL;
+  }
+
+ /*
+  *  Invoke TSO command FREE
+  */
+
+  sprintf(command, "  FREE FILE(%s)", UT100_CLEANUP_DDCARD);
+  ESA_DIAG_printf(PLT_COMP_API_UT100,5, "command = %s", command);
+
+  /* IS10174
+  rc_free = ESA_CLI_exec_wait(EXECOUT_DDNAME,
+                              command, &tso_rc, dest, msgs);  */
+  rc_free = ESA_CLI_exec_wait(eoddn, command, &tso_rc,   /* IS10174 */
+                              admin_params);             /* IS10174 */
+  if (rc_free EQ ESA_OK) {
+    if (tso_rc LT 4)
+      rc = ESA_OK;
+    else if (tso_rc LT 8)
+      rc = ESA_ERR;
+    else rc = ESA_FATAL;
+  }
+     else rc = ESA_FATAL;
+
+  ESA_DIAG_printf(PLT_COMP_API_UT100,5,
+                  "ESA_CLI_exec_wait rc=%d TSO rc=%d", rc_free,tso_rc);
+
+  ESA_DIAG_exit(PLT_COMP_API_UT100, 5, func, rc);
+  return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : UT100_write_request                        *
+*                                                             *
+* DESCRIPTION    : Write request to requests file.            *
+*                  For delay processing                       *
+*                                                             *
+* INPUT          : request   "DELUSER", "DELGROUP"            *
+*                  objid     userid/ group-name               *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+**************************************************************/
+
+ESA_RC UT100_write_request(char                        * request,
+                           char                        * mode ,
+                           RACF_UT100_ID_typ             replace,
+                           RACF_DELETE_OPTIONS_rec_typ * opts,
+                           ADMIN_PARAMS_rec_typ        * adm_params)
+ {
+
+ /*
+  *     Variables
+  */
+
+  static char                   func[]="UT100_write_request";
+  CTSAMSG_PARAMS_rec_typ        msg_params;
+  char                          file_name[MAX_FILENAME_LEN+10];
+  char                          dsn[MAX_FILENAME_LEN+10];
+  char                          ddname[9];                /* WS10054 */
+  char                          opnmode[5];
+  time_t                        crttime;
+  struct  tm                   *tm_ptr;
+  static char sep_record[]="****************************************\
+**************************************************\n";
+  char                          date_str[100];
+  ESA_RC                        rc = ESA_OK;
+  ESA_RC                        rc_unlock = ESA_OK;
+  ESA_RC                        rc_term = ESA_OK;
+  FILE                        * file_rq = NULL ;
+  int                           rc_acc;
+  void                        * lock_handle = NULL ;
+  RACF_DELETE_OPTIONS_rec_typ   opti;
+  ADMIN_PARAMS_rec_typ          adm_parami;
+  RACF_UT100_ID_typ             replacei;
+  char                          dummy_rec[2];
+  /* * * * * * * BS10076 start * * * * * * */
+  char                          wait_lock_char[10] = " ";
+  char                          wait_lock_interval_char[10] = " ";
+  int                           wait_lock_value;
+  int                           wait_lock_interval_value;
+  /* * * * * * * BS10076 end * * * * * * */
+  char             ddn_with[MAX_FILENAME_LEN+10];         /* SAS2IBMT */
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter( PLT_COMP_API_UT100 , 1, func);
+
+  msg_params.ctsamsg_handle = adm_params->ctsamsg_handle;
+  msg_params.ctsamsg_dest   = adm_params->ctsamsg_dest;
+
+ /*
+  *    Lock request file
+  */
+
+   /* * * * * * * BS10076 start * * * * * * */
+   rc = adm_params->cs_func.rssprm_get_opt_ptr(
+                    ALL_RSS, "WAIT_LOCK",
+                    sizeof(wait_lock_char),
+                    wait_lock_char,
+                    OPT_TRUE,
+                    OPT_FALSE);
+
+   if (rc EQ ESA_OK)
+      wait_lock_value = atoi(wait_lock_char);
+   else
+      wait_lock_value = WAIT_LOCK_TOTAL;
+
+   ESA_DIAG_printf (PLT_COMP_API_UT100, 6,
+                    "WAIT_LOCK parm = <%s> = <%d>",
+                    wait_lock_char,
+                    wait_lock_value);
+
+   rc = adm_params->cs_func.rssprm_get_opt_ptr(
+                    ALL_RSS, "WAIT_LOCK_INTERVAL",
+                    sizeof(wait_lock_interval_char),
+                    wait_lock_interval_char,
+                    OPT_TRUE,
+                    OPT_FALSE);
+
+   if (rc EQ ESA_OK)
+      wait_lock_interval_value = atoi(wait_lock_interval_char);
+   else
+      wait_lock_interval_value = WAIT_LOCK_INTERVAL_DFLT;
+
+   ESA_DIAG_printf (PLT_COMP_API_UT100, 6,
+                    "WAIT_LOCK_INTERVAL parm = <%s> = <%d>",
+                    wait_lock_interval_char,
+                    wait_lock_interval_value);
+   /* * * * * * * BS10076 end * * * * * * */
+
+  rc = OS_MVS_ddinfo(FILE_RQ , file_name , TRUE,
+                     msg_params.ctsamsg_dest,
+                     msg_params.ctsamsg_handle, 0);      /* IS10174 */
+         /* IS10174  msg_params.ctsamsg_handle);    */
+  ESA_DIAG_printf(PLT_COMP_API_UT100, 1,
+            "OS_MVS_ddinfo rc=%d file name %s", rc, file_name);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   strcpy(ddname, FILE_RQ);                               /* WS10054 */
+
+   /* WS10054 We are passing a ddname (not the dsname) to the
+      OS_CS_lock_init routine just like all the other callers
+      of this routine.  The routine itself will issue the ddinfo
+      function to get the dsname (which will become the rname of
+      the ENQ and DEQ). Other handle fields are initialized there.
+   rc = OS_CS_lock_init(file_name, 0 , &lock_handle, NULL,           */
+   /* BS10076
+   rc = OS_CS_lock_init(ddname, 0 , &lock_handle, NULL,   // WS10054 */
+   rc = OS_CS_lock_init(ddname, &lock_handle,             /* BS10076 */
+                        wait_lock_value,                  /* BS10076 */
+                        wait_lock_interval_value,         /* BS10076 */
+                        SCOPE_REMOTE, &msg_params );
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   /* WS10054 Making the interval larger - from 3 seconds to 10 minutes
+   rc = OS_CS_lock (lock_handle,DELREQ_LOCK_INTERVAL, &msg_params);  */
+   /* BS10076
+   rc = OS_CS_lock (lock_handle,LOCK_INTERVAL, &msg_params);//WS10054*/
+   rc = OS_CS_lock (lock_handle, &msg_params);            /* BS10076 */
+   if ( rc NE ESA_OK )
+      goto exit;
+
+  /*
+   *    Determine open mode (write/append)
+   */
+
+   strcpy(dsn, "dsn:" );
+   strcat(dsn, file_name );
+
+   /* SAS2IBMN - start */
+   /*
+   rc_acc = access( dsn, 0 );
+   if ( rc_acc EQ 0 )             * File exist  *
+      strcpy(opnmode, "a");       * Append mode *
+   else strcpy(opnmode, "w");       * Write mode  *
+   */
+
+   /* Verify that the file is not empty (as done by SAS/C access() ) */
+
+   strcpy(ddn_with,"DD:");                                /* SAS2IBMT */
+   strcat(ddn_with, FILE_RQ );                            /* SAS2IBMT */
+
+   /* SAS2IBMT file_rq = fopen(FILE_RQ , "r");                       */
+   file_rq = fopen(ddn_with , "r");                       /* SAS2IBMT */
+   if (file_rq EQ NULL)      /* open failed (file does not exist ?) */
+     strcpy(opnmode, "w");       /* Write mode  */
+   else
+   {
+     fgets(dummy_rec, 2, file_rq);
+     if ( feof(file_rq) )
+       strcpy(opnmode, "w");    /* file empty - Write mode  */
+     else
+       strcpy(opnmode, "a");    /* file containes data - append mode */
+     fclose(file_rq);
+   }
+   /* SAS2IBMN - end   */
+
+  /*
+   *    Open requests file
+   */
+
+   ESA_DIAG_printf(PLT_COMP_API_UT100, 1,
+                   "Open mode for requests file %s", opnmode);
+
+   /* SAS2IBMT file_rq = fopen(FILE_RQ , opnmode);                   */
+   file_rq = fopen(ddn_with , opnmode);                   /* SAS2IBMT */
+   HANDLE_REQ_FILE_IOERR("FOPEN")
+
+  /*
+   *     Put comment record
+   */
+
+   time(&crttime);
+   tm_ptr = localtime(&crttime);
+   strftime(date_str, sizeof(date_str),
+            "* Request was written at %d/%m/%Y  %H:%M:%S\n", tm_ptr);
+
+   fputs( sep_record, file_rq);    /* Separate record */
+   HANDLE_REQ_FILE_IOERR("FPUTS")
+
+   fputs( date_str, file_rq);      /* Comments records */
+   HANDLE_REQ_FILE_IOERR("FPUTS")
+
+  /*
+   *     Check and set options
+   */
+
+   ESA_DIAG_printf(PLT_COMP_API_UT100, 1,
+            "request=%s cmdfile=%s replace=%s dfltgrp=%s\
+             sup_grp=%s admin=%s/%s id=%s mode=%s",
+             request, opts->cmdfile, replace, opts->dfltgrp,
+             opts->sup_grp, adm_params->admin_uname,
+             adm_params->admin_gname, opts->id, mode);
+
+  /*
+   *   Move var that can be changed to internal var
+   */
+
+   strcpy(opti.cmdfile,opts->cmdfile);
+   strcpy(replacei,replace);
+   strcpy(opti.sup_grp,opts->sup_grp);
+   strcpy(opti.dfltgrp,opts->dfltgrp);
+   strcpy(adm_parami.rss_name   ,adm_params->rss_name);
+   strcpy(adm_parami.admin_uname,adm_params->admin_uname);
+   strcpy(adm_parami.admin_gname,adm_params->admin_gname);
+
+
+   if ( strlen(opti.cmdfile)    EQ 0 )
+        strcpy(opti.cmdfile,"?");
+
+   if ( strlen(replacei) EQ 0 )
+        strcpy(replacei,"?");
+
+   if ( strlen(opti.sup_grp)    EQ 0 )
+        strcpy(opti.sup_grp,"?");
+
+   if ( strlen(opti.dfltgrp)    EQ 0 )
+        strcpy(opti.dfltgrp,"?");
+
+   if ( strlen(adm_parami.rss_name) EQ 0 )
+        strcpy(adm_parami.rss_name,"?");
+
+   if ( strlen(adm_parami.admin_uname) EQ 0 )
+        strcpy(adm_parami.admin_uname,"?");
+
+   if ( strlen(adm_parami.admin_gname) EQ 0 )
+        strcpy(adm_parami.admin_gname,"?");
+
+  /*
+   *     Put request record
+   */
+
+   if ( strcmp(request,"DELUSER") EQ 0 )
+      fprintf(file_rq, usr_format ,
+                          adm_parami.rss_name,
+                          adm_parami.admin_uname,
+                          adm_parami.admin_gname,
+                          opts->id,
+                          mode,
+                          opti.cmdfile,
+                          replacei,
+                          opti.dfltgrp);
+   else      /* DELGROUP  request */
+      fprintf(file_rq, grp_format ,
+                            adm_parami.rss_name,
+                            adm_parami.admin_uname,
+                            adm_parami.admin_gname,
+                            opts->id,
+                            mode,
+                            opti.cmdfile,
+                            replacei,
+                            opti.sup_grp);
+
+
+  /* Handle errors */
+
+   HANDLE_REQ_FILE_IOERR("FPRINTF")
+
+ exit :;
+
+     if (file_rq NE NULL)
+        fclose(file_rq);
+
+     if ( lock_handle NE NULL ) {
+       rc_unlock = OS_CS_unlock (lock_handle, &msg_params );
+
+       rc_term = OS_CS_lock_term (&lock_handle, &msg_params );
+     }
+
+     if ( ( rc_unlock   NE ESA_OK  )  OR
+          ( rc          NE ESA_OK  )  OR
+          ( rc_term     NE ESA_OK  )   )
+        rc=ESA_FATAL;
+     else
+        rc=ESA_OK;
+
+
+  ESA_DIAG_exit(PLT_COMP_API_UT100, 1, func, rc);
+  return rc;
+
+}
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : parse_line                                 *
+*                                                             *
+* DESCRIPTION    : Parse one line                             *
+*                                                             *
+* INPUT          : line_id                                    *
+*                  line                                       *
+*                                                             *
+* OUTPUT         : None                                       *
+*                                                             *
+* RETURN VALUE   : Number of parsed arguments                 *
+*                                                             *
+**************************************************************/
+
+static int parse_line (short line_id, char  * line)
+{
+
+   int nargs = 0 ;
+   static char func[]="parse_line";
+
+  ESA_DIAG_enter(PLT_COMP_API_UT100, 4, func);
+
+   /* Format line */
+
+   arg1[0] = NULL_CHAR;
+   arg2[0] = NULL_CHAR;
+   arg3[0] = NULL_CHAR;
+   arg4[0] = NULL_CHAR;
+
+   if ( strlen(in[line_id]) GT 0)
+      nargs = sscanf( line, in[line_id], arg1, arg2, arg3, arg4);
+
+   /* Print line  */
+
+   ESA_DIAG_printf(PLT_COMP_API_UT100, 4, "line = %s", line);
+
+   handle_arg(1,arg1) ;
+   handle_arg(2,arg2) ;
+   handle_arg(3,arg3) ;
+   handle_arg(4,arg4) ;
+
+   /* Thats all folks */
+
+   ESA_DIAG_exit(PLT_COMP_API_UT100, 4, func, ESA_OK );
+
+   return nargs;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : handle_line                                *
+*                                                             *
+* DESCRIPTION    : Analyze one line                           *
+*                                                             *
+* INPUT          : line_id                                    *
+*                  opts                                       *
+*                                                             *
+* OUTPUT         : None                                       *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+**************************************************************/
+
+static ESA_RC handle_line (short                         line_id,
+                           RACF_DELETE_OPTIONS_rec_typ * opts,
+                           CTSAMSG_DEST_TABLE_rec_typ  * dest,
+                           CTSAMSG_HANDLE_rec_typ      * msgs  )
+{
+
+/*
+ *   Variables
+ */
+
+ char *cnctusr, *cnctgrp, *gen_str, notify_str[20], resown_str[40];
+ ESA_RC rc = ESA_OK;
+ static char func[]="handle_line";
+
+/*
+ *   Initialize
+ */
+
+ ESA_DIAG_enter(PLT_COMP_API_UT100, 2, func);
+
+/*
+ *   Check if we located the required RACF ID
+ */
+
+ ESA_DIAG_printf(PLT_COMP_API_UT100, 2,
+                 "Line Id=%d, Located ID=%s, Required Id=%s",
+                 line_id, racf_id, opts->id);
+
+ if ( (strcmp(racf_id,opts->id) NE 0) AND
+      (line_id NE 1 )  )  {
+    rc = ESA_OK;
+    goto exit;
+
+ }
+
+/*
+ *   Check if we located the required RACF ID
+ */
+
+ switch (line_id) {
+   case 0 :
+      break;
+
+  /*
+   *    x'01' - Begining of chain
+   */
+
+   case 1:       /* x'01' - Beginning of chain                   */
+
+      strcpy(racf_id, arg1);
+      strcpy(hilvl_str, racf_id) ;
+      strcat(hilvl_str, ".");
+      hilvl_len = strlen(hilvl_str);
+      break;
+
+  /*
+   *    x'02' - Group exists
+   */
+
+   case  2:
+
+      racf_id_type = 2;
+      break;
+
+  /*
+   *    x'03' - In subgroup list of
+   */
+
+   case  3:
+      break;
+
+  /*
+   *    x'04' - Superior group of
+   */
+
+   case  4:
+
+      if (strlen(opts->sup_grp) NE 0)
+         pcmd(0,"ALG %s SUPGROUP(%s)", arg1, opts->sup_grp);
+  /*  else pcmd(1, "ALG %s SUPGROUP(????????)", arg1);       BS10143 */
+      else pcmd(1, "ALG %s SUPGROUP(???????\?)", arg1);   /* BS10143 */
+      break;
+
+  /*
+   *    x'05' - Owner of group
+   */
+
+   case  5:      /* x'05' - Owner of group                       */
+
+      if (strlen(opts->grp_owner) NE 0)
+         pcmd(0,"ALG %s OWNER(%s)", arg1, opts->grp_owner);
+  /*  else pcmd(1, "ALG %s OWNER(????????)", arg1);          BS10143 */
+      else pcmd(1, "ALG %s OWNER(???????\?)", arg1);      /* BS10143 */
+      break;
+
+  /*
+   *    x'06' - In access list of group
+   */
+
+   case  6:
+
+      if (strcmp(arg1,opts->dfltgrp) NE 0 )
+         pcmd(0, "RE %s GROUP(%s)", racf_id, arg1);
+      break;
+
+  /*
+   *    x'07' - User exists
+   */
+
+   case  7:      /* x'07' - User entry exists                    */
+
+      racf_id_type = 7;
+      break;
+
+  /*
+   *    x'08' - Owner of user
+   */
+
+   case  8:
+
+      if (strlen(opts->usr_owner) NE 0)
+         pcmd(0, "ALU %s OWNER(%s)", arg1, opts->usr_owner);
+   /* else pcmd(1, "ALU %s OWNER(????????)", arg1);         BS10143 */
+      else pcmd(1, "ALU %s OWNER(???????\?)", arg1);     /* BS10143 */
+      break;
+
+  /*
+   *    x'09' - Default group for user
+   */
+
+   case  9:
+
+      if (strlen(opts->new_dfltgrp) NE 0) {
+         pcmd(0, "CO %s GROUP(%s)", arg1, opts->new_dfltgrp);
+         pcmd(0, "ALU %s DFLTGRP(%s)", arg1, opts->new_dfltgrp);
+      }
+      else {
+      /* pcmd(1, "CO %s GROUP(????????)", arg1);         BS10143 */
+         pcmd(1, "CO %s GROUP(???????\?)", arg1);     /* BS10143 */
+      /* pcmd(1, "ALU %s DFLTGRP(????????)", arg1);      BS10143 */
+         pcmd(1, "ALU %s DFLTGRP(???????\?)", arg1);  /* BS10143 */
+      }
+      break;
+
+  /*
+   *    x'0a' - Connect group for user
+   */
+
+   case 10:
+
+      pcmd(0,"RE %s GROUP(%s)", arg1, racf_id);
+      break;
+
+  /*
+   *    x'0b' - First qualifier of a dataset
+   */
+
+   case 11:
+
+      hilvl_flag = RACF_YES;
+      gen_str = get_generic_string(arg2);
+
+      if (opts->dsnforce EQ RACF_YES)
+         pcmd(0, "DD %s %s", arg1, gen_str);
+      else pcmd(1, "DD %s %s", arg1, gen_str);
+      break;
+
+  /*
+   *    x'0c' - Owner of dataset profile
+   */
+
+   case 12:
+
+      gen_str = get_generic_string(arg2);
+
+      if (memcmp(hilvl_str, arg1, hilvl_len) NE 0) {
+         if (strlen(opts->ds_owner) NE 0) {
+            pcmd(0, "ALD %s %s OWNER(%s)", arg1, gen_str,
+                    opts->ds_owner);
+         }
+      /* else pcmd(1, "ALD %s %s OWNER(????????)", arg1, gen_str);   BS10143 */
+         else pcmd(1, "ALD %s %s OWNER(???????\?)", arg1, gen_str); /* BS10143*/
+      }
+      break;
+
+  /*
+   *    x'0d' - In standard access list of dataset
+   */
+
+   case 13:
+
+      gen_str = get_generic_string(arg2);
+      if (memcmp(hilvl_str, arg1, hilvl_len) NE 0)
+         pcmd(0, "PE %s %s ID(%s) DELETE", arg1, gen_str, racf_id);
+      break;
+
+  /*
+   *    x'0e' - Create group of dataset
+   */
+
+   case 14:
+      break;
+
+  /*
+   *    x'0f' - Owner of a resource
+   */
+
+   case 15:      /* x'0f' - Owner of resource                    */
+
+/*bs2545  gen_str = get_generic_string(arg3);    */
+      gen_str = get_generic_string("(N)");                /*bs2545*/
+
+/* BS10143 - Check if we have a digital certificate to process */
+/*           and ignore it, since we cant issue a RALT command */
+/*           to change its owner and its processing causes an  */
+/*           S0C4.                                             */
+
+      if ((strcmp(arg1,"DIGTCERT") EQ 0) OR               /* BS10143 */
+         (strcmp(arg1,"DIGTRING") EQ 0) OR                /* BS10143 */
+         (strcmp(arg1,"DIGTNMAP") EQ 0))                  /* BS10143 */
+         break;                                           /* BS10143 */
+
+      if (strlen(opts->gen_owner) GT 0) {
+         if ((strcmp(opts->gen_owner,"?") NE 0) AND       /*bs2545*/
+            (strcmp(opts->gen_owner,"NONE") NE 0))        /*bs2545*/
+         pcmd(0, "RALT %s %s %s OWNER(%s)", arg1, arg2, gen_str,
+                 opts->gen_owner);
+         else if (strcmp(opts->dfltgrp,"?") NE 0)         /*bs2545*/
+              pcmd(0, "RALT %s %s %s OWNER(%s)", arg1, arg2, gen_str,
+                 opts->dfltgrp);                          /*bs2545*/
+        /*   else pcmd(1, "RALT %s %s %s OWNER(????????)", arg1, arg2, */
+             else pcmd(1, "RALT %s %s %s OWNER(???????\?)", arg1, arg2,
+                          gen_str);
+      }
+  /*  else pcmd(1, "RALT %s %s %s OWNER(????????)", arg1, arg2,    BS10143 */
+      else pcmd(1, "RALT %s %s %s OWNER(???????\?)", arg1, arg2, /* BS10143 */
+                 gen_str);
+      break;
+
+  /*
+   *    x'10' - In standard access list of resource
+   */
+
+   case 16:
+
+      gen_str = get_generic_string(arg3);
+
+      if ((strcmp(arg1,"DIGTCERT") EQ 0) OR               /* BS10143 */
+         (strcmp(arg1,"DIGTRING") EQ 0) OR                /* BS10143 */
+         (strcmp(arg1,"DIGTNMAP") EQ 0))                  /* BS10143 */
+         break;                                           /* BS10143 */
+
+      pcmd(0, "PE %s CLASS(%s) %s ID(%s) DELETE",
+              arg2, arg1, gen_str, racf_id );
+      break;
+
+  /*
+   *    x'11' - Owner of connect profile
+   */
+
+   case 17:
+
+      cnctusr = arg1;
+      cnctgrp = strchr(arg1,'/');
+      *cnctgrp = NULL_CHAR;
+      cnctgrp += 1;
+      if (strlen(opts->cnct_owner) GT 0)
+         pcmd(0, "CO %s GROUP(%s) OWNER(%s)", cnctusr, cnctgrp,
+                 opts->cnct_owner);
+      else
+     /*  pcmd(1, "CO %s GROUP(%s) OWNER(????????)", cnctusr,       BS10143 */
+         pcmd(1, "CO %s GROUP(%s) OWNER(???????\?)", cnctusr,   /* BS10143 */
+                 cnctgrp );
+      break;
+
+  /*
+   *    x'12' - In notify field of dataset
+   */
+   case 18:
+
+
+      gen_str = get_generic_string(arg2);
+
+      if (memcmp(hilvl_str, arg1, hilvl_len) NE 0) {
+         if (strlen(opts->notify_id) GT 0) {
+            if (strcmp(opts->notify_id, "NONE") EQ 0)
+               strcpy(notify_str,"NONOTIFY");
+            else sprintf(notify_str,"NOTIFY(%s)", opts->notify_id);
+            pcmd(0, "ALD %s %s %s", arg1, gen_str, notify_str);
+         }
+     /*  else pcmd(1, "ALD %s %s NOTIFY(????????)", arg1, gen_str);  BS10143*/
+         else pcmd(1, "ALD %s %s NOTIFY(???????\?)", arg1, gen_str);/* BS10143*/
+      }
+      break;
+
+  /*
+   *    x'13' - In notify field of resource
+   */
+   case 19:
+
+/*bs2545  gen_str = get_generic_string(arg3);   */
+      gen_str = get_generic_string("(N)");       /*bs2545*/
+
+      if (strlen(opts->notify_id) GT 0) {
+         if ((strcmp(opts->notify_id, "NONE") EQ 0) OR    /*bs2545*/
+            (strcmp(opts->notify_id, "?") EQ 0))          /*bs2545*/
+            strcpy(notify_str,"NONOTIFY");
+         else sprintf(notify_str,"NOTIFY(%s)", opts->notify_id);
+         pcmd(0, "RALT %s %s %s %s", arg1, arg2, gen_str,
+                 notify_str);
+      }
+      else pcmd(0, "RALT %s %s %s %s", arg1, arg2,
+                  gen_str, "NONOTIFY");
+      break;
+
+/*bs2545 else pcmd(1, "RALT %s %s %s NOTIFY(????????)", arg1, arg2,
+                  gen_str );    */
+
+  /*
+   *    x'14' - In conditional access list of dataset
+   */
+   case 20:
+
+      gen_str = get_generic_string(arg2);
+
+      if (memcmp(hilvl_str, arg1, hilvl_len) NE 0) {
+         pcmd(0, "PE %s %s ID(%s) WHEN(PROGRAM(*)) DELETE",
+              arg1, gen_str, racf_id);
+         pcmd(0, "PE %s %s ID(%s) WHEN(TERMINAL(*)) DELETE",
+              arg1, gen_str, racf_id);
+         pcmd(0, "PE %s %s ID(%s) WHEN(APPCPORT(*)) DELETE",
+              arg1, gen_str, racf_id);
+         pcmd(0, "PE %s %s ID(%s) WHEN(CONSOLE(*)) DELETE",
+              arg1, gen_str, racf_id);
+         pcmd(0, "PE %s %s ID(%s) WHEN(JESINPUT(*)) DELETE",
+              arg1, gen_str, racf_id);
+      }
+      break;
+
+  /*
+   *    x'15' - In conditional access list of resource
+   */
+   case 21:
+
+      gen_str = get_generic_string(arg3);
+
+      pcmd(0, "PE %s CLASS(%s) %s ID(%s) WHEN(TERMINAL(*)) DELETE",
+          arg2, arg1, gen_str, racf_id);
+      pcmd(0, "PE %s CLASS(%s) %s ID(%s) WHEN(APPCPORT(*)) DELETE",
+          arg2, arg1, gen_str, racf_id);
+      pcmd(0, "PE %s CLASS(%s) %s ID(%s) WHEN(CONSOLE(*)) DELETE",
+          arg2, arg1, gen_str, racf_id);
+      pcmd(0, "PE %s CLASS(%s) %s ID(%s) WHEN(JESINPUT(*)) DELETE",
+          arg2, arg1, gen_str, racf_id);
+      break;
+
+  /*
+   *    x'16' - Reswoner of a profile
+   */
+   case 22:
+
+      gen_str = get_generic_string(arg2);
+
+      if (memcmp(hilvl_str, arg1, hilvl_len) NE 0) {
+         if (strlen(opts->resown_id) GT 0) {
+            if (strcmp(opts->resown_id, "NONE") EQ 0)
+               strcpy(notify_str,"NODFP");
+            else sprintf(resown_str,"DFP(RESOWNER(%s))",
+                         opts->resown_id);
+            pcmd(0, "ALD %s %s %s", arg1, gen_str, resown_str);
+         }
+      /* else pcmd(1,"ALD %s %s DFP(RESOWNER(????????)", arg1,      BS10143 */
+         else pcmd(1,"ALD %s %s DFP(RESOWNER(???????\?)", arg1,   /*BS10143 */
+                      gen_str);
+      }
+      break;
+ }
+
+/*
+ *    Handle i/o error
+ */
+
+ if (ferror(fr)) {
+    CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                  "put","UT100 CLEANUP",fnr,strerror(errno));
+    rc = ESA_FATAL;
+ }
+
+/*
+ *    Finish
+ */
+
+ exit :;
+
+   ESA_DIAG_exit(PLT_COMP_API_UT100, 2, func, rc);
+
+   return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : pcmd                                       *
+*                                                             *
+* DESCRIPTION    : Suppress trailing blanks of argument       *
+*                  and print it                               *
+*                                                             *
+* INPUT          : arg_id                                     *
+*                                                             *
+* INPUT/OUTPUT     arg                                        *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+**************************************************************/
+
+static void pcmd(int comment, char *format, ...)
+{
+
+   va_list  arg_list;
+   char     output_buffer[1024];
+   char     comment_format[]="/* \"CTSAEXC %s\" */\n";
+   char     comment_line1 []="/* \"CTSAEXC %s\", */\n";
+   char     comment_line2 []="/* \"%s\" */\n";
+   char     real_format[]="\"CTSAEXC %s\" \n";
+   char     real_line1[]="\"CTSAEXC %s\",\n";
+   char     real_line2[]="\"        %s\"\n";
+   char     line1[80];
+   char     line2[80];
+   int      i ;
+   int      totlen ;                                   /* BS10143 */
+   static char func[]="pcmd";
+
+   ESA_DIAG_enter(PLT_COMP_API_UT100, 5, func);
+
+   racf_cmd_counter++;
+
+   va_start(arg_list, format);
+/* vsprintf (output_buffer, format, arg_list);            BS10143 */
+   totlen=vsprintf(output_buffer, format, arg_list);   /* BS10143 */
+   va_end(arg_list);                                   /* BS10143 */
+
+/* if (strlen(output_buffer) GT 55) {                     BS10143 */
+   if (totlen GT 60) {                                 /* BS10143 */
+
+      /****** separate command into two lines *****/
+
+      for (i=60; i GT 0; i--)
+      /*  if (output_buffer[i-1] EQ BLANK)                BS10143 */
+          if ((output_buffer[i-1] EQ BLANK) AND        /* BS10143 */
+              (i GT 5))                                /* BS10143 */
+             break;
+      memcpy(line1,output_buffer,i);
+      line1[i]=NULL_CHAR;
+      strcpy(line2,output_buffer+i);
+
+      /****** print the 2 lines *****/
+      if (comment) {
+         fprintf(fr, comment_line1, line1);
+         fprintf(fr, comment_line2, line2);
+      }
+      else {
+         fprintf(fr, real_line1, line1);
+         fprintf(fr, real_line2, line2);
+      }
+   }
+   else {
+      if (comment)
+         fprintf(fr, comment_format, output_buffer);
+      else
+         fprintf(fr, real_format, output_buffer);
+
+   }
+
+   ESA_DIAG_exit(PLT_COMP_API_UT100, 5, func, ESA_OK );
+   return;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : handle_arg                                 *
+*                                                             *
+* DESCRIPTION    : Suppress trailing blanks of argument       *
+*                  and print it                               *
+*                                                             *
+* INPUT          : arg_id                                     *
+*                                                             *
+* INPUT/OUTPUT     arg                                        *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+**************************************************************/
+
+static void handle_arg(int arg_id, char * arg)
+{
+   int i;
+   static char func[]="handle_arg";
+
+   ESA_DIAG_enter(PLT_COMP_API_UT100, 5, func);
+
+   if (arg[0] NE NULL_CHAR) {
+      for (i = strlen(arg)-1; arg[i] EQ BLANK; i--)
+          arg[i] = NULL_CHAR;
+      ESA_DIAG_printf(PLT_COMP_API_UT100, 5, "arg %d = %s",
+                      arg_id, arg);
+   }
+
+   ESA_DIAG_exit(PLT_COMP_API_UT100, 5, func, ESA_OK);
+
+   return;
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : get_generic_string                         *
+*                                                             *
+* DESCRIPTION    : convert generic mark of (G) to GENERIC     *
+*                                                             *
+* INPUT          : str_in                                     *
+*                                                             *
+* OUTPUT         : None                                       *
+*                                                             *
+* RETURN VALUE   : char *                                     *
+*                                                             *
+**************************************************************/
+
+static char *get_generic_string (char * str)
+{
+
+   static char generic_string[] = "GENERIC";
+   static char empty_string[] = NULL_STRING;
+
+   if (strcmp(str, "(G)") EQ 0)
+      return generic_string;
+   else return empty_string;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : write_rexx_header                          *
+*                                                             *
+* DESCRIPTION    : write header for REXX generated program    *
+*                                                             *
+* INPUT          : None                                       *
+*                                                             *
+* OUTPUT         : None                                       *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL - I/O problems           *
+*                                                             *
+**************************************************************/
+
+static ESA_RC write_rexx_header(RACF_DELETE_OPTIONS_rec_typ   * opts,
+                                CTSAMSG_DEST_TABLE_rec_typ    * dest,
+                                CTSAMSG_HANDLE_rec_typ        * msgs)
+{
+
+ ESA_RC rc=ESA_OK ;
+ int    i;
+ char   id[]="ID=%s\n";
+ char   trace[]="IF ( TRACE = 'TRACEON' ) THEN TRACE R\n";
+ char   id8[10];
+ char   *xx_ptr;
+ struct  tm                  * tm_ptr;
+ size_t                        nchar;
+ char                          date_str[80];
+ char                        * first_q;
+ char                        * last_q;
+ int                           quest_size ;
+ char   release[] = SA_AGENT_NAME " " SA_AGENT_VERSION " - " _CTSF_;
+                                                        /* SAS2IBMN */
+ static char func[]="write_rexx_header";
+
+ char rexx_prog[][80]={
+ "/***** REXX *****************************************************/\n",
+ "/* CREATED BY ??????????????????????????????? XX/XX/XX XX:XX:XX */\n",
+ "/* THE REXX WAS PREPARED TO DELETE XXXXXXXX FROM RACF DATABASE  */\n",
+ "/* PLEASE REVIEW THE REXX CAREFULLY BEFORE ACTIVATING IT.       */\n",
+ "/****************************************************************/\n",
+ "ARG TRACE\n",
+ "ADDRESS TSO\n",
+ "\n",
+ "CALL PROCESS\n",
+ "EXIT RESULT\n",
+ "\n",
+ "PROCESS_ERROR:\n",
+ " SAY 'CLEANUP COMMANDS TERMINATED AT LINE ' SIGL\n",
+ " SAY 'COMMAND: ' CONDITION(D) ' FAILED RC=' RC\n",
+ " RETURN RC\n",
+ "\n",
+ "PROCESS:\n",
+ "\n",
+ "SIGNAL ON ERROR NAME PROCESS_ERROR\n",
+ ""};
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(PLT_COMP_API_UT100, 5, func);
+
+ /*
+  *   Insert Release,  Date , Time in header line
+  */
+
+  first_q= strchr(rexx_prog[1],'?');      /* ptr to first ?  */
+  last_q = strrchr(rexx_prog[1],'?');     /* ptr to last  ?  */
+  quest_size = last_q - first_q +1 ;
+
+  ESA_DIAG_printf(PLT_COMP_API_UT100, 5,
+                  "Prog line=%s first(?)=%X last(?)=%X len=%d",
+                   rexx_prog[1],first_q, last_q, quest_size);
+
+  if ( first_q NE NULL ) {
+     memset(first_q, BLANK, quest_size );
+     if ( strlen(release) GT quest_size )
+        memcpy( first_q, release , quest_size );
+     else
+        memcpy( first_q, release , strlen(release) ) ;
+  }
+
+  tm_ptr = localtime(&(opts->crttime) );
+  nchar  = strftime(date_str, sizeof(date_str),
+                    "%d/%m/%y %H:%M:%S", tm_ptr);
+  xx_ptr=strstr(rexx_prog[1],"XX/XX/XX");
+  if ( xx_ptr NE NULL )
+    if ( nchar GT 0 )
+       memcpy(xx_ptr, date_str , nchar ) ;
+    else
+       memcpy(xx_ptr, "Undefined", sizeof("Undefined") );
+
+ /*
+  *   Insert Userid in Header line
+  */
+
+  sprintf(id8 , "%-8s" , opts->id);  /* Object ID */
+  xx_ptr=strstr(rexx_prog[2],"XXXXXXXX");
+  if ( xx_ptr NE NULL )
+      memcpy(xx_ptr, id8 , 8 );
+
+ /*
+  *   Write REXX header
+  */
+
+  for ( i=0 ; *rexx_prog[i] NE NULL_CHAR ; i++ )  {
+    fputs(rexx_prog[i],fr );     /* put REXX sentence */
+    if (ferror(fr)) {            /* I/O error handling*/
+       CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                     "put","UT100 CLEANUP",fnr,strerror(errno));
+       rc=ESA_FATAL ;
+       goto exit;
+    }
+  }
+
+  fprintf(fr, id , opts->id);        /* Object ID */
+  fprintf(fr, trace );               /* TRACE line*/
+
+  exit :;
+     ESA_DIAG_exit(PLT_COMP_API_UT100, 5, func, rc);
+     return rc;
+  }
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : write_rexx_bottom                          *
+*                                                             *
+* DESCRIPTION    : write REXX program bottom lines            *
+*                                                             *
+* INPUT          : None                                       *
+*                                                             *
+* OUTPUT         : None                                       *
+*                                                             *
+* RETURN VALUE   : None                                       *
+*                                                             *
+**************************************************************/
+
+static void write_rexx_bottom(RACF_DELETE_OPTIONS_rec_typ * opts,
+                              CTSAMSG_DEST_TABLE_rec_typ  * dest,
+                              CTSAMSG_HANDLE_rec_typ      * msgs)
+{
+
+   int    i;
+   ESA_RC rc=ESA_OK;
+   static char func[]="write_rexx_bottom";
+   char        **bottom_lines;
+
+   static char *rexx_bottom_ok[]={
+      "TRACE OFF\n",
+      "RETURN 0\n",
+      "" };
+
+   static char *rexx_bottom_wrn[]={
+      "TRACE OFF\n",
+      "SAY 'NO OCCURRENCES OF ' ID ' WERE FOUND'\n",
+      "RETURN 0\n",
+      "" };
+
+   ESA_DIAG_enter(PLT_COMP_API_UT100, 5, func);
+
+   if ( racf_cmd_counter GT 0 )
+       bottom_lines=rexx_bottom_ok;
+   else
+       bottom_lines=rexx_bottom_wrn;
+
+   for ( i=0 ; *bottom_lines[i] NE NULL_CHAR ; i++ ) {
+      fputs(bottom_lines[i],fr );     /* put REXX sentence */
+      if (ferror(fr)) {            /* I/O error handling*/
+          CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                        "put","UT100 CLEANUP",fnr,strerror(errno));
+          rc=ESA_FATAL ;
+          goto exit;
+      }
+   }
+  exit :;
+   ESA_DIAG_exit(PLT_COMP_API_UT100, 5, func, rc);
+
+}

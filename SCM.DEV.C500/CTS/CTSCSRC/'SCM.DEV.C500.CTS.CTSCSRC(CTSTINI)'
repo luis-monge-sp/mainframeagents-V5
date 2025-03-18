@@ -1,0 +1,823 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Initialize TSS  api                      *
+ *                                                             *
+ * File Name        : ctstini.c                                *
+ *                                                             *
+ * Author           : Alexander Shvartsman                     *
+ *                                                             *
+ * Creation Date    : 15/01/97                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * IS0159   MichaelC 30Dec2003 Use callable services           *
+ * WS10009  MeirS    18/10/07 Support RU_LOCKED & RU_SUSPENDED.*
+ * WS10020  AvnerL   05/02/09 VERIFY_PASSWORD_BY_LOGIN to TSS. *
+ * IS10091  NuritY   05/06/13 Support dynamic tsscfile record  *
+ *                            description table. (WS10034...   *
+ *                            WS10036)                         *
+ * IS10093  NuritY   11/06/13 Add SWITCH_TO_ENDUSER parm...    *
+ *                            ...(WS10037)                     *
+ * IS10094  NuritY   11/06/13 Complie because of changes in    *
+ *                            CTSTF51. (BS10032)               *
+ * IS10020  AvnerL   01/05/14 Do not use NOPW in TSS AddUser.  *
+ * SAS2IBMA AvnerL   18/07/16 SAS/C to IBM/C                   *
+ * WS10054  SeligT   26/07/16 Add ENQ/DEQ SYSTEMS RNL Parameter*
+ * IS10091A NuritY   15/09/16 No need for dynamic tsscfile     *
+ *                            record description table for     *
+ *                            parent container suppert because *
+ *                            it is not parameter-dependent.   *
+ * SAS2IBMT SeligT   09/10/16 SAS/C to IBM C Conversion Project*
+ * SAS2IBMN NuritY   05/02/17 SAS/C to IBM C Conversion Project*
+ * WS10061  KailasP  25/05/17 No error if RUUG is connected.   *
+ * BS10063  SeligT   04/09/17 CTSTF51 Not Compiled/Linked Into *
+ *                            CTSTINI For Password Phrase Mod  *
+ *                   To apply any changes to TSS CMAC, CTSTF51,*
+ *                   you must recompile the CTSTINI module and *
+ *                   relink the CTSCTSS load module. Under     *
+ *                   CHGBMC, first PB CTSTF51 and then CTSTINI.*
+ * BS10068  SeligT   17/10/17 Just recompiling this module     *
+ *                            because of changes to CTSTF51.   *
+ * IS10174  NuritY   31/12/17 1. Dyncamic EXECUOT support.     *
+ *                            2. Move VERIFY_BY_LOGIN to       *
+ *                               common params.                *
+ * IS10182  AvnerL   17/07/19 S0C4/S0C1 due to DIAG vsprintf   *
+ * IS10184  NuritY   31/08/21 Improve scripts performance      *
+ * BS10118  AvnerL   05/08/22 UID & GID = 0. comp CTSTF51      *
+ * WS10082  MauriC   14/11/22 Add call to ADDINFO_spi_init     *
+ * WS10082N NuritY   02/10/23 Use a general message.           *
+ * WS10088  AvnerL   23/01/24 Recompile to support WAEMAIL     *
+ ***************************************************************/
+
+ /**************************************************************
+ *                                                             *
+ *  TSSCFILE records description table initialization          *
+ *  =================================================          *
+ *                                                             *
+ *  (Added by IS10091 and modified by IS10091A)                *
+ *                                                             *
+ *  TSSCFILE output is processed using TSSCFILE records        *
+ *  description table. This table contain pointers to          *
+ *  descriptions of all TSSCFILE output lines including        *
+ *  processing instructions (SKIP, SAVE, processing routine).  *
+ *                                                             *
+ *  There are several tables, used according to the command    *
+ *  output to be analyzed:                                     *
+ *  general - used to analyze LIST ACID command output.        *
+ *  modify  - used to analyze MODIFY command output.           *
+ *  resource - used to analyze WHOHAS command output.          *
+ *                                                             *
+ *  The 'resource' table is defined in CTSTRES CMEM member.    *
+ *  This table wil not be discussed here.                      *
+ *                                                             *
+ *  the 'modify' table is tsscm_recs_51 static table defined   *
+ *  in CTSTF51 CMAC member. It's address is put in params_ptr  *
+ *  to be used by the issuers of the MODIFY command.           *
+ *                                                             *
+ *  The 'general' table is created dynamically. It's address   *
+ *  is put in params_ptr to be used by the issuers of the      *
+ *  LIST ACID command.                                         *
+ *  The table is created of tsscf_recs_51 table defined in     *
+ *  CTSTF51 CMAC member as base table, followed by "process"   *
+ *  or "ignore" record tables, according to RSS paramerters.   *
+ *                                                             *
+ *  When field processing depeneds on RSS parameter value,     *
+ *  two tables should be prepated for the relevant records:    *
+ *  - a "process" table containing definition required to      *
+ *    process the records.                                     *
+ *  - an "ignore" table containing definition required to      *
+ *    ignore the records.                                      *
+ *  The appropriate table will be attached to the general      *
+ *  table, according to the value of the corresponsing RSS     *
+ *  parameter.                                                 *
+ *                                                             *
+ *                                                             *
+ *  'general' table creation is described below in function    *
+ *  Create_tsscf_general.                                      *
+ *                                                             *
+ *                                                             *
+ ***************************************************************/
+
+ #include <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include STDIO
+ #include STDLIB
+ #include STRING
+
+ #include ESA_DIAG
+ #include ESA_API
+ #include ESA_CTSAMSG
+ #include ESA_API_CODES
+ #include API_AUTH                                        /* IS10174 */
+
+ /*
+  *   TSS include files
+  */
+
+ #include TSS
+ #include TSS_CODES
+ #include TSS_TSSCFILE_TABLE_51                           /* IS10091 */
+ /* IS10091A #include TSS_TSSCFILE_PC_PROC                 * IS10091 */
+ /* IS10091A #include TSS_TSSCFILE_PC_IGN                  * IS10091 */
+
+ /* SAS2IBMN #include <CTSCSRV.h>  * IS0159 */
+ #include MVS_SRV                                          /* SAS2IBMN */
+ /*WS10082N #define P3270_INVALID_RSSPARM "CTS7301E"@*WS10009*/
+ /* #exout@
+ #define VERIFY_PASSWORD_BY_LOGIN "VERIFY_PASSWORD_BY_LOGIN"  *WS10020*
+ */
+ /* IS10091A #define PARENT_CONTAINER   "PARENT_CONTAINER"   *IS10091 */
+ #define SWITCH_TO_ENDUSER  "SWITCH_TO_ENDUSER"             /*IS10093 */
+ #define NOPW               "NOPW"                          /*IS10020 */
+
+
+ /* WS10082 - store ref to admin_params */
+ ADMIN_PARAMS_rec_typ * admin_params_copy;
+ /* WS10082 - store ref to admin params */
+
+ /* IS10091 - start */
+
+ static ESA_RC Create_tsscf_general(TSSCFILE_REC_typ **tsscf_general,
+                                 TSS_PARAMS_rec_typ   * params_ptr,
+                                 ADMIN_PARAMS_rec_typ * admin_params);
+
+ /* IS10091 - end */
+
+/****************************************************
+ * Procedure Name : apiinit
+ * Description    : API initialization
+ * Input          : admin
+ * Output         : err
+ * Input/Output   : addinfo,
+ * Return Value   : ESA_RC
+ * Side Effects   :
+ * Comments       : Platform-dependent operations to be performed
+ *                  prior to any API call.
+ ***************************************************/
+
+ ESA_RC CTSAPIInit (ADMIN_PARAMS_rec_typ * admin_params,
+                    ERR_STRUCT_rec_typ   * err)
+ {
+
+ /* IS0159 - no need to initialize Diag
+   char          log[]      = NULL_STRING;
+   char          shadow[]   = NULL_STRING;
+   char          progname[] = "CTSAPIInit";  */
+
+   ESA_RC        rc = ESA_OK;
+   int           arc=0;
+   int           debug_level = 0;
+   char          component[] = "CTSTINI";                /* WS10009 */
+   char          func[] = "CTSAPIInit";                  /* WS10009 */
+   TSS_PARAMS_rec_typ * params_ptr = NULL;               /* WS10009 */
+   CTSAMSG_HANDLE_rec_typ     * msgs;                    /* WS10009 */
+   CTSAMSG_DEST_TABLE_rec_typ * dest;                    /* WS10009 */
+   char  errmsg[81] = "";                                /* WS10009 */
+   char  revoked_types[5];                               /* WS10009 */
+   int   i = 0;                                          /* WS10009 */
+   int   j = 0;                                          /* WS10009 */
+   TSSCFILE_REC_typ * tsscf_general;                     /* IS10091 */
+
+   COMMON_PARAMS_rec_typ      * comm_parms = NULL;       /* IS10174 */
+   int                          do_build = FALSE;        /* IS10184 */
+
+   RSS_ADMINS_LIST_rec_typ    * admins_list = NULL;      /* IS10174 */
+   /*   Assembler module. Check TSS running status  */
+
+   /* SAS2IBMT prototype changed for IBM C
+   extern ESA_RC ctsschk(int  *debug_level);                         */
+   extern ESA_RC ctsschk();                               /* SAS2IBMT */
+
+   init_global_admin_params(admin_params);    /* IS0159 */
+
+ /* IS0159 - no need to initialize Diag
+   ESA_DIAG_initialize (log, shadow, progname,
+                        &admin_params->esadiag_handle) ;
+ */
+
+   /* WS10009 starts
+    * print TSS version only once at apiinit.              */
+
+   ADDINFO_spi_init(admin_params);  /* WS10082 store ptr */
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+   admin_params->cs_func.DIAG_enter_ptr(
+     ESA_COMP_APIINIT, 1, func );
+
+   /*IS10182 admin_params->cs_func.DIAG_printf_ptr( */
+   ESA_DIAG_printf(                                  /*IS10182*/
+     ESA_COMP_APIINIT,1,
+     "Verify version of %s ", admin_params->rss_type);
+
+
+   /*   Invoke program check TSS status */
+
+   debug_level = ESA_DIAG_get_debug_level(ESA_COMP_RSS_CHECK);
+
+   /*   Obtain TSS running status  */
+
+   /* SAS2IBMT
+   arc=ctsschk(&debug_level);                                        */
+   arc=(*(ASM_RTN_TYP *)&ctsschk)(&debug_level);          /* SAS2IBMT */
+   if ( arc NE 0)  {
+        CTSAMSG_print(TSS_NOT_ACTIVE,
+                      admin_params->ctsamsg_handle,
+                      NULL,
+                      admin_params->ctsamsg_dest);
+        rc=ESA_FATAL ;
+        goto exit;
+   }
+   /********************* WS10009 starts ****************************/
+   /*                     -------------                             */
+   /* When function is first called, do the following:              */
+   /*  1. allocate area for TSS usa-api global parameters.          */
+   /*  2. set SUSPEND_IS_LOCKED value in it.                        */
+   /*  3. set DISREGARD_RU_SUSPENDED value in it.                   */
+   /*  4. Set TSSCFILE records processing tables.           IS10091 */
+   /*  5. Set SWITCH_TO_ENDUSER  value in it.               IS10093 */
+   /*  6. Set NOPW value in it.                             IS10020 */
+   /*  7. Sets MSG_CONNGRP_ERR value in it.                 WS10061 */
+   /*  8. set common usaapi parameters.                     WS10054 */
+   /*  9. Create the Admins list.eters.                     IS10174 */
+   /* 10. Set allocated area addr in admin_params->apiinit_handle.  */
+   /*****************************************************************/
+
+   /* IS10184 - start                                             */
+   /*           we build tha params block when:                   */
+   /*           1. No parameters block exists.                    */
+   /*           2. A parameter block exists but there is no       */
+   /*              common_params block.                           */
+   /*           3. A common_params block exists, and the          */
+   /*              PARASM_type in it is not us.                   */
+   /*                                                             */
+   /*           We do not build the params block When there is    */
+   /*           a parameters block pointing to a common_params    */
+   /*           block, and the PARAMS_type is ours.               */
+
+   /* IS10184 if (admin_params->apiinit_handle EQ 0) */
+   if (admin_params->apiinit_handle NE NULL) /* there is params_block */
+   {
+     GET_P_CMNPRMS(admin_params, comm_parms, rc, NULL)
+     if (comm_parms EQ NULL)  /* When no Common_params */
+       do_build = TRUE;       /* ...and create all */
+     else                     /* common_[arams exists */
+       /* check params block type */
+       if (comm_parms->PARAMS_type EQ PARAMS_TYPE_TSS)  /* ours ? */
+         do_build = FALSE;   /* yes, no need to re-create */
+       else
+         do_build = TRUE;    /* no - probably dummy - recreate */
+   }
+   else
+     do_build = TRUE;
+   /* IS10184 - end */
+
+   if (do_build)                                          /* IS10184 */
+   {
+   /*  1. allocate area for TSS usa-api global parameters.        */
+    /*admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,1,*/
+    ESA_DIAG_printf(ESA_COMP_APIINIT,1,               /*IS10182*/
+       "Allocating <%d> bytes for TSS_PARAMS ",
+       sizeof(TSS_PARAMS_rec_typ));
+    params_ptr = malloc(sizeof(TSS_PARAMS_rec_typ));
+    if (params_ptr EQ NULL)
+     {
+      sprintf(errmsg,"TSS_PARAMS in comp=%s fn=%s",component,func);
+      /* SAS2IBMN admin_params->cs_func.MSG_printf_ptr (
+          ERR_MALLOC, errmsg,sizeof(TSS_PARAMS_rec_typ));  */
+      CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,        /* SAS2IBMN */
+                    errmsg,sizeof(TSS_PARAMS_rec_typ));  /* SAS2IBMN */
+      rc = ESA_FATAL;
+      goto exit;
+     }
+    else
+     {
+      /*admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,1,*/
+      ESA_DIAG_printf(ESA_COMP_APIINIT,1,               /*IS10182*/
+      "TSS_PARAMS allocated at %X",params_ptr);
+     }
+
+    /*  2. set LOCKED_TYPES                                  */
+    for(i = 0 ; i < 256 ; i++)
+       params_ptr->rssparm_REVOKE_TYPES[i] = NULL_CHAR;  /*SAS2IBMA*/
+    params_ptr->rssparm_REVOKE_TYPES['A'] = '1' ;  /* Suspended  */
+    params_ptr->rssparm_REVOKE_TYPES['P'] = '1' ;  /* Locked     */
+    params_ptr->rssparm_REVOKE_TYPES['V'] = '1' ;  /* Locked     */
+    params_ptr->rssparm_REVOKE_TYPES['X'] = '1' ;  /* Suspended  */
+    /* extract value of LOCKED_TYPES                             */
+    rc = admin_params->cs_func.rssprm_get_opt_ptr(
+                    admin_params->rss_name,
+                    LOCKED_TYPES,
+                    sizeof(revoked_types),
+                    revoked_types,
+                    OPT_TRUE,
+                    OPT_TRUE) ;
+
+    if (rc NE ESA_OK)
+      {            /* set default value for LOCKED_TYPES         */
+      strcpy(revoked_types,"PV") ;
+      rc = ESA_OK; /*parm is not mandatory, set rc=0 */
+      }
+    /* check validity of LOCKED_TYPES */
+    for(i = 0 ; i < 5 AND
+                i < strlen(revoked_types) AND
+                revoked_types[i] != NULL_CHAR;   /*SAS2IBMA*/
+        i++)
+      {
+      j = revoked_types[i] ;
+      if(params_ptr->rssparm_REVOKE_TYPES[j] == '1')
+        params_ptr->rssparm_REVOKE_TYPES[j] = 'L';
+      else
+       {
+        sprintf(errmsg,"%c",revoked_types[i]);
+        if(params_ptr->rssparm_REVOKE_TYPES[j]==NULL_CHAR)/*SAS2IBMA*/
+ /*WS10082N CTSAMSG_print(P3270_INVALID_RSSPARM, msgs, NULL, dest,*/
+          CTSAMSG_print(ERR_INVALID_RSSPARM,              /* WS10082N */
+                        msgs, NULL, dest,                 /* WS10082N */
+                        errmsg,
+                        LOCKED_TYPES,
+                        admin_params->rss_name);
+        else
+          {
+          sprintf(errmsg,"%c type of",revoked_types[i]);
+          CTSAMSG_print(TSS_ERR_DUP_ACID, msgs, NULL, dest,
+                        errmsg,
+                        LOCKED_TYPES);
+          }
+        /*admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,1,*/
+        ESA_DIAG_printf(ESA_COMP_APIINIT,1,               /*IS10182*/
+            "supplied suspended type = <%c> vector contains <%c>",
+            revoked_types[i],
+            params_ptr->rssparm_REVOKE_TYPES[j])  ;
+        rc = ESA_FATAL ;
+        goto exit;
+       }
+     }
+    /*IS10182admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,1,*/
+    ESA_DIAG_printf(ESA_COMP_APIINIT,1,                  /*IS10182*/
+        "LOCKED_TYPES values = <%s> ",
+        revoked_types);
+
+    /*  3. set SUSPENDED_TYPES                               */
+    rc = admin_params->cs_func.rssprm_get_opt_ptr(
+                    admin_params->rss_name,
+                    SUSPENDED_TYPES,
+                    sizeof(revoked_types),
+                    revoked_types,
+                    OPT_TRUE,
+                    OPT_TRUE) ;
+    if (rc NE ESA_OK)
+      {            /* set default value for SUSPENDED_TYPES      */
+      strcpy(revoked_types,"AX") ;
+      rc = ESA_OK; /*parm is not mandatory, set rc=0 */
+      }
+    /* check validity of SUSPENDED_TYPES */
+    for(i = 0 ; i < 5 AND
+                i < strlen(revoked_types) AND
+                revoked_types[i] != NULL_CHAR   ; /*SAS2IBMA*/
+        i++)
+      {
+      j = revoked_types[i] ;
+      if(params_ptr->rssparm_REVOKE_TYPES[j] == '1') /* the only value
+                                                        valid*/
+        params_ptr->rssparm_REVOKE_TYPES[j] = 'S';
+      else
+       {
+        sprintf(errmsg,"%c",revoked_types[i]);
+        if(params_ptr->rssparm_REVOKE_TYPES[j]==NULL_CHAR)/*SAS2IBMA*/
+ /*WS10082 CTSAMSG_print(P3270_INVALID_RSSPARM, msgs, NULL, dest,*/
+          CTSAMSG_print(ERR_INVALID_RSSPARM, msgs,NULL,dest,/*WS10082*/
+                        errmsg,
+                        SUSPENDED_TYPES,
+                        admin_params->rss_name);
+        else
+          {
+          sprintf(errmsg,"%c type of",revoked_types[i]);
+          CTSAMSG_print(TSS_ERR_DUP_ACID, msgs, NULL, dest,
+                        errmsg,
+                        SUSPENDED_TYPES);
+          }
+        /*admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,1,*/
+        ESA_DIAG_printf(ESA_COMP_APIINIT,1,            /*IS10182*/
+            "supplied suspended type = <%c> vector contains <%c>",
+            revoked_types[i],
+            params_ptr->rssparm_REVOKE_TYPES[j]);
+        rc = ESA_FATAL ;
+        goto exit;
+       }
+     }
+    /*admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,1,*/
+    ESA_DIAG_printf(ESA_COMP_APIINIT,1,                 /*IS10182*/
+        "SUSPENDED_TYPES values = <%s> ",
+        revoked_types);
+    if(params_ptr->rssparm_REVOKE_TYPES['A'] == '1')
+       params_ptr->rssparm_REVOKE_TYPES['A'] = 'S'; /* Suspended  */
+    if(params_ptr->rssparm_REVOKE_TYPES['P'] == '1')
+       params_ptr->rssparm_REVOKE_TYPES['P'] = 'L'; /* Locked     */
+    if(params_ptr->rssparm_REVOKE_TYPES['V'] == '1')
+       params_ptr->rssparm_REVOKE_TYPES['V'] = 'L'; /* Locked     */
+    if(params_ptr->rssparm_REVOKE_TYPES['X'] == '1')
+       params_ptr->rssparm_REVOKE_TYPES['X'] = 'S'; /* Suspended  */
+
+    /*IS10182admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,1,*/
+    ESA_DIAG_printf(ESA_COMP_APIINIT,1,                  /*IS10182*/
+        "REVOKE TYPE values are: A<%c>, P<%c>, V<%c>, X<%c>",
+        params_ptr->rssparm_REVOKE_TYPES['A'],
+        params_ptr->rssparm_REVOKE_TYPES['P'],
+        params_ptr->rssparm_REVOKE_TYPES['V'],
+        params_ptr->rssparm_REVOKE_TYPES['X']);
+
+    /* IS10174 - the field is moved to common parameters and
+                 the code is moved to CTSCSRV
+     *   . set VERIFY_PASSWORD_BY_LOGIN parm value in it. WS10020   *
+    rc = admin_params->cs_func.rssprm_get_opt_ptr(
+                    admin_params->rss_name,
+                    VERIFY_PASSWORD_BY_LOGIN,
+                    sizeof(params_ptr->rssparm_VERIFY_PASS_LOGIN),
+                    params_ptr->rssparm_VERIFY_PASS_LOGIN,
+                    OPT_TRUE,
+                    OPT_TRUE) ;
+    admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,3,
+      "VERIFY_PASSWORD_BY_LOGIN = <%s> ,rc = <%d> ",
+      params_ptr->rssparm_VERIFY_PASS_LOGIN, rc);
+
+    if ((rc NE ESA_OK) OR   * default for TSS is 'Y' *
+        (rc EQ ESA_OK  AND
+         params_ptr->rssparm_VERIFY_PASS_LOGIN[0] NE 'N' AND
+         params_ptr->rssparm_VERIFY_PASS_LOGIN[0] NE 'Y')) {
+      params_ptr->rssparm_VERIFY_PASS_LOGIN[0] = 'Y';
+                                                 *SAS2IBMA*
+      params_ptr->rssparm_VERIFY_PASS_LOGIN[1] = NULL_CHAR;
+      rc = ESA_OK;  *parm is not mandatory, set rc=0 *
+      }
+    admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,3,
+      "VERIFY_PASSWORD_BY_LOGIN final value = <%c> ",
+      *params_ptr->rssparm_VERIFY_PASS_LOGIN);
+       *************** end of WS10020 ******************
+    */
+
+   /* IS10091A  - remove PARENT_CONTAINER parameter processing
+    * IS10091 - start *
+     *   . set ParentContainer    parm value in it.           *
+    rc = admin_params->cs_func.rssprm_get_opt_ptr(
+                    admin_params->rss_name,
+                    PARENT_CONTAINER,
+                    sizeof(params_ptr->rssparm_PARENT_CONTAINER),
+                    params_ptr->rssparm_PARENT_CONTAINER,
+                    OPT_TRUE,
+                    OPT_TRUE) ;
+    admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,3,
+      "PARENT_CONTAINER = <%s> ,rc = <%d> ",
+      params_ptr->rssparm_PARENT_CONTAINER, rc);
+
+    if ((rc NE ESA_OK) OR   * default for TSS is 'N' *
+        (rc EQ ESA_OK  AND
+         params_ptr->rssparm_PARENT_CONTAINER[0] NE 'N' AND
+         params_ptr->rssparm_PARENT_CONTAINER[0] NE 'Y')) {
+      params_ptr->rssparm_PARENT_CONTAINER[0] = 'N';
+      params_ptr->rssparm_PARENT_CONTAINER[1]=NULL_CHAR; *SAS2IBMA*
+      rc = ESA_OK;  *parm is not mandatory, set rc=0 *
+      }
+    admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,3,
+      "PARENT_CONTAINER final value = <%c> ",
+      *params_ptr->rssparm_PARENT_CONTAINER);
+    * IS10091 - end *
+   */
+
+   /* IS10091 - start */
+   /*  4. Set TSSCFILE records processing tables.                   */
+   params_ptr->tsscf_rec_modify = tsscm_recs_51;
+
+   rc = Create_tsscf_general(&tsscf_general, params_ptr, admin_params);
+   if (rc NE ESA_OK)
+     rc = ESA_FATAL;
+   params_ptr->tsscf_rec_general = (TSSCFILE_REC_typ **)tsscf_general;
+
+   /*IS10182 admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,3,*/
+   ESA_DIAG_printf(ESA_COMP_APIINIT, 3,                  /*IS10182*/
+      "TSSCF record blocks:  general=%8X   modify=%8X",
+      params_ptr->tsscf_rec_general, params_ptr->tsscf_rec_modify);
+   /* IS10091 - end */
+
+    /*  5. set SWITCH_TO_ENDUSER  parm value in it. IS10093   */
+    rc = admin_params->cs_func.rssprm_get_opt_ptr(
+                    admin_params->rss_name,
+                    SWITCH_TO_ENDUSER,
+                    sizeof(params_ptr->rssparm_SWITCH_TO_ENDUSER),
+                    params_ptr->rssparm_SWITCH_TO_ENDUSER,
+                    OPT_TRUE,
+                    OPT_TRUE) ;
+    /*IS10182admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,3,*/
+    ESA_DIAG_printf(ESA_COMP_APIINIT,3,                /*IS10182*/
+      "SWITCH_TO_ENDUSER = <%s> ,rc = <%d> ",
+      params_ptr->rssparm_SWITCH_TO_ENDUSER, rc);
+
+    if ((rc NE ESA_OK) OR  /* default for TSS is 'N' */
+        (rc EQ ESA_OK  AND
+         params_ptr->rssparm_SWITCH_TO_ENDUSER[0] NE 'N' AND
+         params_ptr->rssparm_SWITCH_TO_ENDUSER[0] NE 'Y')) {
+      params_ptr->rssparm_SWITCH_TO_ENDUSER[0] = 'N';
+      params_ptr->rssparm_SWITCH_TO_ENDUSER[1]=NULL_CHAR; /*SAS2IBMA*/
+      rc = ESA_OK; /*parm is not mandatory, set rc=0 */
+      }
+    /*IS10182admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,3,*/
+    ESA_DIAG_printf(ESA_COMP_APIINIT,3,                   /*IS10182*/
+      "SWITCH_TO_ENDUSER final value = <%c> ",
+      *params_ptr->rssparm_SWITCH_TO_ENDUSER);
+      /*************** end of IS10093 ******************/
+
+    /*   6. set NOPW  parm value in it. IS10020   */
+    /*   **************************************** */
+    /*   Default is N which means do not use NOPW */
+    rc = admin_params->cs_func.rssprm_get_opt_ptr(
+                    admin_params->rss_name,
+                    NOPW,
+                    sizeof(params_ptr->rssparm_NOPW),
+                    params_ptr->rssparm_NOPW,
+                    OPT_TRUE,
+                    OPT_TRUE) ;
+    /*IS10182admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,3,*/
+    ESA_DIAG_printf(ESA_COMP_APIINIT,3,                   /*IS10182*/
+      "NOPW = <%s> ,rc = <%d> ",
+      params_ptr->rssparm_NOPW, rc);
+
+    if ((rc NE ESA_OK) OR  /* default for TSS is 'N' */
+        (rc EQ ESA_OK  AND
+         params_ptr->rssparm_NOPW[0] NE 'N' AND
+         params_ptr->rssparm_NOPW[0] NE 'Y')) {
+      params_ptr->rssparm_NOPW[0] = 'N';
+      params_ptr->rssparm_NOPW[1] = NULL_CHAR; /*SAS2IBMA*/
+      rc = ESA_OK; /*parm is not mandatory, set rc=0 */
+      }
+    /*IS10182admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,3,*/
+    ESA_DIAG_printf(ESA_COMP_APIINIT,3,               /*IS10182*/
+      "NOPW final value = <%c> ",
+      *params_ptr->rssparm_NOPW);
+      /*************** end of IS10020 ******************/
+
+   /***************  start of WS10054  ********************/
+   /*   . set common usaapi parameters.                   */
+   /*  See comments related to this fix in CTSCSRV.
+   set_common_usaapi_parms(admin_params,
+                          (DUMMY_PARAMS_rec_typ *) params_ptr); */
+   /***************  end of WS10054  **********************/
+
+   /* 7. WS10061 Set MSG_CONNGRP_ERR parameter*****/
+    rc = admin_params->cs_func.rssprm_get_opt_ptr(
+                     admin_params->rss_name,
+                     MSG_CONNGRP_ERR,
+                     sizeof(params_ptr->rssparm_MSG_CONNGRP_ERR),
+                     params_ptr->rssparm_MSG_CONNGRP_ERR,
+                     OPT_TRUE,
+                     OPT_TRUE);
+    /*IS10182admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,3,*/
+    ESA_DIAG_printf(ESA_COMP_APIINIT,3,                      /*IS10182*/
+                  "MSG_CONNGRP_ERR = <%s> , rc = <%d> ",
+                   params_ptr->rssparm_MSG_CONNGRP_ERR,rc);
+    if((rc NE ESA_OK)) {
+       params_ptr->rssparm_MSG_CONNGRP_ERR[0]=MSG_CONNGRP_ERR_ON;
+       rc=ESA_OK;
+    }
+   /***** End of WS10061 ****************************/
+
+
+   /* IS10174 - start */
+   /*
+    *   8. Allocate the Common params.
+    *
+    *     If we were called after common_params was created and is
+    *     pointed to by dummy_params, we do not need to create a
+    *     new block. Justtake the address we retrieved from the
+    *     dummy_params block.
+    */
+    if (comm_parms EQ NULL)  /* If not allocated yet...      IS10184 */
+    {                                                     /* IS10184 */
+      /* IS10184
+      rc = Common_params_Handle ("INIT", &comm_parms, admin_params); */
+      rc = Common_params_Handle ("INIT",                  /* IS10184 */
+                                 COMMON_PARAMS_OWNER_SPI, /* IS10184 */
+                                 &comm_parms,             /* IS10184 */
+                                 admin_params);           /* IS10184 */
+      /*IS10182 admin_params->cs_func.DIAG_printf_ptr( */
+      ESA_DIAG_printf(                                  /*IS10182*/
+                      ESA_COMP_APIINIT, 3,
+                      "Common_params_Handle(INIT): rc = %d   area=%8X",
+                      rc, comm_parms);
+      if (rc NE ESA_OK)
+        goto exit;
+    };                                                    /* IS10184 */
+
+    comm_parms->PARAMS_type = PARAMS_TYPE_TSS;            /* IS10184 */
+    params_ptr->common_params = comm_parms;
+
+
+    /* IS10184 - the code bellow was moved to Common_params_handle
+                 to be executed each time comon_params is created
+                 either by CC or by SPI.
+   /@
+    *   9. Allocate and initialize the Administrators list
+    @/
+    rc = CTSCRSS_AdminsList_Handle ("INIT",
+                       (RSS_ADMINS_LIST_rec_typ **)&admins_list,
+                        ESA_COMP_APIINIT,
+                        admin_params);
+
+    /@IS10182 admin_params->cs_func.DIAG_printf_ptr( @/
+    ESA_DIAG_printf(                               /@IS10182@/
+                    ESA_COMP_APIINIT, 3,
+                    "AdminsLIst_Handle(INIT): rc = %d   area=%8X",
+                    rc, admins_list);
+    if (rc NE ESA_OK)
+      goto exit;
+
+    params_ptr->common_params->RSS_Admins_list = (void *)admins_list;
+     end of removed code - IS10184 */
+
+   /* IS10174 - end   */
+
+   /* 10. Sets allocated area addr in admin_params->apiinit_handle. */
+
+    /* If dummy_params exist, free it                        IS10184 */
+    if (admin_params->apiinit_handle NE NULL)             /* IS10184 */
+      free (admin_params->apiinit_handle);                /* IS10184 */
+
+    admin_params->apiinit_handle = params_ptr;
+   }
+        /*************** end of WS10009 ********************/
+
+  /*
+   * Initialize global parameters
+   */
+
+   rc = TSS_global_init (ESA_COMP_APIINIT, admin_params, err);
+   if (rc NE ESA_OK)
+     rc = ESA_FATAL;
+
+  /*
+   *  Finish
+   */
+
+   exit :;
+
+   admin_params->cs_func.DIAG_exit_ptr(              /* WS10009 */
+     ESA_COMP_APIINIT, 1, func, rc);                 /* WS10009 */
+
+    return rc;
+
+ }
+
+ /* IS10091 - start */
+/********************************************************************
+ *
+ * Procedure Name : Create_tsscf_general
+ *
+ * Description    : Allocate the TSSCFILE records general block
+ *                  and copy the common general block, the
+ *                  direct-permissions process or ignore block and
+ *                  the parent-container process or ignore block
+ *                  according to the PARENT_CONTAINER RSS parameter.
+ *
+ * Input          : Nne.
+ *
+ * Output         : None.
+ *
+ * Input/Output   :
+ *
+ * Return Value   : tsscf_recs_generl block address.
+ *
+ * Side Effects   :
+ *
+ * Comments       :
+ *
+ ********************************************************************/
+
+ static ESA_RC Create_tsscf_general(TSSCFILE_REC_typ  ** tsscf_general,
+                                 TSS_PARAMS_rec_typ    * params_ptr,
+                                 ADMIN_PARAMS_rec_typ  * admin_params)
+{
+
+  char          func[] = "Create_tsscf_general";
+
+  ESA_RC rc;
+  TSSCFILE_REC_typ      *recs_blk;
+  TSSCFILE_REC_typ      **pp_blk;
+  int                     common_len;
+  int                     blk_len;
+  int                     pp_len;
+  TSSCFILE_REC_typ      * null_entry[] = {NULL};
+  int                     null_entry_len = sizeof(null_entry);
+
+  admin_params->cs_func.DIAG_enter_ptr(ESA_COMP_APIINIT, 1, func);
+
+  *tsscf_general = NULL;
+
+  common_len = sizeof(tsscf_recs_51);
+
+  /* IS10091A - start  */
+  /* Remove parent container records handling because they
+     are now part of the general table.
+
+  if (params_ptr->rssparm_PARENT_CONTAINER[0] EQ 'Y')
+  {
+    pp_len = sizeof(tsscf_pcp_recs);
+    pp_blk = tsscf_pcp_recs;
+  }
+  else
+  {
+    pp_len = sizeof(tsscf_pci_recs);
+    pp_blk = tsscf_pci_recs;
+  }
+
+  blk_len = common_len + pp_len + null_entry_len;
+  admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT, 5,
+     "common len=%d, pp=%8X / %d, blk len=%d",
+      common_len, pp_blk, pp_len, blk_len);
+  */
+
+  blk_len = common_len + null_entry_len;
+  /*IS10182admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,5,*/
+  ESA_DIAG_printf(ESA_COMP_APIINIT, 5,                   /*IS10182*/
+     "common len=%d,  blk len=%d",
+      common_len, blk_len);
+  /* IS10091A - end    */
+
+  recs_blk = (TSSCFILE_REC_typ *)malloc(blk_len);
+  if (recs_blk NE NULL)
+  {
+    memcpy(recs_blk, tsscf_recs_51, common_len);
+    /* IS10091A memcpy((char *)recs_blk+common_len, pp_blk, pp_len);  */
+    /* IS10091A memcpy((char *)recs_blk+common_len+pp_len,            */
+    /* IS10091A        null_entry, null_entry_len);                   */
+    memcpy((char *)recs_blk+common_len,                   /* IS10091A */
+            null_entry, null_entry_len);                  /* IS10091A */
+    rc = ESA_OK;
+  }
+  else
+   rc = ESA_FATAL;
+
+  *tsscf_general = recs_blk;
+
+  /*IS10182admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,5,*/
+  ESA_DIAG_printf(ESA_COMP_APIINIT, 5,                 /*IS10182*/
+                    "Allocated block:  address = %8X   length = %d",
+                    recs_blk, blk_len);
+
+  admin_params->cs_func.DIAG_exit_ptr(ESA_COMP_APIINIT, 1, func, rc);
+
+  return rc;
+
+}
+
+/********************************************************************
+ *
+ * Procedure Name : Free_tsscf_general
+ *
+ * Description    : Free tsscf general records block
+ *
+ * Input          : -> block address
+ *
+ * Output         : None.
+ *
+ * Input/Output   :
+ *
+ * Return Value   : None.
+ *
+ * Side Effects   :
+ *
+ * Comments       :
+ *
+ ********************************************************************/
+
+ void   TSS_Free_tsscf_general(TSSCFILE_REC_typ   **block,
+                           ADMIN_PARAMS_rec_typ *admin_params)
+{
+
+  char          func[] = "Free_tsscf_general";
+
+  admin_params->cs_func.DIAG_enter_ptr(ESA_COMP_APIINIT, 1, func);
+
+  if (block NE NULL)
+  {
+    /*IS10182admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_APIINIT,5,*/
+    ESA_DIAG_printf(ESA_COMP_APIINIT, 5,                    /*IS10182*/
+                  "Free block at %8X", block);
+    free (block);
+  }
+
+  admin_params->cs_func.DIAG_exit_ptr(ESA_COMP_APIINIT, 1,
+                                      func, ESA_RC_VOID);
+
+}
+ /* IS10091 - end */

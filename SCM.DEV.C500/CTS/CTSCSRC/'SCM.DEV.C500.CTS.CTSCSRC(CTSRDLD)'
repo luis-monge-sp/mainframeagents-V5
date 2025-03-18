@@ -1,0 +1,3080 @@
+/****************************************************************
+*                                                               *
+* Title            : RACF delayed delete utility                *
+*                                                               *
+* File Name        : ctsrdld.c                                  *
+*                                                               *
+* Author           : Alexander Shvartsman                       *
+*                                                               *
+* Creation Date    : 01-Dec-94                                  *
+*                                                               *
+* External parm    : RSS_NAME                                   *
+*                                                               *
+* Description      : Delete request delay processing            *
+*                                                               *
+* Assumptions and                                               *
+*   Considerations : 1) Caller is APF authorized                *
+*                    2) The following ddcards are set to        *
+*                       temporary datasets :                    *
+*                                                               *
+*                       * SYSUT1                                *
+*                       * SYSPRINT                              *
+*                       * SYSIN                                 *
+*                                                               *
+*                    3) Following ddcards are requested :       *
+*                       * DELREQ    - delete request file       *
+*                       * DELREQB   - delete request backup file*
+*                                                               *
+****************************************************************/
+
+/****************************************************************
+* Mod.Id   Who      When     Description                        *
+* -------- -------- -------  ---------------------------------- *
+* dc0706   Doron    07/6/95  correct main nmae in call os_cs_xx *
+* spr168   Alex     30/10/95 Correct RSS_TYPE definition        *
+* spr178   Alex     31/10/95 Check administrator group and set  *
+*                            to NULL_CHAR in case it empty.     *
+* ps0004   Alex     10/10/96 Adjust to new common code          *
+* BS2019   AS       10/03/97 Remove workfiles                   *
+* ps0295   Guy      16/08/98 Changes for common code 3.0.0 GA   *
+* bs2535   ShmuelK  04/07/02 Obtain RSSTYPE from RSSPARM        *
+* bs2546   BellaP   02/10/02 If a user is deleted twice,        *
+*                            allocation of workfile fails due   *
+*                            dsname-timestamp is duplicate.     *
+* WS10054  SeligT   08/08/16 Add ENQ/DEQ SYSTEMS RNL Parameter  *
+* IS10139  SeligT   28/08/16 Update OS Functions for Agents     *
+* SAS2IBMT SeligT   30/06/16 SAS/C to IBM C Conversion Project  *
+* SAS2IBMA Avner    30/06/16 SAS/C to IBM C Conversion Project  *
+* BS10076  SeligT   11/12/17 Organize Connector Locking         *
+*                            Functions and Structures           *
+* IS10174  NuritY   15/01/18 Dynamic EXECOUT support.           *
+* BS10116  AvnerL   15/09/21 delay delete # is limited to 400   *
+* BS10145  NuritY   27/11/24 S0C1 after addinfo fix (WS10082)   *
+****************************************************************/
+
+#define THIS_IS_MAIN
+#include <globs.h>
+
+/*
+ *   STANDARD include files
+ */
+
+#include STRING
+#include STDIO
+#include STDLIB
+#include TIME
+/* SAS2IBMT #include OS                                              */
+#include ERRNO                                            /* SAS2IBMT */
+
+/*
+ *   ESA include files
+ */
+
+#include ESA_API
+#include ESA_API_CODES
+#include ESA_CS_OS
+#include ESA_CTSAMSG
+#include ESA_DIAG
+#include ESA_INIT
+#include ESA_QUEUE
+
+/*
+ *   MVS include files
+ */
+
+#include MVS_COMP
+#include MVS_OS_MVS
+
+/*
+ *   RACF include files
+ */
+
+/* IS10139 #include <CTSCSRV.h>                              WS10054 */
+#include RACF_CODES
+#include RACF
+#include RACF_UT100
+
+/*
+ *   I/O error macro
+ */
+
+#define UT100_IO_ERR(a,b)                           \
+       CTSAMSG_print(ERR_IO,                        \
+                     envir->ctsamsg_handle,         \
+                     NULL,                          \
+                     envir->ctsamsg_dest,           \
+                     a, b, strerror(errno) );       \
+       ESA_DIAG_printf(PLT_COMP_CTSC100, 1,         \
+          "file %s error %s", b, strerror(errno));  \
+       rc=ESA_FATAL;
+
+#define CONSOLE_ON(msgs)              \
+     if (msgs.ctsamsg_dest NE NULL)   \
+        msgs.ctsamsg_dest->dests[CTSAMSG_DEST_CNSL].active = FLAG_YES;
+
+#define CONSOLE_OFF(msgs)              \
+     if (msgs.ctsamsg_dest NE NULL)    \
+        msgs.ctsamsg_dest->dests[CTSAMSG_DEST_CNSL].active = FLAG_NO;
+
+/*
+ *   Some defines
+ */
+
+#define UT100_BACKUP_DDN       "DELREQB"
+#define UT100_TEMP_FILE        "UT100WRK"
+#define UT100_ALL_MODE         "ALL"
+/* BS10076
+#define LOCK_INTERVAL 600 // Seconds = 10 minutes            WS10054 */
+
+#define DDNAME                   'D'
+#define DSNAME                   'N'
+#define BINARY_FILE              "b"
+#define TEXT_FILE                ""
+
+static  void                    *cs_handle = NULL;
+static  ENVIRONMENT_rec_typ     *envir = NULL;            /* ps0295 */
+
+static  char                     ut100_mode[50];
+static  FILE                    *file_out ;
+static  RACF_UT100_WORK_rec_typ  record;
+static  RACF_UT100_WORK_rec_typ  hold_record;
+static  char                     component[]="CTSC100";
+
+#define DELREQ_FILE_REC_LEN      255
+#define UT100_REQ_MAX            200
+static  int                      ut100_req_max = UT100_REQ_MAX;
+
+typedef struct req_struct {
+     RSS_typ                       rss_name;
+     USER_typ                      admin_uname;
+     UG_typ                        admin_gname;
+     RACF_UT100_ID_typ             object;
+     char                          file_name[MAX_FILENAME_LEN+10];
+     int                           records;
+     RACF_DELETE_OPTIONS_rec_typ   opts;
+     RACF_UT100_ID_typ             delreq;
+     RACF_UT100_ID_typ             mode;
+     RACF_FLAG_typ                 delay;
+} UT100_REQ_typ, *UT100_REQ_ptr;
+
+static  int     record_counter     = 0 ;  /* Request table */
+static  int     done_counter       = 0 ;  /* Done counter  */
+static  int     done_err_counter   = 0 ;  /* Done err cntr */
+
+static  RACF_UT100_ID_typ         *objlist             = NULL;
+static  RACF_UT100_ID_typ         *objlist_new         = NULL;
+static  UT100_REQ_ptr              ut100_req_table     = NULL;
+static  UT100_REQ_ptr              ut100_req_table_new = NULL;
+static  UT100_REQ_ptr              ut100_req_rec       = NULL;
+static  RACF_UT100_WORK_rec_typ   *ut100_table         = NULL;
+
+static  FUNC_PTR_rec_typ           api_ptr;
+static  RSS_LIMITS_rec_typ         rss_limits;
+static  void                      *logev_handle=NULL;
+
+/*
+ *   internal functions
+ */
+
+static  ESA_RC separate_ut100_records(
+                           RACF_UT100_WORK_rec_typ   ut100_table[1],
+                           long int                  max_records);
+
+static  ESA_RC allocate_file(RACF_UT100_WORK_rec_typ * curr_record,
+                             char                    * file_name,
+                             RACF_UT100_ID_typ       * object);
+
+static  ESA_RC chain_process(RACF_UT100_WORK_rec_typ ut100_table[1],
+                             int                     curr_rec_ind,
+                             char                  * file_name,
+                             long int                max_records);
+
+static ESA_RC output_analyze(void);
+
+static ESA_RC ut100_table_init(FILE               * file_in ,
+                         long int                 * records,
+                         RACF_UT100_WORK_rec_typ ** ut100_table);
+
+static ESA_RC chain_init(RACF_UT100_WORK_rec_typ * curr_rec,
+                         char                    * file_name,
+                         RACF_UT100_ID_typ       * object);
+
+static ESA_RC  get_del_requests(void);
+
+static ESA_RC rec_analyze(char                 req_rec_flag,
+                          UT100_REQ_ptr        ut100_req_rec,
+                          RACF_UT100_ID_typ    replace,
+                          RACF_UT100_ID_typ    dfltgrp,
+                          RACF_UT100_ID_typ    supgrp) ;
+
+static ESA_RC check_object_validity(RACF_UT100_ID_typ object);
+
+static ESA_RC alloc_ut100_buff(char      * op);
+
+static ESA_RC copy_ut100_file(char       * request,
+                              char       * from,
+                              char         from_dd,
+                              char       * to,
+                              char         to_dd,
+                              char       * open_mode,
+                              char       * io_buf,
+                              size_t       size );
+
+static ESA_RC separate_ut100_output(char       file_type,
+                                    char      *file_name);
+
+static ESA_RC clear_delreq_file(void);
+
+static ESA_RC lock_delreq_file(char        *op,
+                               char        *ddn,
+                               void        **lock_handle);
+
+static ESA_RC end_check_request(void);
+
+static void   remove_workfiles(void);    /* BS2019 */
+
+static ESA_RC rexx_execute(USER_typ     admin_uname);
+
+static ESA_RC do_main_delete_command(UT100_REQ_ptr        req,
+                                     USER_typ             admin_uname);
+
+static ESA_RC get_backup_file_name(char              *ddn,
+                                   char              *dsn);
+
+/**************************************************************
+*                                                             *
+* Program name    : ctsc100                                   *
+*                                                             *
+* DESCRIPTION     : main program                              *
+*                                                             *
+* INPUT           :                                           *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_OK, ESA_FATAL                         *
+*                                                             *
+**************************************************************/
+
+/*SAS2IBMA ESA_RC main(int argc,char **argv) BEGIN */
+int main(int argc,char **argv)       /*allows int only for main SAS2IBMA*/
+{
+ /*
+  *    Variables
+  */
+
+  ESA_RC                   rc;
+  ESA_RC                   rc_get;
+  ESA_RC                   rc_api_init = ESA_ERR;
+  RSS_STATUS_typ           status;
+  int                      prolog_succeed = 0 ;
+  int                      i;
+  char                     file_result[MAX_FILENAME_LEN+10];
+  static                   char func[]="ctsc100";
+  void                   * attach_rss_handle = NULL;
+
+ /*
+  *    Initialize
+  */
+
+  prolog_succeed = 0 ;
+  rc = CG_prolog (ESA_CTSC100_PROC, argc, argv);
+
+  if (rc NE ESA_OK) {
+     fprintf (stderr, PROLOG_INIT_ERROR, ESA_rc2str(rc));
+     rc=ESA_FATAL;
+     goto exit;
+  }
+  prolog_succeed = 1 ;
+
+  ESA_DIAG_enter (PLT_COMP_CTSC100, 1, func );
+
+ /* ps0295
+  *
+  *    Get envir address
+  */
+  CS_get_envir_address (&envir);
+
+ /*
+  *    Set RSS name parameter
+  */
+
+  if ( argc LE 1 ) {       /* External PARM not available */
+     fprintf (stderr, "RSS_NAME parameter missing\n");
+     rc=ESA_FATAL;
+     goto exit;
+  }
+  else
+     strcpy(envir->msg_admin_param.rss_name, argv[1]);  /* RSS name */
+            /* ps0295 */
+
+  /* spr168 . deleted.
+     strcpy(envir->msg_admin_param.rss_type, "RACF") ; RSS type */
+
+
+  /* spr168 . added */
+  /*bs2535
+  RACF_version_get(envir->msg_admin_param.rss_type);          ps0295 */
+
+  rc = rssprm_get (envir->msg_admin_param.rss_name, RSS_TYPE, /*bs2535*/
+                   RSS_NAME_LEN,
+                   envir->msg_admin_param.rss_type);
+
+  if (rc NE ESA_OK) {
+     ESA_DIAG_printf (PLT_COMP_CTSC100, 1,
+                      "RSS_TYPE cound not be obtained rc=%d", rc);
+     rc=ESA_FATAL; goto exit;
+  }
+
+
+
+ /*
+  *    Open Q file (for log_event)
+  */
+
+  rc = OS_Q_open (envir->file_queue, &(envir->q_handle),  /* ps0295 */
+                  &(envir->msg_params) );                 /* ps0295 */
+  if (rc NE ESA_OK) {
+     ESA_DIAG_printf (PLT_COMP_CTSC100, 1,
+                     "queue %s failed (rc=%d)",
+                     envir->file_queue, (int)rc);         /* ps0295 */
+     goto exit;
+  }
+  else ESA_DIAG_printf (PLT_COMP_CTSC100, 1,
+            "queue %s opened successfuly", envir->file_queue);
+                                           /* ps0295 */
+  /*
+ /*
+  *    Issue started log event
+  */
+
+  CTSLogEvent(envir->msg_admin_param.rss_type,            /* ps0295 */
+              envir->msg_admin_param.rss_name,            /* ps0295 */
+              logev_handle,                               /* ps0295 */
+              RACF_C100_START );
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100, 1, "argc=%d",argc);
+  for (i=0; i LT argc; i++)
+      ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                      "argv(%d)=%s",i,argv[i]);
+
+ /*
+  *    Set mode parameter
+  */
+
+  strcpy(ut100_mode, UT100_ALL_MODE );
+
+ /*
+  *    Attach appropriate API module
+  */
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                  "Attach: rss_name=%s rss_type=%s",
+                   envir->msg_admin_param.rss_name,       /* ps0295 */
+                   envir->msg_admin_param.rss_type);      /* ps0295 */
+
+  rc = OS_CS_attach_rss (envir->msg_admin_param.rss_name, /* ps0295 */
+                         envir->msg_admin_param.rss_type, /* ps0295 */
+                         &api_ptr, &rss_limits,
+                         &(envir->msg_admin_param),       /* ps0295 */
+                         &(envir->msg_err), &attach_rss_handle );
+                         /* ps0295 */
+
+  if (rc NE ESA_OK) {
+     CTSAMSG_print(ERR_TL_FUNC_CALL,
+                   envir->ctsamsg_handle, NULL,           /* ps0295 */
+                   envir->ctsamsg_dest,                   /* ps0295 */
+                   component, __LINE__,
+                   "OS_CS_attach_rss()");
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+  rc_api_init = api_ptr.apiinit_ptr(&(envir->msg_admin_param),
+                                    &(envir->msg_err) );  /* ps0295 */
+  if (rc NE ESA_OK) {
+     CTSAMSG_print(ERR_TL_FUNC_CALL,
+                   envir->ctsamsg_handle, NULL,           /* ps0295 */
+                   envir->ctsamsg_dest,                   /* ps0295 */
+                   component, __LINE__,
+                   "CTSAPIInit()");
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+  /* Initialize the admin_params copy address needed for     BS10145*/
+  /* calling addinfo routines.                               BS10145*/
+  ADDINFO_spi_init(&(envir->msg_admin_param));            /* BS10145*/
+
+  rc = api_ptr.rss_check_ptr(envir->msg_admin_param.rss_name,
+                             &status,
+                             &(envir->msg_admin_param),
+                             &(envir->msg_err) );         /* ps0295 */
+
+  if ( ( rc NE ESA_OK) OR ( status EQ RSS_DOWN ) ) {
+     CTSAMSG_print(ERR_TL_FUNC_CALL,
+                   envir->ctsamsg_handle, NULL,           /* ps0295 */
+                   envir->ctsamsg_dest,                   /* ps0295 */
+                   component, __LINE__,
+                   "CTSRSSCheck()");
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+ /*
+  *    Initialize TSO commands environment
+  */
+
+  rc = OS_CS_init(ESA_MAIN_CTSC100,
+                  &(envir->msg_params),                   /* ps0295 */
+                  &cs_handle);
+
+  if (rc NE ESA_OK) {
+     CTSAMSG_print(ERR_TL_FUNC_CALL,
+                   envir->ctsamsg_handle, NULL,           /* ps0295 */
+                   envir->ctsamsg_dest,                   /* ps0295 */
+                   component, __LINE__,
+                   "OS_CS_init()");
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+ /*
+  *    Read delete requests from requests file
+  */
+
+  rc = get_del_requests();
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                  "rc=%s  mode=%s", ESA_rc2str(rc), ut100_mode);
+
+  if (rc EQ ESA_FATAL )
+     goto exit;
+  else if ( rc EQ ESA_ERR ) {      /* Request file is empty */
+         rc=ESA_OK;
+         goto exit;
+  }
+
+  rc_get = OS_MVS_ddinfo("UT100IN" , file_result, FALSE,
+                         envir->ctsamsg_dest,             /* ps0295 */
+                         envir->ctsamsg_handle, 0);       /* IS10174 */
+         /* IS10174      envir->ctsamsg_handle);           * ps0295 * */
+  if ( rc_get NE ESA_OK ) {
+
+    strcpy(file_result , UT100_WORK_DDCARD);
+    rc = UT100_activate (objlist, record_counter,
+                         envir->ctsamsg_dest,             /* ps0295 */
+                         envir->ctsamsg_handle);          /* ps0295 */
+    if ( rc NE ESA_OK )
+        goto exit ;
+
+    rc = separate_ut100_output(DDNAME, file_result);
+  }
+  else
+    rc = separate_ut100_output(DSNAME, file_result);
+
+  if ( rc EQ ESA_OK ) {
+     output_analyze();   /* create REXX command files */
+     rc=end_check_request();
+  }
+  else
+     goto exit;
+
+  remove_workfiles();
+  rc=rexx_execute(envir->msg_admin_param.admin_uname);    /* ps0295 */
+
+ /*
+  *     Termination
+  */
+
+  exit: ;
+
+  if ( ut100_req_table NE NULL )    /* Delrequest table    */
+     free(ut100_req_table);
+
+  if ( ut100_table NE NULL )        /* IRRUT100 file table */
+    free(ut100_table);
+
+  if ( objlist NE NULL )            /* Object list         */
+    free(objlist);
+
+  if ( prolog_succeed )  {
+
+     if ( ( rc EQ ESA_OK )  AND ( done_err_counter EQ 0 ) ) {
+        CTSLogEvent(envir->msg_admin_param.rss_type,      /* ps0295 */
+                    envir->msg_admin_param.rss_name,      /* ps0295 */
+                    logev_handle,                         /* ps0295 */
+                    RACF_C100_ENDOK );
+     }
+     else {
+        CTSLogEvent(envir->msg_admin_param.rss_type,      /* ps0295 */
+                    envir->msg_admin_param.rss_name,      /* ps0295 */
+                    logev_handle,                         /* ps0295 */
+                    RACF_C100_ENDERR );
+     }
+
+    /*
+     *    Close Q file (for log_event)
+     */
+
+     if (envir->q_handle.file NE NULL)                    /* ps0295 */
+        OS_Q_close (&(envir->q_handle) );                 /* ps0295 */
+
+     ESA_DIAG_exit(PLT_COMP_CTSC100    , 1, func, rc);
+
+     if ( rc_api_init EQ ESA_OK )
+        api_ptr.apiterm_ptr(&(envir->msg_admin_param),    /* ps0295 */
+                            &(envir->msg_err) );          /* ps0295 */
+
+     OS_CS_term(ESA_MAIN_CTSC100,
+                &(envir->msg_params),                     /* ps0295 */
+                &cs_handle);
+
+  }
+
+  CG_epilog (rc, 0);
+
+  return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : separate_ut100_records                    *
+*                                                             *
+* DESCRIPTION     : Determine chains in ut100 file            *
+*                                                             *
+* INPUT           : ut100_table    - IRRUT100 output file     *
+*                   max_records    - number of records        *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_OK, ESA_FATAL                         *
+*                                                             *
+**************************************************************/
+
+static ESA_RC separate_ut100_records(
+                           RACF_UT100_WORK_rec_typ  ut100_table[1],
+                           long int                 max_records)
+
+{
+
+ /*
+  *     Variables
+  */
+
+  static char              func[]="separate_ut100_records";
+  ESA_RC                   rc = ESA_OK ;
+  char                     file_name[MAX_FILENAME_LEN+10];
+  RACF_UT100_ID_typ        object;
+  RACF_UT100_WORK_rec_typ *ut100_rec;
+  long int                 max_records_chk;
+  short                    line_id;
+  int                      i;
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter (PLT_COMP_CTSC100, 1, func );
+
+ /*
+  *   Handle all records of type '1' (start chain for id)
+  */
+
+  max_records_chk = max_records ;
+
+  for ( i=0; i LT max_records; i++ ) {
+
+   ut100_rec = &ut100_table[i] ;
+   line_id = ut100_rec->type[0];
+
+  /*
+   *   Found record type x'01' beginig of the chain
+   */
+
+   if ( line_id EQ 1 ) {        /* Start of chain */
+
+     /*
+      *    Start a new chain for the object
+      */
+
+      rc = chain_init(ut100_rec, file_name, &object);
+      if ( rc NE ESA_OK ) {
+         rc = ESA_FATAL;
+         goto exit;
+      }
+
+     /*
+      *    Run on object chain and create his own work file
+      */
+
+      rc = chain_process(ut100_table, i, file_name, max_records);
+      if ( file_out NE NULL )
+         fclose(file_out);
+      if ( rc NE ESA_OK ) {
+         rc = ESA_FATAL;
+         goto exit;
+      }
+
+      max_records_chk -= ut100_req_rec->records;
+
+   }
+    else
+      break;
+
+  } /* Records loop */
+
+  /*
+   *    Issue  error message if not all records were handled
+   */
+
+  if (  max_records_chk GT 0 ) {
+     CTSAMSG_print(RACF_C100_IRRUT100_ERR_FILE,
+                   envir->ctsamsg_handle,                 /* ps0295 */
+                   NULL, envir->ctsamsg_dest);            /* ps0295 */
+     CTSAMSG_print(RACF_C100_INVALID_CHAIN,
+                   envir->ctsamsg_handle,                 /* ps0295 */
+                   NULL, envir->ctsamsg_dest,             /* ps0295 */
+                   max_records_chk);
+     rc = ESA_FATAL ;
+     goto exit ;
+  }
+
+  /*
+   *    Finish
+   */
+
+  exit :;
+
+  ESA_DIAG_exit(PLT_COMP_CTSC100    , 1, func, rc);
+  return rc ;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : chain_process                             *
+*                                                             *
+* DESCRIPTION     : Chain definitions                         *
+*                                                             *
+* INPUT           : ut100_table     - IRRUT100 output records *
+*                   curr_rec_ind    - Index of 1st record in  *
+*                                     chain (x'01' record)    *
+*                   file_name       - dsname result file      *
+*                   max_records     - number of records       *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_OK, ESA_FATAL                         *
+*                                                             *
+**************************************************************/
+static  ESA_RC chain_process(RACF_UT100_WORK_rec_typ  ut100_table[1],
+                             int                      curr_rec_ind,
+                             char                    *file_name,
+                             long int                 max_records)
+
+{
+
+ /*
+  *     Variables
+  */
+
+  ESA_RC                        rc=ESA_OK;
+  static char                   func[]="chain_process";
+  RACF_UT100_WORK_rec_typ      *ut100_rec;
+  char                          char_rba[5];
+  char                         *int_new_rba;
+  char                          msg_buf[100];
+  int                           rba;
+  int                           end_of_chain=0;
+  size_t                        iw;
+
+ /*
+  *     Initialize
+  */
+
+  ESA_DIAG_enter (PLT_COMP_CTSC100, 1, func );
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                 "First record in chain=%d", curr_rec_ind);
+
+ /*
+  *     Ptr to records conter for new rba for new chains
+  */
+
+  int_new_rba = ((char *)&(ut100_req_rec->records)); /* rec count */
+
+ /*
+  *     Loop on records of the chain and write to file
+  */
+
+  do {
+
+      ESA_DIAG_printf(PLT_COMP_CTSC100, 3,
+                      "Record in chain =%d", curr_rec_ind);
+
+     /*
+      *  Get RBA from current record
+      */
+
+      ut100_rec = &ut100_table[curr_rec_ind];
+      memcpy(char_rba, ut100_rec->next_rba, 3 );
+
+      ESA_DIAG_printf(PLT_COMP_CTSC100, 3,
+                      "Record %d Next RBA=%X-%X-%X", curr_rec_ind,
+                      char_rba[0], char_rba[1], char_rba[2]);
+
+      rba=(char_rba[0] << 16 ) | (char_rba[1] << 8  ) | char_rba[2] ;
+
+      ESA_DIAG_printf(PLT_COMP_CTSC100, 3,
+                      "Current record %d Next record=%d",
+                      curr_rec_ind, rba );
+
+     /*
+      *    Check RBA validity
+      */
+
+      if ( ( rba LT 0 ) OR ( rba GT max_records )) {
+         CTSAMSG_print(RACF_C100_IRRUT100_ERR_FILE,
+                       envir->ctsamsg_handle, NULL,       /* ps0295 */
+                       envir->ctsamsg_dest);              /* ps0295 */
+         CTSAMSG_print(RACF_C100_INVALID_RBA,
+                       envir->ctsamsg_handle, NULL,       /* ps0295 */
+                       envir->ctsamsg_dest, rba, max_records );
+         rc = ESA_FATAL ;
+         goto exit ;
+      }
+
+     /*
+      *    Valid RBA obtained
+      */
+
+      if ( rba NE 0 ) {
+         ut100_rec = &ut100_table[rba];
+         ut100_req_rec->records++;
+
+        /*
+         *    Duplicate reference check
+         */
+
+         if ( ut100_rec->type[0] EQ  '*' ) {
+           CTSAMSG_print(RACF_C100_IRRUT100_ERR_FILE,
+                         envir->ctsamsg_handle, NULL,     /* ps0295 */
+                         envir->ctsamsg_dest);            /* ps0295 */
+           sprintf(msg_buf,"%d (%s)",
+                   curr_rec_ind, ut100_req_rec->object);
+           CTSAMSG_print(RACF_C100_DUPLICATE_CHAIN_REF,
+                        envir->ctsamsg_handle, NULL,      /* ps0295 */
+                        envir->ctsamsg_dest,              /* ps0295 */
+                        rba, msg_buf, ut100_rec->data);
+           rc = ESA_FATAL ;
+           goto exit ;
+         }
+
+        /*
+         *    Write previous record since only now we know the rba
+         *    of the next chain element
+         */
+
+         ut100_rec = &hold_record;
+         memcpy(ut100_rec->next_rba, int_new_rba+1 , 3 );
+         iw = fwrite( &hold_record, sizeof(RACF_UT100_WORK_rec_typ),
+                      1, file_out);
+         if ( iw EQ 0 ) {
+            UT100_IO_ERR("FWRITE", UT100_TEMP_FILE)
+            goto exit;
+         }
+
+        /*
+         *    Save current record and mark in table that the record
+         *    was processed for duplicate reference checking
+         */
+
+         ut100_rec = &ut100_table[rba];
+         memcpy(&hold_record,ut100_rec,
+                sizeof(RACF_UT100_WORK_rec_typ));
+
+         ut100_rec->type[0] = '*';    /* Record was processed */
+         sprintf(ut100_rec->data,"%d (%s)", curr_rec_ind,
+                 ut100_req_rec->object);
+
+         curr_rec_ind=rba;
+
+      }      /* rba NE 0 */
+
+  } while ( rba NE 0 )    ;
+
+ /*
+  *    Write last record in the chain.
+  *    If chain is empty, write at least the first record, that
+  *    was saved in chain_init routine
+  */
+
+  ut100_req_rec->records++;
+  int_new_rba = ( (char *)&(end_of_chain) );
+  ut100_rec = &hold_record;
+  memcpy(ut100_rec->next_rba, int_new_rba+1 , 3 );
+
+  iw = fwrite( &hold_record, sizeof(RACF_UT100_WORK_rec_typ), 1,
+             file_out);
+  if ( iw EQ 0 ) {
+      UT100_IO_ERR("FWRITE", UT100_TEMP_FILE)
+      goto exit;
+  }
+
+ /*
+  *     Finish
+  */
+
+  exit :;
+
+  ESA_DIAG_exit(PLT_COMP_CTSC100, 1, func, rc);
+  return rc ;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : allocate_file                             *
+*                                                             *
+* DESCRIPTION     : Create output file                        *
+*                                                             *
+* INPUT           : curr_record    - ptr to rec x'01'         *
+*                                    start of chain           *
+*                                                             *
+* OUTPUT          : file_name      - work file name           *
+*                   object         - object ID                *
+*                                                             *
+* RETURN VALUE    : ESA_OK, ESA_FATAL                         *
+*                                                             *
+**************************************************************/
+static  ESA_RC allocate_file(RACF_UT100_WORK_rec_typ *curr_record,
+                             char                    *file_name,
+                             RACF_UT100_ID_typ       *object)
+
+{
+
+ /*
+  *   Variables
+  */
+
+  ESA_RC                        rc=ESA_OK;
+  ESA_RC                        rc_free=ESA_OK;
+  ESA_RC                        rc_get=ESA_OK;
+  static char                   func[]="allocate_file";
+  RACF_UT100_WORK_rec_typ      *ut100_rec;
+  char                          command[100];
+  char                         *blank_ptr;
+  int                           tso_rc;
+  RACF_UT100_ID_typ             objid;
+  struct  tm                   *tm_ptr;
+  time_t                        c_time;
+  size_t                        nchar;
+  char                          date_str[10];
+  char                          time_str[10];
+  static int                    mcount = 100;        /* bs2546*/
+  char                eoddn[9] = EXECOUT_DDNAME;      /* IS10174 */
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter (PLT_COMP_CTSC100, 1, func );
+
+
+  time(&c_time);                 /* Get current time */
+
+  tm_ptr = localtime(&c_time);   /* convert date time to tm struct*/
+  nchar  = strftime(date_str, sizeof(date_str), "%y%j", tm_ptr);
+  nchar  = strftime(time_str, sizeof(time_str), "%H%M%S", tm_ptr);
+
+  if(mcount < 1000) mcount++;                         /* bs2546*/
+  else mcount = 100;                                  /* bs2546*/
+
+  ut100_rec = curr_record;
+
+  /* Obtained object ID from record x'01' start of chain */
+
+  memcpy(&objid, ut100_rec->data, 8 );
+  objid[8]=NULL_CHAR ;
+
+  blank_ptr=strchr( (char *)&objid, BLANK );
+  if ( blank_ptr NE NULL )
+     *blank_ptr=NULL_CHAR;
+
+  /* Return object ID to caller */
+
+  strcpy((char *)object, (char *)&objid);
+
+  /* Search object ID in the request table */
+
+  rc = check_object_validity(objid);
+  if ( rc NE ESA_OK )      /* Object not found */
+     goto exit;
+
+ /*
+  *  Invoke REXX:allocate new file
+  */
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100,1,
+   "ddcard=%s admin=%s delrequest=%s id=%s date=%s time=%s mcount=%d",
+            UT100_TEMP_FILE,
+            envir->msg_admin_param.admin_uname,           /* ps0295 */
+            UT100_TEMP_FILE, objid , date_str, time_str, mcount );
+                                                          /* bs2546*/
+ /*bs2546 sprintf(command, "%%CTSALLC  %s  %s %s %s %s %s ",
+          UT100_TEMP_FILE,
+          envir->msg_admin_param.admin_uname,
+          UT100_TEMP_FILE, objid , date_str, time_str );   */
+
+  sprintf(command, "%%CTSALLC  %s  %s %s %s %s %s M%3d",   /* bs2546*/
+          UT100_TEMP_FILE,
+          envir->msg_admin_param.admin_uname,             /* ps0295 */
+          UT100_TEMP_FILE, objid , date_str, time_str, mcount);
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100,1, "command = %s", command);
+
+  /* IS10174
+  rc = ESA_CLI_exec_wait(EXECOUT_DDNAME, command, &tso_rc,
+                         envir->ctsamsg_dest,              * ps0295 *
+                         envir->ctsamsg_handle);           * ps0295 * */
+
+  rc = ESA_CLI_exec_wait(eoddn, command, &tso_rc,        /* IS10174 */
+                         &(envir->msg_admin_param));     /* IS10174 */
+ /*
+  *  Check alloaction results
+  */
+
+  if (rc EQ ESA_OK) {
+    if (tso_rc LT 4)
+       rc = ESA_OK;
+    else if (tso_rc LT 8)
+       rc = ESA_ERR;
+    else rc = ESA_FATAL;
+  }
+  else rc = ESA_FATAL;
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100,1,
+                  "ESA_CLI_exec_wait rc=%d TSO rc=%d", rc,tso_rc);
+
+ /*
+  *  Alloaction failed- issue error message
+  */
+
+  if ( rc NE ESA_OK ) {
+     CTSAMSG_print(RACF_CLEAN_ALLOC_FAILED,
+                   envir->ctsamsg_handle,                 /* ps0295 */
+                   NULL, envir->ctsamsg_dest,             /* ps0295 */
+                   UT100_TEMP_FILE);
+     rc = ESA_FATAL ;
+  }
+
+ /*
+  *  Allocation succeess - obtain dsname
+  */
+
+  else {
+     rc_get = OS_MVS_ddinfo(UT100_TEMP_FILE , file_name, TRUE,
+                            envir->ctsamsg_dest,          /* ps0295 */
+                            envir->ctsamsg_handle, 0);    /* IS10174 */
+           /* IS10174       envir->ctsamsg_handle);     * ps0295 *  */
+     CTSAMSG_print(RACF_C100_WORK_FILE_CREATED,
+                   envir->ctsamsg_handle, NULL,           /* ps0295 */
+                   envir->ctsamsg_dest,                   /* ps0295 */
+                   object , file_name);
+  }
+
+ /*
+  *  free ddname via TSO command FREE
+  */
+
+  sprintf(command, "  FREE FILE(%s)", UT100_TEMP_FILE);
+  ESA_DIAG_printf(PLT_COMP_CTSC100,1, "command = %s", command);
+
+  /* IS10174
+  rc_free = ESA_CLI_exec_wait(EXECOUT_DDNAME,
+                              command, &tso_rc,
+                              envir->ctsamsg_dest,         * ps0295 *
+                              envir->ctsamsg_handle);      * ps0295 * */
+  rc_free = ESA_CLI_exec_wait(eoddn, command, &tso_rc,    /* IS10174 */
+                              &(envir->msg_admin_param)); /* IS10174 */
+  if (rc_free EQ ESA_OK) {
+     if (tso_rc LT 4)
+        rc = ESA_OK;
+     else if (tso_rc LT 8)
+        rc = ESA_ERR;
+     else rc = ESA_FATAL;
+  }
+  else rc = ESA_FATAL;
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100,1,
+                  "ESA_CLI_exec_wait rc=%d TSO rc=%d", rc_free,tso_rc);
+
+ /*
+  *  Finish
+  */
+
+  exit :;
+
+  if ( rc_get NE ESA_OK )
+     rc = ESA_FATAL;
+
+  ESA_DIAG_exit(PLT_COMP_CTSC100, 1, func, rc);
+  return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : output_analyze                            *
+*                                                             *
+* DESCRIPTION     : Analyze created output and build cmd file *
+*                                                             *
+* INPUT           : none                                      *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_OK, ESA_FATAL                         *
+*                                                             *
+**************************************************************/
+
+static  ESA_RC  output_analyze   (void)
+{
+
+ /*
+  *      Variables
+  */
+
+  ESA_RC rc=ESA_OK;
+  int    i;
+  static char func[]="output_analyze";
+
+ /*
+  *      initialize
+  */
+
+  ESA_DIAG_enter (PLT_COMP_CTSC100, 1, func );
+
+ /*
+  *      loop on output records
+  */
+
+  for (i=0; i LT record_counter; i++) {
+
+      ut100_req_rec = ut100_req_table  + i;
+      ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+              "Table ptr=%X file_name=%s records=%d object=%s",
+               ut100_req_rec , ut100_req_rec->file_name,
+               ut100_req_rec->records, ut100_req_rec->object );
+
+      if ( ut100_req_rec->records GT 0 ) {
+
+        /*
+         *   If Result file was not entered create it
+         */
+
+         if ( strlen(ut100_req_rec->opts.cmdfile) EQ 0 )
+            rc = UT100_allocate(ut100_req_rec->delreq,
+                                ut100_req_rec->opts.id ,
+                                &(envir->msg_admin_param), /* ps0295 */
+                                ut100_req_rec->opts.cmdfile,
+                                ut100_req_rec->opts.crttime );
+
+        /*
+         *      Create REXX program
+         */
+
+         if ( rc EQ ESA_OK )
+            rc = UT100_analyze (&(ut100_req_rec->opts),
+                                  envir->ctsamsg_dest,    /* ps0295 */
+                                  envir->ctsamsg_handle); /* ps0295 */
+        /*
+         *      Increase statistics counters
+         */
+
+         if ( rc EQ ESA_OK )
+            done_counter++;
+         else
+            done_err_counter++;
+
+      }     /* Was found object with inf after ut100 utility */
+
+  }
+
+ /*
+  *      Finish
+  */
+
+  exit:;
+
+  rc = ESA_OK;
+
+  ESA_DIAG_exit(PLT_COMP_CTSC100, 1, func, rc);
+
+  return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : ut100_table_init                          *
+*                                                             *
+* DESCRIPTION     : Create ut100 table                        *
+*                                                             *
+* INPUT           : file_in       -  ddn/dsn IRRUT100 file    *
+*                                                             *
+* OUTPUT          : records       -  number of records        *
+*                   ut100_table   -  addr of IRRUT100 area    *
+*                                                             *
+* RETURN VALUE    : ESA_OK, ESA_FATAL                         *
+*                                                             *
+**************************************************************/
+static ESA_RC ut100_table_init(FILE                    * file_in ,
+                               long int                * records,
+                               RACF_UT100_WORK_rec_typ **ut100_table)
+
+
+{
+
+ /*
+  *     Variables
+  */
+
+  ESA_RC               rc=ESA_OK;
+  int                  i;
+  long int             bcount;
+  size_t               read_records = 0;
+  static char          func[]="ut100_table_init";
+
+ /*
+  *    Initialize
+  */
+
+  ESA_DIAG_enter (PLT_COMP_CTSC100, 1, func );
+
+ /*
+  *    Determine the number of records in the file by 'seeking' to its
+  *    end .
+  */
+
+  i=fseek(file_in, 0, SEEK_END ) ;     /* refers to end of file */
+  ESA_DIAG_printf(PLT_COMP_CTSC100, 1, "fseek rc=%d", i);
+  if ( i NE 0 ) {
+     UT100_IO_ERR("FSEEK", UT100_WORK_DDCARD)
+     goto exit;
+  }
+  bcount=ftell(file_in);
+  ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                  "ftell bytes_count=%d records=%d",
+                  bcount, bcount/sizeof(RACF_UT100_WORK_rec_typ));
+  if ( bcount EQ EOF ) {
+     UT100_IO_ERR("FTELL", UT100_WORK_DDCARD)
+     goto exit;
+  }
+
+ /*
+  *   Allocate area for ut100 records
+  */
+
+  *records =  bcount / sizeof(RACF_UT100_WORK_rec_typ) ;
+  *ut100_table = (RACF_UT100_WORK_rec_typ *) malloc( bcount ) ;
+  ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                  "UT100_table addr=%X", *ut100_table);
+  if ( *ut100_table EQ NULL ) {
+      CTSAMSG_print(ERR_MALLOC,
+                    envir->ctsamsg_handle, NULL,          /* ps0295 */
+                    envir->ctsamsg_dest,                  /* ps0295 */
+                    "UT100_table", bcount );
+      rc = ESA_FATAL ;
+      goto exit ;
+  }
+
+ /*
+  *   Reset file position to the start of the file and
+  *   read it to allocated storage
+  */
+
+  i=fseek(file_in, 0, SEEK_SET ) ;     /* refers to start of file */
+  ESA_DIAG_printf(PLT_COMP_CTSC100, 1, "fseek rc=%d", i);
+  if ( i NE 0 ) {
+     UT100_IO_ERR("FSEEK", UT100_WORK_DDCARD)
+     goto exit;
+  }
+  read_records = fread(*ut100_table , sizeof(RACF_UT100_WORK_rec_typ),
+                       *records,file_in);
+  ESA_DIAG_printf(PLT_COMP_CTSC100, 1, "Read %d records",
+                  read_records );
+ /*
+  *   Handle errors
+  */
+
+  if ( (ferror(file_in))  OR ( read_records LT *records)  ) {
+     UT100_IO_ERR("FREAD", UT100_WORK_DDCARD)
+     goto exit;
+  }
+
+ /*
+  *   Finish
+  */
+
+  exit :;
+
+  ESA_DIAG_exit(PLT_COMP_CTSC100, 1, func, rc);
+  return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : chain_init                                *
+*                                                             *
+* DESCRIPTION     : chain initiation                          *
+*                                                             *
+* INPUT           : curr_rec      -  ptr to rec x'01'         *
+*                                    start of chain           *
+*                                                             *
+* OUTPUT          : file_name     -  work file name           *
+*                   object        -  object ID                *
+*                                                             *
+* RETURN VALUE    : ESA_OK, ESA_FATAL                         *
+*                                                             *
+**************************************************************/
+static ESA_RC chain_init(RACF_UT100_WORK_rec_typ * curr_rec,
+                         char                    * file_name,
+                         RACF_UT100_ID_typ       * object)
+
+{
+
+ /*
+  *   Variables
+  */
+
+  static char             func[]="chain_init";
+  ESA_RC                  rc = ESA_OK ;
+  char                    file_ddn[MAX_FILENAME_LEN+10];
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter (PLT_COMP_CTSC100, 1, func );
+
+ /*
+  *   Search start chain record in file requests,
+  *   allocate file for current object
+  *   ptr to record in file requests : ut100_req_rec
+  */
+
+  rc=allocate_file(curr_rec, file_name, object );
+  ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                  "Allocate file rc=%d", rc);
+  if ( rc NE ESA_OK ) {
+    rc=ESA_FATAL;
+    goto exit;
+  }
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                  "Table ptr=%X file_name=%s object=%s",
+                  ut100_req_rec ,file_name, object );
+
+  strcpy(ut100_req_rec->file_name, file_name);
+  strcpy(ut100_req_rec->object , (char *)object );
+
+  if ( ut100_req_rec->opts.cmdfile[0] EQ '?' )
+      strcpy(ut100_req_rec->opts.cmdfile, "");
+
+  strcpy(ut100_req_rec->opts.wrkfile, ut100_req_rec->file_name);
+
+  /* In SAS C, when using a data set name in fopen, we had   SAS2IBMT
+     to use the following construct:  "dsn:dsname"           SAS2IBMT
+     However, in IBM C, we must use the following construct: SAS2IBMT
+     //'dsname'                                              SAS2IBMT */
+  /* SAS2IBMT strcpy(file_ddn,"dsn:");                               */
+  strcpy(file_ddn,"//'");                                 /* SAS2IBMT */
+  strcat(file_ddn, file_name );
+  strcat(file_ddn,"'");                                   /* SAS2IBMT */
+
+ /*
+  *   Open the file
+  */
+
+  /* SAS2IBMT file_out=fopen(file_ddn,"wb");                         */
+  file_out=fopen(file_ddn,"wb,recfm=*");                  /* SAS2IBMT */
+  if ( file_out EQ NULL) {
+     UT100_IO_ERR("OPEN", file_ddn)
+     goto exit;
+  }
+
+ /*
+  *   Store record to hold place
+  */
+
+  memcpy(&hold_record,curr_rec,sizeof(RACF_UT100_WORK_rec_typ));
+  ut100_req_rec->records = 0 ; /* Write records counter  */
+
+ /*
+  *   Finish
+  */
+
+  exit :;
+
+  ESA_DIAG_exit(PLT_COMP_CTSC100, 1, func, rc);
+  return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : get_del_requests                          *
+*                                                             *
+* DESCRIPTION     : Read delete requests file into memory     *
+*                                                             *
+* INPUT           : none                                      *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_OK, ESA_ERR, ESA_FATAL                *
+*                                                             *
+**************************************************************/
+
+static ESA_RC  get_del_requests(void)
+
+{
+
+ /*
+  *   Variables
+  */
+
+  ESA_RC           rc=ESA_OK;
+  FILE            *file_rq           = NULL ;
+  int              i;
+  int              total_rec_cnt     = 0;
+  char            *newline_ptr;
+  void            *lock_handle       = NULL ;
+  char             obj_type[8];
+  char             req_rec_flag;      /* 'U' - Usr format record */
+                                      /* 'G' - Grp format record */
+  char             recrq[1024];
+  char             ddn_with[MAX_FILENAME_LEN+10];         /* SAS2IBMT */
+
+  RACF_UT100_ID_typ    replace;
+  RACF_UT100_ID_typ    dfltgrp;
+  RACF_UT100_ID_typ    supgrp;
+  static char func[]="get_del_requests";
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter (PLT_COMP_CTSC100, 1, func );
+
+ /*
+  *   Allocate buffer for requests
+  */
+
+  rc = alloc_ut100_buff("ALLOC");
+  if ( rc NE ESA_OK )
+     goto exit ;
+
+  rc = lock_delreq_file("LOCK", FILE_RQ, &lock_handle);
+  if ( rc NE ESA_OK )
+     goto exit ;
+
+ /*
+  *    Open request file
+  */
+
+  strcpy(ddn_with,"DD:");                                 /* SAS2IBMT */
+  strcat(ddn_with, FILE_RQ );                             /* SAS2IBMT */
+
+  /* SAS2IBMT file_rq=fopen(FILE_RQ ,"r");                           */
+  file_rq=fopen(ddn_with ,"r");                           /* SAS2IBMT */
+  if ( file_rq EQ NULL) {
+     UT100_IO_ERR("OPEN", FILE_RQ)
+     goto exit;
+  }
+
+  fgets(recrq,sizeof(recrq),file_rq);
+
+ /*
+  *    Read delete requests file
+  */
+
+  /* SAS2IBMA while ( (feof(file_rq) EQ NULL ) BEGIN */
+  while ( (feof(file_rq) EQ (int) NULL) )           /*SAS2IBMA*/
+  {
+     total_rec_cnt++;
+
+    /*
+     *   Handle errors
+     */
+
+     if (ferror(file_rq)) {
+        UT100_IO_ERR("FGET", FILE_RQ)
+        goto exit ;
+     }
+
+    /*
+     *   Handle actual lines (ignore remarks or empty lines)
+     */
+
+     if ( ( recrq[0] NE '*' ) AND ( recrq[0] NE BLANK  ))   {
+
+       record_counter++;
+
+       /*
+        *  If overflow - enlarge buffer
+        */
+
+       if ( record_counter GE ut100_req_max) {
+          rc = alloc_ut100_buff("REALLOC");
+          if ( rc NE ESA_OK )
+             goto exit ;
+       }
+
+       ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                       "rec.n=%d len=%d record: %s", record_counter,
+                       strlen(recrq), recrq);
+
+      /*
+       *   Try to parse record according to user
+       */
+
+       ut100_req_rec = ut100_req_table + record_counter - 1 ;
+       req_rec_flag = 'U';
+       strcpy(obj_type, "User");
+       i = sscanf( recrq, usr_format ,
+                   ut100_req_rec->rss_name,
+                   ut100_req_rec->admin_uname,
+                   ut100_req_rec->admin_gname,
+                   ut100_req_rec->opts.id,
+                   ut100_req_rec->mode,
+                   ut100_req_rec->opts.cmdfile,
+                   replace, dfltgrp );
+
+       ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                       "Usr sscanf Number of items=%d Wait for=%d",
+                       i, USR_ITEMS_COUNT );
+
+      /*
+       *   If sscanf return error during record's processing
+       *   maybe this record is in group format
+       */
+
+       if ( i NE USR_ITEMS_COUNT ) {
+         req_rec_flag = 'G';
+         strcpy(obj_type, "Group");
+         i = sscanf( recrq, grp_format ,
+                     ut100_req_rec->rss_name,
+                     ut100_req_rec->admin_uname,
+                     ut100_req_rec->admin_gname,
+                     ut100_req_rec->opts.id,
+                     ut100_req_rec->mode,
+                     ut100_req_rec->opts.cmdfile,
+                     replace, supgrp );
+
+         ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                         "Grp sscanf Number of items=%d Wait for=%d",
+                         i, GRP_ITEMS_COUNT );
+        /*
+         *   Invalid record format
+         */
+
+         if ( i NE GRP_ITEMS_COUNT ) {
+              record_counter--;
+              newline_ptr=strchr(recrq, NEWLINE );
+              if ( newline_ptr NE NULL )
+                  *newline_ptr = NULL_CHAR ;
+
+              CTSAMSG_print(RACF_C100_INVALID_REC_FORMAT,
+                            envir->ctsamsg_handle, NULL,  /* ps0295 */
+                            envir->ctsamsg_dest,          /* ps0295 */
+                            total_rec_cnt);
+              CTSAMSG_print(RACF_C100_INVALID_REC,
+                            envir->ctsamsg_handle, NULL,  /* ps0295 */
+                            envir->ctsamsg_dest,          /* ps0295 */
+                            recrq );
+              rc = ESA_FATAL ;
+              done_counter     =0 ;
+              done_err_counter = record_counter;
+              goto exit ;
+         } /* invalid format */
+
+       }    /* non user format record */
+
+
+       if ( ut100_req_rec->admin_gname[0] EQ '?' )     /* spr178 */
+            ut100_req_rec->admin_gname[0] = NULL_CHAR; /* spr178 */
+
+       ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                       "Adm user=%s group=%s",
+                        ut100_req_rec->admin_uname,
+                        ut100_req_rec->admin_gname);
+       ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                        "Mode=%s", ut100_req_rec->mode);
+
+       CTSAMSG_print(RACF_C100_READ_REQUEST,
+                     envir->ctsamsg_handle, NULL,         /* ps0295 */
+                     envir->ctsamsg_dest,                 /* ps0295 */
+                     obj_type,
+                     ut100_req_rec->opts.id,
+                     ut100_req_rec->admin_uname,
+                     ut100_req_rec->mode);
+      /*
+       *   Build request table record
+       */
+
+       rec_analyze(req_rec_flag, ut100_req_rec, replace, dfltgrp,
+                   supgrp);
+
+     }        /* Actual Record */
+
+    /*
+     *   Read next record from file
+     */
+
+     fgets(recrq,sizeof(recrq),file_rq);
+
+  }      /* read requests file */
+
+ /*
+  *   Processed all request file records, finish
+  */
+
+  exit :;
+
+ /*
+  *   Clear request file for next run
+  */
+
+  if (file_rq NE NULL) {
+     fclose(file_rq);
+     if ( rc EQ ESA_OK )
+        clear_delreq_file();
+  }
+
+ /*
+  *   Release request file lock
+  */
+
+  if ( lock_handle NE NULL )
+     lock_delreq_file("UNLOCK", FILE_RQ, &lock_handle);
+
+ /*
+  *   Issue statistics messages
+  */
+
+  if ( ( record_counter EQ 0 ) AND ( rc EQ ESA_OK ) ) {
+     CTSAMSG_print(RACF_C100_DELREQ_EMPTY,
+                   envir->ctsamsg_handle,                 /* ps0295 */
+                   NULL, envir->ctsamsg_dest);            /* ps0295 */
+     rc = ESA_ERR;
+  }
+
+ /*
+  *   Actually finish
+  */
+
+  ESA_DIAG_exit(PLT_COMP_CTSC100, 1, func, rc);
+  return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : rec_analyze                               *
+*                                                             *
+* DESCRIPTION     : Rec  analyze and move var to rights places*
+*                                                             *
+* INPUT           : req_rec_flag   - 'U' - user format rec    *
+*                                    'G' - grp  format rec    *
+*                   ut100_req_rec  - ptr to requests table    *
+*                   replace        - replace parameter        *
+*                   dfltgrp        - default group parameter  *
+*                   supgrp         - superiour group param    *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_OK                                    *
+*                                                             *
+**************************************************************/
+static ESA_RC rec_analyze(char                 req_rec_flag,
+                          UT100_REQ_ptr        ut100_req_rec,
+                          RACF_UT100_ID_typ    replace,
+                          RACF_UT100_ID_typ    dfltgrp,
+                          RACF_UT100_ID_typ    supgrp)
+{
+
+ /*
+  *     Variables
+  */
+
+  ESA_RC        rc=ESA_OK;
+  static char   func[]="rec_analyze";
+
+ /*
+  *     Initialize
+  */
+
+  ESA_DIAG_enter (PLT_COMP_CTSC100, 1, func );
+
+ /*
+  *    Update object list vector
+  */
+
+  strcpy( (char *)(objlist + record_counter - 1) ,
+           ut100_req_rec->opts.id);
+
+  strcpy(ut100_req_rec->object, ut100_req_rec->opts.id);
+
+ /*
+  *    User format record processing
+  */
+
+  if ( req_rec_flag EQ 'U' ) {
+     strcpy(ut100_req_rec->delreq, "DELUSER" );
+     strcpy(ut100_req_rec->opts.dfltgrp, dfltgrp);
+     ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                     "User=%s", ut100_req_rec->opts.id);
+  }
+
+ /*
+  *    Group format record processing
+  */
+
+  else {
+     strcpy(ut100_req_rec->delreq, "DELGROUP" );
+     strcpy(ut100_req_rec->opts.sup_grp, supgrp );
+     ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                     "Group=%s", ut100_req_rec->opts.id);
+  }
+
+ /*
+  *    Common record's processing
+  */
+
+  time(&(ut100_req_rec->opts.crttime));
+  ut100_req_rec->records = 0;
+  ut100_req_rec->file_name[0]=NULL_CHAR;
+
+ /*
+  *    Force option
+  */
+
+  if ( strcmp(ut100_req_rec->mode,"FORCE") EQ 0 )
+    ut100_req_rec->opts.dsnforce = RACF_YES;
+  else ut100_req_rec->opts.dsnforce = RACF_NO;
+
+ /*
+  *    Replace option
+  */
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100, 1, "Replace=%s", replace);
+
+  strcpy( ut100_req_rec->opts.ds_owner     ,replace );
+  strcpy( ut100_req_rec->opts.grp_owner    ,replace );
+  strcpy( ut100_req_rec->opts.usr_owner    ,replace );
+  strcpy( ut100_req_rec->opts.gen_owner    ,replace );
+  strcpy( ut100_req_rec->opts.cnct_owner   ,replace );
+  strcpy( ut100_req_rec->opts.notify_id    ,replace );
+  strcpy( ut100_req_rec->opts.resown_id    ,replace );
+  strcpy( ut100_req_rec->opts.new_dfltgrp  ,replace );
+
+ /*
+  *    Finish
+  */
+
+  exit :;
+
+  ESA_DIAG_exit(PLT_COMP_CTSC100, 1, func, rc);
+  return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : check_object_validity                     *
+*                                                             *
+* DESCRIPTION     : Search objid in request table             *
+*                                                             *
+* INPUT           : object    -  object ID                    *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_OK, ESA_FATAL                         *
+*                                                             *
+**************************************************************/
+static ESA_RC check_object_validity(RACF_UT100_ID_typ object)
+{
+
+ /*
+  *   Variables
+  */
+
+  ESA_RC         rc=ESA_OK;
+  int            i;
+  static char func[]="check_object_validity";
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter (PLT_COMP_CTSC100, 1, func );
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+            "Search object request=%s", object );
+
+ /*
+  *     Search process in delete request table
+  */
+
+  for (i=0; i LT record_counter; i++) {
+
+    ut100_req_rec = ut100_req_table + i;
+    ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+            "Table ptr=%X object=%s",
+             ut100_req_rec , ut100_req_rec->object );
+
+   /*
+    *    Object found .
+    *    Update administrator parameters in environment var
+    *    for this object
+    */
+
+    if ( ( strcmp( ut100_req_rec->object , object ) EQ 0 ) AND
+         ( ut100_req_rec->records EQ 0                   )   ) {
+        strcpy(envir->msg_admin_param.admin_uname,        /* ps0295 */
+               ut100_req_rec->admin_uname);
+        strcpy(envir->msg_admin_param.admin_gname,        /* ps0295 */
+               ut100_req_rec->admin_gname);
+        goto exit ;
+    }
+
+  }
+
+ /*
+  *   Error messages
+  */
+
+  CTSAMSG_print(RACF_C100_IRRUT100_ERR_FILE,
+                envir->ctsamsg_handle, NULL,              /* ps0295 */
+                envir->ctsamsg_dest);                     /* ps0295 */
+  CTSAMSG_print(RACF_C100_OBJECT_NOT_FOUND,
+                envir->ctsamsg_handle, NULL,              /* ps0295 */
+                envir->ctsamsg_dest,                      /* ps0295 */
+                object );
+  done_counter     =0 ;
+  done_err_counter = record_counter;
+  rc = ESA_FATAL ;
+
+ /*
+  *   Finish
+  */
+
+  exit :
+
+  ESA_DIAG_exit(PLT_COMP_CTSC100, 1 , func , rc );
+
+  return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : alloc_ut100_buff                          *
+*                                                             *
+* DESCRIPTION     : Allocate/Reallocate buffers for delete    *
+*                   requests file                             *
+*                                                             *
+* INPUT           : op     - option ( ALLOC/ REALLOC )        *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_OK, ESA_FATAL                         *
+*                                                             *
+**************************************************************/
+static ESA_RC alloc_ut100_buff(char      *op)
+{
+
+ /*
+  *   Variables
+  */
+
+  ESA_RC          rc = ESA_OK;
+  static char     func[] = "alloc_ut100_buff";
+
+ /*
+  *   initialize
+  */
+
+  ESA_DIAG_enter (PLT_COMP_CTSC100, 1, func );
+  ESA_DIAG_printf(PLT_COMP_CTSC100, 1, "Option=%s", op);
+
+ /*
+  *   Allocate memory for delete request table
+  *   and for object list vector
+  */
+
+  if ( strcmp(op , "ALLOC" ) EQ 0 ) {
+     ut100_req_table = (UT100_REQ_ptr ) malloc \
+                       (sizeof(UT100_REQ_typ)*UT100_REQ_MAX);
+     ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                    "UT100_req_table addr=%X", ut100_req_table);
+
+     if ( ut100_req_table EQ NULL ) {
+         CTSAMSG_print(ERR_MALLOC,
+                       envir->ctsamsg_handle, NULL,       /* ps0295 */
+                       envir->ctsamsg_dest,               /* ps0295 */
+                       "UT100_req_table",
+                       sizeof(UT100_REQ_typ)*UT100_REQ_MAX);
+         rc=ESA_FATAL;
+         goto exit;
+     }
+
+     objlist = (RACF_UT100_ID_typ *) malloc \
+               (sizeof(RACF_UT100_ID_typ) * UT100_REQ_MAX);
+     ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                    "UT100_obj_table addr=%X", objlist);
+
+     if ( objlist EQ NULL ) {
+         CTSAMSG_print(ERR_MALLOC,
+                       envir->ctsamsg_handle, NULL,       /* ps0295 */
+                       envir->ctsamsg_dest,               /* ps0295 */
+                       "UT100_obj_table",
+                       sizeof(RACF_UT100_ID_typ)*UT100_REQ_MAX);
+         rc=ESA_FATAL;
+         goto exit;
+     }
+  }       /* ALLOC option  */
+
+
+ /*
+  *   Reallocate memory for delete request table and for object list
+  *   vector because not enough memory was allocated previously
+  */
+
+  else {
+
+     ut100_req_table_new = (UT100_REQ_ptr ) realloc \
+                           (ut100_req_table,
+         /*BS10116*/        sizeof(UT100_REQ_typ)*ut100_req_max*2);
+         /*BS10116          sizeof(UT100_REQ_typ)*UT100_REQ_MAX*2);*/
+     ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                  "UT100_req_table_new addr=%X", ut100_req_table_new);
+
+     if ( ut100_req_table_new EQ NULL ) {
+         CTSAMSG_print(ERR_MALLOC,
+                       envir->ctsamsg_handle, NULL,       /* ps0295 */
+                       envir->ctsamsg_dest,               /* ps0295 */
+                       "UT100_req_table",
+           /*BS10116*/ sizeof(UT100_REQ_typ)*ut100_req_max*2);
+           /*BS10116   sizeof(UT100_REQ_typ)*UT100_REQ_MAX*2);      */
+         rc=ESA_FATAL;
+         goto exit;
+     }
+     else ut100_req_table = ut100_req_table_new ;
+
+     objlist_new = (RACF_UT100_ID_typ *) realloc \
+     /*BS10116*/  (objlist,sizeof(RACF_UT100_ID_typ)*ut100_req_max*2);
+     /*BS10116    (objlist,sizeof(RACF_UT100_ID_typ)*UT100_REQ_MAX*2);*/
+     ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                    "UT100_obj_table_new addr=%X", objlist_new);
+
+     if ( objlist_new EQ NULL ) {
+         CTSAMSG_print(ERR_MALLOC,
+                       envir->ctsamsg_handle, NULL,       /* ps0295 */
+                       envir->ctsamsg_dest,               /* ps0295 */
+                       "UT100_obj_table",
+          /*BS10116*/  sizeof(RACF_UT100_ID_typ)*ut100_req_max*2);
+          /*BS10116    sizeof(RACF_UT100_ID_typ)*UT100_REQ_MAX*2);  */
+         rc=ESA_FATAL;
+         goto exit;
+     }
+     else objlist = objlist_new ;
+
+    /*
+     *    Update borders for new reallocation table
+     */
+
+   /*BS10116 ut100_req_max += UT100_REQ_MAX; */
+     ut100_req_max += ut100_req_max;              /*BS10116*/
+
+  } /* realloc */
+
+ /*
+  *    Finish
+  */
+
+  exit:;
+
+  ESA_DIAG_exit(PLT_COMP_CTSC100, 1 , func , rc );
+
+  return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : separate_ut100_output                     *
+*                                                             *
+* DESCRIPTION     : Treatment output after IRRUT100 util      *
+*                                                             *
+* INPUT           : file_type  -  ddname/dsname               *
+*                   file_name  -  name of : ddn/ dsn          *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_OK, ESA_FATAL                         *
+*                                                             *
+*************************************************************/
+static ESA_RC separate_ut100_output(char       file_type,
+                                      char      *file_name)
+{
+
+ /*
+  *    Variables
+  */
+
+  ESA_RC          rc=ESA_OK;
+  FILE           *file_in = NULL ;
+  char            file[MAX_FILENAME_LEN+10];
+  long int        records;
+  static char     func[]="separate_ut100_output";
+
+ /*
+  *    Initialize
+  */
+
+  ESA_DIAG_enter (PLT_COMP_CTSC100, 1, func );
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100, 1, "File=%s", file_name);
+
+ /*
+  *    Determine file name string according to file type
+  */
+
+  if ( file_type EQ DSNAME ) {        /* data set name entered */
+     /* SAS2IBMT strcpy(file,"dsn:");                                */
+     strcpy(file,"//'");                                  /* SAS2IBMT */
+     strcat(file, file_name );
+     strcat(file,"'");                                    /* SAS2IBMT */
+  }
+  else strcpy(file, file_name );        /* ddname entered */
+
+ /*
+  *    Open file
+  */
+
+  file_in=fopen(file,"rb");
+  if ( file_in EQ NULL) {
+     UT100_IO_ERR("OPEN", file)
+     goto exit;
+  }
+
+ /*
+  *  Allocate ut100 table, and fill it
+  */
+
+  rc = ut100_table_init( file_in , &records, &ut100_table );
+  if ( rc NE ESA_OK )
+     goto exit ;
+
+ /*
+  *  Separate ut100 utility records
+  */
+
+  rc = separate_ut100_records(ut100_table,records);
+ /*
+  *  Finish
+  */
+
+  exit:;
+
+  if ( file_in NE NULL)
+     fclose(file_in);
+
+  ESA_DIAG_exit(PLT_COMP_CTSC100, 1 , func , rc );
+
+  return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : copy_ut100_file                           *
+*                                                             *
+* DESCRIPTION     : Save ut100 output file for cont fork      *
+*                                                             *
+* INPUT           : request    -  kind of file to copy        *
+*                   from       -  from ddn/dsn name           *
+*                   from_dd    -  from ddn/dsn type           *
+*                   to         -  to   ddn/dsn name           *
+*                   to_dd      -  to   ddn/dsn type           *
+*                   open_mode  -  binary, text                *
+*                   io_buf     -  io buffer                   *
+*                   size       -  size of buffer              *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_OK, ESA_FATAL                         *
+*                                                             *
+**************************************************************/
+static ESA_RC  copy_ut100_file(char       *request,
+                               char       *from,
+                               char        from_dd,
+                               char       *to,      /*  '?', */
+                               char        to_dd,
+                               char       *open_mode,
+                               char       *io_buf,
+                               size_t      size )
+{
+
+ /*
+  *    Variables
+  */
+
+  ESA_RC rc=ESA_OK;
+  static char func[]="copy_ut100_file";
+  FILE       *f_in = NULL ;
+  FILE       *f_out= NULL ;
+  char        dsn_from[MAX_FILENAME_LEN+10];
+  char        dsn_to[MAX_FILENAME_LEN+10];
+  char        opnmode[10];
+  int         i;
+  char        dsn[MAX_FILENAME_LEN+10];
+  char       *newline_ptr;
+  time_t      crttime;
+
+ /*
+  *    Initialize
+  */
+
+  ESA_DIAG_enter (PLT_COMP_CTSC100, 1, func );
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                  "Copy from=%s To=%s open mode=%s",
+                  from, to, open_mode);
+
+ /*
+  *   Determine open mode of source file
+  */
+
+  strcpy(opnmode,"r");
+  strcat(opnmode, open_mode);
+
+  if ( from_dd EQ DSNAME ) {            /* Name of file */
+     /* SAS2IBMT strcpy(dsn_from,"dsn:");                            */
+     strcpy(dsn_from,"//'");                              /* SAS2IBMT */
+     strcat(dsn_from, from );
+     strcat(dsn_from,"'");                                /* SAS2IBMT */
+  }
+  /* SAS2IBMT else strcpy(dsn_from, from );                          */
+  else {
+       strcpy(dsn_from,"DD:");                            /* SAS2IBMT */
+       strcat(dsn_from, from );                           /* SAS2IBMT */
+  }
+
+ /*
+  *   Open source file
+  */
+
+  f_in=fopen(dsn_from, opnmode );
+  if ( f_in EQ NULL) {
+     UT100_IO_ERR("OPEN", dsn_from)
+     goto exit;
+  }
+
+ /*
+  *   If no target file was passed, allocate a new target file
+  */
+
+  if ( *to EQ NULL_CHAR ) {
+     time(&crttime);
+     rc=UT100_allocate(request,
+                       envir->msg_admin_param.admin_uname, /* ps0295 */
+                       &(envir->msg_admin_param),         /* ps0295 */
+                       dsn, crttime);
+     if ( rc NE ESA_OK )
+        goto exit;
+     strcpy(to, dsn);
+     to_dd=DSNAME;
+  }
+
+  strcpy(dsn, to );
+
+ /*
+  *   Determine open mode of target file
+  */
+
+  strcpy(opnmode,"w");
+  strcat(opnmode, open_mode);
+  strcat(opnmode, ",recfm=*");                            /* SAS2IBMT */
+  if ( to_dd EQ DSNAME ) {          /* name of file */
+     /* SAS2IBMT strcpy(dsn_to,"dsn:");                              */
+     strcpy(dsn_to,"//'");                                /* SAS2IBMT */
+     strcat(dsn_to, dsn );
+     strcat(dsn_to,"'");                                  /* SAS2IBMT */
+  }
+  /* SAS2IBMT else strcpy(dsn_to, dsn );                             */
+  else {
+       strcpy(dsn_to,"DD:");                              /* SAS2IBMT */
+       strcat(dsn_to, dsn );                              /* SAS2IBMT */
+  }
+
+ /*
+  *   Open target file
+  */
+
+  f_out=fopen(dsn_to, opnmode);
+  if ( f_out EQ NULL) {
+     UT100_IO_ERR("OPEN", dsn_to)
+     goto exit;
+  }
+
+ /*
+  *   Copy file records
+  */
+
+  if ( strcmp(open_mode,TEXT_FILE) EQ 0 )  {
+     i=1;
+     fgets(io_buf,size,f_in);
+  }
+  else i=fread(io_buf, size,1,f_in);
+
+  /*SAS2IBMA while ( (feof(f_in) EQ NULL) ) BEGIN*/
+  while ( (feof(f_in) EQ (int) NULL) ) {         /*SAS2IBMA*/
+
+     if ( (ferror(f_in))  OR ( i LT 1) ) {
+        UT100_IO_ERR("FREAD", dsn_from)
+        goto exit;
+     }
+
+     if ( strcmp(open_mode,TEXT_FILE) EQ 0 )  {
+        i=1;
+        newline_ptr=strchr(io_buf, NEWLINE );
+        if ( newline_ptr NE NULL )
+           *newline_ptr = NULL_CHAR ;
+        fputs(io_buf,f_out);
+        fputc(NEWLINE, f_out);
+     }
+     else i=fwrite(io_buf, size,1,f_out);
+
+     if ( (ferror(f_out))  OR ( i LT 1) ) {
+        UT100_IO_ERR("FWRITE", dsn_to)
+        goto exit;
+     }
+
+     if ( strcmp(open_mode,TEXT_FILE) EQ 0 )  {
+        i=1;
+        fgets(io_buf,size,f_in);
+     }
+     else i=fread(io_buf, size,1,f_in);
+
+  }
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                 ">>> UT100 output file saved to=%s <<<", dsn_to );
+
+ /*
+  *   Finish and close files
+  */
+
+  exit:;
+  if ( f_in NE NULL )
+     fclose(f_in);
+
+  if ( f_out NE NULL )
+     fclose(f_out);
+
+  ESA_DIAG_exit(PLT_COMP_CTSC100, 1 , func , rc );
+
+  return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : lock_delreq_file                          *
+*                                                             *
+* DESCRIPTION     : Use request for delete request file       *
+*                   lock/unlock service                       *
+*                                                             *
+* INPUT           : op     -  option  ( LOCK/UNLOCK )         *
+*                                                             *
+* OUTPUT          : ddn    -  name of locked delreq file      *
+*                   lock_handle - ptr to lock/unlock service  *
+*                                                             *
+* RETURN VALUE    : ESA_OK, ESA_FATAL                         *
+*                                                             *
+**************************************************************/
+static ESA_RC lock_delreq_file(char        *op,
+                               char        *ddn,
+                               void        **lock_handle)
+{
+
+ /*
+  *    Variables
+  */
+
+  static char func[]="lock_delreq_file";
+  ESA_RC      rc=ESA_OK;
+  ESA_RC      rc_unlock=ESA_OK;
+  ESA_RC      rc_term=ESA_OK;
+  /* WS10054 char        file_name[MAX_FILENAME_LEN+10];             */
+  char        backup_file_name[MAX_FILENAME_LEN+10];
+  char        copy_record[DELREQ_FILE_REC_LEN];
+  char        wait_lock_char[10] = " ";                   /* BS10076 */
+  char        wait_lock_interval_char[10] = " ";          /* BS10076 */
+  int         wait_lock_value;                            /* BS10076 */
+  int         wait_lock_interval_value;                   /* BS10076 */
+
+ /*
+  *    Initialize
+  */
+
+  ESA_DIAG_enter (PLT_COMP_CTSC100, 1, func );
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                  "Option=%s ddn=%s", op, ddn);
+
+ /*
+  *    LOCK option
+  */
+
+  if ( strcmp(op, "LOCK" ) EQ 0 ) {
+
+   /* * * * * * * BS10076 start * * * * * * */
+   rc = rssprm_get_opt (ALL_RSS, "WAIT_LOCK",
+                    sizeof(wait_lock_char),
+                    wait_lock_char,
+                    OPT_TRUE,
+                    OPT_FALSE);
+
+   if (rc EQ ESA_OK)
+      wait_lock_value = atoi(wait_lock_char);
+   else
+      wait_lock_value = WAIT_LOCK_TOTAL;
+
+   ESA_DIAG_printf (PLT_COMP_CTSC100, 6,
+                    "WAIT_LOCK parm = <%s> = <%d>",
+                    wait_lock_char,
+                    wait_lock_value);
+
+   rc = rssprm_get_opt (ALL_RSS, "WAIT_LOCK_INTERVAL",
+                    sizeof(wait_lock_interval_char),
+                    wait_lock_interval_char,
+                    OPT_TRUE,
+                    OPT_FALSE);
+
+   if (rc EQ ESA_OK)
+      wait_lock_interval_value = atoi(wait_lock_interval_char);
+   else
+      wait_lock_interval_value = WAIT_LOCK_INTERVAL_DFLT;
+
+   ESA_DIAG_printf (PLT_COMP_CTSC100, 6,
+                    "WAIT_LOCK_INTERVAL parm = <%s> = <%d>",
+                    wait_lock_interval_char,
+                    wait_lock_interval_value);
+   /* * * * * * * BS10076 end * * * * * * */
+
+    /* WS10054 We are removing the following call because the ddinfo
+       function will be done in the OS_CS_lock_init routine if the
+       ddname is passed to the routine.
+    rc = OS_MVS_ddinfo(ddn , file_name , TRUE,
+                       envir->ctsamsg_dest,
+                       envir->ctsamsg_handle);
+    if ( rc NE ESA_OK )
+       goto exit;                                                   */
+
+    /* WS10054 rc=OS_CS_lock_init(file_name, 0 , lock_handle, NULL, */
+    /* BS10076
+    rc=OS_CS_lock_init(ddn, 0 , lock_handle, NULL,       // WS10054 //
+                       SCOPE_REMOTE,
+                       &(envir->msg_params) );            // ps0295 */
+    rc=OS_CS_lock_init(ddn, lock_handle,                  /* BS10076 */
+                       wait_lock_value,                   /* BS10076 */
+                       wait_lock_interval_value,          /* BS10076 */
+                       SCOPE_REMOTE,
+                       &(envir->msg_params) );            /* ps0295 */
+    if ( rc NE ESA_OK )
+       goto exit;
+
+    /* WS10054 Making the interval larger - from 3 seconds to 10 minutes
+    rc = OS_CS_lock (*lock_handle,DELREQ_LOCK_INTERVAL,             */
+    /* BS10076
+    rc = OS_CS_lock (*lock_handle,LOCK_INTERVAL,          // WS10054 */
+    rc = OS_CS_lock (*lock_handle,                        /* BS10076 */
+                     &(envir->msg_params) );              /* ps0295 */
+    if ( rc NE ESA_OK )
+       goto exit;
+
+   /*
+    *   Check exist/no DDN for backup file
+    */
+
+    rc = OS_MVS_ddinfo(UT100_BACKUP_DDN , backup_file_name, FALSE,
+                       envir->ctsamsg_dest,               /* ps0295 */
+                       envir->ctsamsg_handle, 0);         /* IS10174 */
+           /* IS10174  envir->ctsamsg_handle);           * ps0295 *  */
+
+    if ( rc EQ ESA_OK ) {
+      rc = copy_ut100_file(FILE_RQ,FILE_RQ,
+                           DDNAME, UT100_BACKUP_DDN, DDNAME,
+                           TEXT_FILE,copy_record, DELREQ_FILE_REC_LEN);
+      if ( rc NE ESA_OK )
+          goto exit;
+    }
+
+   /*
+    *   DDN for backup file does not exist
+    */
+
+    else {
+      rc = get_backup_file_name(FILE_RQ, backup_file_name);
+      if ( rc NE ESA_OK )
+         goto exit;
+
+      rc = copy_ut100_file(FILE_RQ,FILE_RQ,
+                           DDNAME, backup_file_name, DSNAME,
+                           TEXT_FILE,copy_record, DELREQ_FILE_REC_LEN);
+      if ( rc NE ESA_OK )
+         goto exit;
+
+    }
+  }         /* Lock option */
+
+ /*
+  *    UNLOCK option
+  */
+
+  else  {
+    rc_unlock = OS_CS_unlock (*lock_handle,
+                              &(envir->msg_params) );     /* ps0295 */
+    rc_term = OS_CS_lock_term (lock_handle,
+                              &(envir->msg_params) );     /* ps0295 */
+    if ( (rc_unlock NE ESA_OK) OR (rc_term NE ESA_OK))
+       rc=ESA_FATAL;
+    else rc=ESA_OK;
+  }          /* Unlock option */
+
+ /*
+  *    Finish
+  */
+
+  exit :;
+
+  ESA_DIAG_exit(PLT_COMP_CTSC100, 1 , func , rc );
+
+  return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : clear_delreq_file                         *
+*                                                             *
+* DESCRIPTION     : Clear file delete requests                *
+*                                                             *
+* INPUT           : none                                      *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_OK,  ESA_FATAL                        *
+*                                                             *
+**************************************************************/
+static ESA_RC clear_delreq_file(void)
+{
+
+ /*
+  *   Variables
+  */
+
+  static char func[]="clear_delreq_file";
+  ESA_RC                        rc = ESA_OK;
+  time_t                        crttime;
+  struct  tm                   *tm_ptr;
+  size_t                        nchar;
+  char                          date_str[100];
+  FILE                         *file_rq = NULL ;
+  char                     ddn_with[MAX_FILENAME_LEN+10]; /* SAS2IBMT */
+
+ /*
+  *   initialize
+  */
+
+  ESA_DIAG_enter (PLT_COMP_CTSC100, 1, func );
+
+ /*
+  *   open requests file
+  */
+
+  strcpy(ddn_with,"DD:");                                 /* SAS2IBMT */
+  strcat(ddn_with, FILE_RQ );                             /* SAS2IBMT */
+
+  /* SAS2IBMT file_rq=fopen(FILE_RQ ,"w");                           */
+  file_rq=fopen(ddn_with ,"w,recfm=*");                   /* SAS2IBMT */
+  if ( file_rq EQ NULL) {
+     UT100_IO_ERR("OPEN", FILE_RQ)
+     goto exit;
+  }
+
+ /*
+  *   write initialization text
+  */
+
+  time(&crttime);
+
+  tm_ptr = localtime(&crttime);
+  nchar  = strftime(date_str, sizeof(date_str),
+          "* File cleared by last activation at %d/%m/%Y  %H:%M:%S",
+                    tm_ptr);
+
+  fputs( date_str, file_rq);
+  fputc(NEWLINE,file_rq);
+
+ /*
+  *   finish
+  */
+
+  exit :;
+  if (file_rq NE NULL)
+     fclose(file_rq);
+
+  ESA_DIAG_exit(PLT_COMP_CTSC100, 1 , func , rc );
+
+  return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* Subroutine name : end_check_request                         *
+*                                                             *
+* DESCRIPTION     : End check request table                   *
+*                                                             *
+* INPUT           : none                                      *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_OK,  ESA_FATAL                        *
+*                                                             *
+**************************************************************/
+static ESA_RC end_check_request(void)
+ {
+
+ /*
+  *   Variables
+  */
+
+  ESA_RC         rc=ESA_OK;
+  int            i;
+  short          main_err=0;
+  static char func[]="end_check_request";
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter (PLT_COMP_CTSC100, 1, func );
+
+ /*
+  *  If in request table found object with  records = 0 error
+  */
+
+  for (i=0; i LT record_counter; i++) {
+
+    ut100_req_rec = ut100_req_table + i;
+    ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+            "Table ptr=%X object=%s records=%d",
+             ut100_req_rec , ut100_req_rec->object,
+             ut100_req_rec->records);
+
+   /*
+    *    Object found with no records in IRRUT100 output file
+    */
+
+      if ( ut100_req_rec->records EQ 0 ) {
+
+         /*
+          *   Error messages
+          */
+
+           if ( main_err EQ 0 ) {
+              CTSAMSG_print(RACF_C100_IRRUT100_ERR_FILE,
+                        envir->ctsamsg_handle, NULL,      /* ps0295 */
+                        envir->ctsamsg_dest);             /* ps0295 */
+              main_err=1;
+           }
+           CTSAMSG_print(RACF_C100_OBJECT_NOT_FOUND,
+                         envir->ctsamsg_handle, NULL,     /* ps0295 */
+                         envir->ctsamsg_dest,             /* ps0295 */
+                         ut100_req_rec->object);
+           done_err_counter++;
+           rc = ESA_FATAL ;
+      }
+
+  }
+
+ /*
+  *   Finish
+  */
+
+  ESA_DIAG_exit(PLT_COMP_CTSC100, 1 , func , rc );
+
+  return rc;
+
+ }
+
+/**************************************************************
+*                                                             *
+* Subroutine name : rexx_execute                              *
+*                                                             *
+* DESCRIPTION     : Execute REXX programs                     *
+*                                                             *
+* INPUT           : none                                      *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_OK, ESA_ERR                           *
+*                                                             *
+**************************************************************/
+static ESA_RC rexx_execute(USER_typ     admin_uname)
+ {
+
+ /*
+  *   Variables
+  */
+
+  ESA_RC         rc;
+  ESA_RC         rc_ret=ESA_OK;
+  int            i;
+  char           object_type[10];
+  static char    func[]="rexx_execute";
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter (PLT_COMP_CTSC100, 1, func );
+
+  for (i=0; i LT record_counter; i++) {
+
+    ut100_req_rec = ut100_req_table + i;
+    ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+            "Table ptr=%X object=%s rexx_file=%s",
+             ut100_req_rec , ut100_req_rec->object,
+             ut100_req_rec->opts.cmdfile);
+
+    if ( strcmp(ut100_req_rec->delreq, "DELUSER" ) EQ 0 )
+      strcpy(object_type, "user");
+    else
+      strcpy(object_type, "group");
+
+   /*
+    *    Execute REXX program if one was created
+    */
+
+    if ( ( ut100_req_rec->records GT 0 ) AND
+         ( ( strcmp(ut100_req_rec->mode, "FORCE" ) EQ 0 ) OR
+         ( strcmp(ut100_req_rec->mode, "FULL"  ) EQ 0 )  )   ) {
+
+       CTSAMSG_print(RACF_C100_CLEANUP_START,
+                     envir->ctsamsg_handle, NULL,         /* ps0295 */
+                     envir->ctsamsg_dest,                 /* ps0295 */
+                     object_type, ut100_req_rec->object,
+                     ut100_req_rec->admin_uname,
+                     ut100_req_rec->opts.cmdfile);
+
+       strcat(ut100_req_rec->opts.cmdfile,"' ");
+       strcat(ut100_req_rec->opts.cmdfile,"'TRACEON");
+
+       rc = UT100_execute_file(&(ut100_req_rec->opts),
+                               &envir->msg_admin_param);  /* IS10174 */
+             /* IS10174        envir->ctsamsg_dest,        * ps0295 * */
+             /* IS10174        envir->ctsamsg_handle);     * ps0295 * */
+       ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+                       "UT100_execute rc=%d",rc);
+
+       if (rc EQ ESA_OK) {
+          rc = do_main_delete_command(ut100_req_rec, admin_uname);
+          if ( rc EQ ESA_OK )
+              CTSLogEvent(envir->msg_admin_param.rss_type, /* ps0295 */
+                          envir->msg_admin_param.rss_name, /* ps0295 */
+                          logev_handle,
+                          RACF_C100_CLEANUP_ENDOK, object_type,
+                          ut100_req_rec->object);
+
+         /*
+          *  Main delete command ended with error
+          */
+
+          else {
+             rc_ret = ESA_ERR;
+             CTSLogEvent(envir->msg_admin_param.rss_type, /* ps0295 */
+                         envir->msg_admin_param.rss_name, /* ps0295 */
+                         logev_handle,
+                         RACF_C100_CLEANUP_ENDERR, object_type,
+                         ut100_req_rec->object);
+          }
+       }    /* Cleanup commands ended ok         */
+
+       /*** Cleanup commands ended with error ***/
+
+       else {
+          rc_ret = ESA_ERR;
+          CTSLogEvent(envir->msg_admin_param.rss_type,    /* ps0295 */
+                      envir->msg_admin_param.rss_name,    /* ps0295 */
+                      logev_handle,                       /* ps0295 */
+                      RACF_C100_CLEANUP_ENDERR, object_type,
+                      ut100_req_rec->object);
+       }
+    }     /* FORCE, FULL mode */
+    else if ( ut100_req_rec->records GT 0 )
+            CTSLogEvent(envir->msg_admin_param.rss_type,  /* ps0295 */
+                        envir->msg_admin_param.rss_name,  /* ps0295 */
+                        logev_handle,
+                        RACF_C100_CLEANUP_NOT_EXECUTE,
+                        object_type, ut100_req_rec->object,
+                        ut100_req_rec->mode);
+
+  }
+
+ /*
+  *   Finish
+  */
+
+  ESA_DIAG_exit(PLT_COMP_CTSC100, 1 , func , rc_ret );
+  return rc_ret;
+
+ }
+
+/**************************************************************
+*                                                             *
+* Subroutine name : do_main_delete_command                    *
+*                                                             *
+* DESCRIPTION     : Perform command: DELUSER/ DELGROUP        *
+*                                                             *
+* INPUT           : ptr to request                            *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : none                                      *
+*                                                             *
+**************************************************************/
+static ESA_RC do_main_delete_command(UT100_REQ_ptr        req,
+                                     USER_typ             admin_uname)
+ {
+
+ /*
+  *   Variables
+  */
+
+  ESA_RC         rc         = ESA_OK ;
+  ESA_RC         rc_login   = ESA_ERR;
+  ESA_RC         rc_login_f = ESA_ERR;
+  void           *login_handle = NULL;
+  ESA_RC         rc_cmnd;
+  char           command[100];
+
+ /*
+  *     MKT for DELUSER/DELGROUP
+  *         (Mandatory Keywords Table)
+  */
+
+  static ADDINFO_MKTE_rec_typ mkt[] = {
+       ""         /* a null string indicate end-of-mkt */
+  };
+
+ /*
+  *     KDT for DELUSER/DELGROUP COMMAND
+  *         (Keyword Decscription Table)
+  */
+
+ static ADDINFO_KDTE_rec_typ kdt[] = {
+   {""                     ,KDT_FLG ,""            ,""   ,"" }
+   };
+
+  static char    func[]="do_main_delete_command";
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter (PLT_COMP_CTSC100, 1, func );
+
+ /*
+  *    Check whether need to perform DELETE command
+  */
+
+  if ( ( strcmp(req->delreq, "DELUSER" ) EQ 0 ) AND
+       ( strcmp(req->opts.dfltgrp, "?" ) EQ 0 )   )
+      goto exit;
+
+  if ( ( strcmp(req->delreq, "DELGROUP" ) EQ 0 ) AND
+       ( strcmp(req->opts.sup_grp, "?"  ) EQ 0 )   )
+      goto exit;
+
+ /*
+  *    Login appropriate administrator
+  */
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100,1,
+                  "Login rss_name=%s adm.userid=%s adm.group=%s",
+                   envir->msg_admin_param.rss_name,       /* ps0295 */
+                   req->admin_uname, req->admin_gname);
+
+  rc_login_f = api_ptr.rss_login_ptr(envir->msg_admin_param.rss_name,
+                                                        /* ps0295 */
+                                   req->admin_uname,
+                                   req->admin_gname,
+                                   "",     /* password */
+                                   LOGIN_MODE_FIRST,
+                                   &login_handle,
+                                   &(envir->msg_admin_param),
+                                   &(envir->msg_err) );   /* ps0295 */
+  if ( rc_login_f NE ESA_OK ) {
+     CTSAMSG_print(ERR_TL_FUNC_CALL,
+                   envir->ctsamsg_handle, NULL,           /* ps0295 */
+                   envir->ctsamsg_dest,                   /* ps0295 */
+                   component, __LINE__,
+                   "CTSRSSLogin(LOGIN_MODE_FIRST)");
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+  rc_login = api_ptr.rss_login_ptr(envir->msg_admin_param.rss_name,
+                                                     /* ps0295 */
+                                   req->admin_uname,
+                                   req->admin_gname,
+                                   "",     /* password */
+                                   LOGIN_MODE,
+                                   &login_handle,
+                                   &(envir->msg_admin_param),
+                                   &(envir->msg_err) );   /* ps0295 */
+  if ( rc_login NE ESA_OK ) {
+     CTSAMSG_print(ERR_TL_FUNC_CALL,
+                   envir->ctsamsg_handle, NULL,           /* ps0295 */
+                   envir->ctsamsg_dest,                   /* ps0295 */
+                   component, __LINE__,
+                   "CTSRSSLogin(LOGIN_MODE)");
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+ /*
+  *  Create delete command
+  */
+
+  if ( strcmp(req->delreq, "DELUSER" ) EQ 0 )
+    sprintf(command, "  DELUSER   %s", req->object);
+  else
+    sprintf(command, "  DELGROUP  %s", req->object);
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100,1, "command = %s", command);
+
+ /*
+  *   Execute the DELUSER/DELGROUP command
+  */
+
+  rc_cmnd = racfcmd(component, EXECOUT_DDNAME, admin_uname,
+                    command, MAX_OK_RC_0,
+                    0, NULL, mkt, kdt,
+                    &envir->msg_admin_param,              /* IS10174 */
+                    CMDOUT_YES, RACF_YES);
+       /* IS10174   envir->ctsamsg_dest,                   * ps0295 * */
+       /* IS10174   envir->ctsamsg_handle,                 * ps0295 * */
+
+  if (rc_cmnd EQ ESA_OK)
+      rc = ESA_OK;
+  else rc = ESA_FATAL;
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100,1, "racfcmd rc_cmnd=%d", rc_cmnd);
+
+ /*
+  *   Finish
+  */
+
+ exit :;
+  if ( rc_login EQ ESA_OK ) {
+     ESA_DIAG_printf(PLT_COMP_CTSC100,1,
+                     "Logout rss_name=%s adm.userid=%s adm.group=%s",
+                      envir->msg_admin_param.rss_name,    /* ps0295 */
+                      req->admin_uname, req->admin_gname);
+
+     rc_login = api_ptr.rss_logout_ptr(envir->msg_admin_param.rss_name,
+                                                    /* ps0295 */
+                                       req->admin_uname,
+                                       req->admin_gname,
+                                       LOGOUT_MODE,
+                                       &login_handle,
+                                       &(envir->msg_admin_param),
+                                       &(envir->msg_err) );
+                                                          /* ps0295 */
+     if ( rc_login NE ESA_OK )
+        CTSAMSG_print(ERR_TL_FUNC_CALL,
+                      envir->ctsamsg_handle, NULL,        /* ps0295 */
+                      envir->ctsamsg_dest,                /* ps0295 */
+                      component, __LINE__,
+                      "CTSRSSLogout(LOGOUT_MODE)");
+
+  }
+
+  if ( rc_login_f EQ ESA_OK ) {
+     ESA_DIAG_printf(PLT_COMP_CTSC100,1,
+                     "Logout rss_name=%s adm.userid=%s adm.group=%s",
+                      envir->msg_admin_param.rss_name,    /* ps0295 */
+                      req->admin_uname, req->admin_gname);
+
+     rc_login_f = api_ptr.rss_logout_ptr(
+                                       envir->msg_admin_param.rss_name,
+                                                          /* ps0295 */
+                                       req->admin_uname,
+                                       req->admin_gname,
+                                       LOGOUT_MODE_LAST,
+                                       &login_handle,
+                                       &(envir->msg_admin_param),
+                                       &(envir->msg_err) );
+                                                          /* ps0295 */
+     if ( rc_login_f NE ESA_OK )
+        CTSAMSG_print(ERR_TL_FUNC_CALL,
+                      envir->ctsamsg_handle, NULL,        /* ps0295 */
+                      envir->ctsamsg_dest,                /* ps0295 */
+                      component, __LINE__,
+                      "CTSRSSLogout(LOGOUT_MODE_LAST)");
+
+  }
+
+  ESA_DIAG_exit(PLT_COMP_CTSC100, 1 , func , rc );
+  return rc;
+
+ }
+
+/**************************************************************
+*                                                             *
+* Subroutine name : get_backup_file_name                      *
+*                                                             *
+* DESCRIPTION     : Create file name for request backup file  *
+*                                                             *
+* INPUT           : ddn     -   delete request file           *
+*                                                             *
+* OUTPUT          : dsn     -   backup_file_name              *
+*                                                             *
+* RETURN VALUE    : ESA_OK, ESA_FATAL                         *
+*                                                             *
+**************************************************************/
+static ESA_RC get_backup_file_name(char              *ddn,
+                                   char              *dsn)
+ {
+
+ /*
+  *   Variables
+  */
+
+  ESA_RC         rc=ESA_OK;
+  int            tso_rc;
+  char          *token;
+  char           hlvl1[10];
+  char           hlvl2[10];
+  char           command[100];
+  char           file_name[MAX_FILENAME_LEN+10];
+  static char    func[]="get_backup_file_name";
+  char           eoddn[9] = EXECOUT_DDNAME;              /* IS10174 */
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter (PLT_COMP_CTSC100, 1, func );
+
+
+ /*
+  *   DDN for backup file does not exist
+  *   Try create it dynamically
+  */
+
+ /*
+  *   Clear parameters before parsing
+  */
+
+  hlvl1[0] = NULL_CHAR;
+  hlvl2[0] = NULL_CHAR;
+
+  rc = OS_MVS_ddinfo(ddn , file_name, TRUE,
+                     envir->ctsamsg_dest,                 /* ps0295 */
+                     envir->ctsamsg_handle, 0);           /* IS10174 */
+          /* IS10174 envir->ctsamsg_handle);             * ps0295 *  */
+  ESA_DIAG_printf(PLT_COMP_CTSC100,1,
+                  "Obtained file name=%s rc=%s",
+                  file_name, ESA_rc2str(rc));
+
+  if ( rc NE ESA_OK )
+     goto exit;
+
+  token = strtok( file_name , "." );
+  if ( token NE NULL ) {
+     strcpy(hlvl1, token );
+     token = strtok( NULL, "." );
+     if ( token NE NULL )
+        strcpy(hlvl2, token );
+  }
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100,1,
+                  "High qualifiers 1=%s 2=%s", hlvl1, hlvl2);
+
+  if ( ( strlen(hlvl1) EQ 0 ) OR
+       ( strlen(hlvl2) EQ 0 )  )  {
+     rc=ESA_FATAL;
+     goto exit;
+  }
+
+
+  sprintf(command, "%%CTSALBK %s  %s %s ", UT100_TEMP_FILE,
+                    hlvl1, hlvl2);
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100,1, "command = %s", command);
+
+  /* IS10174
+  rc = ESA_CLI_exec_wait(EXECOUT_DDNAME, command, &tso_rc,
+                         envir->ctsamsg_dest,              * ps0295 *
+                         envir->ctsamsg_handle);           * ps0295 * */
+  rc = ESA_CLI_exec_wait(eoddn, command, &tso_rc,        /* IS10174 */
+                         &(envir->msg_admin_param));     /* IS10174 */
+ /*
+  *  Check alloaction results
+  */
+
+  if (rc EQ ESA_OK) {
+    if (tso_rc LT 4)
+       rc = ESA_OK;
+    else if (tso_rc LT 8)
+       rc = ESA_ERR;
+    else rc = ESA_FATAL;
+  }
+  else rc = ESA_FATAL;
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100,1,
+                  "ESA_CLI_exec_wait rc=%d TSO rc=%d", rc,tso_rc);
+
+ /*
+  *  Alloaction failed - issue error message
+  */
+
+  if ( rc NE ESA_OK )
+     CTSAMSG_print(RACF_CLEAN_ALLOC_FAILED,
+                   envir->ctsamsg_handle,                 /* ps0295 */
+                   NULL, envir->ctsamsg_dest,             /* ps0295 */
+                   UT100_TEMP_FILE);
+  else
+     rc = OS_MVS_ddinfo(UT100_TEMP_FILE , dsn, TRUE,
+                        envir->ctsamsg_dest,              /* ps0295 */
+                        envir->ctsamsg_handle, 0);        /* IS10174 */
+             /* IS10174 envir->ctsamsg_handle);          * ps0295 *  */
+
+ /*
+  */
+
+  sprintf(command, "  FREE FILE(%s)", UT100_TEMP_FILE);
+  ESA_DIAG_printf(PLT_COMP_CTSC100,1, "command = %s", command);
+
+  /* IS10174
+  rc = ESA_CLI_exec_wait(EXECOUT_DDNAME,
+                         command, &tso_rc,
+                         envir->ctsamsg_dest,              * ps0295 *
+                         envir->ctsamsg_handle);           * ps0295 * */
+  rc = ESA_CLI_exec_wait(eoddn, command, &tso_rc,        /* IS10174 */
+                         &(envir->msg_admin_param));     /* IS10174 */
+  if (rc EQ ESA_OK) {
+     if (tso_rc LT 4)
+        rc = ESA_OK;
+     else if (tso_rc LT 8)
+        rc = ESA_ERR;
+     else rc = ESA_FATAL;
+  }
+  else rc = ESA_FATAL;
+
+  ESA_DIAG_printf(PLT_COMP_CTSC100,1,
+                  "ESA_CLI_exec_wait rc=%d TSO rc=%d", rc,tso_rc);
+
+ exit :;
+
+  ESA_DIAG_exit(PLT_COMP_CTSC100, 1 , func , rc );
+  return rc;
+
+ }
+
+/**************************************************************
+*                                                             *
+* Subroutine name : remove_workfiles                          *
+*                                                             *
+* DESCRIPTION     : Remove workfiles                          *
+*                                                             *
+* INPUT           : none                                      *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : none                                      *
+*                                                             *
+**************************************************************/
+
+static  void  remove_workfiles (void)
+{
+
+ /*
+  *      Variables
+  */
+
+  int    i;
+  int    tso_rc;
+  char   command[100];
+  static char func[]="remove_workfiles";
+  char   eoddn[9] = EXECOUT_DDNAME;                    /* IS10174 */
+
+ /*
+  *      initialize
+  */
+
+  ESA_DIAG_enter (PLT_COMP_CTSC100, 1, func );
+
+
+ /*
+  *      loop on output records
+  */
+
+  for (i=0; i LT record_counter; i++) {
+
+      ut100_req_rec = ut100_req_table  + i;
+      ESA_DIAG_printf(PLT_COMP_CTSC100, 1,
+              "Table ptr=%X work file_name=%s records=%d object=%s",
+               ut100_req_rec , ut100_req_rec->file_name,
+               ut100_req_rec->records, ut100_req_rec->object );
+
+      if ( ut100_req_rec->records GT 0 ) {
+
+        /*
+         *  Invoke REXX:allocate new file
+         */
+
+         sprintf(command, "%%CTSADEL  %s", ut100_req_rec->file_name);
+
+         ESA_DIAG_printf(PLT_COMP_CTSC100,1, "command = %s", command);
+
+         /* IS10174
+         ESA_CLI_exec_wait(EXECOUT_DDNAME, command, &tso_rc,
+                           envir->ctsamsg_dest,            * ps0295 *
+                           envir->ctsamsg_handle);         * ps0295 * */
+         ESA_CLI_exec_wait(eoddn, command, &tso_rc,      /* IS10174 */
+                           &(envir->msg_admin_param));   /* IS10174 */
+      }     /* Was found object with inf after ut100 utility */
+
+  }
+
+ /*
+  *      Finish
+  */
+
+  exit:;
+
+  ESA_DIAG_exit(PLT_COMP_CTSC100, 1, func, ESA_OK);
+
+}
+

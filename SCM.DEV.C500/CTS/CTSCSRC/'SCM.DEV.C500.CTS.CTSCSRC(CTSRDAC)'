@@ -1,0 +1,381 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Delete an ACE from a resource ACL (RACF) *
+ *                                                             *
+ * File Name        : ctsrdac.c                                *
+ *                                                             *
+ * Author           : Doron Cohen                              *
+ *                                                             *
+ * Creation Date    : 22/05/94                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * PS0238   Alex    16/02/98  Refresh GENERIC                  *
+ * PS0252   Guy     13/04/98  Common code changes              *
+ * PS0288   Alex    30/06/98  WHEN.SYSID support               *
+ * WS2517   Michael 19/10/03  Add quoted to RACF commands      *
+ * IS0272   Michael 10/06/04  Update RACF 3.2.0 with old fixes *
+ * IS10174  NuritY  31/12/17  Dynamic EXECOUT support.         *
+ * WS10082  AvnerL  02/10/23  Recompile & allow 16K volumes    *
+ **************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_API
+ #include ESA_API_CODES
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_OS_CLI
+
+ /*
+  *   RACF include files
+  */
+
+ #include RACF_CODES
+ #include API_ADDINFO
+ #include RACF
+ #include RACF_RES
+
+
+ static char component[]="DELACE"  ;
+
+ /*
+  *     MKT for PERMIT
+  *         (Mandatory Keywords Table)
+  */
+
+ static ADDINFO_MKTE_rec_typ mkt[] = {
+    "DELETE",
+    "ID",
+    "CLASS",
+    ""         /* a null string indicate end-of-mkt */
+  };
+
+ /*
+  *     RKT for delace
+  *         (Reserved Keywords Table)
+  */
+
+ static ADDINFO_RKTE_rec_typ rkt[] = {
+    "DELETE",
+    "ID",
+    "CLASS",
+    ""         /* a null string indicate end-of-rkt */
+  };
+
+ /*
+  *     KDT for PERMIT COMMAND
+  *         (Keyword Decscription Table)
+  */
+
+ static ADDINFO_KDTE_rec_typ kdt[] =      {
+
+  /*                                                            */
+  /* keyword             type   negative       value delimiters */
+  /*                             value                          */
+  /* =================== ====== ============== ================ */
+
+   {"UNIT"               ,KDT_IGN ,""          ,"(" , ")" },
+   {"CLASS"              ,KDT_KEY ,""          ,"(" , ")" },
+   {"ACCESS"             ,KDT_IGN ,""          ,"(" , ")" },
+   {"VOLUME"             ,KDT_KEY ,""          ,"(" , ")" },
+   {"GENERIC"            ,KDT_FLG ,""          ,""  , ""  },
+   {"DELETE"             ,KDT_FLG ,""          ,""  , ""  },
+   {"ID"                 ,KDT_KEY ,""          ,"(" , ")" },
+   {"WHEN.APPCPORT"      ,KDT_KEY ,""          ,"(" , ")" },
+   {"WHEN.CONSOLE"       ,KDT_KEY ,""          ,"(" , ")" },
+   {"WHEN.JESINPUT"      ,KDT_KEY ,""          ,"(" , ")" },
+   {"WHEN.PROGRAM"       ,KDT_KEY ,""          ,"(" , ")" },
+   {"WHEN.TERMINAL"      ,KDT_KEY ,""          ,"(" , ")" },
+   {"WHEN.SYSID"         ,KDT_KEY ,""          ,"(" , ")" },/* PS0288 */
+   {""                   ,KDT_FLG ,"      "    ,""  , ""  }};
+
+ /**************************************************************
+ *                                                             *
+ * Procedure Name : delace                                     *
+ *                                                             *
+ * Description    : Disconnect user/group from resource        *
+ *                                                             *
+ * Input          : resource, ACE, addinfo, admin              *
+ *                                                             *
+ * Output         : err                                        *
+ *                                                             *
+ * Return Value   : ESA_RC                                     *
+ *                                                             *
+ * Side Effects   :                                            *
+ *                                                             *
+ * Comments       : 1. addinfo contains the requested          *
+ *                     permissions.                            *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC CTSDelACE (RES_PARAMS_rec_typ   * res_params_ess,
+            /*     ADDINFO_rec_typ      * res_addinfo_ess,  PS0252 */
+                   ACE_rec_typ          * ace,
+                   ADDINFO_rec_typ      * addinfo,
+                   ADMIN_PARAMS_rec_typ * admin_params,
+                   ERR_STRUCT_rec_typ   * err)
+ {
+
+   static char                func[]="CTSDelACE";
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc, chk_rc;
+   ADDINFO_rec_typ       * res_addinfo = NULL;
+   RES_PARAMS_rec_typ      res_params_tmp;
+   RES_PARAMS_rec_typ    * res_params = &res_params_tmp;
+   char                    cmd[MAX_API_ST];
+   ADDINFO_rec_ptr         laddinfo = NULL;
+   ADDINFO_rec_ptr         addinfo_vec[3] = { NULL, NULL, NULL };
+   CTSAMSG_HANDLE_rec_ptr  msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr dest;
+   int                     generic_flag = 0;
+   char                    objid[RCF_USER_NAME_LEN+1];
+   /*WS10082 char          volume[RCF_ADDINFO_VAL_LEN+1]=NULL_STRING;*/
+   char           volume[ADDINFO_16K_VAL_LEN+1]=NULL_STRING;/*WS10082*/
+   ONE_FIELD_rec_ptr       gen_pair;
+   ONE_FIELD_rec_ptr       vol_pair;
+   ONE_FIELD_rec_ptr       ace_acc;
+   ONE_FIELD_rec_ptr       ace_pair;
+   char                    racf_dataset_quotes[4];  /* WS2517 */
+  #define RACF_DATASET_QUOTES "RACF_DATASET_QUOTES" /* WS2517 */
+   ESA_RC prm_rc;                                   /* WS2517 */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_DELACE, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+  /*
+   *  Build addinfo_res from resource name
+   */
+
+   rc = RCFRES_build_res_addinfo(res_params_ess, res_params,
+                                 &res_addinfo, dest, msgs);
+   if (rc NE ESA_OK)
+     goto exit;
+
+  /*
+   *   Check that Reserved Keywords were not used
+   */
+
+   if (ADDINFO_rkt_check(func,1,&addinfo,rkt,
+                         dest, msgs ) NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *   Check for valid ACE (non duplicate WHEN.)
+   */
+
+   chk_rc = ADDINFO_dup_check(addinfo,"WHEN.", RCF_ADDINFO_KWD_LEN,
+                              FALSE,     /* ps0288 */
+                              &ace_pair, dest ,msgs);
+   if (chk_rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }    /* duplicate WHEN. */
+
+  /*
+   *   Check resource existance
+   */
+
+   gen_pair = ADDINFO_search("GENERIC", RCF_ADDINFO_KWD_LEN,
+                              res_addinfo->pair,
+                              res_addinfo->num_pairs);
+   if ( gen_pair NE NULL)
+      if ( strcmp(gen_pair->value,KWD_FLAG_ON) EQ 0 )
+         generic_flag = 1;
+
+   if ( ( generic_flag EQ 0 ) AND
+        ( strcmp(res_params->restype, "DATASET" ) EQ 0 ) ) {
+
+     vol_pair = ADDINFO_search("VOLUME", RCF_ADDINFO_KWD_LEN,
+                                res_addinfo->pair,
+                                res_addinfo->num_pairs);
+     if ( vol_pair NE NULL)
+        strcpy( volume, vol_pair->value );
+
+   }
+
+   ESA_DIAG_printf(ESA_COMP_DELACE, 1,
+          "Checking resource %s %s existance generic=%d volume=%s",
+           res_params->restype, res_params->resource,
+           generic_flag, volume );
+
+   chk_rc = RACF_chk_res(res_params->restype, res_params->resource,
+                         volume,
+                         generic_flag, OBJ_EXIST, TRUE, dest, msgs);
+   if ( chk_rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   if (ace->ace_type EQ ACE_TYPE_GROUP)
+      strcpy(objid, ace->ug_name);
+   else if ( ace->ace_type EQ ACE_TYPE_USER )
+      strcpy(objid, ace->user_name);
+   else if ( ace->ace_type EQ ACE_TYPE_WORLD )
+      strcpy(objid, "*");
+   else
+      strcpy(objid, ace->user_name);
+
+  /*
+   *   Check ACE existance
+   */
+
+   ace_acc = ADDINFO_search("ACCESS", RCF_ADDINFO_KWD_LEN,
+                             addinfo->pair, addinfo->num_pairs);
+   if ( ace_acc EQ NULL ) {
+      CTSAMSG_print(RACF_MANDATORY_MISS, msgs, NULL, dest,"ACCESS");
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   if (ace_pair NE NULL)
+      chk_rc = RACF_chk_cond_ace(res_params->restype,
+                                 res_params->resource,
+                                 volume,
+                                 generic_flag,
+                                 objid,              /* res_object */
+                                 ace_acc->value,     /* res_access */
+                                 ace_pair->keyword,  /* res_wtype  */
+                                 ace_pair->value,    /* res_wname  */
+                                 OBJ_EXIST,
+                                 TRUE,               /* msg_flag   */
+                                 dest, msgs);
+
+   else
+      chk_rc = RACF_chk_ace(res_params->restype,
+                            res_params->resource,
+                            volume,
+                            generic_flag,
+                            objid,                   /* res_object */
+                            ace_acc->value,          /* res_access */
+                            OBJ_EXIST,
+                            TRUE,                    /* msg_flag   */
+                            dest, msgs);
+
+   if ( chk_rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *   Create a local additional info buffer
+   */
+
+   if (ADDINFO_alloc(func, 5, &laddinfo, dest, msgs) NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   addinfo_vec[0] = laddinfo;
+   addinfo_vec[1] = addinfo;
+   addinfo_vec[2] = res_addinfo;
+
+  /*
+   *   Add  ID and CLASS to local addinfo
+   */
+
+   ESA_DIAG_printf(ESA_COMP_DELACE, 1,
+                   "Inserting paramters to local addinfo");
+
+   /* CLASS parameter */
+
+   ADDINFO_insert(TYPE_1A, "CLASS", res_params->restype, laddinfo,
+                  RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                  UNIQUE);
+
+   /* ID parameter */
+
+   ADDINFO_insert(TYPE_1A, "ID", objid, laddinfo,
+                  RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                  UNIQUE);
+
+   /* DELETE parameter */
+
+   ADDINFO_insert(TYPE_1A, "DELETE", KWD_FLAG_ON, laddinfo,
+                  RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                  UNIQUE);
+
+  /*
+   *   PERMIT command
+   */
+
+   prm_rc = admin_params->cs_func.rssprm_get_opt_ptr      /* WS2517 */
+                             (admin_params->rss_name,     /* WS2517 */
+                             RACF_DATASET_QUOTES,         /* WS2517 */
+                             1,                           /* WS2517 */
+                             racf_dataset_quotes,         /* WS2517 */
+                             OPT_TRUE,                    /* WS2517 */
+                             OPT_FALSE);                  /* WS2517 */
+             if (prm_rc NE ESA_OK)                        /* WS2517 */
+               racf_dataset_quotes[0] = 'N'; /* Default=N    WS2517 */
+                                                          /* WS2517 */
+  if ( racf_dataset_quotes[0] EQ 'Y')                     /* WS2517 */
+   sprintf(cmd,"PERMIT '%s' ",res_params->resource);      /* WS2517 */
+  else                                                    /* WS2517 */
+   sprintf(cmd,"PERMIT %s ",res_params->resource);
+   ESA_DIAG_printf(ESA_COMP_DELACE, 1,
+                   "Command header prepared (%s)", cmd);
+   rc = racfcmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+                cmd, MAX_OK_RC_4,
+                3, addinfo_vec, mkt, kdt,                /* IS10174 */
+                admin_params,                            /* IS10174 */
+                CMDOUT_YES, RACF_YES);
+     /* IS10174 3, addinfo_vec, mkt, kdt, dest, msgs,    */
+
+  /*
+   *   Refresh based on resource class
+   */
+
+   if ( rc EQ ESA_OK )
+    RACF_refresh(res_params_ess->resource,      /* ps0239 */
+                 res_params_ess->restype,       /* ps0239 */
+                 admin_params, dest,msgs);      /* ps0239 */
+  /*
+   *   Finish
+   */
+
+   exit:;
+
+   ADDINFO_free(&laddinfo);
+   ADDINFO_free(&res_addinfo);
+
+   ESA_DIAG_exit(ESA_COMP_DELACE, 1, func, rc);
+
+   return rc;
+
+ }

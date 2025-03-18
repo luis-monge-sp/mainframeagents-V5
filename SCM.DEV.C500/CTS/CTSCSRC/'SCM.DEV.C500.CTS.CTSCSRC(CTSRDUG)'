@@ -1,0 +1,796 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Delete a user group (RACF)               *
+ *                                                             *
+ * File Name        : ctsrdug.c                                *
+ *                                                             *
+ * Author           : Doron Cohen                              *
+ *                                                             *
+ * Creation Date    : 22/06/94                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ *                                                             *
+ * as1506   A.Shv    15/06/95 call to new racf check program   *
+ * spr136   Alex     30/07/95 Add new logic of cmdfile process *
+ * spr138   Alex     31/07/95 STDERR ( memcpy failed ) in      *
+ *                            RACF_extract_field routine       *
+ * as0801   Alex     08/01/96 Replace TRACEOFF to TRACEON      *
+ * as1101   Alex     08/01/96 Replace TRACEON  to TRACEOFF     *
+ * BSAR1011 A.SH     17/09/96 Delete group option SUPGRP is    *
+ *                            ignored by API, invalid field    *
+ *                            length calculation               *
+ * is0328   yonatan  01/12/05 update parent group              *
+ * SAS2IBMT SeligT   30/06/16 SAS/C to IBM C Conversion Project*
+ * IS10174  NuritY   31/12/17 Dynamic EXECOUT support.         *
+ * WS10082  MauriC&AL07/12/22 Changes for new ADDINFO structure*
+ * WS10082N NuritY   21/09/23 Changes for new ADDINFO structure*
+ *                            Few changes only because all     *
+ *                            values are expected to be short. *
+ **************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+ #include   TIME
+ #include   ERRNO                                         /* SAS2IBMT */
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_API
+ #include ESA_API_CODES
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_OS_CLI
+
+ /*
+  *   RACF include files
+  */
+
+ #include RACF_CODES
+ #include API_ADDINFO
+ #include RACF
+ #include RACF_UT100
+
+ static   char   component[]="DELGROUP";
+
+ /*
+  *     Delete option conversion table
+  */
+
+  /* SAS2IBMT REVOKE is not supported
+  typedef enum {
+     DEL_UNDEF, DEL_REVOKE, DEL_DELETE, DEL_SCAN, DEL_FULL, DEL_FORCE
+  } RACF_DELETE_OPT_typ;                                             */
+  typedef enum {
+     DEL_UNDEF, DEL_DELETE, DEL_SCAN, DEL_FULL, DEL_FORCE
+  } RACF_DELETE_OPT_typ;                                 /* SAS2IBMT */
+
+  typedef struct {
+        char                * opt_str;
+        RACF_DELETE_OPT_typ   opt_code;
+  }  RACF_DELETE_OPTCONV_TABLE_rec_typ;
+
+  static RACF_DELETE_OPTCONV_TABLE_rec_typ opt_table[] = {
+    { "DELETE", DEL_DELETE },
+    { "SCAN"  , DEL_SCAN   },
+    { "FULL"  , DEL_FULL   },
+    { "FORCE" , DEL_FORCE  },
+    { ""      , DEL_DELETE }
+  };
+
+ /*
+  *     MKT for DELUG
+  *         (Mandatory Keywords Table)
+  */
+
+ static ADDINFO_MKTE_rec_typ mkt[] = {
+       ""         /* a null string indicate end-of-mkt */
+  };
+
+ /*
+  *     KDT for DELGROUP COMMAND
+  *         (Keyword Decscription Table)
+  */
+
+ static ADDINFO_KDTE_rec_typ kdt[] =      {
+
+  /*                                                            */
+  /* keyword             type   negative       value delimiters */
+  /*                             value                          */
+  /* =================== ====== ============== ================ */
+
+   {"CMDFILE"              ,KDT_IGN ,""            ,""   ,"" },
+   {"DELAY"                ,KDT_IGN ,""            ,""   ,"" },
+   {"MODE"                 ,KDT_IGN ,""            ,""   ,"" },
+   {"REPLACE"              ,KDT_IGN ,""            ,""   ,"" },
+   {"SUPGRP"               ,KDT_IGN ,""            ,""   ,"" },
+   {"CONNECT_OWNER"        ,KDT_IGN ,""            ,""   ,"" },
+   {"DS_OWNER"             ,KDT_IGN ,""            ,""   ,"" },
+   {"GENRES_OWNER"         ,KDT_IGN ,""            ,""   ,"" },
+   {"GROUP_OWNER"          ,KDT_IGN ,""            ,""   ,"" },
+   {"USER_OWNER"           ,KDT_IGN ,""            ,""   ,"" },
+   {"RESOWNER"             ,KDT_IGN ,""            ,""   ,"" },
+   {""                     ,KDT_FLG ,""            ,""   ,"" }
+
+   };
+
+ static  char          FF = '\xFF' ;
+ #define DELGROUP_REQUEST   "DELGROUP"
+ #define RACF_DELAY_DELGRP  "RCF_DELAY_DELGRP"
+
+ static ESA_RC chk_delay_enabl(ADMIN_PARAMS_rec_typ      * admin_params,
+                               char                      * keyword,
+                               CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                               CTSAMSG_HANDLE_rec_ptr      msgs);
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : delug                                      *
+ *                                                             *
+ * DESCRIPTION    : Delete a RACF user group                   *
+ *                                                             *
+ * INPUT          :                                            *
+ *                                                             *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC CTSDelUG (UG_PARAMS_rec_typ    * ug_params,
+                  ADDINFO_rec_typ      * addinfo,
+                  ADMIN_PARAMS_rec_typ * admin_params,
+                  ERR_STRUCT_rec_typ   * err)
+ {
+
+   static char                   func[]="CTSDelUG";
+
+  /*
+   *     Variables
+   */
+
+   ESA_RC                        rc, chk_rc;
+   char                          cmd[MAX_API_ST];
+   char                          supgrp_val[10];  /* Extract buffer */
+   int                           supgrp_len = 8;  /* Extract buffer */
+                                      /*    =8 - see spr138 */
+   RACF_UT100_ID_typ             replace;
+   CTSAMSG_HANDLE_rec_typ      * msgs;
+   CTSAMSG_DEST_TABLE_rec_typ  * dest;
+   RACF_DELETE_OPTIONS_rec_typ   opts;
+   ONE_FIELD_rec_typ           * cpair;
+   ONE_FIELD_rec_typ           * dly_pair, * del_pair;
+   int                           i;
+   ADDINFO_rec_typ             * laddinfo = NULL;
+   char                          fnr[MAX_FILENAME_LEN+1];
+   FILE                        * fr;
+   RACF_DELETE_OPT_typ           del_opt;
+   RACF_UT100_ID_typ             racf_id;
+   char                          old_supgrp[10];   /* is0328 */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_DELUG, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   if (ADDINFO_alloc(func, 1,&laddinfo, dest, msgs) NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *  Fail the request for group SYS1
+   */
+
+   if (  (strcmp(ug_params->group, "SYS1") EQ 0) OR
+         (strcmp(ug_params->group, "sys1") EQ 0)     ) {
+      CTSAMSG_print(RACF_SYS1_NODELETE, msgs, NULL, dest );
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *  Check that delete flag was specified
+   */
+
+   del_pair = ADDINFO_search("MODE", RCF_ADDINFO_KWD_LEN,
+                             addinfo->pair,
+                             addinfo->num_pairs);
+   if (del_pair EQ NULL) {
+      CTSAMSG_print(RACF_MANDATORY_MISS,   msgs, NULL, dest, "MODE");
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   ESA_DIAG_printf(ESA_COMP_DELUG, 1,
+                   "DELETE parameter found. %s=%s",
+                   del_pair->keyword, del_pair->value);
+
+  /*
+   *   Convert delete option string to a token
+   */
+
+   del_opt = DEL_UNDEF;
+   for (i=0; strlen(opt_table[i].opt_str) GT 0; i++)
+       if (strcmp(del_pair->value,opt_table[i].opt_str) EQ 0) {
+          del_opt = opt_table[i].opt_code;
+          break;
+       }
+
+   if (del_opt EQ DEL_UNDEF) {
+      CTSAMSG_print(RACF_UNDEF_OPTION,   msgs, NULL, dest,
+                    "MODE", del_pair->value );
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   ESA_DIAG_printf(ESA_COMP_DELUG, 1,
+                   "DELETE parameter converted to %d",del_opt);
+
+  /*
+   *  For DELETE mode check group's existance
+   */
+
+   if (del_opt EQ DEL_DELETE) {
+     chk_rc = RACF_chk_group(ug_params->group, OBJ_EXIST,
+                             TRUE, dest, msgs);
+     if ( chk_rc NE ESA_OK ) {
+        rc = ESA_FATAL;
+        goto exit;
+     }
+   }
+
+  /*
+   *  Get SUPGROUP
+   */
+
+  /***************** is0328 part 1 start ************************/
+  /* getting the supgroup of current group before it's deleted. */
+   rc = RACF_extract_field("GROUP ", ug_params->group, "BASE ",
+                          "SUPGROUP", old_supgrp, &supgrp_len,
+                          dest , msgs );
+   old_supgrp[8] = NULL_CHAR;
+   if (rc NE ESA_OK )
+      ESA_DIAG_printf(ESA_COMP_DELUG, 10,
+         "Failed to get SUPGROUP of %s",ug_params->group);
+   else
+      ESA_DIAG_printf(ESA_COMP_DELUG, 10,
+         "SUPGROUP of %s is : %s",ug_params->group,old_supgrp);
+  /********************** is0328 part 1 end ***********************/
+
+  /*
+   *  Search delay option.
+   */
+
+   dly_pair = ADDINFO_search("DELAY", RCF_ADDINFO_KWD_LEN,
+                             addinfo->pair,
+                             addinfo->num_pairs);
+   if ( dly_pair NE NULL)
+     if (strcmp(dly_pair->value, KWD_FLAG_OFF ) EQ 0)
+        dly_pair = NULL;
+
+  /*
+   *   Check ug dataset profiles existance
+   *   if no DELAY=Y option requested
+   */
+
+   if ( dly_pair EQ NULL) {
+     if ( (del_opt EQ DEL_FULL) OR (del_opt EQ DEL_DELETE) ) {
+        ESA_DIAG_printf(ESA_COMP_DELUG, 1,
+                        "Checking hi level ds %s existance",
+                        ug_params->group);
+        chk_rc = RACF_chk_hilvds(ug_params->group, OBJ_NOT_EXIST,
+                                 TRUE, dest, msgs);
+        if ( chk_rc EQ ESA_ERR ) {
+           CTSAMSG_print(RACF_GRPDS,   msgs, NULL, dest,
+                         ug_params->group);
+           rc = ESA_FATAL;
+           goto exit;
+        }      /* racfchck erorr               */
+     }         /* FULL or DELETE option        */
+   }           /* No DELAY process requested   */
+
+  /*
+   *    Delay process handling
+   */
+
+   if ( dly_pair NE NULL) {
+
+       /*
+        *  Check enable/disable delay delete processing
+        */
+
+        rc=chk_delay_enabl(admin_params,
+                           RACF_DELAY_DELGRP,
+                           dest, msgs);
+        if ( rc NE ESA_OK )  /* Delay delete processing disable */
+          goto exit;
+
+        if ( del_opt EQ DEL_DELETE ) {
+           CTSAMSG_print(RACF_ERR_UNSUPP_DELAY,   msgs, NULL, dest,
+                         del_pair->value );
+           rc = ESA_FATAL;
+           goto exit;
+        }
+   }
+
+  /*
+   *  Scan RACF database if delete=scan/full/force
+   */
+
+   if (   (del_opt EQ DEL_SCAN) OR
+          (del_opt EQ DEL_FULL) OR
+          (del_opt EQ DEL_FORCE)   ) {
+
+       strcpy(opts.id, ug_params->group);
+
+      /*
+       *  Obtain ug details for superior group
+       */
+
+        ESA_DIAG_printf(ESA_COMP_DELUG, 1,
+                        "Obtaining ug %s details", ug_params->group);
+
+        memset(supgrp_val, BLANK, sizeof(supgrp_val) );
+        rc = RACF_extract_field("GROUP ", ug_params->group, "BASE ",
+                                "SUPGROUP", supgrp_val, &supgrp_len,
+                                dest , msgs );
+        supgrp_val[sizeof(supgrp_val)-1] = NULL_CHAR;
+
+        ESA_DIAG_printf(ESA_COMP_DELUG, 1,
+                        "ug %s SUPGROUP=%d/%s",
+                        ug_params->group, supgrp_len, supgrp_val);
+
+      /*
+       *   Serious error during acces to RACF database
+       */
+
+       if ( rc EQ ESA_FATAL) {
+          CTSAMSG_print(RACF_UG_NODELETE, msgs, NULL, dest,
+                        ug_params->group );
+          goto exit;
+       }
+
+      /*
+       *    Profile not found
+       */
+
+       else if ( rc EQ ESA_ERR) {
+          CTSAMSG_print(ERR_NO_GROUP, msgs, NULL, dest,
+                        ug_params->group );
+          strcpy(opts.sup_grp, "?");
+       }
+
+      /*
+       *    Superior group returned
+       */
+
+       else {
+         if (supgrp_val[7] EQ BLANK) {
+            supgrp_len = strchr(supgrp_val, BLANK) - supgrp_val;
+  /*  Deleted by BSAR1011   supgrp_val[supgrp_len-1] = NULL_CHAR; */
+            supgrp_val[supgrp_len] = NULL_CHAR;  /* BSAR1011 */
+         }
+         ESA_DIAG_printf(ESA_COMP_DELUG, 1,
+                         "Group=%s Supgrp=%s",
+                         ug_params->group, supgrp_val);
+         strcpy(opts.sup_grp, supgrp_val);
+       }
+       strcpy(opts.dfltgrp, NULL_STRING);
+
+       /* force option  */
+
+       if ( del_opt EQ DEL_FORCE )
+        opts.dsnforce = RACF_YES;
+       else opts.dsnforce = RACF_NO;
+
+       /* clear detailed options  */
+
+       strcpy(opts.cmdfile,"");  /* command file */
+       strcpy(opts.wrkfile,"");  /* work    file */
+
+       /* handle global substitue option */
+
+       cpair = ADDINFO_search("REPLACE", RCF_ADDINFO_KWD_LEN,
+                               addinfo->pair,
+                               addinfo->num_pairs);
+       if (cpair NE NULL) {
+          if (strlen(cpair->value) NE 0) {
+             strcpy(replace, cpair->value );
+             strcpy(opts.ds_owner,cpair->value);
+             strcpy(opts.grp_owner,cpair->value);
+             strcpy(opts.usr_owner,cpair->value);
+             strcpy(opts.gen_owner,cpair->value);
+             strcpy(opts.cnct_owner,cpair->value);
+             strcpy(opts.resown_id,cpair->value);
+             strcpy(opts.new_dfltgrp,cpair->value);
+          }
+       }
+       else {
+          strcpy(replace, "");
+          strcpy(opts.ds_owner,"");
+          strcpy(opts.grp_owner,"");
+          strcpy(opts.usr_owner,"");
+          strcpy(opts.gen_owner,"");
+          strcpy(opts.cnct_owner,"");
+          strcpy(opts.resown_id,"");
+          strcpy(opts.new_dfltgrp,"");
+       }
+
+       /* scan specified options */
+
+       cpair = addinfo->pair;
+       for (i=0; i LT addinfo->num_pairs; i++) {
+           /* WS10082N ESA_DIAG_printf(ESA_COMP_DELUG, 1,
+                           "%s=%s", cpair->keyword, cpair->value);  */
+           ESA_DIAG_printf(ESA_COMP_DELUG, 1,               /*WS10082N*/
+                           "%s=%*.s (%d)",                  /*WS10082N*/
+                           cpair->keyword, cpair->value,    /*WS10082N*/
+                           ((cpair->twin NE cpair) ? 100 :  /*WS10082N*/
+                                             cpair->vallen),/*WS10082N*/
+                            cpair->vallen);                 /*WS10082N*/
+
+           if (strcmp(cpair->keyword,"CMDFILE") EQ 0)
+              strcpy(opts.cmdfile,cpair->value);
+           else if (strcmp(cpair->keyword,"DS_OWNER") EQ 0)
+              strcpy(opts.ds_owner,cpair->value);
+           else if (strcmp(cpair->keyword,"GROUP_OWNER") EQ 0)
+              strcpy(opts.grp_owner,cpair->value);
+           else if (strcmp(cpair->keyword,"USER_OWNER") EQ 0)
+              strcpy(opts.usr_owner,cpair->value);
+           else if (strcmp(cpair->keyword,"GENRES_OWNER") EQ 0)
+              strcpy(opts.gen_owner,cpair->value);
+           else if (strcmp(cpair->keyword,"CONNECT_OWNER") EQ 0)
+              strcpy(opts.cnct_owner,cpair->value);
+           else if (strcmp(cpair->keyword,"RESOWNER") EQ 0)
+              strcpy(opts.resown_id,cpair->value);
+           else if (strcmp(cpair->keyword,"DFLTGRP") EQ 0)
+              strcpy(opts.new_dfltgrp,cpair->value);
+
+ /*----------------------------------------------------------*
+  * Deleted by BSAR1011                                      *
+  *       else if (strcmp(cpair->keyword,"SUPGROUP") EQ 0)   *
+  *----------------------------------------------------------*/
+
+           else if (strcmp(cpair->keyword,"SUPGRP") EQ 0) /*BSAR1011*/
+              strcpy(opts.sup_grp,cpair->value);
+           cpair++;   /* WS10082N - all are expectd to be short */
+       }
+
+       ESA_DIAG_printf(ESA_COMP_DELUG, 1,
+                       "Superior grp  = %s", opts.sup_grp);
+       ESA_DIAG_printf(ESA_COMP_DELUG, 1,
+                       "Command file  = %s", opts.cmdfile);
+       ESA_DIAG_printf(ESA_COMP_DELUG, 1,
+                       "DS_Owner      = %s", opts.ds_owner);
+       ESA_DIAG_printf(ESA_COMP_DELUG, 1,
+                      "Group_Owner   = %s", opts.grp_owner);
+       ESA_DIAG_printf(ESA_COMP_DELUG, 1,
+                       "User_Owner    = %s", opts.usr_owner);
+       ESA_DIAG_printf(ESA_COMP_DELUG, 1,
+                       "Genres_Owner  = %s", opts.gen_owner);
+       ESA_DIAG_printf(ESA_COMP_DELUG, 1,
+                       "Connect_Owner = %s",opts.cnct_owner);
+       ESA_DIAG_printf(ESA_COMP_DELUG, 1,
+                       "Resowner      = %s", opts.resown_id);
+       ESA_DIAG_printf(ESA_COMP_DELUG, 1,
+                       "New Dfltgrp   = %s", opts.new_dfltgrp);
+
+     /*
+      *  Handle delayed processing (for delete/scan/full/force)
+      */
+
+      if ( dly_pair NE NULL) {
+         ESA_DIAG_printf(ESA_COMP_DELUG, 1,
+                         "Delayed processing requested");
+
+         CTSAMSG_print(RACF_UG_NODELETE,
+                       msgs, NULL, dest, opts.id );
+
+        /*
+         *   Back to CS - server authority
+         */
+
+         rc = CTSRSSLogout (admin_params->rss_name,
+                            admin_params->admin_uname,
+                            admin_params->admin_gname,
+                            LOGOUT_MODE,
+                            &(admin_params->login_handle),
+                            admin_params, err);
+         if ( rc NE ESA_OK ) {
+           CTSAMSG_print(RACF_DELAY_REQUEST_NO_SAVED,
+                         msgs, NULL, dest, opts.id);
+           goto exit;
+         }
+
+         rc = UT100_write_request(DELGROUP_REQUEST,
+                                  del_pair->value,
+                                  replace, &opts , admin_params);
+        /*
+         *   Back to administrator authority
+         */
+
+         CTSRSSLogin (admin_params->rss_name,
+                      admin_params->admin_uname,
+                      admin_params->admin_gname,
+                      "",
+                      LOGIN_MODE,
+                      &(admin_params->login_handle),
+                      admin_params, err);
+
+         if ( rc EQ ESA_OK ) {
+            CTSAMSG_print(RACF_DELAY_REQUEST_SAVED,
+                       msgs, NULL, dest, opts.id);
+            rc = ESA_WARN;
+         }
+         else
+            CTSAMSG_print(RACF_DELAY_REQUEST_NO_SAVED,
+                       msgs, NULL, dest, opts.id);
+         goto exit;
+      }
+
+      /* spr136 Start */
+      /*
+       *  If cmdfile is not supplied - allocate it
+       */
+
+       time(&opts.crttime); /* obtain created date, time */
+       if ( strlen(opts.cmdfile) EQ 0 ) {
+          rc=UT100_allocate(DELGROUP_REQUEST,
+                            ug_params->group, admin_params,
+                            opts.cmdfile, opts.crttime );
+          if ( rc NE ESA_OK )
+             goto exit;
+       }
+
+      /*
+       *  Check cmdfile accessability (and clear it ... )
+       */
+
+       if ( strlen(opts.cmdfile) GT 0 ) {
+          /* SAS2IBMT strcpy(fnr, "dsn:");                           */
+          strcpy(fnr,"//'");                              /* SAS2IBMT */
+          strcat(fnr, opts.cmdfile);
+          strcat(fnr,"'");                                /* SAS2IBMT */
+          fr = fopen( fnr, FILE_OPEN_WRITE_TEXT);
+          if (fr EQ NULL) {
+             CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                           "open","UT100_CLEANUP",fnr,strerror(errno));
+          }
+          fputs("/* File was cleared for RACF cleanup commands */", fr);
+          if (ferror(fr)) {
+             CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                           "put","UT100_CLEANUP",fnr,strerror(errno));
+             rc = ESA_FATAL;
+             goto exit;
+          }
+          fclose(fr);
+       }
+       else {
+          CTSAMSG_print(ERR_INTERNAL2,msgs,NULL,dest,
+                        component, func,"Invalid file name",
+                        "",__LINE__);
+          goto exit;
+       }
+
+      /* spr136 End   */
+
+      /*
+       *  Activate IRRUT100 to find group occurences in RACF database
+       */
+
+       strncpy( racf_id, ug_params->group, sizeof(racf_id) );
+
+       rc = UT100_activate(&racf_id,1,dest,msgs);
+
+       if (rc NE ESA_OK) {
+          CTSAMSG_print(RACF_UT100ACT_ERR,   msgs, NULL, dest,
+                        "group", ug_params->group);
+          rc = ESA_FATAL;
+          goto exit;
+       }
+
+      /*
+       *  Analyze IRRUT100 output and produce cleanup commands
+       */
+
+       rc = UT100_analyze(&opts, dest, msgs);
+       if (rc NE ESA_OK) {
+          CTSAMSG_print(RACF_UT100ANL_ERR,   msgs, NULL, dest,
+                        "group", ug_params->group);
+          rc = ESA_FATAL;
+          goto exit;
+       }
+
+      /*
+       *  Execute cleanup commands if delete=full/force
+       */
+
+       if ( (del_opt EQ DEL_FULL) OR (del_opt EQ DEL_FORCE) ) {
+          strcat(opts.cmdfile,"' ");
+
+          /* as0801  delete, as1101 added */
+          strcat(opts.cmdfile,"'TRACEOFF");
+
+          /* as0801  added, as1101 deleted
+           * strcat(opts.cmdfile,"'TRACEON");
+           * -------------------------------- */
+
+          /* IS10174 rc = UT100_execute_file(&opts, dest, msgs);  */
+          rc = UT100_execute_file(&opts, admin_params);  /* IS10174 */
+          if (rc NE ESA_OK) {
+             rc = ESA_FATAL;
+             goto exit;
+          }
+       }
+
+   }
+
+  /*
+   *  Delete the ug, if delete was requested
+   */
+
+   if ( (del_opt EQ DEL_DELETE) OR
+        (del_opt EQ DEL_FULL)  OR
+        (del_opt EQ DEL_FORCE)   ) {
+
+       /*
+        *   Check ug existance (for delete only)
+        */
+
+        if (del_opt EQ DEL_DELETE) {
+           chk_rc = RACF_chk_group(ug_params->group, OBJ_EXIST,
+                                   TRUE, dest, msgs);
+           if ( chk_rc NE ESA_OK ) {
+              rc = ESA_FATAL;
+              goto exit;
+           }
+        }
+
+       /*
+        *   Execute the DELGROUP command
+        */
+
+        sprintf(cmd, "DELGROUP %s ", ug_params->group);
+
+        ESA_DIAG_printf(ESA_COMP_DELUG, 1,
+                       "Command header prepared (%s)", cmd);
+        rc = racfcmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+                     cmd, MAX_OK_RC_0,
+                     0, NULL, mkt, kdt, admin_params,    /* IS10174 */
+                     CMDOUT_YES, RACF_YES);
+          /* IS10174 0, NULL, mkt, kdt, dest, msgs,    */
+                            /************** IS0328 *******************/
+        if ( rc NE ESA_OK ) /* Skip subgroup field update for        */
+           goto exit;       /* SUPGROUP, when DG RACF command fails. */
+
+   }
+
+  /*
+   *  If the ug was not really deleted, set error code (to avoid
+   *  confusing of the CS since the ug is not really deleted) and
+   *  issue explaination message .
+   */
+
+   else {
+      CTSAMSG_print(RACF_DELETE_OPTION,   msgs, NULL, dest,
+                    ug_params->group, del_pair->value );
+      rc = ESA_ERR;
+      goto exit;
+   }
+
+  /*
+   *   Finish
+   */
+
+   /******************* IS0328 part 2 start **********************/
+   /* Updating the old supgroup by writing event to the queue */
+   if (strcmp(supgrp_val,"") NE 0)
+   {
+      rc = (admin_params->cs_func.intercept_set_ptr)
+                    (INTERCEPT_SPECIFIC,
+                     INTERCEPT_GROUP,
+                     NULL,
+                     NULL,
+                     old_supgrp);
+      if (rc NE ESA_OK )
+          ESA_DIAG_printf(ESA_COMP_DELUG, 10,
+              "Failed to write event for old supgroup %s",old_supgrp);
+      else
+          ESA_DIAG_printf(ESA_COMP_DELUG, 10,
+              "Write event for old supgroup %s",old_supgrp);
+   }
+   /******************* IS0328 part 2 end ************************/
+
+   exit:;
+
+   ADDINFO_free(&laddinfo);
+
+   ESA_DIAG_exit(ESA_COMP_DELUG, 1, func, rc);
+
+   return rc;
+
+ }
+
+/****************************************************
+ * Procedure Name: chk_delay_enabl
+ * Description   : Check enabling of delay processing
+ *
+ * Input         : admin_params
+ *                 keyword
+ *                 dest
+ *                 msgs
+ *
+ * Output        : None
+ *
+ * Input/Output  : admin, err
+ *
+ * Return Value  : ESA_OK     delay delete processing enable
+ *                 ESA_ERR    delay delete processing disable
+ ****************************************************/
+
+ static ESA_RC chk_delay_enabl(ADMIN_PARAMS_rec_typ      * admin_params,
+                               char                      * keyword,
+                               CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                               CTSAMSG_HANDLE_rec_ptr      msgs)
+  {
+
+   /*
+    *    Variables
+    */
+
+    ESA_RC       rc;
+    char         result[80];
+    static char  func[]="chk_delay_enabl";
+
+   /*
+    *    Initialize
+    */
+
+    ESA_DIAG_enter(ESA_COMP_DELUG, 1, func);
+
+    rc = admin_params->cs_func.rssprm_get_ptr(admin_params->rss_name,
+                                              keyword,
+                                              sizeof(result),result);
+    if (rc NE ESA_OK) {
+        CTSAMSG_print(RACF_DELAY_PARM_NOTFOUND,msgs,NULL,dest, keyword);
+        rc=ESA_ERR;
+    }
+
+    if (strcmp(result, KWD_FLAG_ON) NE 0) {
+        CTSAMSG_print(RACF_DELAY_DISABLE, msgs, NULL, dest);
+        rc=ESA_ERR;
+    }
+
+
+    ESA_DIAG_exit(ESA_COMP_DELUG, 1, func, rc);
+
+    return rc;
+
+  }
+

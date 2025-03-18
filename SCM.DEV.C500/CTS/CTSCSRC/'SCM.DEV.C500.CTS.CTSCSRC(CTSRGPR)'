@@ -1,0 +1,1101 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Get RSS parameters (RACF)                *
+ *                                                             *
+ * File Name        : ctsrgpr.c                                *
+ *                                                             *
+ * Author           : A.Shv                                    *
+ *                                                             *
+ * Creation Date    : 31/07/94                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * WSAR1001 Alex     29/04/96 Add Get RACF options facility    *
+ * ps0232   Alex     28/12/97 CDT retrieval support            *
+ * ps0391   AlexS    09/11/99 RACF 2.8  Support                *
+ * ps0436   ShmuelK  07/11/00 RACF 2.10 Support                *
+ * ps0484   ShmuelK  06/11/01 RACF z/os1.2 Support             *
+ * ws2457   Yonatan  08/03/02 Return SUPPORT_VERIFY_PASSWORD   *
+ * ps0490   Yonatan  08/03/02 Solve bug in ws2457              *
+ * ps0511   ShmuelK  24/06/02 RACF z/os1.4 Support             *
+ * WS2532   AmirH    12/05/04 RACF z/os1.5 Support             *
+ * IS0272   Michael 10/06/04  Update RACF 3.2.0 with old fixes *
+ * is0263   AvnerL   05/08/04 RACF z/os 1.6 Support            *
+ * is0322   AvnerL   03/08/05 RACF z/os 1.7 Support            *
+ * BS2703   yonim    26/03/06 Support Multi subgroup keyword   *
+ * is0369   AvnerL   06/09/06 RACF z/os 1.8 Support            *
+ * WS10004  AvnerL   05/06/07 Extend ICHEINTY & add SUBGROUP3  *
+ * WS10018  AvnerL   07/07/08 RACF z/os 1.10 Support           *
+ * IS10061  AvnerL   12/09/11 Support zOS 1.11,1.12,1.13       *
+ * IS10070  AvnerL   07/02/11 Update RACF versions supported   *
+ * IS10076  Nurity   23/01/13 Support Custom Fields.           *
+ * IS10080  AvnerL   24/01/13 Support zOS 2.1                  *
+ * IS10132  AvnerL   11/06/15 Support zOS 2.2                  *
+ * SAS2IBMT SeligT   09/10/16 SAS/C to IBM C Conversion Project*
+ * BS10053  AvnerL   27/10/16 Support zOS 2.2 with OA47956     *
+ *                            (Copied by Nurit form 3.3)       *
+ * SAS2IBMN NuritY   05/02/17 SAS/C to IBM C Conversion Project*
+ * IS10181  SeligT   06/06/19 Display Message When ADDINFO     *
+ *                            Value Is Too Large - No Change;  *
+ *                            Recompile Because of Larger      *
+ *                            RACF_OUTPUT_SIZE                 *
+ * IS10182  AvnerL   17/07/19 S0C4/S0C1 due to DIAG vsprintf   *
+ * WS10082  MauriC   24/11/22 Replace pair++ with ppair macro  *
+ * WS10082N NuritY   21/09/23 addinfo new structure.           *
+ **************************************************************/
+
+ #include <globs.h>
+
+/*
+ *    Standard include files
+ */
+
+ #include   STDLIB
+ #include   STRING
+ #include   STDIO
+
+/*
+ *    ESA include files
+ */
+
+ #include   ESA_API
+ #include   ESA_DIAG
+ #include   ESA_CTSAMSG
+ #include   ESA_API_CODES
+
+/*
+ *    RACF include files
+ */
+
+ #include   RACF_CODES
+ #include   RACF        /* WSAR1001 */
+ #include   RACF_RES    /* ps0232   */
+
+/*
+ *    Assebler program - get RSS parameters
+ */
+
+typedef struct S_RACF_RSS_PARAMS_rec_typ {   /* AJK018 */
+    int       min_pass_len;
+    int       max_expire;
+    int       max_logins;
+} RACF_RSS_PARAMS_rec_typ, *RACF_RSS_PARAMS_rec_ptr;
+
+ /* SAS2IBMT prototype changed for IBM C
+ int  ctsfrop(int                      *debug_level,
+              RACF_RSS_PARAMS_rec_typ  *rss_params);                 */
+ int  ctsfrop();                                          /* SAS2IBMT */
+
+
+ /*
+  *   PS0391. Assembler module. Get RACF version/release
+  */
+
+  /* SAS2IBMT prototype changed for IBM C
+  extern ESA_RC ctsfver(int         *debug_level,
+                        char        *racf_real_nm_version);          */
+  extern ESA_RC ctsfver();                                /* SAS2IBMT */
+
+ /* ps0232 */
+ static ESA_RC cdt_table_service(ADDINFO_rec_ptr             addinfo,
+                                 CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                                 CTSAMSG_HANDLE_rec_ptr      msgs);
+
+ static int RCF_cdt_compare (const void * cdt1,
+                             const void * cdt2);
+
+ static ESA_RC cdt_service_rc_check (int                         arc,
+                                     CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                                     CTSAMSG_HANDLE_rec_ptr      msgs);
+
+ /* ps0391 */
+ static ESA_RC RACF_convert_version(char                *racf_version,
+  /*IS0322 add parm*/              ADMIN_PARAMS_rec_typ * admin_params);
+  /* drop 2 other                  CTSAMSG_HANDLE_rec_typ     * msgs,
+                                   CTSAMSG_DEST_TABLE_rec_typ * dest);*/
+
+ /*  IS10076 - start   */
+static ESA_RC Handle_CFDEF_keywords(ADDINFO_rec_ptr     addinfo,
+                              ONE_FIELD_rec_ptr         cfdef_1st,
+                              ADMIN_PARAMS_rec_typ    * admin_params);
+
+static ESA_RC Set_CFDEF_keyword(ONE_FIELD_rec_ptr          p_pair,
+                             RACF_CUSTOM_FIELDS_block_ptr *p_block,
+                             int                          *p_entnum,
+                             ADMIN_PARAMS_rec_typ        *admin_params);
+ /*  IS10076 - end     */
+ typedef char CDT_ENTRY_typ [8]; /* Not NULL terminated string */
+
+ static char component[] = "CTSRGPR";
+
+/****************************************************
+ * Procedure Name : gtrsprm
+ * Description    : Get RSS parameters
+ * Input          :
+ * Output         : rss_params
+ * Input/Output   :
+ * Return Value   : ESA_RC
+ * Side Effects   :
+ * Comments       :
+ ***************************************************/
+
+ ESA_RC CTSGetRSSParams (RSS_PARAMS_rec_typ   * rss_params,
+                         ADDINFO_rec_typ      * addinfo,
+                         ADMIN_PARAMS_rec_typ * admin_params,
+                         ERR_STRUCT_rec_typ   * err)
+ {
+
+  /*
+   *   Variables
+   */
+
+   static char func[]="CTSGetRSSParams";
+   char                         racf_version[50];  /* RACF version */
+   CTSAMSG_HANDLE_rec_typ     * msgs;
+   CTSAMSG_DEST_TABLE_rec_typ * dest;
+   int                          rc_asm=0;
+   int                          debug_level;
+   int                          i;
+   int                          get_cdt_invoked = FALSE; /* ps0232 */
+   int                          get_cf_invoked = FALSE;  /* IS10076 */
+   ESA_RC                       rc = ESA_OK;
+   ONE_FIELD_rec_ptr            addinfo_pair;
+   RACF_RSS_PARAMS_rec_typ      racf_rss_params;
+   RACF_OPTIONS_rec_typ         work_area = {0,0,NULL};  /*WSAR1001*/
+   RACF_PARAMS_rec_typ        * params_ptr = NULL;       /* IS10076 */
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GTRSPRM, 1, func );
+
+   debug_level = ESA_DIAG_get_debug_level(ESA_COMP_GTRSPRM);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+   params_ptr = admin_params->apiinit_handle;             /* IS10076 */
+
+   /* PS0391. Get RACF version  */
+
+   /* SAS2IBMT
+   rc_asm=ctsfver(&debug_level, racf_version);                       */
+   rc_asm=(*(ASM_RTN_TYP *)&ctsfver)                      /* SAS2IBMT */
+                 (&debug_level, racf_version);
+   if ( rc_asm EQ 0 ) {
+     racf_version[4]=NULL_CHAR;  /* RACF version ID */
+  /* RACF_convert_version(racf_version, msgs, dest); chg parms IS0322*/
+     RACF_convert_version(racf_version, admin_params); /* IS0322 */
+     addinfo_pair = ADDINFO_search("RACF_VERSION_ID",
+                                    RCF_ADDINFO_KWD_LEN,
+                                    addinfo->pair,
+                                    addinfo->num_pairs);
+     if (addinfo_pair NE NULL) {
+      ADDINFO_updval(racf_version,
+                     RCF_ADDINFO_VAL_LEN, addinfo_pair );
+     }
+   }
+
+   /* ws2457 start PS0490 update only if keyword exists */
+   addinfo_pair = ADDINFO_search("SUPPORT_VERIFY_PWD",
+                          RCF_ADDINFO_KWD_LEN,
+                          addinfo->pair,
+                          addinfo->num_pairs);
+
+   if (addinfo_pair NE NULL)
+      ADDINFO_updval(KWD_FLAG_ON,
+                      RCF_ADDINFO_VAL_LEN, addinfo_pair);
+   /* ws2457 end   */
+
+   /* SAS2IBMT
+   rc_asm=ctsfrop(&debug_level, &racf_rss_params );                  */
+   rc_asm=(*(ASM_RTN_TYP *)&ctsfrop)                      /* SAS2IBMT */
+                 (&debug_level, &racf_rss_params );
+
+   ESA_DIAG_printf(ESA_COMP_GTRSPRM, 1,
+                  "max password len=%d max interval=%d max attempts=%d",
+                  racf_rss_params.min_pass_len,
+                  racf_rss_params.max_expire,
+                  racf_rss_params.max_logins);
+
+   if ( rc_asm NE 0 ) {
+        CTSAMSG_print(RACF_NOT_ACTIVE,msgs, NULL, dest);
+        rc=ESA_FATAL ;
+        goto exit;
+   }
+   else {
+
+        rss_params->min_pass_len =  racf_rss_params.min_pass_len;
+        if ( rss_params->min_pass_len EQ 0 )
+           rss_params->min_pass_len = EMPTY_NUMBER;
+
+        rss_params->max_expire   =  racf_rss_params.max_expire;
+        if ( rss_params->max_expire EQ 0 )
+           rss_params->max_expire = EMPTY_NUMBER;
+
+        rss_params->max_logins   =  racf_rss_params.max_logins;
+        if ( rss_params->max_logins EQ 0 )
+           rss_params->max_logins = EMPTY_NUMBER;
+   }
+
+  /* WSAR1001 */
+
+  /*
+   *    ADDINFO field processing
+   */
+
+   if (addinfo EQ NULL)
+      goto exit;
+
+   /*
+    *  Create Output buffer
+    */
+
+   work_area.buffer = malloc(RACF_OPTIONS_OUTPUT_BUF_LEN);
+   if ( work_area.buffer EQ NULL ) {
+      CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                   "OUTPUT BUFFER",
+                   RACF_OPTIONS_OUTPUT_BUF_LEN);
+      CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                   component, func, "MALLOC OUTPUT",
+                   8, __LINE__);
+      rc = ESA_FATAL;
+      goto exit ;
+   }
+
+   work_area.max_len = RACF_OPTIONS_OUTPUT_BUF_LEN;
+
+   /* addinfo num pairs */
+
+   ESA_DIAG_printf(ESA_COMP_GTRSPRM,3,
+                   "num_pairs = %d, max_pairs = %d",
+                   addinfo->num_pairs,addinfo->max_pairs);
+
+   /* addinfo pairs */
+
+   i = 0;
+   /* WS10082N addinfo_pair = addinfo->pair;  */
+   while ( i LT addinfo->num_pairs)
+   {
+     addinfo_pair = ppairi(addinfo_pair, i);         /* WS10082N */
+     ESA_DIAG_printf(ESA_COMP_GTRSPRM,4,
+                     "pair no. %3d: kwd=%s(%3d)",
+                     i+1, addinfo_pair->keyword,
+                     addinfo_pair->keylen);
+     if (memcmp(addinfo_pair->keyword,"CDT",3) EQ 0)       /* ps0232 */
+     {
+       if (NOT get_cdt_invoked)                            /* ps0232 */
+         rc = cdt_table_service(addinfo, dest, msgs);      /* ps0232 */
+       get_cdt_invoked = TRUE;                             /* ps0232 */
+     }                                                     /* ps0232 */
+     /*  IS10076 - start                                             */
+     else                                                  /* ps0232 */
+       /*  IS10076 - start  */
+       /*  Process Custom Fields, if supported.    */
+       if (memcmp(addinfo_pair->keyword,"CFDEF.",6) EQ 0)
+       {
+         if (params_ptr->rssparm_CUSTOM_FIELDS_SUPPORT[0] EQ 'Y'
+              AND
+             NOT get_cf_invoked)
+           rc = Handle_CFDEF_keywords(addinfo, addinfo_pair,
+                                      admin_params);
+         get_cf_invoked = TRUE;
+       }
+       else
+       /*  IS10076 - end  */
+         rc = RACF_get_option( addinfo_pair, &work_area,
+                               dest, msgs );
+       if ( rc NE ESA_OK )
+       {
+         rc = ESA_FATAL;
+         goto exit;
+       }
+
+     /* WS10082 addinfo_pair++;          */
+     i++;
+   }
+
+  exit :;
+
+   if ( addinfo )
+     if ( ESA_DIAG_get_debug_level(ESA_COMP_GTRSPRM) GE 5 )
+        ADDINFO_dump(addinfo,1);
+
+   if ( work_area.buffer NE NULL )
+      free(work_area.buffer);
+
+   ESA_DIAG_exit(ESA_COMP_GTRSPRM, 1, func, rc );
+   return rc;
+
+ }
+
+
+/* ps0232 */
+/****************************************************
+ * Procedure Name : cdt_table_service
+ * Description    : Get CDT table parameters
+ * Input          :
+ * Output         : rss_params
+ * Input/Output   :
+ * Return Value   : ESA_RC
+ * Side Effects   :
+ * Comments       :
+ ***************************************************/
+
+ static ESA_RC cdt_table_service(ADDINFO_rec_ptr             addinfo,
+                                 CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                                 CTSAMSG_HANDLE_rec_ptr      msgs)
+ {
+
+   int                        arc;
+   int                        debug;
+   ADDINFO_rec_typ          * laddinfo = NULL;
+   int                        entries_number;
+   int                        cdt_info_portion;
+   int                        max_cdt_info_fld_names = 0;
+   int                        i;
+   div_t                      d;
+   RACF_OUTPUT_LINE_rec_typ   extract_area;
+   ESA_RC                     rc = ESA_OK;
+   char                       mode[25];
+   static char                func[] = "cdt_table_service";
+
+   ONE_FIELD_rec_ptr          pair;
+   char                       diag_list_value[RCF_ADDINFO_VAL_LEN + 1];
+   char                      *p;
+   static  char               cdt_field_name[10] = "";
+   static  SLIST_typ          cdt_info= { cdt_field_name, 9 };
+   static  SKWDS_typ          cdt_keywords[] = {
+      { "CDT.CLASS",            TYPE_1B , &cdt_info , NULL },
+      { "CDT.UACC",             TYPE_1B , &cdt_info , NULL },
+      { "CDT.FIRST",            TYPE_1B , &cdt_info , NULL },
+      { "CDT.GROUP_CLASS_REF",  TYPE_1B , &cdt_info , NULL },
+      { "CDT.MEMBER_CLASS_REF", TYPE_1B , &cdt_info , NULL },
+      { "CDT.MAXLNTH",          TYPE_1B , &cdt_info , NULL },
+      { "CDT.OTHER",            TYPE_1B , &cdt_info , NULL },
+      { "CDT.POSIT",            TYPE_1B , &cdt_info , NULL },
+      { "CDT.ATTR",             TYPE_1B , &cdt_info , NULL },
+      { NULL,                   TYPE_1A , NULL , NULL } };
+
+ /*
+  *  Assembler cdt-service routine
+  */
+
+  /* SAS2IBMT prototype changed for IBM C
+  extern int ctsfcdt (char                     * option,
+                      int                      * debug,
+                      ...);                                          */
+  extern int ctsfcdt ();                                  /* SAS2IBMT */
+
+  char           tmp[9];
+  CDT_ENTRY_typ *cdt_entries = NULL;
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_GTRSPRM, 3, func);
+
+  debug = ESA_DIAG_get_debug_level(ESA_COMP_GTRSPRM);
+
+  /***   Create Local addinfo  ***/
+
+  rc = ADDINFO_alloc(component, 40, &laddinfo, dest, msgs);
+  if (rc NE ESA_OK) {
+    rc = ESA_FATAL;
+    goto exit;
+  }
+
+  /*
+   *   Get CDT entries number
+   */
+
+  memset(mode, ' ', sizeof(mode) );
+  strcpy(mode, "GET-ENTRIES-NUMBER");
+
+  /* SAS2IBMT
+  arc = ctsfcdt (mode, &debug, &entries_number);                     */
+  arc = (*(ASM_RTN_TYP *)&ctsfcdt)                        /* SAS2IBMT */
+                (mode, &debug, &entries_number);
+  ESA_DIAG_printf(ESA_COMP_GTRSPRM, 3,
+                  "mode=%s rc=%d entries_number=%d",
+                  mode, arc, entries_number);
+
+  rc = cdt_service_rc_check (arc, dest, msgs);
+  if (rc NE ESA_OK) {
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+  /***  Allocate output line buffer   ***/
+
+  cdt_entries = (CDT_ENTRY_typ *)malloc( sizeof(CDT_ENTRY_typ) *
+                                         entries_number );
+  if ( cdt_entries EQ NULL) {
+     CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                  "CDT TABLE BUFFER", sizeof(CDT_ENTRY_typ) );
+     rc = ESA_FATAL ;
+     goto exit ;
+  }
+
+  /*
+   *   Obtain CDT TABLE entries list
+   */
+
+  memset(mode, ' ', sizeof(mode) );
+  strcpy(mode, "GET-ENTRIES");
+
+  ESA_DIAG_printf(ESA_COMP_GTRSPRM, 3,
+                  "mode=%s cdt_entries=%X", mode, cdt_entries);
+
+  /* SAS2IBMT
+  arc = ctsfcdt (mode, &debug, cdt_entries);                         */
+  arc = (*(ASM_RTN_TYP *)&ctsfcdt)                        /* SAS2IBMT */
+                (mode, &debug, cdt_entries);
+  ESA_DIAG_printf(ESA_COMP_GTRSPRM, 3,
+                  "mode=%s rc=%d cdt_entries=%X",
+                  mode, arc, cdt_entries);
+
+  rc = cdt_service_rc_check (arc, dest, msgs);
+  if (rc NE ESA_OK) {
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+  /*
+   *   Sort CDT table entries
+   */
+
+   qsort(cdt_entries,                 /* sort area     */
+         entries_number,              /* num elements  */
+         sizeof(CDT_ENTRY_typ),       /* element size  */
+         &RCF_cdt_compare);           /* compare func  */
+
+  /*
+   *   Extract CDT TABLE info
+   *   The entire CDT table info cannot be placed
+   *   in one addinfo field, because it is too long.
+   *   Here, is assumed that two addinfo fields will
+   *   be enough.
+   */
+
+  cdt_info_portion     = (entries_number / 2) + 1;
+
+  memset(mode, ' ', sizeof(mode) );
+  strcpy(mode, "GET-ENTRY-INFO");
+
+  ESA_DIAG_printf(ESA_COMP_GTRSPRM, 3,
+                  "mode=%s extract_area=%X", mode, &extract_area);
+
+  for (i=0; i LT entries_number; i++) {
+
+    /** Create name of CDT info field **/
+
+    d = div(i, cdt_info_portion);
+    max_cdt_info_fld_names = MAX( max_cdt_info_fld_names, d.quot +1 );
+    sprintf( cdt_field_name, "%s%1d", "CDT", d.quot + 1);
+
+    memcpy(tmp, cdt_entries[i], 8);
+    tmp[8] = NULL_CHAR;
+    ESA_DIAG_printf(ESA_COMP_GTRSPRM, 8, "'%s'===>>> %d.%s",
+                    cdt_field_name, i+1, tmp);
+
+    extract_area.max_len  = RACF_OUTPUT_SIZE;
+    extract_area.used_len = 0 ;
+
+    /* SAS2IBMT
+    arc = ctsfcdt (mode, &debug, cdt_entries[i], &extract_area);     */
+    arc = (*(ASM_RTN_TYP *)&ctsfcdt)                      /* SAS2IBMT */
+                  (mode, &debug, cdt_entries[i], &extract_area);
+    ESA_DIAG_printf(ESA_COMP_GTRSPRM, 3,
+                    "mode=%s rc=%d entry=%s",
+                     mode, arc, cdt_entries[i]);
+    rc = cdt_service_rc_check (arc, dest, msgs);
+    if (rc NE ESA_OK) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+
+    cdt_info.init_list = FALSE;
+    ADDINFO_empty( laddinfo );
+    RACF_res_output_to_addinfo(&extract_area , addinfo, laddinfo,
+                               cdt_keywords, dest, msgs );
+  }
+
+  /*
+   *   Diag ....
+   */
+
+  for (i=0; i LT max_cdt_info_fld_names; i++) {
+    sprintf( cdt_field_name, "%s%1d", "CDT", i + 1);
+    pair = ADDINFO_search(cdt_field_name, RCF_ADDINFO_KWD_LEN,
+                          addinfo->pair,
+                          addinfo->num_pairs);
+    if (pair NE NULL) {
+       /* WS10082N strcpy(diag_list_value, pair->value) ;  */
+       strncpy(diag_list_value, pair->value,              /* WS10082N */
+                          sizeof(diag_list_value)-1);  /* WS10082N */
+
+       if (sizeof(diag_list_value) LE pair->vallen)    /* WS10082N */
+           ESA_DIAG_printf(ESA_COMP_GTRSPRM, 3,
+                       "Data for CDT field is truncated");
+       for (p=diag_list_value; *p; p++) {
+          if (*p EQ ADDINFO_LIST_ENTRY)
+             *p = '\n';
+          else if (*p EQ ADDINFO_LIST_SUBFIELD)
+             *p = '#';
+       }
+       ESA_DIAG_printf(ESA_COMP_GTRSPRM, 3,
+                       "----**** %s ****----\n%s",
+                       cdt_field_name, diag_list_value);
+    }
+  }
+
+ /*
+  *   Finish
+  */
+
+  exit : ;
+
+  if ( laddinfo )
+     ADDINFO_free(&laddinfo);
+
+  if ( cdt_entries )
+     free( cdt_entries );
+
+  ESA_DIAG_exit(ESA_COMP_GTRSPRM, 3, func, rc);
+
+  return rc;
+ }
+
+/**************************************************************
+*                                                             *
+* Procedure Name   : RCF_cdt_compare                          *
+*                                                             *
+* Description      : Compare routine for qsort                *
+*                                                             *
+* Input            : 1) cdt entry 1                           *
+*                    2) cdt entry 2                           *
+*                                                             *
+* Output           : None                                     *
+*                                                             *
+* Return Value     : negative - cdt1 less than cdt2           *
+*                  : zero     - cdt1 equal to  cdt2           *
+*                  : positive - cdt1 greater than cdt2        *
+*                                                             *
+**************************************************************/
+
+static int RCF_cdt_compare (const void * cdt1,
+                            const void * cdt2)
+{
+
+  CDT_ENTRY_typ   * rcf_cdt1 = (CDT_ENTRY_typ *)cdt1;
+  CDT_ENTRY_typ   * rcf_cdt2 = (CDT_ENTRY_typ *)cdt2;
+
+  return(memcmp(rcf_cdt1, rcf_cdt2, 8));
+
+}    /* RCF_cdt_compare */
+
+
+/**************************************************************
+*                                                             *
+* Procedure Name   : cdt_service_check                        *
+*                                                             *
+* Description      : Check assembler cdt service routine rc   *
+*                                                             *
+* Input            : 1) rc                                    *
+*                                                             *
+* Output           : None                                     *
+*                                                             *
+* Return Value     : ESA_OK   - o.k.                          *
+*                  : ESA_ERR  - detected errors               *
+*                                                             *
+**************************************************************/
+
+static ESA_RC cdt_service_rc_check (int                         arc,
+                                    CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                                    CTSAMSG_HANDLE_rec_ptr      msgs)
+{
+
+  static char func[] = "cdt_service_rc_check";
+
+  switch (arc) {
+    case 0 :   return ESA_OK;
+
+    case 4 :   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                             component, func,
+                             "CDT table is not accessable",
+                             8, __LINE__);
+               return ESA_ERR;
+
+    case 8 :   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                             component, func,
+                             "Invalid option mode", 8, __LINE__);
+               return ESA_ERR;
+
+    case 16:   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                             component, func,
+                             "RACF (DOWN)", 8, __LINE__);
+               return ESA_ERR;
+
+    default:   return ESA_ERR;
+  }
+
+}
+
+/* ps0391 */
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : RACF_convert_version                       *
+*                                                             *
+* DESCRIPTION    : Convert RACF version                       *
+*                                                             *
+* INPUT/OUTPUT   : racf_version                               *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_OK                                     *
+*                                                             *
+**************************************************************/
+
+static ESA_RC RACF_convert_version(char                *racf_version,
+  /*IS0322 add parm*/              ADMIN_PARAMS_rec_typ * admin_params)
+  /*IS0322 drop 2 other            CTSAMSG_HANDLE_rec_typ     * msgs,
+                                   CTSAMSG_DEST_TABLE_rec_typ * dest)*/
+{
+
+ /*
+  *   Variables
+  */
+
+  /* static      char func[] = "RACF_convert_version"; not used IS0322*/
+  /* char        err_msg[200]; currently not used               IS0322*/
+  ESA_RC      rc = ESA_OK;
+  CTSAMSG_HANDLE_rec_typ     * msgs;                     /* SAS2IBMN */
+  CTSAMSG_DEST_TABLE_rec_typ * dest;                     /* SAS2IBMN */
+
+
+  ESA_DIAG_printf(ESA_COMP_GTRSPRM, 3,
+                  "racf_version=%s", racf_version);
+
+  msgs = admin_params->ctsamsg_handle;                   /* SAS2IBMT */
+  dest = admin_params->ctsamsg_dest;                     /* SAS2IBMT */
+
+
+  /* IS10061 drop old os/390 versions & set latest 1st
+  if ( memcmp( racf_version, "109" , 3 ) EQ 0)
+    strcpy( racf_version, "109");
+  else  if ( memcmp( racf_version, "201" , 3 ) EQ 0)
+    strcpy( racf_version, "201");
+  else  if ( memcmp( racf_version, "202" , 3 ) EQ 0)
+    strcpy( racf_version, "202");
+  else  if ( memcmp( racf_version, "203" , 3 ) EQ 0)
+    strcpy( racf_version, "203");
+  else  if ( memcmp( racf_version, "204" , 3 ) EQ 0)
+    strcpy( racf_version, "204");
+  else  if ( memcmp( racf_version, "205" , 3 ) EQ 0)
+    strcpy( racf_version, "205");
+  else  if ( memcmp( racf_version, "206" , 3 ) EQ 0)
+    strcpy( racf_version, "206");
+  else  if ( memcmp( racf_version, "2608" ,4 ) EQ 0)
+    strcpy( racf_version, "208");                            */
+  if ( memcmp( racf_version, "7780" ,4 ) EQ 0)       /*IS10061*/
+    strcpy( racf_version, "Z13");                    /*IS10061*/
+  else  if ( memcmp( racf_version, "7790" ,4 ) EQ 0) /*IS10080 */
+    strcpy( racf_version, "Z21");                    /*IS10080 */
+  else  if ( memcmp( racf_version, "77A0" ,4 ) EQ 0) /*IS10132 */
+    strcpy( racf_version, "Z22");                    /*IS10132 */
+  else  if ( memcmp( racf_version, "7791" ,4 ) EQ 0) /*BS10053 */
+    strcpy( racf_version, "Z22");                    /*BS10053 */
+  else  if ( memcmp( racf_version, "7770" ,4 ) EQ 0) /*IS10061*/
+    strcpy( racf_version, "Z12");                    /*IS10061*/
+  else  if ( memcmp( racf_version, "7760" ,4 ) EQ 0) /*IS10061*/
+    strcpy( racf_version, "Z11");                    /*IS10061*/
+  /* drop old RACF versions from list                  IS10070
+  else  if ( memcmp( racf_version, "7703" ,4 ) EQ 0)  *ps0436*
+    strcpy( racf_version, "210");                     *ps0436*
+  else  if ( memcmp( racf_version, "7705" ,4 ) EQ 0)  *ps0484*
+    strcpy( racf_version, "Z12");                     *ps0484*
+  else  if ( memcmp( racf_version, "7706" ,4 ) EQ 0)  *      *
+    strcpy( racf_version, "Z13");                     *      */
+  else  if ( memcmp( racf_version, "7707" ,4 ) EQ 0) /*ps0511*/
+    strcpy( racf_version, "Z14");                    /*ps0511*/
+  else  if ( memcmp( racf_version, "7708" ,4 ) EQ 0) /*WS2532*/
+    strcpy( racf_version, "Z15");                    /*WS2532*/
+  else  if ( memcmp( racf_version, "7709" ,4 ) EQ 0) /*is0263*/
+    strcpy( racf_version, "Z16");                    /*is0263*/
+  else  if ( memcmp( racf_version, "7720" ,4 ) EQ 0) /*is0322*/
+    strcpy( racf_version, "Z17");                    /*is0322*/
+  else  if ( memcmp( racf_version, "7730" ,4 ) EQ 0) /*is0369*/
+    strcpy( racf_version, "Z18");                    /*is0369*/
+  else  if ( memcmp( racf_version, "7740" ,4 ) EQ 0) /*WS10014*/
+    strcpy( racf_version, "Z19");                    /*WS10014*/
+  else  if ( memcmp( racf_version, "7750" ,4 ) EQ 0) /*WS10018*/
+    strcpy( racf_version, "Z10");                    /*WS10018*/
+  else {
+    /* BS10053 rc = ESA_ERR; set RC=OK as "operation continues" */
+    rc = ESA_OK; /* otherwise CS_init stops and care files
+                    with scope are not loaded        BS10053    */
+    /*** drop error message       IS0322 ****
+    sprintf(err_msg, "Undefined RACF version '%s'",
+            racf_version);
+    CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                  component, func, err_msg, 8, __LINE__);
+    /*** IS0322 send warning instead of error message ***/
+      /*IS10182 admin_params->cs_func.DIAG_printf_ptr(*/
+      ESA_DIAG_printf(                                 /*IS10182*/
+       ESA_COMP_APIINIT,0,
+       "Version %s identified for rss_type %s. Operation continues.",
+       racf_version, admin_params->rss_type);
+
+       /* SAS2IBMN
+       admin_params->cs_func.MSG_printf_ptr(
+         INVALID_RSS_VER,racf_version);     */
+       CTSAMSG_print(INVALID_RSS_VER, msgs, NULL, dest,  /* SAS2IBMN */
+                     racf_version);                      /* SAS2IBMN */
+    /*** end of IS0322 ***/
+  }
+
+  exit:;
+
+  return rc;
+
+}
+
+/*  IS10076 - start   */
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : Handle_CFDEF_keywords                      *
+*                                                             *
+* DESCRIPTION    : Set values for CFDEF.USERx and             *
+*                  CFDEF.GROUPx addinfo keywords.             *
+*                                                             *
+* INPUT/OUTPUT   : addinfo                                    *
+*                  cfdef_1st - first CFDEF. entry to fill.    *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_OK                                     *
+*                                                             *
+* NOTES          : - We assume that keyword number 1 of each  *
+*                  type (CFDEF.USER1 / CFDEF.GROUP1) is the   *
+*                  first to appear in the addinfo list. If it *
+*                  is not, we ignore the keyword.             *
+*                  - We assume that the keywords of each type *
+*                  will have sequential order (1, 2, 3...).   *
+*                  If a keyword is missing (1, 3...), we will *
+*                  stop the process.                          *
+*                                                             *
+**************************************************************/
+
+static ESA_RC Handle_CFDEF_keywords(ADDINFO_rec_ptr     addinfo,
+                              ONE_FIELD_rec_ptr         cfdef_1st,
+                              ADMIN_PARAMS_rec_typ    * admin_params)
+{
+
+ /* Should be synchronized with CFDEF_TYPE enum below */
+ #define CFDEF_TYPE_NUM  2
+ #define CFDEF_PREFIX    "CFDEF."
+ #define CFDEF_USER      "USER"
+ #define CFDEF_GROUP     "GROUP"
+
+ #define FILL_CFDEF_STRUCT(p_blk, typ_str)                            \
+   strcpy(cfdef_proc_data[i].type, CFDEF_PREFIX);  /* Set field... */ \
+   strcat(cfdef_proc_data[i].type, typ_str);       /* ...name.     */ \
+   cfdef_proc_data[i].block = (p_blk);             /* Set CF block */ \
+                                                                      \
+   /* If current pair matches the type and number, use it. else */    \
+   /* look for required pair.                                   */    \
+   strcpy(curr_name, cfdef_proc_data[i].type);                        \
+   strcat(curr_name, "1");                                            \
+   if (NOT cfdef_1st_ok   AND                                         \
+       strcmp(cfdef_1st->keyword, curr_name) EQ 0)                    \
+   {                                                                  \
+     cfdef_proc_data[i].first_pair = cfdef_1st;                       \
+     cfdef_1st_ok = TRUE;                                             \
+   }                                                                  \
+   else                                                               \
+     cfdef_proc_data[i].first_pair = ADDINFO_search(                  \
+                  curr_name,                                          \
+                  RCF_ADDINFO_KWD_LEN,                                \
+                  cfdef_1st + 1,                                      \
+                  addinfo->num_pairs-(cfdef_1st - addinfo->pair));    \
+   cfdef_proc_data[i].first_pair =                    /* WS10082N */  \
+        get_orig_pair(cfdef_proc_data[i].first_pair); /* Ws10082N */
+
+ typedef enum {
+    USER = 1,
+    GROUP
+ }  CFDEF_TYPE;  /* Should be synchronized with CFDEF_TYPE_NUM above */
+
+ typedef struct {
+  char                          type[12];
+  ONE_FIELD_rec_ptr             first_pair;
+  RACF_CUSTOM_FIELDS_block_ptr  block;
+ } CFDEF_PROC_typ;
+
+ static char        func[]="Handle_CFDEF_keywords";
+
+ ESA_RC             rc = ESA_OK;
+ CFDEF_PROC_typ     cfdef_proc_data[CFDEF_TYPE_NUM];
+ CFDEF_TYPE         ic;
+ int                i, j;
+ int                cfdef_1st_ok = FALSE;
+ ONE_FIELD_rec_ptr  curr_pair = NULL;
+ char               curr_name[13];
+ RACF_PARAMS_rec_typ  * params_ptr = NULL;
+ RACF_CUSTOM_FIELDS_block_ptr curr_block;
+ int                set_CF_handle = 0;
+
+ CTSAMSG_DEST_TABLE_rec_ptr  dest;
+ CTSAMSG_HANDLE_rec_ptr      msgs;
+
+ /*
+  *   Initialization
+  */
+
+ ESA_DIAG_enter(ESA_COMP_GTRSPRM, 3, func);
+ msgs = admin_params->ctsamsg_handle;
+ dest = admin_params->ctsamsg_dest;
+ params_ptr = admin_params->apiinit_handle;
+
+
+ /*
+  *  Prepare CFDEF processing structure
+  */
+ for  (ic=1; ic LE CFDEF_TYPE_NUM; ic++)
+ {
+   i = ic-1;
+   switch (ic)
+   {
+     case USER:
+       FILL_CFDEF_STRUCT(params_ptr->p_user_CFields, CFDEF_USER)
+       break;
+     case GROUP:
+       FILL_CFDEF_STRUCT(params_ptr->p_group_CFields, CFDEF_GROUP)
+       break;
+     deafult:
+       break;
+   }
+ }
+
+ /*   print the list of CFDEF fields to process */
+ ESA_DIAG_printf(ESA_COMP_GTRSPRM, 5,
+                 "CFDEF proc strucure - before processing");
+ for  (i=0; i LT CFDEF_TYPE_NUM; i++)
+ {
+   ESA_DIAG_printf(ESA_COMP_GTRSPRM, 5,
+                  "(%d) %s, %s, %8X",
+                  i,
+                  cfdef_proc_data[i].type,
+                  cfdef_proc_data[i].first_pair->keyword,
+                  cfdef_proc_data[i].block);
+   ESA_DIAG_printf(ESA_COMP_GTRSPRM, 5,
+                   "=======================");
+ }
+
+ /*  If CFDEF received is not USER or GROUP - error  */
+ if (NOT cfdef_1st_ok)
+   CTSAMSG_print(RACF_KEYWORD_NOSUPP, msgs, NULL, dest,
+                 cfdef_1st->keyword);
+
+ /*
+  *  Set the CFDEF fields values, by type
+  */
+ for (i=0; i LT CFDEF_TYPE_NUM; i++)
+ {
+   ESA_DIAG_printf(ESA_COMP_GTRSPRM, 5,
+                   "procesing CFDEF entry nunber %d", i);
+
+   curr_pair = cfdef_proc_data[i].first_pair;
+   curr_block = cfdef_proc_data[i].block;
+   strcpy(curr_name, cfdef_proc_data[i].type);
+   strcat(curr_name, "1");
+
+   /*   Fill all pairs of each type, or until no more fields in  */
+   /*   the Custom Fields block.                                 */
+   j = 1;
+
+   while (curr_pair NE NULL)
+   {
+     ESA_DIAG_printf(ESA_COMP_GTRSPRM, 5,
+                   "Set data in %s", curr_name);
+     /* WS10082N ADDINFO_clear_value(curr_pair);  */
+     ADDINFO_clear_value(&curr_pair);                     /* WS10082N */
+
+     rc = Set_CFDEF_keyword(curr_pair, &curr_block, &set_CF_handle,
+                            admin_params);
+
+     /* Pair value is full, look for next pair of the same type  */
+     if (rc EQ ESA_ERR)
+     {
+       sprintf(&curr_name[strlen(curr_name)-1], "%d", ++j);
+
+       ESA_DIAG_printf(ESA_COMP_GTRSPRM, 5,
+                   "Look for addinfo entry %s", curr_name);
+
+       curr_pair = ADDINFO_search(curr_name,
+                    RCF_ADDINFO_KWD_LEN,
+                    curr_pair + 1,
+                    addinfo->num_pairs-(curr_pair - addinfo->pair));
+       if (curr_pair EQ NULL)
+       {
+         CTSAMSG_print(RACF_ADDINFO_CF_OVRFLW, msgs, NULL, dest,
+                   cfdef_proc_data[i].type, cfdef_proc_data[i].type);
+         rc = ESA_FATAL;
+         break;
+       }
+     }
+     else              /* All OK.                              */
+       break;
+   }
+
+   if (rc NE ESA_OK)
+     break;
+ }
+
+ exit:;
+
+   ESA_DIAG_exit(ESA_COMP_GTRSPRM, 3, func, rc);
+   return rc;
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : Set_CFDEF_value                            *
+*                                                             *
+* DESCRIPTION    : Fill the CFDEF entry with custom field     *
+*                  definitions.                               *
+*                                                             *
+* INPUT/OUTPUT   :                                            *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_OK                                     *
+*                                                             *
+**************************************************************/
+
+static ESA_RC Set_CFDEF_keyword(ONE_FIELD_rec_ptr          p_pair,
+                             RACF_CUSTOM_FIELDS_block_ptr *p_block,
+                             int                          *p_entnum,
+                             ADMIN_PARAMS_rec_typ       * admin_params)
+{
+
+ static char       func[]="Set_CFDEF_keyword";
+ ESA_RC            rc = ESA_OK;
+ RACF_CUSTOM_FIELDS_block_ptr block = *p_block;
+ RACF_CUSTOM_FIELD_rec_typ   *entry;
+ int               i;
+ int               len;
+ char              value[256] = "";
+ char              sep_subf[2];
+
+ CTSAMSG_DEST_TABLE_rec_ptr  dest;
+ CTSAMSG_HANDLE_rec_ptr      msgs;
+
+ /*
+  *   Initialization
+  */
+
+ ESA_DIAG_enter(ESA_COMP_GTRSPRM, 1, func);
+ msgs = admin_params->ctsamsg_handle;
+ dest = admin_params->ctsamsg_dest;
+
+ BUILD_STRING_SEPARATOR(sep_subf , ADDINFO_LIST_SUBFIELD)
+
+ i = *p_entnum;
+
+ /*
+  *  Process Custom Fields
+  */
+ while (block NE NULL)
+ {
+
+   entry = &block->fields[i];
+
+   for ( ; i LT block->used_fields_count; i++, entry++)
+   {
+     strcpy(value, entry->name);
+     strcat(value, sep_subf);
+
+     len = strlen(value);
+     value[len] = entry->type;
+     value[len+1] = NULL_CHAR;
+     strcat(value, sep_subf);
+
+     strcat(value, entry->label);
+     strcat(value, sep_subf);
+
+     if (entry->max_length NE 0)
+       sprintf(&value[strlen(value)], "%d", entry->max_length);
+     strcat(value, sep_subf);
+
+     if (entry->min_value NE 0)
+       sprintf(&value[strlen(value)], "%d", entry->min_value);
+     strcat(value, sep_subf);
+
+     if (entry->max_value NE 0)
+       sprintf(&value[strlen(value)], "%d", entry->max_value);
+     strcat(value, sep_subf);
+
+     strcat(value, entry->first);
+     strcat(value, sep_subf);
+
+     strcat(value, entry->other);
+     strcat(value, sep_subf);
+
+     len = strlen(value);
+     value[len] = entry->mixed;
+     value[len+1] = NULL_CHAR;
+
+     ESA_DIAG_printf(ESA_COMP_GTRSPRM, 5,
+                   "Add value %.40s", value);
+
+     rc = ADDINFO_addval(value, RCF_ADDINFO_VAL_LEN,
+                         ADDINFO_LIST_ENTRY, p_pair,
+                         dest, msgs);
+     /* WS10082N - start */
+     /* if (rc EQ ESA_FATAL)
+         ESA_DIAG_printf(ESA_COMP_GTRSPRM, 5,
+                         "Not enough space for value %.40s",
+                         value);                                   */
+     if (rc NE ESA_OK)
+     {
+       if ( (rc EQ ESA_EOF)  OR              /* overflow */
+              (rc EQ ESA_ERR) )              /* L pair alloc failed */
+          CTSAMSG_print(RACF_ADDINFO_VAL_OVRFLW,
+                        msgs, NULL, dest,
+                        p_pair->keyword, value);
+       else
+       /* WS10082N - end   */
+         ESA_DIAG_printf(ESA_COMP_GTRSPRM, 4,
+                         "addval failed for keyword <%s> value <%s>",
+                         p_pair->keyword, value);
+       rc = ESA_ERR;
+       break;
+     }
+   }
+
+   if (rc NE ESA_OK)
+     break;
+
+   block = block->next_block;
+   i = 0;
+ }
+
+ *p_entnum = i;
+ *p_block = block;
+
+ exit:;
+
+   ESA_DIAG_exit(ESA_COMP_GTRSPRM, 1, func, rc);
+   return rc;
+}
+
+/*  IS10076 - start   */

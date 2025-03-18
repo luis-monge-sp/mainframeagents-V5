@@ -1,0 +1,3128 @@
+/**************************************************************
+*                                                             *
+* Title            : RACF Extractor functions                 *
+*                                                             *
+* File Name        : ctsrext.c                                *
+*                                                             *
+* Author           : Doron Cohen                              *
+*                                                             *
+* Creation Date    : 30/03/94                                 *
+*                                                             *
+* Description      :                                          *
+*                                                             *
+* Assumptions and                                             *
+*   Considerations :                                          *
+*                                                             *
+**************************************************************/
+
+/**************************************************************
+* dc1005   Doron    10/5/95  Add extract_defug function       *
+* r0003    Doron    28/5/95  Tolerate overflow of output line *
+* as1506   Alex Shv 15/6/95  Remove zeroes supressing         *
+* as3007   Alex     30/07/95 Add new debug prints             *
+*                            ( see func :  RACF_get_field  )  *
+* WSAR1001 Alex     29/04/96 Add Get RACF options facility    *
+* ps0004   Alex     09/10/96 Adjust to new common code        *
+* ps0162   Alex     28/07/97 Remove internal message in case  *
+*                            unknown rss parameter detected   *
+* ps0163   Alex     29/07/97 RACF security server support     *
+* ps0231   Alex     28/12/97 RACF extract res functions       *
+* ps0259   Alex     29/04/98 Change behavior when detected    *
+*                            errors during extraction of RSS  *
+*                            parameters                       *
+* ps0292   AS       23/07/98 Digital certificate support      *
+* ps0402   AS       20/12/99 RACF database corruption handling*
+* ws2480   Yonatan  02/05/02 translate nulls to blanks in the *
+*                            DATA field                       *
+* WS2350   AmirH    23/09/04 Prevent alerts when resource     *
+*                            has no ACE                       *
+* BS2703   yonim    26/02/06 Support  Multi subgroup keyword  *
+* WS2557   EliMY    23/05/06 RACF MIXEDCASE PASSWORD SUPPORT  *
+*                            FOR ZOS 1.7                      *
+* BS2711   yonim    26/07/06 Fix CS ABEND OC4 create by BS2703*
+* WS10004  AvnerL   05/06/07 Extend ICHEINTY & drop error msg *
+* BS10008  AvnerL   20/03/08 alloc more for connection output *
+* sas750   AvnerL   23/11/09 Clear SAS/C 7.5 warnings.        *
+* BS10021  AvnerL   07/02/10 send diag for SUBGROUPx when >=1 *
+* IS10069  AvnerL   06/02/12 Add 2 SUBGROUPx keywords-total 5 *
+* IS10076  NuritY   31/01/13 Support Custom Fields.           *
+* IS10100  NuritY   29/07/13 Support CTSA internal custom     *
+*                            fields (CTSACFs).                *
+* IS10100B NuritY   17/17/13 Do not issue an error message    *
+*                            when CSDATA fields do not exist  *
+*                            in addinfo becasue addinfo may   *
+*                            contain only part of user        *
+*                            keywords.                        *
+* IS10109  NuritY   26/12/13 Remove redundant messgaes        *
+*                            (cts3151 and cts3153).           *
+* SAS2IBMT SeligT   09/10/16 SAS/C to IBM C Conversion Project*
+* SAS2IBMN NuritY   29/01/17 SAS/C to IBM C Conversion Project*
+* SAS2IBMA AvnerL   28/02/17 fix BS10008                      *
+* WS10074  NuritY   04/11/18 Extended Password support OA43999*
+* IS10181  SeligT   03/06/19 Display Message When ADDINFO     *
+*                            Value Is Too Large               *
+* WS10081  ThomaS   07/09/21 MFA support                      *
+* IS10185  AvnerL   22/08/22 Recomp with CTSRRCF              *
+* WS10082  AvnerL   19/09/23 Update length of callers         *
+* WS10082N NuritY   28/09/23 MFA.TAGS - support long value.   *
+**************************************************************/
+#include   <globs.h>
+
+/*
+ *   Standard include files
+ */
+
+#include   STDIO
+#include   STDLIB
+#include   STRING
+
+/*
+ *   CONTROL-SA include files
+ */
+
+#include ESA_DIAG
+#include ESA_CTSAMSG
+#include ESA_API_CODES
+
+#include MVS_COMP
+#include MVS_CODES                                 /* IS10076 */
+
+#include RACF
+#include RACF_RES
+#include RACF_CODES
+
+#define RACF_MAX_ENTRY_NAME_LEN 255
+
+/* #define LAST_SUBGROUP_SUFFIX 2        * BS2703 Number of SUBGROUPx*/
+#define LAST_SUBGROUP_SUFFIX 4      /* sets to 4 (total = 5) IS10069 */
+/*
+ *   Field blocking and coversion
+ */
+
+#define FIELD_BLOCK(a,b)                  \
+      memset(a, BLANK, sizeof(a) );       \
+      memcpy(a, b, strlen(b));
+/*
+ *   Assembler routine for RACXTRCT
+ */
+
+/* SAS2IBMT prototype changed for IBM C
+extern int ctsfrxf ( char *ext_class, char *ext_id, char *ext_seg,
+                     char *ext_fld, char *ext_value, int *ext_valuel,
+                     int *ext_dbg, int *saf_rc, int *racf_rc,
+                     int *racf_reason);                              */
+extern int ctsfrxf ();                                    /* SAS2IBMT */
+
+/* WSAR1001 */
+/*
+ *   Assembler routine for EXTRACT RACF OPTIONS
+ */
+
+/* SAS2IBMT prototype changed for IBM C
+extern int ctsfopt ( int  *dbg_level, char *option, char *ext_area,
+                     char *sep);                                     */
+extern int ctsfopt ();                                    /* SAS2IBMT */
+
+ /* ps0292 */
+ static void Dig_cert_put_info(ESA_DIAG_COMP_typ           comp,
+                               ADDINFO_rec_ptr             addinfo,
+                               char                      * keyword,
+                               char                      * value,
+                               CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                               CTSAMSG_HANDLE_rec_ptr      msgs);
+
+/* IS10076 - start    */
+static ESA_RC CSDATA_to_addinfo(ONE_RACF_FIELD_rec_typ   *racf_value,
+                             ADDINFO_rec_ptr              addinfo,
+                             RACF_CUSTOM_FIELDS_block_ptr p_cfb,
+               /* IS10100 */ ADDINFO_rec_ptr              addinfo_in,
+               /* IS10100 */ RACF_CTSACF_block_ptr        p_ctsacf_blk,
+               /* IS10100 */ int                         *sitecfs_yes,
+                             ADMIN_PARAMS_rec_typ     *admin_params);
+/* IS10076 - end      */
+
+static char component[]="RACFEXT";
+
+/***************************************************************
+*                                                              *
+* PROCEDURE NAME : RACF_extract                                *
+*                                                              *
+* DESCRIPTION    : Extract information from racf data base     *
+*                                                              *
+* INPUT          : racfprg   - access program ( assembler )    *
+*                  entry     - profile name                    *
+*                  entry_type- profile type (user, group, ...) *
+*                  debug     - debug level                     *
+*                  generic_flag - 1 - generic , 0 - no         *
+*                              ( only for resource profiles )  *
+*                  locate_err_flag - send/no err msg           *
+*                  option    - locate / next / nextc           *
+*                  dest      - Vector of error msg dests       *
+*                  msgs      - Error messages buffer           *
+*                                                              *
+* OUTPUT         : output    - output area                     *
+*                                                              *
+* RETURN VALUE   : ESA_ERR   - End of database/Profile n/a     *
+*                  ESA_FATAL - Fatal extractor error           *
+*                                                              *
+*                  Rc from assembler access programs :         *
+*                                                              *
+*                   16  -  overflow of output area             *
+*                   20  -  invalid option                      *
+*                   24  -  invalid entry-type                  *
+*                   28  -  invalid map code                    *
+*                   32  -  invalid freemain operation          *
+*                   36  -  invalid connection request          *
+*                   40  -  invalid load extractor (for connect)*
+*                   42  -  invalid del  extractor (for connect)*
+*                                                              *
+*                   When return code = 0  - RACF extractor OK  *
+*                   ------------------------------------------ *
+*                                                              *
+*                   racf_rc     - racf return code             *
+*                   racf_reason - racf reason code             *
+*                                                              *
+***************************************************************/
+
+/* SAS2IBMT typedef and prototype changed for IBM C
+ESA_RC RACF_extract(RACF_ACCESS_PROG_E           racfprg,            */
+ESA_RC RACF_extract(ASM_RTN_TYP                * racfprg, /* SAS2IBMT */
+                    char                       * option,
+                    char                       * entry_type,
+                    char                       * entry,
+                    int                          generic_flag,
+                    char                       * func,
+                    RACF_OUTPUT_LINE_rec_typ   * output,
+                    int                          debug,
+                    RACF_FLAG_typ                locate_err_flag,
+                    CTSAMSG_DEST_TABLE_rec_typ * dest,
+                    CTSAMSG_HANDLE_rec_typ     * msgs,
+                    int                          max_connect) /*BS10008*/
+{
+
+  /*
+   *      Variables
+   */
+
+   int rc,racf_rc,racf_reason;  /* return codes from racf extractor */
+   char   sep[2];
+   ESA_RC inf_rc = ESA_OK;
+   char   e1[RACF_MAX_ENTRY_NAME_LEN+1] ;
+   char   e2[RACF_MAX_ENTRY_NAME_LEN+1] ;               /*WS10082A*/
+   static char fn[]="RACF_extract";
+
+  /*
+   *      Initialize
+   */
+
+   ESA_DIAG_enter(PLT_COMP_API_RACF,2,fn);
+
+   BUILD_STRING_SEPARATOR(sep, ADDINFO_LIST_ENTRY)
+   strcpy(e1,entry);
+   sprintf(e2,"%s (%s)",entry,option);                     /*WS10082A*/
+   strcpy(e1,entry);
+   ESA_DIAG_printf(PLT_COMP_API_RACF,2,    /*BS10008*/
+                   "option=%s entry_type=%s entry=%s max_connect=%d",
+                   option, entry_type, entry,max_connect);
+
+  /*
+   *      Call assembler access program
+   */
+
+   rc = (*racfprg)(option, entry_type, entry, &generic_flag, output,
+                   &debug, &racf_rc, &racf_reason, sep,
+                   (int *)max_connect);    /* SAS2IBMN +    BS10008*/
+        /* SAS2IBMN max_connect);                            *BS10008*/
+    /* max_connect_number is relevant only to CTSFRGC & CTSFRCN. BS10008
+       However, parm should be passed to all RACF_extract calls. */
+
+   ESA_DIAG_printf( PLT_COMP_API_RACF,2,
+                   "Extractor area=(%d,%d,%d), %s/%s/%s, rc=(%d,%d,%d)",
+   /*BS10008*/      output->max_len, output->used_len, max_connect,
+                    option, entry_type, e1, rc, racf_rc, racf_reason);
+  /*
+   *    Analyze access program return codes
+   */
+
+   if (rc NE 0) {
+
+      /*
+       *    rc = 16 means overflow of output area
+       */
+
+       if (rc EQ 16)  {                                    /* r0003 */
+         CTSAMSG_print(RACF_EXTRACTOR_ERR, msgs, NULL,     /* r0003 */
+                  dest, entry_type, e2 );                  /*WS10082A*/
+         /*WS10082A dest, entry_type, e1 );                 * r0003 */
+         CTSAMSG_print(RACF_EXTRACTOR_ERR_RC, msgs, NULL,  /* r0003 */
+                  dest, rc , racf_rc, racf_reason, func ); /* r0003 */
+         inf_rc = ESA_OK ;                                 /* r0003 */
+         goto exit;                                        /* r0003 */
+       }                                                   /* r0003 */
+
+      /*
+       *    Other rc - internal error
+       */
+
+       else {                                              /* r0003 */
+         CTSAMSG_print(RACF_EXTRACTOR_ERR, msgs, NULL,
+                 dest, entry_type, e2 ) ;                 /*WS10082A*/
+         /*WS10082A dest, entry_type, e1 ) ;                        */
+         CTSAMSG_print(RACF_EXTRACTOR_ERR_RC, msgs, NULL,
+                 dest, rc, racf_rc, racf_reason, func ) ;
+         inf_rc = ESA_FATAL;
+         goto exit;
+       }                                                   /* r0003 */
+
+   }
+
+   if (racf_rc NE 0) {
+
+      /*
+       *    RACF return code = 12 means :
+       *
+       *    For operation 'locate'  - Profile not found
+       *    For operation 'next'    - End of database
+       */
+
+      if (racf_rc EQ 12)  {
+         if ( ( strcmp(option, RACF_OPERATION_LOCATE) EQ 0) AND
+              ( locate_err_flag  EQ RACF_YES  )              ) {
+            if (  strcmp(entry_type, RACF_USER_PROFILE) EQ 0)
+   /*WS10082A*/CTSAMSG_print(ERR_NO_USER, msgs, NULL, dest, e2);
+   /*WS10082A  CTSAMSG_print(ERR_NO_USER, msgs, NULL, dest, e1); */
+            else CTSAMSG_print(ERR_NO_GROUP, msgs, NULL, dest, e1);
+         }
+         else {                                            /* ps0402 */
+           if (racf_reason EQ 12) {                        /* ps0402 */
+            CTSAMSG_print(RACF_DB_ERR1, msgs, NULL, dest); /* ps0402 */
+            CTSAMSG_print(RACF_DB_ERR2, msgs, NULL, dest,  /* ps0402 */
+                          entry_type, e2);                 /*WS10082A*/
+            /*WS10082A    entry_type, e1);                  * ps0402 */
+           }                                               /* ps0402 */
+         }                                                 /* ps0402 */
+         inf_rc = ESA_ERR ;
+         goto exit;
+      }
+
+      /*
+       *    Other non zero return code means - extract error
+       */
+
+      else {
+         ESA_DIAG_printf(PLT_COMP_API_RACF,1,
+                         "Access error. Entry=%s rc=%d reason=%d",
+                         e1, racf_rc, racf_reason);
+         CTSAMSG_print(RACF_EXTRACTOR_ERR,   msgs, NULL, dest,
+                       entry_type, e2 );                 /*WS10082A*/
+         /*WS10082A    entry_type, e1 );                           */
+         CTSAMSG_print(RACF_EXTRACTOR_ERR_RC,   msgs, NULL, dest,
+                       rc , racf_rc, racf_reason, func );
+         inf_rc = ESA_FATAL ;
+         goto exit;
+      }
+   } /* non zero racf rc */
+
+  /*
+   *  finish
+   */
+
+   exit: ;
+
+   ESA_DIAG_exit(PLT_COMP_API_RACF,2, fn, inf_rc);
+   return inf_rc ;
+
+} /* RACF_extract */
+
+/* PS0231 */
+/***************************************************************
+*                                                              *
+* PROCEDURE NAME : RACF_extract_res                            *
+*                                                              *
+* DESCRIPTION    : Extract information from racf data base     *
+*                  (resources)                                 *
+* INPUT          : racfprg   - access program ( assembler )    *
+*                  entry     - profile name                    *
+*                  entry_type- profile type (DS, GEN)          *
+*                  debug     - debug level                     *
+*                  generic_flag - 1 - generic , 0 - no         *
+*                              ( only for resource profiles )  *
+*                  locate_err_flag - send/no err msg           *
+*                  option    - locate / next / nextc           *
+*                  dest      - Vector of error msg dests       *
+*                  msgs      - Error messages buffer           *
+*                                                              *
+* OUTPUT         : output    - output area                     *
+*                                                              *
+* RETURN VALUE   : ESA_ERR   - End of database/Profile n/a     *
+*                  ESA_FATAL - Fatal extractor error           *
+*                                                              *
+*                  Rc from assembler access programs :         *
+*                                                              *
+*                   16  -  overflow of output area             *
+*                   20  -  invalid option                      *
+*                   24  -  invalid entry-type                  *
+*                   28  -  invalid map code                    *
+*                   32  -  invalid freemain operation          *
+*                   36  -  invalid connection request          *
+*                   40  -  invalid load extractor (for connect)*
+*                   42  -  invalid del  extractor (for connect)*
+*                                                              *
+*                   When return code = 0  - RACF extractor OK  *
+*                   ------------------------------------------ *
+*                                                              *
+*                   racf_rc     - racf return code             *
+*                   racf_reason - racf reason code             *
+*                                                              *
+***************************************************************/
+
+/* SAS2IBMT typedef and prototype changed for IBM C
+ESA_RC RACF_extract_res(RACF_RES_ACCESS_PROG             racfprg,    */
+ESA_RC RACF_extract_res(ASM_RTN_TYP                    * racfprg,
+                    char                               * option,
+                    char                               * entry_type,
+                    char                               * entry,
+                    int                                  generic_flag,
+                    char                               * volume,
+                    char                               * unit,
+                    char                               * func,
+                    RACF_OUTPUT_LINE_rec_typ           * output,
+                    int                                  debug,
+                    RACF_FLAG_typ                       locate_err_flag,
+                    CTSAMSG_DEST_TABLE_rec_typ         * dest,
+                    CTSAMSG_HANDLE_rec_typ             * msgs)
+{
+
+  /*
+   *   Variables
+   */
+
+   int           rc,racf_rc,racf_reason;
+   char          sep[2];
+   ESA_RC        inf_rc = ESA_OK;
+   RESOURCE_typ  prf_name;
+   static char   fn[]="RACF_extract_res";
+
+  /*
+   *      Initialize
+   */
+
+   ESA_DIAG_enter(PLT_COMP_API_RACF,2,fn);
+
+   BUILD_STRING_SEPARATOR(sep, ADDINFO_LIST_ENTRY)
+
+   strcpy(prf_name, entry);  /* Keep prev value of profile name */
+   ESA_DIAG_printf(PLT_COMP_API_RACF,2,
+                   "option=%s entry_type=%s entry=%s",
+                   option, entry_type, entry);
+
+   /***   Call assembler access program  ***/
+
+   rc = (*racfprg)(option, entry_type, entry, &generic_flag,
+                   volume, unit, output, &debug,
+                   &racf_rc, &racf_reason, sep);
+
+   ESA_DIAG_printf( PLT_COMP_API_RACF,2,
+                    "Extractor area=(%d,%d), %s/%s/%s, rc=(%d,%d,%d)",
+                    output->max_len, output->used_len, option,
+                    entry_type, prf_name, rc, racf_rc, racf_reason);
+
+   /***  Analyze access program return codes  ***/
+
+   if (rc NE 0) {
+
+       /***  rc = 16 means overflow of output area   ***/
+
+       if (rc EQ 16)  {
+         CTSAMSG_print(RACF_EXTRACTOR_ERR, msgs, NULL,
+                  dest, entry_type, prf_name );
+         CTSAMSG_print(RACF_EXTRACTOR_ERR_RC, msgs, NULL,
+                  dest, rc , racf_rc, racf_reason, func );
+         inf_rc = ESA_OK ;
+         goto exit;
+       }
+
+       /***  Other rc - internal error  ***/
+
+       else {
+         CTSAMSG_print(RACF_EXTRACTOR_ERR, msgs, NULL,
+                 dest, entry_type, prf_name ) ;
+         CTSAMSG_print(RACF_EXTRACTOR_ERR_RC, msgs, NULL,
+                 dest, rc, racf_rc, racf_reason, func ) ;
+         inf_rc = ESA_FATAL;
+         goto exit;
+       }                                                   /* r0003 */
+
+   }
+
+   if (racf_rc NE 0) {
+
+      /*
+       *    RACF return code = 12 means :
+       *
+       *    For operation 'locate'  - Profile not found
+       *    For operation 'next'    - End of database
+       */
+
+      if (racf_rc EQ 12)  {
+         if ( ( strcmp(option, RACF_OPERATION_LOCATE) EQ 0) AND
+              ( locate_err_flag  EQ RACF_YES  )              ) {
+            CTSAMSG_print(ERR_RES_NOT_EXIST,
+                          msgs, NULL, dest, prf_name);
+         }
+         inf_rc = ESA_ERR ;
+         goto exit;
+      }
+
+      /***  Other non zero return code means - extract error  ***/
+
+      else {
+         ESA_DIAG_printf(PLT_COMP_API_RACF,1,
+                         "Access error. Entry=%s rc=%d reason=%d",
+                         prf_name, racf_rc, racf_reason);
+         CTSAMSG_print(RACF_EXTRACTOR_ERR,   msgs, NULL, dest,
+                       entry_type, prf_name );
+         CTSAMSG_print(RACF_EXTRACTOR_ERR_RC,   msgs, NULL, dest,
+                       rc , racf_rc, racf_reason, func );
+         inf_rc = ESA_FATAL ;
+         goto exit;
+      }
+   } /* non zero racf rc */
+
+  /*
+   *  finish
+   */
+
+   exit: ;
+
+   ESA_DIAG_exit(PLT_COMP_API_RACF,2, fn, inf_rc);
+   return inf_rc ;
+
+} /* RACF_extract_res */
+
+/* PS0231 */
+/***************************************************************
+*                                                              *
+* PROCEDURE NAME : RACF_extract_ace                            *
+*                                                              *
+* DESCRIPTION    : Extract information from racf data base     *
+*                  (ace's)                                     *
+* INPUT          : racfprg   - access program ( assembler )    *
+*                  entry     - profile name                    *
+*                  entry_type- profile type (DS, GEN)          *
+*                  debug     - debug level                     *
+*                  generic_flag - 1 - generic , 0 - no         *
+*                              ( only for resource profiles )  *
+*                  locate_err_flag - send/no err msg           *
+*                  option    - locate / next / nextc           *
+*                  dest      - Vector of error msg dests       *
+*                  msgs      - Error messages buffer           *
+*                                                              *
+* OUTPUT         : output    - output area                     *
+*                                                              *
+* RETURN VALUE   : ESA_ERR   - End of database/Profile n/a     *
+*                  ESA_FATAL - Fatal extractor error           *
+*                                                              *
+*                  Rc from assembler access programs :         *
+*                                                              *
+*                   16  -  overflow of output area             *
+*                   20  -  invalid option                      *
+*                   24  -  invalid entry-type                  *
+*                   28  -  invalid map code                    *
+*                   32  -  invalid freemain operation          *
+*                   36  -  invalid connection request          *
+*                   40  -  invalid load extractor (for connect)*
+*                   42  -  invalid del  extractor (for connect)*
+*                                                              *
+*                   When return code = 0  - RACF extractor OK  *
+*                   ------------------------------------------ *
+*                                                              *
+*                   racf_rc     - racf return code             *
+*                   racf_reason - racf reason code             *
+*                                                              *
+***************************************************************/
+
+/* SAS2IBMT typedef and prototype changed for IBM C
+ESA_RC RACF_extract_ace(RACF_ACE_ACCESS_PROG             racfprg,    */
+ESA_RC RACF_extract_ace(ASM_RTN_TYP                    * racfprg,
+                    char                               * option,
+                    char                               * entry_type,
+                    char                               * entry,
+                    int                                  generic_flag,
+                    char                               * volume,
+                    char                               * unit,
+                    char                               * func,
+                    int                                * acl_amount,
+                    RACF_ACE_AREA_rec_typ              * output,
+                    int                                  debug,
+                    RACF_FLAG_typ                       locate_err_flag,
+                    CTSAMSG_DEST_TABLE_rec_typ         * dest,
+                    CTSAMSG_HANDLE_rec_typ             * msgs)
+{
+
+  /*
+   *   Variables
+   */
+
+   int           rc,racf_rc,racf_reason;
+   char          sep[2];
+   ESA_RC        inf_rc = ESA_OK;
+   RESOURCE_typ  prf_name;
+   static char   fn[]="RACF_extract_ace";
+
+  /*
+   *      Initialize
+   */
+
+   ESA_DIAG_enter(PLT_COMP_API_RACF,2,fn);
+
+   BUILD_STRING_SEPARATOR(sep, ADDINFO_LIST_ENTRY)
+
+   strcpy(prf_name, entry);  /* Keep prev value of profile name */
+   ESA_DIAG_printf(PLT_COMP_API_RACF,2,
+                   "option=%s entry_type=%s entry=%s",
+                   option, entry_type, entry);
+
+   /***   Call assembler access program  ***/
+
+   rc = (*racfprg)(option, entry_type, entry, &generic_flag, volume,
+                   unit, acl_amount, output, &debug, &racf_rc,
+                   &racf_reason, sep);
+
+   ESA_DIAG_printf( PLT_COMP_API_RACF,2,
+                    "Extractor area=(%d,%d), %s/%s/%s, rc=(%d,%d,%d)",
+                    output->max_len, output->used_len, option,
+                    entry_type, prf_name, rc, racf_rc, racf_reason);
+
+   /***  Analyze access program return codes  ***/
+
+   if (rc NE 0) {
+
+       /***  rc = 16 means overflow of output area   ***/
+
+       if (rc EQ 16)  {
+         CTSAMSG_print(RACF_EXTRACTOR_ERR, msgs, NULL,
+                  dest, entry_type, prf_name );
+         CTSAMSG_print(RACF_EXTRACTOR_ERR_RC, msgs, NULL,
+                  dest, rc , racf_rc, racf_reason, func );
+         inf_rc = ESA_OK ;
+         goto exit;
+       }
+
+       /***  Other rc - internal error  ***/
+
+       else {
+         CTSAMSG_print(RACF_EXTRACTOR_ERR, msgs, NULL,
+                 dest, entry_type, prf_name ) ;
+         CTSAMSG_print(RACF_EXTRACTOR_ERR_RC, msgs, NULL,
+                 dest, rc, racf_rc, racf_reason, func ) ;
+         inf_rc = ESA_FATAL;
+         goto exit;
+       }                                                   /* r0003 */
+
+   }
+
+   if (racf_rc NE 0) {
+
+      /*
+       *    RACF return code = 12 means :
+       *
+       *    For operation 'locate'  - Profile not found
+       *    For operation 'next'    - End of database
+       */
+
+      if (racf_rc EQ 12)  {
+         if ( ( strcmp(option, RACF_OPERATION_LOCATE) EQ 0) AND
+              ( locate_err_flag  EQ RACF_YES  )              ) {
+            CTSAMSG_print(ERR_RES_NOT_EXIST,
+                          msgs, NULL, dest, prf_name);
+         }
+         /* WS2350 inf_rc = ESA_ERR ; */
+         inf_rc = ESA_EOF ;       /* Resource not found  WS2350 */
+         goto exit;
+      }
+
+      /***  Other non zero return code means - extract error  ***/
+
+      else {
+         ESA_DIAG_printf(PLT_COMP_API_RACF,1,
+                         "Access error. Entry=%s rc=%d reason=%d",
+                         prf_name, racf_rc, racf_reason);
+         CTSAMSG_print(RACF_EXTRACTOR_ERR,   msgs, NULL, dest,
+                       entry_type, prf_name );
+         CTSAMSG_print(RACF_EXTRACTOR_ERR_RC,   msgs, NULL, dest,
+                       rc , racf_rc, racf_reason, func );
+         inf_rc = ESA_FATAL ;
+         goto exit;
+      }
+   } /* non zero racf rc */
+
+  /*
+   *  finish
+   */
+
+   exit: ;
+
+   ESA_DIAG_exit(PLT_COMP_API_RACF,2, fn, inf_rc);
+   return inf_rc ;
+
+} /* RACF_extract_res */
+
+/* PS0231 */
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : RACF_output_to_addinfo                     *
+*                                                             *
+* DESCRIPTION    : Separate information reutrned from RACF    *
+*                  in output buffer and insert it to addinfo  *
+*                  buffer                                     *
+*                                                             *
+* INPUT          : output    - output area                    *
+*                  addinfo_in- special addinfo for            *
+*                              special keywords               *
+*                  keywords  - Special keywords names         *
+*                  dest      - Vector of error msg dests      *
+*                  msgs      - Error messages buffer          *
+*                                                             *
+* OUTPUT         : addinfo   - addinfo ptr                    *
+*                                                             *
+* RETURN VALUE   : ESA_OK                                     *
+*                                                             *
+**************************************************************/
+ESA_RC RACF_output_to_addinfo(RACF_OUTPUT_LINE_rec_ptr    output,
+                              ADDINFO_rec_ptr             addinfo,
+                              ADDINFO_rec_ptr             addinfo_in,
+                              char                        *kwds[],
+             /* IS10076 */    RACF_CUSTOM_FIELDS_block_ptr p_cfb,
+             /* IS10076       CTSAMSG_DEST_TABLE_rec_ptr dest,      */
+             /* IS10076       CTSAMSG_HANDLE_rec_ptr     msgs)      */
+             /* IS10100 */    RACF_CTSACF_block_ptr       p_ctsacf_blk,
+             /* IS10076 */    ADMIN_PARAMS_rec_typ        *admin_params)
+{
+
+/*
+ *      Variables
+ */
+
+ int    i;
+ int    length;              /* ps0292 */
+ int    max_ind     = 0;     /* ps0292 */
+ int    cur_ind     = 0;     /* ps0292 */
+ int    ind_fld_flag;        /* ps0292 */
+ char  *wptr;                /* ps0292 */
+ char   idx_fld[80] = "";    /* ps0292 */
+ char   tmp_fld[10] = "";    /* ps0292 */
+ /* WS10082N char   msg_buf[100];        /@ ps0292 @/  */
+ char   msg_buf[256] = "";                                /* WS10082N */
+ int    spec_kwd = 0;
+ char   tag_value[1024+1];                                /* WS10081 */
+ int    num_tagless_factors = 0;                          /* WS10081 */
+ int    tnl                 = 0;                          /* WS10081 */
+ short  tvl                 = 0;                          /* WS10081 */
+ int    factor_tags_len     = 0;                          /* WS10081 */
+ short  factor_tags_len2    = 0;                          /* WS10081 */
+ /* int    with_blank          = TRUE;                       WS10081 */
+ int    first_tag           = TRUE;                       /* WS10081 */
+ char  *tag                 = NULL;                       /* WS10081 */
+ char  *ptag_name           = NULL;                       /* WS10081 */
+ char  *ptag_value          = NULL;                       /* WS10081 */
+ char  sublistsep[2] = {ADDINFO_LIST_SUBFIELD,NULL_CHAR}; /* WS10081 */
+ ONE_RACF_FIELD_rec_typ racf_factor_tags  = { 0 } ;       /* WS10081 */
+
+ ONE_RACF_FIELD_rec_typ racf_keyword = { 0 } ;
+ ONE_RACF_FIELD_rec_typ racf_value   = { 0 } ;
+ ONE_RACF_FIELD_rec_typ racf_pass    = { 0 } ;
+
+
+ int   already = 0;                                      /* IS10181 */
+
+ char *output_char_ptr     ; /* start ptr to text from racf */
+ char *output_char_ptr_end ; /* end   ptr to text from racf */
+
+ int    subgrp_suffix = 0 ;               /*BS2703*/
+ char   curr_split[3]="";                 /*BS2703*/
+
+ ESA_RC addval_rc;
+ ESA_RC inf_rc = ESA_OK;
+ static char func[]="RACF_output_to_addinfo";
+
+ /* size_t l;       as1506 */
+
+ ONE_FIELD_rec_ptr pair;
+
+ CTSAMSG_DEST_TABLE_rec_ptr dest;                         /* IS10076 */
+ CTSAMSG_HANDLE_rec_ptr     msgs;                         /* IS10076 */
+ RACF_PARAMS_rec_typ      * params_ptr = NULL;            /* IS10076 */
+
+ int          sitecfs_yes = FALSE;                        /* IS10100 */
+ int          cfs_done = FALSE;                           /* IS10100 */
+ char         nocsdata[2];                                /* IS10100 */
+
+/*
+ *      Initialize
+ */
+
+ ESA_DIAG_enter(PLT_COMP_API_RACF, 2,func);
+ msgs = admin_params->ctsamsg_handle;                     /* IS10076 */
+ dest = admin_params->ctsamsg_dest;                       /* IS10076 */
+ params_ptr = admin_params->apiinit_handle;               /* IS10076 */
+
+ if (ESA_DIAG_get_debug_level(PLT_COMP_API_RACF) GT 3)    /* IS10076 */
+    ADDINFO_dump(addinfo, 1);                             /* IS10076 */
+
+/*
+ *     Scan output line and seperate keywords
+ */
+
+ output_char_ptr = output->buffer;
+ output_char_ptr_end = output_char_ptr + output->used_len;
+
+ ESA_DIAG_printf(PLT_COMP_API_RACF, 3,
+                 "output_char_ptr=%x used_len=%d addinfo_ptr=%x" ,
+                 output_char_ptr, output->used_len,addinfo) ;
+
+ while( output_char_ptr LT output_char_ptr_end ) {
+
+   /*
+    *   Seperate the next keyword and value
+    */
+
+    output_char_ptr = RACF_get_next_parameter(output_char_ptr,
+                            &racf_keyword, &racf_value, &racf_pass) ;
+
+    if (strcmp(racf_keyword.value,               /*ps0292 */
+               DIG_CERT_DATA_FIELD) EQ 0)        /*ps0292 */
+       ESA_DIAG_printf(PLT_COMP_API_RACF, 5,
+                       "key : l=%d v=%s, value: l=%d v=%s" ,
+                       racf_keyword.length, racf_keyword.value,
+                       racf_value.length, "...");
+    else
+       ESA_DIAG_printf(PLT_COMP_API_RACF, 5,
+                       "key : l=%d v=%s, value: l=%d v=%s" ,
+                       racf_keyword.length, racf_keyword.value,
+                       racf_value.length, racf_value.value);
+
+    /*   Ignore an empty values  */
+
+    if ( racf_value.length EQ 0 )
+       continue ;
+
+   /*   l = strspn(racf_value.value,"0") ;        as1506   */
+   /*   if ( l EQ strlen(racf_value.value) )      as1506   */
+   /*      continue ;                             as1506   */
+
+   /*   Check for index field (started from %%) */        /* ps0292 */
+
+   ind_fld_flag = FALSE;                                  /* ps0292 */
+   if ( memcmp(racf_keyword.value, "%%", 2) EQ 0) {       /* ps0292 */
+                                                          /* ps0292 */
+      /* Index field found. Get Max value */              /* ps0292 */
+                                                          /* ps0292 */
+      max_ind = atoi(racf_value.value);                   /* ps0292 */
+      cur_ind = 0;                                        /* ps0292 */
+      strcpy(idx_fld, racf_keyword.value);                /* ps0292 */
+      ESA_DIAG_printf(PLT_COMP_API_RACF, 5,               /* ps0292 */
+                      "Index field=%s max_value=%d",      /* ps0292 */
+                      idx_fld, max_ind);                  /* ps0292 */
+   }                                                      /* ps0292 */
+   /* Try to apply index field */                         /* ps0292 */
+   else if (strlen(idx_fld) GT 0) {                       /* ps0292 */
+      wptr = strstr(racf_keyword.value, idx_fld);         /* ps0292 */
+                                                          /* ps0292 */
+      /* Index field suffix found. Update it to index */  /* ps0292 */
+                                                          /* ps0292 */
+      if (wptr) {       /* Found index field */           /* ps0292 */
+                                                          /* ps0292 */
+         /* Increase index only for new entry group */    /* ps0292 */
+                                                          /* ps0292 */
+         if (strcmp(racf_pass.value, "0") EQ 0)           /* ps0292 */
+           cur_ind++;     /* Incr index */                /* ps0292 */
+         if (cur_ind GT max_ind) {                        /* ps0292 */
+           sprintf(msg_buf,                               /* ps0292 */
+            "Index field=%s/%d reachs maximum allowed=%d",/* ps0292 */
+            racf_keyword.value, cur_ind, max_ind);        /* ps0292 */
+           CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, /* ps0292 */
+                  component, func, msg_buf, 0, __LINE__); /* ps0292 */
+         }                                                /* ps0292 */
+                                                          /* ps0292 */
+         /* Apply index to current keyword */             /* ps0292 */
+                                                          /* ps0292 */
+         ind_fld_flag = TRUE;                             /* ps0292 */
+         sprintf(tmp_fld, "%d", cur_ind);                 /* ps0292 */
+         strcpy(wptr, tmp_fld);   /* Add index */         /* ps0292 */
+         racf_keyword.length = strlen(racf_keyword.value);/* ps0292 */
+      }                                                   /* ps0292 */
+   }                                                      /* ps0292 */
+   else if ( (strlen(idx_fld) EQ 0)            AND        /* ps0292 */
+             (strstr(racf_keyword.value, "%%")  ) ) { /* ps0292 */
+    sprintf(msg_buf,                                      /* ps0292 */
+     "Found index field=%s but index was not initialized",/* ps0292 */
+     racf_keyword.value);                                 /* ps0292 */
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,       /* ps0292 */
+                 component, func, msg_buf, 0, __LINE__);  /* ps0292 */
+   }                                                      /* ps0292 */
+
+   /*   Try to locate a special keyword  */
+
+    spec_kwd = 0;
+    if  (ind_fld_flag )      /* ps0292 */
+       spec_kwd = 1;         /* ps0292 */
+
+    /* Del by ps0292 if ( addinfo_in NE NULL ) {      */
+    if ( (addinfo_in NE NULL) AND (spec_kwd EQ 0) ) {      /* ps0292 */
+       for (i=0;(strlen(kwds[i]) GT 0) AND (spec_kwd EQ 0);i++) {
+
+           ESA_DIAG_printf(PLT_COMP_API_RACF, 5,
+                           "keyword(%d)=%s", i, kwds[i]);
+           if ( strcmp(kwds[i],racf_keyword.value) EQ 0 )
+              spec_kwd = 1;
+
+       } /* for */
+    } /* special addinfo was passed */
+
+   /*
+    *    Put data in special addinfo
+    */
+
+    if ( spec_kwd NE 0 ) {
+       pair = ADDINFO_search(racf_keyword.value,
+                             RCF_ADDINFO_KWD_LEN,
+                             addinfo_in->pair,
+                             addinfo_in->num_pairs );
+       if (pair NE NULL) {
+        /* WS10081 start */
+        if (strcmp(racf_keyword.value,"MFA.ACTIVE") EQ 0)
+        {
+         num_tagless_factors++;
+         ESA_DIAG_printf(PLT_COMP_API_RACF, 5,
+           "ACTIVE: num_tagless_factors = %d",
+                      num_tagless_factors);
+        }
+        if (strcmp(racf_keyword.value,"MFA.TAGS") EQ 0)
+        {
+         num_tagless_factors--;
+         ESA_DIAG_printf(PLT_COMP_API_RACF, 5,
+           "TAGS  : num_tagless_factors = %d",
+                      num_tagless_factors);
+         ESA_DIAG_printf(PLT_COMP_API_RACF, 5,
+           "TAGS PRE: pair->vallen = %d , racf_value.length = %d",
+                      pair->vallen,       racf_value.length);
+
+         if (ESA_DIAG_get_debug_level(PLT_COMP_API_RACF) GE 5)
+         {
+            SNAP_AREA("TAGS AREA PRE: pair value", pair->value ,
+                      pair->vallen);
+         }
+         /*
+            Factors are provided to higher levels in MFA.FACTORS with
+            list separators and the same for the tags of each factor.
+            We corelate the 1st tags entry in MFA.TAGS to the 1st
+            factor, etc. We need to add a place holder in MFA.TAGS for
+            each factor that did not have tags, so that we know to
+            which factor the current tags belong to.
+         */
+         if (num_tagless_factors GT 0)
+          while (num_tagless_factors GT 0)
+          {
+          addval_rc = ADDINFO_addval("NOTAGS",
+                                     RCF_ADDINFO_VAL_LEN,
+                                     ADDINFO_LIST_ENTRY, pair,
+                                     dest, msgs );
+           num_tagless_factors--;
+          }
+
+         first_tag = TRUE;
+         tag = racf_value.value;
+         /* loop over the tags of this factor and extract each tag's
+            name:value
+         */
+         while (tag LT (racf_value.value + racf_value.length) )
+         {
+          ESA_DIAG_printf(PLT_COMP_API_RACF, 5,
+           "Start while: tag = %p, value = %p, len = %d",
+                         tag , racf_value.value, racf_value.length);
+          if (first_tag)
+          {
+           memcpy(&factor_tags_len,tag,4);
+           tag = tag + 4;
+           first_tag = FALSE;
+          }
+          else
+          {
+           /* WS10082N strcat(racf_factor_tags.value, sublistsep); */
+           memcpy(&factor_tags_len2,tag,2);
+           factor_tags_len = (int)factor_tags_len2;
+           tag = tag + 2;
+          }
+          ESA_DIAG_printf(PLT_COMP_API_RACF, 5,
+                     "TAG length = %d",factor_tags_len);
+          memcpy(&tnl,tag,4);
+          ESA_DIAG_printf(PLT_COMP_API_RACF, 5,
+                     "TAG name length = %d",tnl);
+          ptag_name = tag + 4;
+          ESA_DIAG_printf(PLT_COMP_API_RACF, 5,
+                     "TAG name = %.*s",tnl, ptag_name);
+          memcpy(&tvl, ptag_name + tnl, 2);
+          ESA_DIAG_printf(PLT_COMP_API_RACF, 5,
+                     "TAG value length = %d",tvl);
+          ptag_value = ptag_name + tnl + 2;
+          memcpy(tag_value, ptag_value, tvl);
+          tag_value[tvl] = NULL_CHAR;
+          ESA_DIAG_printf(PLT_COMP_API_RACF, 5,
+                     "TAG value = %s",tag_value);
+          /*
+          if (strchr(tag_value,' ') EQ NULL)
+             with_blank = FALSE;
+          else
+             with_blank = TRUE;
+          if (with_blank)
+           strcat(racf_factor_tags.value, "\"");
+          */
+          strncat(racf_factor_tags.value, ptag_name, tnl);
+          strcat(racf_factor_tags.value, ":");
+          strncat(racf_factor_tags.value, ptag_value, tvl);
+          /* WS10082N - start */
+          /* We put each tag immediately into the the addinfo pair
+             to prevent storage overflow of racf_factor_tags.value
+             if accumulated tags with their names exceed its length  */
+          addval_rc = ADDINFO_addval(racf_factor_tags.value,
+                                     RCF_ADDINFO_VAL_LEN,
+                                     ADDINFO_LIST_ENTRY, pair,
+                                     dest, msgs );
+          if (addval_rc NE ESA_OK) {
+            if ( (addval_rc EQ ESA_EOF)  OR            /* overflow */
+                   (addval_rc EQ ESA_ERR) )  /* L pair alloc failed */
+               CTSAMSG_print(RACF_ADDINFO_VAL_OVRFLW,
+                             msgs, NULL, dest,
+                             racf_keyword.value,
+                             racf_factor_tags.value);
+            else
+              ESA_DIAG_printf(PLT_COMP_API_RACF, 0,
+                "addval error. value ignored or truncated for %s = %s",
+                 racf_keyword.value,
+                 racf_factor_tags.value);
+
+           break;
+          }
+
+          racf_factor_tags.value[0] = NULL_CHAR;
+          /* WS10082N - end   */
+          /*
+          if (with_blank)
+           strcat(racf_factor_tags.value, "\"");
+          */
+          ESA_DIAG_printf(PLT_COMP_API_RACF, 5,
+                     "TAG(s) = %s",racf_factor_tags.value);
+          tag = ptag_value + tvl;
+         }  /* end of while */
+        /* WS10082N - this code was moved up
+        addval_rc = ADDINFO_addval(racf_factor_tags.value,
+                                   RCF_ADDINFO_VAL_LEN,
+                                   ADDINFO_LIST_ENTRY, pair,
+                                   dest, msgs );
+        racf_factor_tags.value[0] = NULL_CHAR;
+            end of moved code  */
+        }   /* end of if (..."MFA.TAGS")   */
+        else
+        /* WS10081 end   */
+        {                                                 /* WS10082N */
+          addval_rc = ADDINFO_addval(racf_value.value,
+                                     RCF_ADDINFO_VAL_LEN,
+                                     ADDINFO_LIST_ENTRY, pair,
+                                     dest, msgs );
+
+          /* IS10181 We will check a specific return code instead of...
+          if (addval_rc NE ESA_OK ) {                               */
+          /* WS10082N if (addval_rc EQ ESA_EOF) {  /@ IS10181 @/  */
+          if ( (addval_rc EQ ESA_EOF)  OR                 /* WS10082N */
+                         (addval_rc EQ ESA_ERR) )         /* WS10082N */
+          {
+             if (already EQ 0) {                         /* IS10181 */
+                CTSAMSG_print(RACF_ADDINFO_VAL_OVRFLW, msgs, NULL,
+                           dest, racf_keyword.value, racf_value.value);
+                already = 1;                             /* IS10181 */
+             }                                           /* IS10181 */
+          }                                              /* IS10181 */
+          else if (addval_rc NE ESA_OK)                  /* IS10181 */
+                  ESA_DIAG_printf(PLT_COMP_API_RACF, 0,  /* IS10181 */
+                      "addval error ignored <keyword %s> <value %s>",
+                      racf_keyword.value, racf_value.value);
+
+          /* IS10181 Remove this end-bracket
+          }                                                         */
+        }                                               /* WS10082N */
+       } /* keyword found */
+      /*
+       *  Special keywords, keywords that related to
+       *  structures ( User, Group, Connections ).
+       *  so, we can be sure that type of this keyword 1A
+       */
+       else {
+          ESA_DIAG_printf(PLT_COMP_API_RACF, 1,
+/*WS10082K*/        "kplog key : l=%d v=%s, value:%s l=%d",
+/*WS10082K*/        racf_keyword.length, racf_keyword.value,
+                    racf_value.value, racf_value.length);
+          if (strcmp(racf_keyword.value,             /*ps0292 */
+                   DIG_CERT_DATA_FIELD) EQ 0) {      /*ps0292 */
+             length = racf_value.length;             /*ps0292 */
+   /*WS10082 ADDINFO_insert_dgt(TYPE_1A,             /@ps0292 @/ */
+             ADDINFO_insert_nonstr(TYPE_1A,  /*ps0292 */ /*WS10082*/
+                            racf_keyword.value,      /*ps0292 */
+                            racf_value.value,        /*ps0292 */
+                            length,                  /*ps0292 */
+                            addinfo_in,              /*ps0292 */
+                            RCF_ADDINFO_KWD_LEN,     /*ps0292 */
+                            RCF_ADDINFO_VAL_LEN,     /*ps0292 */
+                            UNIQUE,                       /* WS10082N */
+                            'N');                         /* WS10082N */
+   /* WS10082N              UNIQUE);                 /@ps0292 @/   */
+          }                                          /*ps0292 */
+          else
+             ADDINFO_insert(TYPE_1A, racf_keyword.value,
+                            racf_value.value, addinfo_in,
+                            RCF_ADDINFO_KWD_LEN,
+                            RCF_ADDINFO_VAL_LEN,
+                            UNIQUE);
+       }
+    }
+
+   /*
+    *    Put data in addinfo
+    */
+
+    else {
+
+       /* BS2703 start */
+       /* to support multi SUBGROUP keywords , we keep keyword
+          'SUBGROUP' and create new keywords .
+          convention 'SUBGROUPx' (x-index , index value between
+          1 to LAST_SUBGROUP_SUFFIX),each keyword contain
+          ~450 values ,when keyword is full we pass to the next
+          'SUBGROUPx' keyword .
+          If more SUBGROUPx keywords are required, the changes which are
+          required are:
+          LAST_SUBGROUP_SUFFIX should be enlarged.
+          SUBGROUPx new keywords should be added to ESS
+          Please keep in mind that there is a limitation on the total
+          answer received from RACF, which currently is 32K
+          Limits are in C sources by RACF_OUTPUT_SIZE
+       */
+       if (strcmp("SUBGROUP",racf_keyword.value) EQ 0) {
+          if (subgrp_suffix)
+          {
+             sprintf (curr_split, "%d",subgrp_suffix);
+             strcat(racf_keyword.value,curr_split);
+          }
+          ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+                          "Subgroup Keyword = '%s'",
+                          racf_keyword.value);
+       }
+       /* BS2703 end */
+
+       /*  IS10076 - start  */
+
+       /*
+        *  Process Custom fields
+        */
+       if (strcmp(racf_keyword.value, "CSDATA.CSCDATA") EQ 0)
+       {
+         /* IS10100
+         if (params_ptr->rssparm_CUSTOM_FIELDS_SUPPORT[0] EQ 'Y')
+         {                                                       */
+           /* Process the Custom fields (site and CTSACF).      */
+           /* No need to get and check the RC because it always */
+           /* returns ESA_OK.                                   */
+         cfs_done = TRUE;
+
+         CSDATA_to_addinfo(&racf_value, addinfo, p_cfb,
+                             addinfo_in, p_ctsacf_blk,    /* IS10100 */
+                             &sitecfs_yes, admin_params); /* IS10100 */
+
+         if ( params_ptr->rssparm_CUSTOM_FIELDS_SUPPORT[0] EQ 'Y')
+         {
+           pair = ADDINFO_search("NOCSDATA",
+                                 RCF_ADDINFO_KWD_LEN,
+                                 addinfo ->pair,
+                                 addinfo ->num_pairs );
+           if (pair NE NULL)
+           {
+             if (sitecfs_yes)          /* If there are site cfs... */
+               nocsdata[0] = 'N';      /* ...set nocsdata N.       */
+             else                      /* Othersie (no site cfs)...*/
+               nocsdata[0] = 'Y';      /* ...set nocsdata Y.       */
+             nocsdata[1] = NULL_CHAR;
+
+             addval_rc = ADDINFO_updval(nocsdata,
+                                      RCF_ADDINFO_VAL_LEN,
+                                      pair);
+             if (addval_rc NE ESA_OK )
+                ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+                                "updval error ignored <NOCSDATA> <%s>",
+                                nocsdata);
+           }
+         }
+         /* IS10100 - }   */
+         continue;
+       }
+
+       /*
+        *  Process NOCSDATA attribute set by extract routine.
+        */
+
+       /* IS10100 - start
+       if (strcmp(racf_keyword.value, "NOCSDATA") EQ 0  AND
+           params_ptr->rssparm_CUSTOM_FIELDS_SUPPORT[0] EQ 'N')
+          continue;    */
+       if (strcmp(racf_keyword.value, "NOCSDATA") EQ 0)
+       {
+         /*
+          *  If Custom Fields are not supproted, or if custom
+          *  fields were already processed, skip.
+          *
+          *  Otherwise, do standard processing.
+          */
+         if ( params_ptr->rssparm_CUSTOM_FIELDS_SUPPORT[0] EQ 'N'  OR
+             cfs_done )
+            continue;
+       }
+       /*  IS10100 - end    */
+
+       /*  IS10076 - end    */
+
+       pair = ADDINFO_search(racf_keyword.value,
+                             RCF_ADDINFO_KWD_LEN,
+                             addinfo ->pair,
+                             addinfo ->num_pairs );
+       if (pair NE NULL) {
+          addval_rc = ADDINFO_addval( racf_value.value,
+                                      RCF_ADDINFO_VAL_LEN,
+                                      ADDINFO_LIST_ENTRY, pair,
+                                      dest, msgs );
+          if (addval_rc NE ESA_OK ) {
+             /* BS2703 start */
+             if (strncmp("SUBGROUP",racf_keyword.value,8) EQ 0) {
+                /* SUBGROUPxx */
+
+                if (subgrp_suffix < LAST_SUBGROUP_SUFFIX)
+                     subgrp_suffix = subgrp_suffix + 1;
+                else
+ /* bs10021         ESA_DIAG_printf(PLT_COMP_API_RACF, 0, */
+                    ESA_DIAG_printf(PLT_COMP_API_RACF, 1, /*BS10021*/
+                       "The last SUBGROUPx keyword is full SUBGROUP=%s",
+                       racf_keyword.value);
+                strcpy(racf_keyword.value,"SUBGROUP");
+                sprintf (curr_split, "%d",subgrp_suffix);
+                strcat(racf_keyword.value,curr_split);
+                pair = ADDINFO_search(racf_keyword.value,
+                             RCF_ADDINFO_KWD_LEN,
+                             addinfo ->pair,
+                             addinfo ->num_pairs );
+                if (pair NE NULL) /* BS2711 */
+                {                 /* BS2711 */
+                   addval_rc = ADDINFO_addval( racf_value.value,
+                                            RCF_ADDINFO_VAL_LEN,
+                                            ADDINFO_LIST_ENTRY, pair,
+                                            dest, msgs );
+                   if (addval_rc NE ESA_OK ) {
+ /* WS10004           CTSAMSG_print(RACF_ADDINFO_VAL_OVRFLW,   msgs, NULL,
+                          dest, racf_keyword.value, racf_value.value);*/
+                      ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+                        "addval error ignored <%s> <%s>",
+                        racf_keyword.value,racf_value.value);/*WS10004*/
+                   }
+                }                 /* BS2711 */
+             }
+             /* BS2703 end */
+             else {
+                 CTSAMSG_print(RACF_ADDINFO_VAL_OVRFLW,   msgs, NULL,
+                          dest, racf_keyword.value, racf_value.value);
+                 ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+                                "addval error ignored");
+             }
+          }
+       } /* keyword processing */
+       else ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+                            "keyword %s value %s ignored",
+                            racf_keyword.value, racf_value.value);
+
+    }
+
+ } /* loop on output line */
+
+/*
+ *  finish
+ */
+
+ exit: ;
+
+ if (ESA_DIAG_get_debug_level(PLT_COMP_API_RACF) GT 3)
+    ADDINFO_dump(addinfo,0);
+
+ ESA_DIAG_exit(PLT_COMP_API_RACF, 2, func, inf_rc );
+
+ return inf_rc ;
+
+} /* RACF_output_to_addinfo */
+
+/*  IS10076 - start   */
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : CSDATA_to_addinfo                          *
+*                                                             *
+* DESCRIPTION    : Analyze the CSDATA.CSCDATA value and       *
+*                  process each field according to its type   *
+*                  (CTSACF or site):                          *
+*                                                             *
+*                  CTSACF field:                              *
+*                  1. Add an entry to the laddinfo with the   *
+*                     original value.                         *
+*                  2. If the addinfo contains an entry for    *
+*                     the field, put the value (in char       *
+*                     format) in the entry.                   *
+*                                                             *
+*                  CTSACF field:                              *
+*                  1. If the addinfo contains an entry for    *
+*                     the field, put the value (in char       *
+*                     format) in the entry.                   *
+*                  2. If the addinfo does not contain an      *
+*                     entry for the field, write a debug      *
+*                     message.                                *
+*                  3. when there is at least 1 site field,    *
+*                     set the site_cfs parameter to TRUE.     *
+*                                                             *
+* INPUT          : racf_value- value of CSDATA.CSCDATA        *
+*                  dest      - Vector of error msg dests      *
+*                  msgs      - Error messages buffer          *
+*                                                             *
+* OUTPUT         : addinfo   - addinfo ptr                    *
+*                : addinfo_in - internal (local) addinfo ptr. *
+*                : sitecfs_yes - an indication whether there. *
+*                                is at least 1 site field.    *
+*                                                             *
+* RETURN VALUE   : ESA_OK                                     *
+*                                                             *
+**************************************************************/
+static ESA_RC CSDATA_to_addinfo(ONE_RACF_FIELD_rec_typ   *racf_value,
+                             ADDINFO_rec_ptr              addinfo,
+                             RACF_CUSTOM_FIELDS_block_ptr p_cfb,
+               /* IS10100 */ ADDINFO_rec_ptr              addinfo_in,
+               /* IS10100 */ RACF_CTSACF_block_ptr        p_ctsacf_blk,
+               /* IS10100 */ int                         *sitecfs_yes,
+                             ADMIN_PARAMS_rec_typ        *admin_params)
+{
+
+ #define  CSDATA_FIELD_NAME_LEN  8     /* max len per IBM     WS10082 */
+ #define  CSDATA_FULL_NAME_LEN   6+1+CSDATA_FIELD_NAME_LEN /* WS10082 */
+ #define  CSDATA_MAX_VALUE_LEN   1100  /* max len per IBM     WS10082 */
+
+ static char            func[]="CSDATA_to_addinfo";
+
+ ESA_RC  rc =  ESA_OK;
+ ESA_RC  updval_rc =  ESA_OK;
+
+ ONE_RACF_FIELD_rec_typ csfield_name = { 0 } ;
+ ONE_RACF_FIELD_rec_typ csfield_type = { 0 } ;
+ ONE_RACF_FIELD_rec_typ csfield_value = { 0 } ;
+
+ RACF_CUSTOM_FIELD_rec_typ *  cfield_entry;
+
+ ONE_FIELD_rec_ptr pair;
+
+ /* WS10082
+ char   csfield_char_value[RCF_ADDINFO_VAL_LEN+1] ;
+ char   csfield_full_name[RCF_ADDINFO_KWD_LEN+1] ;
+ */
+ char   csfield_char_value[CSDATA_MAX_VALUE_LEN+1];       /* WS10082 */
+ char   csfield_full_name[CSDATA_FULL_NAME_LEN+1];        /* WS10082 */
+ char * csdata_curr_ptr;
+ char * csdata_end_ptr;
+
+ int * pi;
+ int   i;
+ int   j;
+ /* IS10100B int   synch_msg_issued = FALSE;                  */
+ int   reload_msg_issued = FALSE;
+ int   ctsacf_fld = FALSE;                             /* IS10100 */
+ RACF_CTSACF_ACT_typ is_act;                           /* IS10100 */
+ int   cf_ok;                                          /* IS10100 */
+
+ CTSAMSG_DEST_TABLE_rec_ptr  dest;
+ CTSAMSG_HANDLE_rec_ptr      msgs;
+ RACF_PARAMS_rec_typ      * params_ptr = NULL;
+
+/*
+ *      Initialize
+ */
+
+ ESA_DIAG_enter(PLT_COMP_API_RACF, 2,func);
+
+ msgs = admin_params->ctsamsg_handle;
+ dest = admin_params->ctsamsg_dest;
+ params_ptr = admin_params->apiinit_handle;
+ *sitecfs_yes = FALSE;                                  /* IS10100 */
+
+ /*
+  *  Split the combined field into its separate fields, find the
+  *  addinfo entry and update the value. Translate when necessary.
+  *  If no addinfo entry, issue an error message.
+  *
+  *  CSCDATA output format:
+  *  - 2 bytes length followed by fields data.
+  *  - field data (repeated for all fields).
+  *
+  *  Field data format:
+  *  - 4 bytes field type length (always 1).
+  *  - field type (01=C; 02=F; 03=B; 04=H).
+  *  - 4 bytes field name length
+  *  - field name.
+  *  - 4 bytes field value length
+  *  - field value
+  *
+  *  Note:
+  *  RACF_get_field excpets that the field length to be in short format
+  *  (2 bytes) while in the CSCDATA output the length is in int format
+  *  (4 bytes). To overcome this, we advance the pointer of the current
+  *  location 2 bytes before caloaing RACF_get_field.
+  */
+ /*  IS10100
+ if (racf_value->length > 0)
+ {               */
+ if (racf_value->length LE 0)                    /* IS10100       */
+   goto exit;                                    /* IS10100       */
+
+ csdata_curr_ptr = racf_value->value + 2;
+ csdata_end_ptr = racf_value->value + racf_value->length;
+
+ while (csdata_curr_ptr < csdata_end_ptr)
+ {
+   /*  Take the field name, type and value                     */
+   csfield_type.length = 0;
+   csfield_name.length = 0;
+   csfield_full_name[0] = NULL_CHAR;
+   csfield_value.length = 0;
+   csfield_char_value[0] = NULL_CHAR;
+
+   csdata_curr_ptr = RACF_get_field(csdata_curr_ptr,
+                                    &csfield_type, FALSE);
+   csdata_curr_ptr = csdata_curr_ptr + 2;
+
+   if (csdata_curr_ptr LT csdata_end_ptr)
+     csdata_curr_ptr = RACF_get_field(csdata_curr_ptr,
+                                      &csfield_name, FALSE);
+   strcpy(csfield_full_name, "CSDATA.");
+   strcat(csfield_full_name, csfield_name.value);
+
+   csdata_curr_ptr = csdata_curr_ptr + 2;
+
+   if (csdata_curr_ptr LT csdata_end_ptr)
+     csdata_curr_ptr = RACF_get_field(csdata_curr_ptr,
+                                      &csfield_value, FALSE);
+   csdata_curr_ptr = csdata_curr_ptr + 2;
+
+   /* IS10100 - start */
+   /*
+   if (csfield_type.length EQ 1 AND
+       csfield_name.length GT 0)      */
+   if (csfield_type.length NE 1 OR
+       csfield_name.length LE 0)
+      continue;                     /* if invalid data - skip */
+   /* {  */
+   /* IS10100 - end */
+
+   ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+      "%s  type = %2X  value = (%d)%2X",
+       csfield_full_name, *csfield_type.value,
+       csfield_value.length,
+       csfield_value.length GT 0 ?
+            *csfield_value.value : csfield_value.length);
+
+   /*  IS10100 - start  */
+
+   /*  If this is a CTSACF field, put it in the local addinfo */
+   /*  the entry in the local addinfo contains the original   */
+   /*  value (not translated to character).                   */
+   if (p_ctsacf_blk NE NULL)
+   {
+     ctsacf_fld = FALSE;
+     updval_rc = RACF_IsIt_CTSACF_cf(PLT_COMP_API_RACF, NULL_CHAR,
+                                     p_ctsacf_blk, csfield_name.value,
+                                     NULL, NULL, &is_act,
+                                     admin_params);
+     if ( updval_rc  EQ  ESA_OK )
+     {
+       ctsacf_fld = TRUE;
+
+       if ( is_act  EQ  ACT_YES )
+       {
+         /* WS10082 updval_rc = ADDINFO_insert_dgt(TYPE_1A, */
+         updval_rc = ADDINFO_insert_nonstr(TYPE_1A,       /* WS10082 */
+                            csfield_full_name,
+                            csfield_value.value,
+                            csfield_value.length,
+                            addinfo_in,
+                            RCF_ADDINFO_KWD_LEN,
+                            RCF_ADDINFO_VAL_LEN,
+                            UNIQUE,                       /* WS10082N */
+                            'Y');                         /* WS10082N */
+        /* WS10082N         UNIQUE);    */
+         /* WS10082 - start */
+         /* ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+          "ADDINFO_insert_dgt for %s - rc = %d  (addinfo = %8X)",
+                 csfield_full_name, updval_rc, addinfo_in);  */
+         ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+          "ADDINFO_insert_nonstr for %s - rc = %d  (addinfo = %8X)",
+                 csfield_full_name, updval_rc, addinfo_in);
+         /* WS10082 - end */
+       }
+       else
+         ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+                   "CTSACF cfield %s is %s - value ignored",
+                   csfield_full_name,
+                   is_act EQ ACT_ERROR ? "in error" : "not active");
+     }
+   }
+
+   /*  IS10100 - end    */
+
+   /*  Translate the value to character, according to its type */
+   /*  for putting in the addinfo                               */
+   if (csfield_value.length GT 0)
+   {
+     switch (csfield_type.value[0])
+     {
+       case 0x01:           /* char */
+         strncpy(csfield_char_value, csfield_value.value,
+                 csfield_value.length);
+         csfield_char_value[csfield_value.length]=NULL_CHAR;
+         break;
+       case 0x02:           /* num  */
+         pi = (int *)csfield_value.value;
+         sprintf(csfield_char_value, "%d", *pi);
+         break;
+       case 0x03:           /* flag */
+         if (csfield_value.value[0] EQ 0x80)
+            strcpy(csfield_char_value, "Y");
+         else
+            strcpy(csfield_char_value, "N");
+         break;
+       case 0x04:          /* hex */
+         for (i=0, j=0; i < csfield_value.length; i++, j+=2)
+         {
+           sprintf(&csfield_char_value[j], "%.2X",
+                   csfield_value.value[i]);
+         }
+         csfield_char_value[j] = NULL_CHAR;
+         break;
+     }
+   }
+   else
+      csfield_char_value[0] = NULL_CHAR;
+
+   ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+                   "%s   value = %s",
+                   csfield_full_name, csfield_char_value);
+
+   /* IS10100 - start */
+   /* if this is a site custom field, check it against the cfb */
+   if ( params_ptr->rssparm_CUSTOM_FIELDS_SUPPORT[0] EQ 'Y' AND
+        NOT ctsacf_fld)
+   {
+     /* IS10100 - end   */
+     *sitecfs_yes = TRUE;
+     /*  Verify that the field exists in the CFB, with the    */
+     /*  correct type.  If not, issue a warning.              */
+     cfield_entry = RACF_Search_CField_Block(
+                               PLT_COMP_API_RACF, p_cfb,
+                               csfield_full_name, admin_params );
+     /* IS10100 - start  */
+     /*
+     if ( NOT
+          (cfield_entry NE NULL                                AND
+          csfield_type.value[0] LE RACF_CFEILD_type_tab_count  AND
+          RACF_CFEILD_type_tab[csfield_type.value[0] - 1] EQ
+             cfield_entry->type) )  */
+     if ( cfield_entry NE NULL                                 AND
+          csfield_type.value[0] LE RACF_CFEILD_type_tab_count  AND
+          RACF_CFEILD_type_tab[csfield_type.value[0] - 1] EQ
+             cfield_entry->type)
+       cf_ok = TRUE;
+     else
+     /* IS10100 - end */
+     {
+       cf_ok = FALSE;                                  /* IS10100 */
+       ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+           "%s/%.2X does not match loaded entry %s/%s",
+           csfield_full_name, csfield_type.value[0],
+           cfield_entry NE NULL ? cfield_entry->name : " ",
+           cfield_entry NE NULL ? cfield_entry->type : ' ');
+
+       if (NOT reload_msg_issued)
+       {
+         CTSAMSG_print(RACF_CFIELDS_OUT_OF_DATE, msgs, NULL, dest);
+         /* IS10109
+         CTSAMSG_print(RACF_CFIELDS_RELOAD_REQ,  msgs, NULL, dest);
+         CTSAMSG_print(RACF_CFIELDS_SYNCH_REQ,   msgs, NULL, dest);  */
+         reload_msg_issued = TRUE;
+       }
+     }
+   }
+   else               /* if no custom fields support...  * IS10100 */
+     cf_ok = FALSE;   /* ...ignore them.                 * IS10100 */
+
+   /*  For CTSACF fields or for site custom fields that     */
+   /*  were verified:                                       */
+   /*  Look for the field in addinfo, and update its value  */
+   /*  for ctsacf fields - the field may or may not exists  */
+   /*                      in addinfo.                      */
+   /*  for site fields - the field must appear in addinfo   */
+   if (ctsacf_fld   OR   cf_ok)                          /* IS10100 */
+   {                                                     /* IS10100 */
+     pair = ADDINFO_search(csfield_full_name,
+                           RCF_ADDINFO_KWD_LEN,
+                           addinfo->pair,
+                           addinfo->num_pairs);
+     if (pair NE NULL)       /* Field exists */
+     {
+       updval_rc = ADDINFO_updval(csfield_char_value,
+                           RCF_ADDINFO_VAL_LEN, pair);
+       ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+                       "%s - vlaue updated",
+                        csfield_full_name);
+       if (updval_rc NE ESA_OK)
+       {
+         CTSAMSG_print(RACF_ADDINFO_VAL_OVRFLW,  msgs, NULL,
+                    dest, csfield_name.value, csfield_char_value);
+         ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+                        "%s - updval error ignored",
+                        csfield_full_name);
+       }
+     }
+     else
+     {
+       if (NOT ctsacf_fld)                       /* IS10100  */
+         ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+                         "%s ignored - was not found in addinfo",
+                         csfield_full_name);
+       /* IS10100B
+       if (NOT synch_msg_issued   AND
+           NOT reload_msg_issued)
+       {
+         CTSAMSG_print(RACF_CFIELDS_NOT_SYNCH,  msgs, NULL, dest);
+         CTSAMSG_print(RACF_CFIELDS_SYNCH_REQ,  msgs, NULL, dest);
+
+         synch_msg_issued = TRUE;
+       }    */
+     }
+   }
+  /* IS10100  }   */
+ }
+
+ exit: ;
+
+  ESA_DIAG_exit(PLT_COMP_API_RACF, 2, func, rc);
+
+  return rc ;
+
+}   /* CSDATA_to_addinfonfo */
+/*  IS10076 - end     */
+
+/**************************************************************
+*                                                             *
+* Procedure Name: RACF_get_field                              *
+*                                                             *
+* Description   : Get current field from output line          *
+*                                                             *
+* Input         : curr_char - Pointer to current position     *
+*                             in output line .                *
+*                                                             *
+* Output        : field                                       *
+*                                                             *
+* Return Value  : Pointer to new position in output line      *
+*                                                             *
+**************************************************************/
+char *RACF_get_field (char                   * curr_char,
+                      ONE_RACF_FIELD_rec_typ * field,
+    /* ps0292 */      int                      update_len_flag)
+{
+
+ /*
+  *   Variables
+  */
+
+  short field_len ;
+  static char func[]="RACF_get_field";
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(PLT_COMP_API_RACF,5, func);
+  ESA_DIAG_printf(PLT_COMP_API_RACF,5,
+                  "Entering with char_ptr %#x", curr_char);
+  /* WS10081 - start */
+  ESA_DIAG_printf(PLT_COMP_API_RACF,5,
+     "Entering with data "
+     "%.2X%.2X%.2X%.2X%.2X%.2X%.2X%.2X"
+     "%.2X%.2X%.2X%.2X%.2X%.2X%.2X%.2X"
+     "%.2X%.2X%.2X%.2X%.2X%.2X%.2X%.2X",
+     curr_char[0],curr_char[1],curr_char[2],curr_char[3],
+     curr_char[4],curr_char[5],curr_char[6],curr_char[7],
+     curr_char[8],curr_char[9],curr_char[10],curr_char[11]);
+  /* WS10081 - end   */
+
+ /*
+  *   Calculate field length
+  */
+
+  field_len=*((short*)curr_char); /* field length           */
+  curr_char += 2  ;               /* branch over the length */
+
+ /*
+  *   Copy field value from output line to parameter
+  */
+
+  field->length = field_len ;
+  memcpy(field->value, curr_char, field_len);
+  field->value[field_len] = NULL_CHAR;
+
+  if (ESA_DIAG_get_debug_level(PLT_COMP_API_RACF) GE 5) /* WS10081 */
+  {                                                     /* WS10081 */
+    SNAP_AREA("RACF_get_field value", field->value,     /* WS10081 */
+    field_len);                                         /* WS10081 */
+  }                                                     /* WS10081 */
+
+  /* as3007 */
+  ESA_DIAG_printf(PLT_COMP_API_RACF, 5,
+                  "1.field=%d/%s", field_len, field->value );
+
+  curr_char += field_len ;       /* branch over the field   */
+
+ /*
+  *    Erase trailing blanks
+  */
+
+  if (update_len_flag)   {          /* ps0292 */
+    if ( field_len GT 0 )
+    {                                                   /* WS10081 */
+       for (field_len--; field->value[field_len] EQ BLANK; field_len--)
+           field->value[field_len] = NULL_CHAR;
+
+      /* field->length = strlen(field->value) ;             WS10081 */
+      field->length = ++field_len;                       /* WS10081 */
+    }                                                    /* WS10081 */
+  }                                 /* ps0292 */
+  /* as3007 */
+  ESA_DIAG_printf(PLT_COMP_API_RACF, 5,
+                  "2.field=%d/%s", field->length, field->value );
+
+ /*
+  *   Finish
+  */
+
+  ESA_DIAG_printf(PLT_COMP_API_RACF,5,
+                  "Exiting with char_ptr %#x", curr_char);
+  ESA_DIAG_exit(PLT_COMP_API_RACF,5, func, ESA_OK);
+  return curr_char ;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : RACF_get_next_parameter                    *
+*                                                             *
+* DESCRIPTION    : Obtain the next field from racf output area*
+*                                                             *
+* INPUT          : 1) Position in RACF output area            *
+*                                                             *
+* OUTPUT         : 1) keyword(length,value)                   *
+*                  2) data_value(length,value)                *
+*                  3) text_after(length,value)                *
+*                                                             *
+* RETURN VALUE   : New position in RACF output area           *
+*                                                             *
+**************************************************************/
+
+char * RACF_get_next_parameter (char                   * output,
+                                ONE_RACF_FIELD_rec_typ * keyword,
+                                ONE_RACF_FIELD_rec_typ * value,
+                                ONE_RACF_FIELD_rec_typ * pass)
+{
+
+  static char func[]="RACF_get_next_parameter";
+  int    update_len;
+  char   null_char = 0x00;  /*ws2480*/
+  char   blank_char = 0x40; /*ws2480*/
+  int    i;                 /*ws2480*/
+  char   *wptr;             /*ws2480*/
+
+ /*
+  *      Initialize
+  */
+
+  ESA_DIAG_enter(PLT_COMP_API_RACF,2,func);
+
+ /*
+  *      Each item is made of 3 fields
+  */
+
+  if ((memcmp(keyword->value+4,                      /* WS10081 */
+             "MFA.TAGS",8) EQ 0))                    /* WS10081 */
+    output += 2;                                     /* WS10081 */
+
+  output = RACF_get_field(output,keyword, TRUE) ;    /*get keyword*/
+  update_len = TRUE;                                 /*ps0292 */
+  if ((strcmp(keyword->value,                        /*ps0292 */
+             DIG_CERT_DATA_FIELD) EQ 0)              /*ps0292 */
+    OR (strcmp(keyword->value,                       /*ws2480 */
+             "DATA") EQ 0)                           /*ws2480 */
+    OR (strcmp(keyword->value,                       /*IS10076 */
+             "CSDATA.CSCDATA") EQ 0))                /*IS10076 */
+     update_len = FALSE;                             /*ps0292 */
+  output = RACF_get_field(output,value, update_len) ;/*get field*/
+  /* WS10081 start */
+  ESA_DIAG_printf(PLT_COMP_API_RACF,2,
+                  "key : l=%d v=%s, value: l=%d v=%s",
+                  keyword->length, keyword->value,
+                  value->length, value->value) ;
+  /* WS10081 end   */
+
+  /* ws2480 special patch - for the DATA field,
+     change NULL values inside the field to blanks */
+  wptr = (char *) &(value->value);            /* add (char *) sas750 */
+
+  if (strcmp(keyword->value,"DATA") EQ 0) {
+     ESA_DIAG_printf(PLT_COMP_API_RACF,2,
+                     "DATA keyword detected") ;
+     for (i=1;i<=value->length;i++) {
+        ESA_DIAG_printf(PLT_COMP_API_RACF,2,
+                     "wptr = %c",*wptr) ;
+        if ((*wptr) EQ null_char)
+           *wptr = blank_char;
+        wptr++;
+    }
+  }
+  /* ws2480 - end */
+
+  output = RACF_get_field(output,pass, 1 ) ;         /*get text after*/
+
+  if (strcmp(keyword->value,                   /*ps0292 */
+             DIG_CERT_DATA_FIELD) EQ 0)        /*ps0292 */
+     ESA_DIAG_printf(PLT_COMP_API_RACF,2,
+                     "key : l=%d v=%s, value: l=%d v=%s",
+                     keyword->length, keyword->value,
+                     value->length, "...") ;
+  else
+     ESA_DIAG_printf(PLT_COMP_API_RACF,2,
+                     "key : l=%d v=%s, value: l=%d v=%s",
+                     keyword->length, keyword->value,
+                     value->length, value->value) ;
+
+ /*
+  *      Finish
+  */
+
+  ESA_DIAG_exit(PLT_COMP_API_RACF,2, func, ESA_OK);
+  return output ;
+
+} /* RACF_get_next_parameter */
+
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : RACF_get_parameter                         *
+*                                                             *
+* DESCRIPTION    : Return value of a specific field name      *
+*                                                             *
+* INPUT          : output     - RACF output buffer            *
+*                  field_name - Required field                *
+*                                                             *
+* OUTPUT         : length     - Length of value               *
+*                  value      - Value of field                *
+*                  dest       - Vector of error msg dests     *
+*                  msgs       - Error messages buffer         *
+*                                                             *
+* RETURN VALUE   : ESA_OK  - field found                      *
+*                  ESA_ERR - field not found                  *
+*                                                             *
+**************************************************************/
+
+ESA_RC RACF_get_parameter(RACF_OUTPUT_LINE_rec_typ   * output,
+                          char                       * field_name,
+                          int                        * length,
+                          char                       * value,
+                          CTSAMSG_DEST_TABLE_rec_typ * dest,
+                          CTSAMSG_HANDLE_rec_typ     * msgs)
+{
+
+ /*
+  *      Variables
+  */
+
+  ONE_RACF_FIELD_rec_typ racf_keyword = { 0 } ;
+  ONE_RACF_FIELD_rec_typ racf_value   = { 0 } ;
+  ONE_RACF_FIELD_rec_typ racf_pass    = { 0 } ;
+  static char func[]="RACF_get_parameter";
+
+  char *output_char_ptr     ; /* start ptr to text from racf      */
+  char *output_char_ptr_end ; /* end   ptr to text from racf      */
+
+  ESA_RC inf_rc = ESA_ERR ;
+
+ /*
+  *      Initialize
+  */
+
+  ESA_DIAG_enter(PLT_COMP_API_RACF,2,func);
+  ESA_DIAG_printf(PLT_COMP_API_RACF,2,
+                  "field_name =%s",field_name) ;
+
+  *length=0 ;
+  output_char_ptr = output->buffer;
+
+  output_char_ptr_end = output_char_ptr+output->used_len;
+
+ /*
+  *      loop on output line and search requested field
+  */
+
+  while( output_char_ptr LT output_char_ptr_end ) {
+
+    output_char_ptr=RACF_get_next_parameter(output_char_ptr,
+                           &racf_keyword, &racf_value, &racf_pass) ;
+
+    ESA_DIAG_printf(PLT_COMP_API_RACF,2,
+                    "key : l=%d v=%s, value: l=%d v=%s",
+                    racf_keyword.length, racf_keyword.value,
+                    racf_value.length, racf_value.value) ;
+
+    if ( strcmp(racf_keyword.value,field_name) EQ 0 ) {
+       ESA_DIAG_printf(PLT_COMP_API_RACF,2,
+                       "field_name =%s found. value=%s",
+                       field_name, racf_value.value);
+       strcpy(value,racf_value.value) ;
+       *length = racf_value.length ;
+       inf_rc = ESA_OK ;
+       goto exit;
+    }
+
+  } /* loop on output line */
+
+  ESA_DIAG_printf(PLT_COMP_API_RACF,2,
+                  "field_name=%s not found",field_name);
+
+ /*
+  *      Finish
+  */
+
+  exit: ;
+
+  ESA_DIAG_exit(PLT_COMP_API_RACF,2, func, inf_rc);
+  return inf_rc ;
+
+} /* RACF_get_parameter */
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : RACF_get_list_count                        *
+*                                                             *
+* DESCRIPTION    : Return count of connections                *
+*                                                             *
+* INPUT          : racfprg    - racf program (assembler)      *
+*                  output     - output line                   *
+*                  entry      -                               *
+*                  opcode     - locate/group                  *
+*                               next/group                    *
+*                  field_name -                               *
+*                                                             *
+* OUTPUT         : field_value-                               *
+*                  dest       - Vector of error msg dests     *
+*                  msgs       - Error messages buffer         *
+*                                                             *
+* RETURN VALUE   : ESA_OK  - field found, value returned      *
+*                  ESA_ERR - field not found ,value not return*
+*                                                             *
+**************************************************************/
+
+/* SAS2IBMT typedef and prototype changed for IBM C
+ESA_RC RACF_get_list_count(RACF_ACCESS_PROG            racfprg,      */
+ESA_RC RACF_get_list_count(ASM_RTN_TYP               * racfprg,
+                          char                       * opcode,
+                          char                       * entry_type,
+                          char                       * entry,
+                          int                          generic_flag,
+                          char                       * func,
+                          RACF_OUTPUT_LINE_rec_typ   * output,
+                          char                       * field,
+                          int                        * field_value,
+                          int                          debug,
+                          CTSAMSG_DEST_TABLE_rec_typ * dest,
+                          CTSAMSG_HANDLE_rec_typ     * msgs)
+
+{
+
+ /*
+  *      Variables
+  */
+
+  int    cnt = 0;
+  int    length ;
+  char   value[256] ;
+  ESA_RC rc_doit = ESA_OK ;
+  static char fn[]="RACF_get_list_count";
+
+ /*
+  *      Initialization
+  */
+
+  ESA_DIAG_enter(PLT_COMP_API_RACF,2,fn);
+
+ /*
+  *      get racf information
+  */
+
+/* SAS2IBMT typedef and prototype changed for IBM C
+  rc_doit = RACF_extract((RACF_ACCESS_PROG_E) racfprg,  *BS10008*    */
+  rc_doit = RACF_extract((ASM_RTN_TYP *) racfprg,         /* SAS2IBMT */
+                         opcode , entry_type , entry ,
+                         generic_flag, func, output , debug,
+                         RACF_YES, dest, msgs,
+                         0);                                /*BS10008*/
+
+  ESA_DIAG_printf(PLT_COMP_API_RACF,2,
+                  "rc_doit=%d opcode=%s e.type=%s entry=%s",
+                  rc_doit,opcode,entry_type,entry);
+
+  if ( rc_doit NE ESA_OK )
+     goto exit ;
+
+ /*
+  *      get connect-number parameter from racf output line
+  */
+
+  rc_doit = RACF_get_parameter(output,field,&length,value,dest,msgs);
+
+  ESA_DIAG_printf(PLT_COMP_API_RACF,2,
+                  "rc_doit=%d length=%d value=%s",
+                  rc_doit, length, value);
+
+  if ( rc_doit EQ ESA_OK)
+     cnt = atoi(value);
+
+ /*
+  *   Finish
+  */
+
+  exit : ;
+
+  ESA_DIAG_printf(PLT_COMP_API_RACF,2,
+                  "entry=%s cnt=%d value=%s", entry, cnt, value);
+
+  *field_value = cnt ;
+
+  ESA_DIAG_exit(PLT_COMP_API_RACF,2, fn, rc_doit);
+
+  return rc_doit ;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : RACF_alloc_output_lines                    *
+*                                                             *
+* DESCRIPTION    : Return ptr to connect_area                 *
+*                                                             *
+* INPUT          : 1) connect counter                         *
+*                                                             *
+* OUTPUT         : 1) ptr to allocated connect-area           *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+**************************************************************/
+
+ESA_RC RACF_alloc_output_lines( void               ** handle,
+                         RACF_CONNECT_AREA_ptr      * grp_us,
+                         char                       * entry,
+                         char                       * func,
+                         int                          cnt,
+                         int                          addinfo_cnt,
+                         CTSAMSG_DEST_TABLE_rec_typ * dest,
+                         CTSAMSG_HANDLE_rec_typ     * msgs)
+{
+
+ /*
+  *    Variables
+  */
+
+  ESA_RC rc_doit = ESA_OK ;
+  int    size ;
+  static char fn[]="RACF_alloc_output_lines";
+
+ /*
+  *    Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_GTUG2UC,3,fn);
+
+ /*
+  *    Obtain output lines buffer
+  */
+
+  size = sizeof(RACF_CONNECT_AREA_typ) + /* SAS2IBMA reset back to 1
+   *     ( cnt+5 ) * sizeof(RACF_CNN_OUTPUT_LINE_rec_typ);  *BS10008*/
+         ( cnt+1 ) * sizeof(RACF_CNN_OUTPUT_LINE_rec_typ);
+  *grp_us = (RACF_CONNECT_AREA_ptr)malloc(size);
+
+  if ( *grp_us EQ NULL ) {
+     CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                   "RACF OUTPUT BUFFER", size);
+     rc_doit = ESA_FATAL ;
+     goto exit ;
+  }
+
+ /*
+  *    Format output lines buffer
+  */
+
+  (*grp_us)->output_lines_ptr = (RACF_CNN_OUTPUT_LINE_rec_ptr)
+                                ( (char *)(*grp_us) +
+                                  sizeof(RACF_CONNECT_AREA_typ) );
+
+  *handle = *grp_us ;
+
+  ESA_DIAG_printf(ESA_COMP_GTUG2UC,3, "Allocate area: p=%X size=%d",
+                                       *handle, size );
+
+  memcpy( (*grp_us)->header.eyecatcher, CNN_EYECATCHER ,4 ) ;
+  (*grp_us)->header.done_request_number = 0 ;
+  (*grp_us)->header.max_connect_number  = cnt ;
+
+  strcpy((*grp_us)->header.entry.f_entry_name, entry);
+
+  ESA_DIAG_printf(ESA_COMP_GTUG2UC,3,
+                  "output_lines_ptr=%x",
+                  (*grp_us)->output_lines_ptr) ;
+
+  (*grp_us)->header.start_ptr   = (*grp_us)->output_lines_ptr;
+  (*grp_us)->header.current_ptr = (*grp_us)->output_lines_ptr;
+  (*grp_us)->header.addinfo_in  = NULL;
+  strcpy( (*grp_us)->header.func,func);
+
+/*
+ *   Create Local addinfo
+ */
+
+  rc_doit = ADDINFO_alloc(func, (short)addinfo_cnt,
+                          &( (*grp_us)->header.addinfo_in ),dest,msgs);
+ if (rc_doit NE ESA_OK) {
+    free( *handle ) ;
+    *handle=NULL;
+    rc_doit= ESA_FATAL;
+    goto exit;
+ }
+
+ ESA_DIAG_printf(ESA_COMP_GTUG2UC,3,
+                 "Allocate addinfo: p=%X addinfo_cnt=%d",
+                 (*grp_us)->header.addinfo_in ,addinfo_cnt );
+
+ /*
+  *   Finish
+  */
+
+  exit : ;
+
+  ESA_DIAG_exit(ESA_COMP_GTUG2UC,3, fn, rc_doit);
+  return rc_doit ;
+
+}
+
+/***************************************************************
+*                                                              *
+* PROCEDURE NAME : RACF_extract_field                          *
+*                                                              *
+* DESCRIPTION    : Extract a field from a RACF user/group      *
+*                  profile                                     *
+*                                                              *
+* INPUT          : class     - user/group                      *
+*                  id        - userid/groupid                  *
+*                  segment   - segment name                    *
+*                  fldname   - field name                      *
+*                  dest      - Vector of error msg dests       *
+*                  msgs      - Error messages buffer           *
+*                                                              *
+* OUTPUT         : value     - value area                      *
+*                                                              *
+* INPUT/OUTPUT   : valuel    - length of value area            *
+*                                                              *
+* RETURN VALUE   : ESA_OK    - extract successful              *
+*                  ESA_ERR   - extract failure                 *
+*                                                              *
+***************************************************************/
+
+ESA_RC RACF_extract_field(char                       * class,
+                          char                       * id,
+                          char                       * segment,
+                          char                       * field,
+                          char                       * value,
+                          int                        * valuel,
+                          CTSAMSG_DEST_TABLE_rec_typ * dest,
+                          CTSAMSG_HANDLE_rec_typ     * msgs)
+{
+
+ /*
+  *      Variables
+  */
+
+  int ext_dbg, ext_rc, saf_rc, racf_rc, racf_reason;
+
+  ESA_RC rc = ESA_OK;
+  static char fn[]="RACF_extract_field";
+
+  char ext_class[8];
+  char ext_id[256];
+  char ext_seg[8];
+  char ext_fld[8];
+  char ext_value[1024];
+  int  ext_valuel = sizeof(ext_value);
+  int  l;
+
+ /*
+  *      Initialize
+  */
+
+  ESA_DIAG_enter(PLT_COMP_API_RACF, 1, fn);
+
+ /*
+  *      Call assembler routine
+  */
+
+  FIELD_BLOCK(ext_class, class)
+  FIELD_BLOCK(ext_id, id)
+  FIELD_BLOCK(ext_seg, segment)
+  FIELD_BLOCK(ext_fld, field)
+
+  ext_dbg = ESA_DIAG_get_debug_level(PLT_COMP_API_RACF);
+  if ( ext_dbg GT 0 )    /* Debug level for Asse,bler routine */
+     ext_dbg=1;
+
+  /* SAS2IBMT
+  ext_rc = ctsfrxf ( ext_class, ext_id, ext_seg, ext_fld, ext_value, */
+  ext_rc = (*(ASM_RTN_TYP *)&ctsfrxf)                     /* SAS2IBMT */
+                   ( ext_class, ext_id, ext_seg, ext_fld, ext_value,
+                     &ext_valuel, &ext_dbg, &saf_rc, &racf_rc,
+                     &racf_reason);
+
+  ESA_DIAG_printf(PLT_COMP_API_RACF,1,
+        "RACXTRCT result: Cls=%s Id=%s Seg=%s Fld=%s rc15=%d/%d/%d/%d",
+        class, id, segment, field, ext_rc, saf_rc, racf_rc,
+        racf_reason);
+ /*
+  *      Success - return extracted field to the caller
+  */
+
+  if (ext_rc EQ 0) {
+     ESA_DIAG_printf(PLT_COMP_API_RACF,1,
+          "RACXTRCT return value - %d bytes at %X",
+           ext_valuel, ext_value) ;
+     l = MIN(*valuel, ext_valuel) ;
+     memcpy(value, ext_value, l );
+     *valuel = l ;
+  }
+
+ /*
+  *      Requested profile/entry name not found
+  */
+
+  else if (  ( saf_rc EQ 4 ) AND ( racf_rc EQ 8     )
+                             AND ( racf_reason EQ 0 )) {
+             rc = ESA_ERR;
+             goto exit;
+  }
+
+ /*
+  *      Error - issue error message
+  */
+
+  else {
+     CTSAMSG_print(RACF_FIELDS_EXTRCTR_ERR, msgs, NULL, dest,
+                   class, id);
+
+     CTSAMSG_print(RACF_FIELDS_EXTRCTR_ERR_RC, msgs, NULL, dest,
+                   saf_rc, racf_rc , racf_reason, field);
+     rc = ESA_FATAL ;
+     goto exit;
+  }
+
+ /*
+  *      Finish
+  */
+
+  exit: ;
+
+  ESA_DIAG_exit(PLT_COMP_API_RACF,1, fn, rc);
+  return rc ;
+
+} /* RACF_extract_field    */
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : RACF_extract_defug                         *
+*                                                             *
+* DESCRIPTION    : Retrive a RACF user default group          *
+*                                                             *
+* INPUT          : user                                      *
+*                                                             *
+* OUTPUT         : group                                      *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+**************************************************************/
+
+ESA_RC RACF_extract_defug ( USER_typ                     user,
+                            UG_typ                       group,
+                            CTSAMSG_DEST_TABLE_rec_typ * dest,
+                            CTSAMSG_HANDLE_rec_typ     * msgs)
+{
+
+ /*
+  *   Variables
+  */
+
+  static char fn[]="RACF_extract_def_ug";
+
+  ESA_RC      rc ;
+  char        dfltgrp_val[10];  /* Extract buffer */
+  int         dfltgrp_len = 10; /*  -"- buffer len*/
+  char        msg_buf[100];
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(PLT_COMP_API_RACF, 1, fn);
+
+  ESA_DIAG_printf(PLT_COMP_API_RACF, 1,
+                  "Obtaining user %s default grorp", user);
+
+  memset( dfltgrp_val, BLANK, dfltgrp_len );
+
+ /*
+  *   Extract database info
+  */
+
+  rc = RACF_extract_field("USER  ", user, "BASE ", "DFLTGRP ",
+                          dfltgrp_val, &dfltgrp_len, dest , msgs );
+  ESA_DIAG_printf(PLT_COMP_API_RACF, 1,
+                  "Extarct field rc = %d", rc);
+
+  if (rc NE ESA_OK ) {
+     strcpy( group , NULL_STRING);
+     goto exit;
+  }
+
+  else {
+
+     dfltgrp_len = strchr( dfltgrp_val, BLANK ) - dfltgrp_val ;
+     if ( dfltgrp_len EQ 0 ) {
+        sprintf(msg_buf, "No default group. user=%s", user );
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                      component, fn, msg_buf, 0, __LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+     }
+
+     dfltgrp_val[dfltgrp_len] = NULL_CHAR;
+     ESA_DIAG_printf(PLT_COMP_API_RACF, 1,
+                     "Obtained dfltgrp=%d/%s", dfltgrp_len,
+                     dfltgrp_val);
+
+     strcpy( group, dfltgrp_val);
+  }
+
+ /*
+  *    Finished
+  */
+
+  exit:;
+
+  ESA_DIAG_exit(PLT_COMP_API_RACF,1, fn, rc);
+  return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : CheckMaskValue                             *
+*                                                             *
+* DESCRIPTION    : Additional checking mask values            *
+*                                                             *
+* INPUT          : 1) work area                               *
+*                                                             *
+* OUTPUT         : 1) work area                               *
+*                                                             *
+* RETURN VALUE   : ESA_OK                                     *
+*                                                             *
+**************************************************************/
+
+static ESA_RC CheckMaskValue(RACF_OPTIONS_rec_typ      *WrkArea,
+                             CTSAMSG_DEST_TABLE_rec_ptr dest,
+                             CTSAMSG_HANDLE_rec_ptr     msgs)
+{
+
+  static char func[] = "CheckMaskValue";
+  ESA_RC rc = ESA_OK;
+
+ /*
+  *      Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_GTRSPRM,4,func);
+
+ /*
+  *   Put NULL_CHAR after Assembler prog
+  */
+
+  if ( WrkArea->used_len GT 0 )
+     WrkArea->buffer[WrkArea->used_len] = NULL_CHAR;
+
+  ESA_DIAG_printf(ESA_COMP_GTRSPRM,4,
+                  "WrkArea->used_len=%d Value=%s",
+                   WrkArea->used_len, WrkArea->buffer);
+
+
+ /*
+  *   If mask '********' - empty mask
+  */
+
+  if ( ( WrkArea->used_len EQ 8 )     AND
+       ( memcmp(WrkArea->buffer, "********", 8 ) EQ 0 ) ) {
+     WrkArea->used_len  = 0;
+     WrkArea->buffer[0] = NULL_CHAR;
+  }
+
+ /*
+  *      Finish
+  */
+
+  exit :;
+
+  ESA_DIAG_exit(ESA_COMP_GTRSPRM,4, func, rc);
+  return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : RACF_get_options                           *
+*                                                             *
+* DESCRIPTION    : Obtain the RACF option                     *
+*                                                             *
+* INPUT          : 1) addinfo                                 *
+*                  2) field ptr                               *
+*                                                             *
+* OUTPUT         : 1) racf option                             *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+**************************************************************/
+
+ESA_RC RACF_get_option( ONE_FIELD_rec_ptr            addinfo_pair,
+                        RACF_OPTIONS_rec_typ       * work_area,
+                        CTSAMSG_DEST_TABLE_rec_typ * dest,
+                        CTSAMSG_HANDLE_rec_typ     * msgs )
+{
+
+  static char func[]="RACF_get_option";
+  char                   msg_buf[100];
+  char                   sep[2];
+  ESA_RC                 rc        = ESA_OK;
+  ESA_RC                 addval_rc = ESA_OK;     /* ps0259 */
+  char                   racf_option[10];
+  int                    i=0;
+  int                    i_rc;
+  int                    debug_level;
+  BUILD_PARAM_FUNC_ptr   parm_prog;
+  RACF_OPTIONS_rec_typ  *WrkArea = NULL;
+  RACF_OPTIONS_rec_typ   work_area_int = {0,0,NULL};
+  static RACF_OPTIONS_DESC_TABLE_rec_typ racf_opt_desc[] = {
+
+  /*
+   * ADDINFO kwd         RACF Option filed      Func
+   * =================== ===================== ================
+   */
+
+  { "ADSP",                 "ADSP",             NULL },
+  { "APPLAUDIT",            "APLAUDIT",         NULL },
+  { "CATDSNS",              "CATDSNS",          NULL },
+  { "CMDVIOL",              "CMDVIOL",          NULL },
+  { "COMPATMODE",           "COMPATM",          NULL },
+  { "EGN",                  "EGN",              NULL },
+  { "NOERASE",              "NOERASE",          NULL },
+  { "ERASE.ALL",            "ERASEALL",         NULL },
+  { "ERASE.SECLEVEL",       "ERASESLV",         NULL },
+  { "GENERICOWNER",         "GENOWNER",         NULL },
+  { "GRPLIST",              "GRPLIST",          NULL },
+  { "INACTIVE",             "INACTIVE",         NULL },
+  { "INITSTATS",            "INISTATS",         NULL },
+  { "JES.BATCHALLRACF",     "JESBAT",           NULL },
+  { "JES.EARLYVERIFY",      "JESVRF",           NULL },
+  { "JES.XBMALLRACF",       "JESXBM",           NULL },
+  { "JES.NJEUSERID",        "JESUID",           NULL },
+  { "JES.UNDEFINEDUSER",    "JESUUSR",          NULL },
+  { "MLACTIVE",             "MLACTIVE",         NULL },
+  { "MLQUIET",              "MLQUIET",          NULL },
+  { "MLS",                  "MLS",              NULL },
+  { "MLSTABLE",             "MLSTBL",           NULL },
+  { "NOMODEL",              "NOMODEL",          NULL },
+  { "MODEL.GDG",            "MDLGDG",           NULL },
+  { "MODEL.GROUP",          "MDLGRP",           NULL },
+  { "MODEL.USER",           "MDLUSR",           NULL },
+  { "OPERAUDIT",            "OPRAUD",           NULL },
+  { "PASSWORD.HISTORY",     "PSWDHIST",         NULL },
+  { "PASSWORD.INTERVAL",    "PSWDINT",          NULL },
+  { "PASSWORD.REVOKE",      "PSWDRVK",          NULL },
+  { "PASSWORD.WARNING",     "PSWDWRN",          NULL },
+  { "PASSWORD.MIXEDCASE",   "PSWMIXC",          NULL }, /* WS2557 */
+  { "PASSWORD.EXTENDED" ,   "PSWEXTN",          NULL }, /* WS10074 */
+  { "PASSWORD.NORULE1",     "NORL1",            NULL },
+  { "PASSWORD.NORULE2",     "NORL2",            NULL },
+  { "PASSWORD.NORULE3",     "NORL3",            NULL },
+  { "PASSWORD.NORULE4",     "NORL4",            NULL },
+  { "PASSWORD.NORULE5",     "NORL5",            NULL },
+  { "PASSWORD.NORULE6",     "NORL6",            NULL },
+  { "PASSWORD.NORULE7",     "NORL7",            NULL },
+  { "PASSWORD.NORULE8",     "NORL8",            NULL },
+  { "RULE1.MINLEN",         "RL1MNL",           NULL },
+  { "RULE2.MINLEN",         "RL2MNL",           NULL },
+  { "RULE3.MINLEN",         "RL3MNL",           NULL },
+  { "RULE4.MINLEN",         "RL4MNL",           NULL },
+  { "RULE5.MINLEN",         "RL5MNL",           NULL },
+  { "RULE6.MINLEN",         "RL6MNL",           NULL },
+  { "RULE7.MINLEN",         "RL7MNL",           NULL },
+  { "RULE8.MINLEN",         "RL8MNL",           NULL },
+  { "RULE1.MAXLEN",         "RL1MXL",           NULL },
+  { "RULE2.MAXLEN",         "RL2MXL",           NULL },
+  { "RULE3.MAXLEN",         "RL3MXL",           NULL },
+  { "RULE4.MAXLEN",         "RL4MXL",           NULL },
+  { "RULE5.MAXLEN",         "RL5MXL",           NULL },
+  { "RULE6.MAXLEN",         "RL6MXL",           NULL },
+  { "RULE7.MAXLEN",         "RL7MXL",           NULL },
+  { "RULE8.MAXLEN",         "RL8MXL",           NULL },
+  { "RULE1.MASK",           "RL1MSK",           CheckMaskValue },
+  { "RULE2.MASK",           "RL2MSK",           CheckMaskValue },
+  { "RULE3.MASK",           "RL3MSK",           CheckMaskValue },
+  { "RULE4.MASK",           "RL4MSK",           CheckMaskValue },
+  { "RULE5.MASK",           "RL5MSK",           CheckMaskValue },
+  { "RULE6.MASK",           "RL6MSK",           CheckMaskValue },
+  { "RULE7.MASK",           "RL7MSK",           CheckMaskValue },
+  { "RULE8.MASK",           "RL8MSK",           CheckMaskValue },
+  { "PREFIX",               "PREFIX",           NULL },
+  { "PROTECTALL",           "PROTCT",           NULL },
+  { "REALDSN",              "REALDSN",          NULL },
+  { "RETPD",                "RETPD",            NULL },
+  { "SAUDIT",               "SAUDIT",           NULL },
+  { "SECLABELAUDIT",        "SLBAUDIT",         NULL },
+  { "SESSIONINTERVAL",      "SESSINT",          NULL },
+  { "SECLABELCONTROL",      "SLBCNTRL",         NULL },
+  { "SECLEVELAUDIT",        "SLVAUDIT",         NULL },
+  { "TAPEDSN",              "TPDSN",            NULL },
+  { "TERMINAL",             "TERMNL",           NULL },
+  { "WHEN.PROGRAM",         "WPROGR",           NULL },
+  { "ADDCREATOR",           "CREATR",           NULL },  /* PS0163 */
+
+  /*
+   *    CDT Related fields
+   */
+
+  { "AUDIT",                "AUDIT",            NULL },
+  { "CLASSACT",             "CLSACT",           NULL },
+  { "GENCMD",               "GENCMD",           NULL },
+  { "GENERIC",              "GENERIC",          NULL },
+  { "GENLIST",              "GENLIST",          NULL },
+  { "GLOBAL",               "GLOBAL",           NULL },
+  { "LOGOPTIONS.ALWAYS",    "LOGOPAW",          NULL },
+  { "LOGOPTIONS.NEVER",     "LOGOPNV",          NULL },
+  { "LOGOPTIONS.SUCCESSES", "LOGOPSC",          NULL },
+  { "LOGOPTIONS.FAILURES",  "LOGOPFL",          NULL },
+  { "LOGOPTIONS.DEFAULT",   "LOGOPDF",          NULL },
+  { "RACLIST",              "RACLIST",          NULL },
+  { "STATISTICS",           "RACSTAT",          NULL },
+
+  { NULL,                   NULL,               NULL } };
+
+ /*
+  *      Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_GTRSPRM,4,func);
+
+  ESA_DIAG_printf(ESA_COMP_GTRSPRM,4,
+                  "work_area=%x keyword=%s",
+                  work_area, addinfo_pair->keyword);
+
+  BUILD_STRING_SEPARATOR(sep, ADDINFO_LIST_ENTRY)
+  debug_level = ESA_DIAG_get_debug_level(ESA_COMP_GTRSPRM);
+
+ /*
+  *      Malloc area if was not obtained
+  */
+
+  WrkArea = work_area;
+  if ( work_area EQ NULL )  {
+     work_area_int.buffer = malloc(RACF_OPTIONS_OUTPUT_BUF_LEN);
+     if ( work_area_int.buffer EQ NULL ) {
+        CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                     "OUTPUT BUFFER",
+                     RACF_OPTIONS_OUTPUT_BUF_LEN);
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                     component, func, "MALLOC OUTPUT",
+                     8, __LINE__);
+        rc = ESA_FATAL;
+        goto exit ;
+     }
+     work_area_int.max_len = RACF_OPTIONS_OUTPUT_BUF_LEN;
+     WrkArea = &work_area_int;
+  }
+
+ /*
+  *      locate entry in options table
+  */
+
+  for (i=0; racf_opt_desc[i].addinfo_kwd; i++) {
+    ESA_DIAG_printf(ESA_COMP_GTRSPRM,5,
+                    "%d desc_table(keyword)=%s requested keyword=%s",
+                     i, racf_opt_desc[i].addinfo_kwd,
+                     addinfo_pair->keyword);
+    if ( strcmp( racf_opt_desc[i].addinfo_kwd,
+                 addinfo_pair->keyword) EQ 0 )
+      break;
+  }
+
+ /*
+  * Removed by ps0162
+  * if ( racf_opt_desc[i].addinfo_kwd EQ NULL) {
+  *   sprintf(msg_buf,
+  *           "Keyword %s not found in RACF OPTIONS DESC TABLE",
+  *            addinfo_pair->keyword);
+  *   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+  *                 component, func, msg_buf, 16, __LINE__);
+  *   rc = ESA_FATAL;
+  *   goto exit;
+  * }
+  */
+
+  if ( racf_opt_desc[i].addinfo_kwd EQ NULL)        /* ps0162 */
+      goto exit;                                    /* ps0162 */
+
+ /*
+  *  Build parameter for Assembler routine
+  */
+
+  parm_prog = racf_opt_desc[i].build_param_prog;
+  WrkArea->used_len = 0;
+  memset( racf_option, ' ', sizeof(racf_option) );
+  memcpy( racf_option, racf_opt_desc[i].racf_option_kwd,
+          strlen(racf_opt_desc[i].racf_option_kwd));
+
+ /*
+  *  Get RACF option
+  */
+
+  ESA_DIAG_printf(ESA_COMP_GTRSPRM,4,
+                  "WrkArea=%x/%x", WrkArea, WrkArea->buffer);
+
+  /* SAS2IBMT
+  i_rc = ctsfopt( &debug_level, racf_option, (char *)WrkArea, sep);  */
+  i_rc = (*(ASM_RTN_TYP *)&ctsfopt)                       /* SAS2IBMT */
+                ( &debug_level, racf_option, (char *)WrkArea, sep);
+
+  ESA_DIAG_printf(ESA_COMP_GTRSPRM,4,
+                  "i_rc=%d WrkArea->used_len=%d",
+                  i_rc, WrkArea->used_len);
+
+ /*
+  *    Extarctor parameters return code handling
+  */
+
+  if ( i_rc NE 0 ) {
+     switch( i_rc ) {
+        case  4 :
+                   sprintf(msg_buf,
+                          "Extract options %s/%s does not support",
+                           addinfo_pair->keyword,
+                           racf_opt_desc[i].racf_option_kwd);
+                   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                             component, func, msg_buf, 16, __LINE__);
+
+                   rc = ESA_FATAL;
+                   break;
+        case  8 :
+                   sprintf(msg_buf,
+                        "Buffer overflow.Extract options %s/%s failed",
+                         addinfo_pair->keyword,
+                         racf_opt_desc[i].racf_option_kwd);
+                   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                             component, func, msg_buf, 16, __LINE__);
+                   /* Removed by ps0259
+                    * rc = ESA_FATAL;
+                    */
+                   break;
+        case 16 :
+                   sprintf(msg_buf,
+                          "RACF DOWN.Extract options %s/%s failed",
+                           addinfo_pair->keyword,
+                           racf_opt_desc[i].racf_option_kwd);
+                   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                           component, func, msg_buf, 16, __LINE__);
+                   rc = ESA_FATAL;
+                   break;
+        case 24 :
+                   sprintf(msg_buf,
+                       "Free memory err.Extract options %s/%s failed",
+                        addinfo_pair->keyword,
+                        racf_opt_desc[i].racf_option_kwd);
+                   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                             component, func, msg_buf, 16, __LINE__);
+                   rc = ESA_FATAL;
+                   break;
+        case 30 :
+                   sprintf(msg_buf,
+               "Password rule number err.Extract options %s/%s failed",
+                          addinfo_pair->keyword,
+                          racf_opt_desc[i].racf_option_kwd);
+                   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                             component, func, msg_buf, 16, __LINE__);
+                   rc = ESA_FATAL;
+                   break;
+        case 32 :
+                   sprintf(msg_buf,
+            "Unknown Password rule field.Extract options %s/%s failed",
+                          addinfo_pair->keyword,
+                          racf_opt_desc[i].racf_option_kwd);
+                   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                             component, func, msg_buf, 16, __LINE__);
+                   rc = ESA_FATAL;
+                   break;
+        case 34 :
+                   sprintf(msg_buf,
+                      "Unknown CDT field.Extract options %s/%s failed",
+                          addinfo_pair->keyword,
+                          racf_opt_desc[i].racf_option_kwd);
+                   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                             component, func, msg_buf, 16, __LINE__);
+                   rc = ESA_FATAL;
+                   break;
+        /* WS2557 part 1 start here */
+        case 40 :
+                   sprintf(msg_buf,
+                "RACF version usupported.Extract options %s/%s failed",
+                          addinfo_pair->keyword,
+                          racf_opt_desc[i].racf_option_kwd);
+                   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                             component, func, msg_buf, 16, __LINE__);
+                   rc = ESA_FATAL;
+                   break;
+        /* WS2557 part 1 end here   */
+        default :
+                   sprintf(msg_buf,
+                         "Unknown rc=%d.Extract options %s/%s failed",
+                          i_rc, addinfo_pair->keyword,
+                          racf_opt_desc[i].racf_option_kwd);
+                   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                             component, func, msg_buf, 16, __LINE__);
+                   rc = ESA_FATAL;
+                   break;
+     }
+  }
+  else {
+
+   /*
+    *  Call to parm specific function
+    */
+
+    if (parm_prog) {
+       rc = (parm_prog)(WrkArea, dest, msgs );
+       if ( rc NE ESA_OK )
+         goto exit;
+    }
+
+   /*
+    *  Update addinfo
+    */
+
+    if ( WrkArea->used_len GT 0 ) {
+        WrkArea->buffer[WrkArea->used_len] = NULL_CHAR;
+        ESA_DIAG_printf(ESA_COMP_GTRSPRM,4,
+                         "WrkArea->used_len=%d value=%s",
+                          WrkArea->used_len, WrkArea->buffer);
+        addval_rc = ADDINFO_addval( WrkArea->buffer,    /* ps0259 */
+                             RCF_ADDINFO_VAL_LEN,
+                             ADDINFO_LIST_ENTRY, addinfo_pair,
+                             dest, msgs );
+        if (addval_rc NE ESA_OK ) {                     /* ps0259 */
+           if ( (addval_rc EQ ESA_EOF)  OR                /* WS10082N */
+                     (addval_rc EQ ESA_ERR) )             /* WS10082N */
+             CTSAMSG_print(RACF_ADDINFO_VAL_OVRFLW, msgs, NULL, dest,
+                           addinfo_pair->keyword, WrkArea->buffer);
+           /* WS10082N - start */
+           else
+             ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+                     "addval error ignored for keyword <%s> value <%s>",
+                      addinfo_pair->keyword, WrkArea->buffer);
+           /* WS10082N - end   */
+           /* Removed by ps0259
+            * rc = ESA_ERR;
+            */
+        }
+    }
+  }
+
+ /*
+  *      Finish
+  */
+
+  exit :;
+
+  if ( work_area_int.buffer NE NULL )
+      free(work_area_int.buffer);
+
+  ESA_DIAG_exit(ESA_COMP_GTRSPRM,4, func, rc);
+  return rc;
+
+} /* RACF_get_option */
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : RACF_get_option_value                      *
+*                                                             *
+* DESCRIPTION    : Get SETROPTS single parameter value        *
+*                                                             *
+* INPUT          : addinfo keyword                            *
+*                                                             *
+*                                                             *
+* OUTPUT         : result                                     *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+**************************************************************/
+
+ESA_RC RACF_get_option_value(char                       * kwd,
+                             ADDINFO_typ                  add_typ,
+                             char                       * result,
+                             CTSAMSG_DEST_TABLE_rec_typ * dest,
+                             CTSAMSG_HANDLE_rec_typ     * msgs)
+{
+
+  ESA_RC            rc = ESA_OK;
+  static            char func[] = "RACF_get_option_value";
+  /* WS10082N
+  ADDINFO_rec_typ   addinfo = { 1, 1 }; /@ num_pairs, max_pairs @/*/
+  ADDINFO_rec_ptr   addinfo = NULL;                       /* WS10082N */
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_GTRSPRM, 4, func);
+
+ /*
+  *  Create ADDINFO
+  */
+
+  /* WS10082N - start */
+  /*   We cannot use a static addinfo because it is passed to
+   *   ADDINFO_addval. The assinfo passed to the standard addinfo
+   *   routines should be standard (initialized properly and with
+   *   a byte map.
+  strcpy( addinfo.pair[0].keyword, kwd );
+  addinfo.pair[0].keylen   = strlen(kwd);
+  addinfo.pair[0].vallen   = 0;
+  addinfo.pair[0].value[0] = NULL_CHAR;
+  addinfo.pair[0].add_typ  = add_typ;
+
+  rc = RACF_get_option( &addinfo.pair[0],NULL, dest, msgs );
+  strcpy( result, addinfo.pair[0].value );
+  */
+  result[0] = NULL_CHAR;
+  rc = ADDINFO_alloc(func, 1, &addinfo, dest, msgs);
+  if (rc NE ESA_OK)
+  {
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                   func, "addinfo allocation failed",
+                   16, __LINE__) ;
+     goto exit;
+  }
+
+  strcpy( addinfo->pair[0].keyword, kwd );
+  addinfo->pair[0].keylen  = strlen(kwd);
+  addinfo->pair[0].vallen  = 0;
+  addinfo->pair[0].value[0] = NULL_CHAR;
+  addinfo->pair[0].add_typ = add_typ;
+
+  rc = RACF_get_option( &addinfo->pair[0], NULL, dest, msgs );
+  /* The caller should ensure that there is enough space *
+   * in result to accomodate the value returned          */
+  strcpy( result, addinfo->pair[0].twin->value );
+  /* WS10082N - end   */
+
+  ESA_DIAG_printf(ESA_COMP_GTRSPRM, 4, "kwd=%s val=%s rc=%d",
+                  kwd, result, rc );
+
+  ESA_DIAG_exit(ESA_COMP_GTRSPRM, 4, func, rc);
+
+ exit:;
+  /* WS10082N - start */
+  if (addinfo NE NULL)
+    ADDINFO_free(&addinfo);
+  /* WS10082N - end   */
+
+  return rc;
+
+}
+
+/* ps0292 */
+/**************************************************************
+*                                                             *
+* Subroutine name : RACF_Dig_cert_get_info                    *
+*                                                             *
+* DESCRIPTION     : Get Dig Cert Info                         *
+*                                                             *
+* INPUT           : serial      - pending serial number       *
+*                   laddinfo    - local addinfo               *
+*                   user        - user                        *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+
+ESA_RC RACF_Dig_cert_get_info(ESA_DIAG_COMP_typ           comp,
+/* SAS2IBMT typedef and prototype changed for IBM C
+                              RACF_ACCESS_PROG            racfprg,   */
+                              ASM_RTN_TYP               * racfprg,
+                              int                       * serial,
+                              char                      * user,
+                              ADDINFO_rec_ptr             laddinfo,
+                              ADDINFO_rec_ptr           * dgt_laddinfo,
+              /* IS10076      CTSAMSG_DEST_TABLE_rec_ptr  dest,     */
+              /* IS10076      CTSAMSG_HANDLE_rec_ptr      msgs) */
+              /* IS10076 */   ADMIN_PARAMS_rec_typ      * admin_params)
+ {
+
+   static char func[]="RACF_Dig_cert_get_info";
+   ESA_RC                       rc = ESA_OK;
+   RACF_OUTPUT_LINE_rec_typ   * output = NULL;
+   char                       * wptr;
+   char                       * token;
+   char                         racf_separator = 0x4A;
+   char   racf_entry[RCF_USER_NAME_LEN+1];
+   short                        max_dig_cert_entries = 100;
+   int                          debug;
+   ADDINFO_rec_ptr              tmp_dgt_laddinfo = NULL;
+   char              msg_buf[200];
+   char              idx_ptn[] = DIG_CERT_PROFILE_PRFX;
+   char              idx_fld[80] = "";
+   ONE_FIELD_rec_ptr dpair;
+   ONE_FIELD_rec_typ wpair;
+   /*wpair refers upto 80 chars, so no risk of wpair GT 1K WS10082A*/
+
+   CTSAMSG_DEST_TABLE_rec_ptr  dest;               /* IS10076 */
+   CTSAMSG_HANDLE_rec_ptr      msgs;               /* IS10076 */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(comp, 1, func );
+   msgs = admin_params->ctsamsg_handle;                  /* IS10076 */
+   dest = admin_params->ctsamsg_dest;                    /* IS10076 */
+
+   ESA_DIAG_printf(comp, 1, "Entered serial=%d user=%s",
+                   (*serial), user);
+   if ( (*serial) EQ 0) {
+
+     /*  Allocate output line buffer  */
+
+     output = (RACF_OUTPUT_LINE_rec_typ *)malloc(
+                     sizeof(RACF_OUTPUT_LINE_rec_typ) );
+     if (output EQ NULL) {
+        CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                     "Dig Cert Output Buffer",
+                     sizeof(RACF_OUTPUT_LINE_rec_typ) );
+        rc = ESA_FATAL;
+        goto exit ;
+     }
+
+     /*  Allocate Local addinfo */
+
+     rc= ADDINFO_alloc(component, max_dig_cert_entries,
+                       &tmp_dgt_laddinfo, dest, msgs);
+     if (rc NE ESA_OK) {
+        free(output);
+        goto exit;
+     }
+
+     (*dgt_laddinfo) = tmp_dgt_laddinfo;
+
+     /* Get the info */
+
+     strcpy(racf_entry, user);
+     output->max_len  = RACF_OUTPUT_SIZE;
+     output->used_len = 0 ;
+     debug = ESA_DIAG_get_debug_level(comp);
+     if (debug NE 0)
+        debug = 7;   /* Extractor's full debug mode */
+
+ /* SAS2IBMT typedef and prototype changed for IBM C
+     rc = RACF_extract((RACF_ACCESS_PROG_E) racfprg,    *BS10008*    */
+     rc = RACF_extract((ASM_RTN_TYP *) racfprg,           /* SAS2IBMT */
+                       RACF_OPERATION_LOCATE,
+                       RACF_USER_PROFILE,
+                       racf_entry, 0, func, output, debug,
+                       RACF_YES,  dest, msgs ,
+                       0 );                                /*BS10008*/
+     if (rc NE ESA_OK)
+        goto exit;
+
+     RACF_output_to_addinfo(output , laddinfo, tmp_dgt_laddinfo,
+             /* IS10076     NULL, dest, msgs );   */
+    /* IS10100  IS10076 */  NULL, NULL, NULL, admin_params);
+     free(output);     /* Free extract area */
+     output = NULL;
+     if (ESA_DIAG_get_debug_level(comp) GT 0) {
+        ESA_DIAG_printf(ESA_COMP_GTUSERS, 0, "Dig Cert Local Addinfo");
+        ADDINFO_dump( tmp_dgt_laddinfo, 0);
+     }
+
+   }     /* serial EQ 0 */
+
+   /* Handling extracted information */
+
+   tmp_dgt_laddinfo = *dgt_laddinfo;
+   (*serial)++;
+   sprintf(idx_fld, "%s%d", idx_ptn, (*serial) );
+
+   dpair = ADDINFO_search(idx_fld, RCF_ADDINFO_KWD_LEN,
+                          tmp_dgt_laddinfo->pair,
+                          tmp_dgt_laddinfo->num_pairs);
+
+   ESA_DIAG_printf(comp, 1, "Dig Cert Data ptr=%X/%s",
+                   dpair, idx_fld);
+
+   if (dpair EQ NULL) { /* The field does not exist */
+       rc = ESA_EOF;
+       goto exit;
+   }
+
+   ESA_DIAG_printf(comp, 1,
+                   "Dig Cert Data ptr=%X field=%s/%s", dpair,
+                   dpair->keyword, dpair->value);
+
+   memcpy( (char *)&wpair, (char *)dpair,  sizeof(ONE_FIELD_rec_typ) );
+
+   token = strtok(wpair.value, ".");   /* '.' - is separator between*/
+   if (NOT token) {                    /* Serial Number and issuer nm*/
+     rc = ESA_FATAL;
+     sprintf(msg_buf,
+             "User=%s. Invalid Digital Certificate Info=%s",
+             user, wpair.value);
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                   func, msg_buf, 8,__LINE__) ;
+     goto exit;
+   }
+
+   /* Put to ADDINFO serial number */
+
+   sprintf(wpair.keyword, "%s%d", "DCERT.SERIAL_NUMBER.", (*serial));
+   Dig_cert_put_info(comp, laddinfo, wpair.keyword, token, dest, msgs);
+
+   /* Put to ADDINFO Issuer name */
+
+   token = strtok(NULL, "\n");
+   if (NOT token) {
+     rc = ESA_FATAL;
+     sprintf(msg_buf,
+             "User=%s. Invalid Digital Certificate Info=%s",
+             user, wpair.value);
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                   func, msg_buf, 8,__LINE__) ;
+     goto exit;
+   }
+
+   /* Convert X'4A' to X'40' (Blank) */
+
+   for (wptr=token; *wptr; wptr++) {
+     if ( (*wptr) EQ racf_separator )
+        *wptr = ' ';
+   }
+
+   sprintf(wpair.keyword, "%s%d", "DCERT.ISSUER_NAME.", (*serial));
+   Dig_cert_put_info(comp, laddinfo, wpair.keyword, token, dest, msgs);
+
+   exit :;
+
+   if (rc NE ESA_OK) {
+     if (output)
+       free(output);     /* Free extract area */
+     ADDINFO_free(&tmp_dgt_laddinfo);
+   }
+
+   ESA_DIAG_exit(comp, 1, func, rc);
+
+   return rc;
+
+ }
+
+ /* ps0292 */
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : Dig_cert_put_info                         *
+ *                                                             *
+ * DESCRIPTION     : Put dcert related fields into addinfo     *
+ *                                                             *
+ * INPUT           : 1.addinfo       - ptr to addinfo          *
+ *                 : 2.keyword       - keyword                 *
+ *                 : 3.value         - value                   *
+ *                                                             *
+ * OUTPUT          : none                                      *
+ *                                                             *
+ * RETURN VALUE    : none                                      *
+ *                                                             *
+ **************************************************************/
+
+ static void Dig_cert_put_info(ESA_DIAG_COMP_typ           comp,
+                               ADDINFO_rec_ptr             addinfo,
+                               char                      * keyword,
+                               char                      * value,
+                               CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                               CTSAMSG_HANDLE_rec_ptr      msgs)
+ {
+
+   static char func[]="Dig_cert_put_info";
+   ESA_RC            rc = ESA_OK;
+   ONE_FIELD_rec_ptr pair;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(comp, 1, func );
+
+   ESA_DIAG_printf(comp, 1,
+                     "keyword=%s value=%s", keyword,  value);
+
+   pair = ADDINFO_search(keyword,
+                         RCF_ADDINFO_KWD_LEN,
+                         addinfo->pair,
+                         addinfo->num_pairs);
+   if (pair)       /* Field exists */
+     ADDINFO_updval(value, RCF_ADDINFO_VAL_LEN, pair );
+   else            /* Field does not exist */
+     ADDINFO_insert(TYPE_1A, keyword, value, addinfo,
+                    RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN, UNIQUE);
+
+   ESA_DIAG_exit(comp, 1, func, rc);
+
+ }
+

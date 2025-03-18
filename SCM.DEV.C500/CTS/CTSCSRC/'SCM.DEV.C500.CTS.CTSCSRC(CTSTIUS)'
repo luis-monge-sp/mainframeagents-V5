@@ -1,0 +1,419 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Add a user (TSS)                         *
+ *                                                             *
+ * File Name        : ctstius.c                                *
+ *                                                             *
+ * Author           : Alexander Shvartsman                     *
+ *                                                             *
+ * Creation Date    : 16/06/96                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * WS10009  MeirS    18/10/07 Support ru_locked & RU_SUSPENDED.*
+ * IS10091  NuritY   06/06/13 Add Diags.  (WS10034)            *
+ * IS10020  AvnerL   01/05/14 Do not use NOPW in TSS AddUser   *
+ * CIQ#6    SeligT   19/03/17 Account Aggr includes Connections*
+ * BS10089  SeligT   06/06/18 DFLTGRP in Provisioning Plan     *
+ *                            Causes Account Creation Problem  *
+ * WS10082  MauriC   14/11/22 Recompile for new ADDINFO macros *
+ **************************************************************/
+
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_API
+ #include ESA_API_CODES
+
+ #include MVS_CODES
+ #include API_ADDINFO
+
+ #include MVS_ONLINE_INTERCEPTOR
+
+
+ #include TSS
+
+ static char component[] = "CTSTIUS";
+ static char internal2_msg_buf[200] = "";
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : CTSAddUser                                 *
+ *                                                             *
+ * DESCRIPTION    : Create a TSS  user                         *
+ *                                                             *
+ * INPUT          : User, addinfo, admin                       *
+ *                                                             *
+ * OUTPUT         : err                                        *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC CTSAddUser (USER_PARAMS_rec_typ  * user_params,
+                    ADDINFO_rec_typ      * addinfo,
+                    ADMIN_PARAMS_rec_typ * admin_params,
+                    ERR_STRUCT_rec_typ   * err)
+ {
+
+   static char                func[]="CTSAddUser";
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                     rc = ESA_OK;
+   int                        user_added = 0;
+   CTSAMSG_HANDLE_rec_ptr     msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr dest;
+   ONE_FIELD_rec_ptr          cpair;
+   ADDINFO_rec_ptr            get_addinfo = NULL;
+   ADDINFO_rec_ptr            ess_addinfo = NULL;
+   TSS_CMD_HANDLE_typ        *cmd_handle  = NULL;
+   TSS_CMD_BUF_rec_typ        del_cmd = { 0, 0, "" };
+
+   static char                spec_symb[]=" ,();'";
+   char                      *spcsmb;
+
+  /*
+   *  Get User parameters
+   */
+
+   TSS_RTT_rec_typ          * rtt;
+   short                      rtt_num_items;
+   OBJ_EXISTS_typ             obj_exist  = OBJ_NOT_EXIST;
+   HAVE_MORE_typ              have_more  = NO_MORE;
+   void                     * handle     = NULL;
+   short                      actual_num = 0;
+   USER_PARAMS_rec_typ        user;
+   OE_typ                     oe = "";
+   UG_typ                     def_group = "";             /* BS10089 */
+   ONE_FIELD_rec_ptr          dgpair;                     /* BS10089 */
+   TSS_CMD_SET_rec_typ  cmd = { 0, "", 0, 0 };     /*IS10020*/
+   TSS_PARAMS_rec_typ        *params_ptr = NULL;           /* IS10079 */
+   char                       get_conn   = 'N';             /* CIQ#6 */
+
+   /*** For TSS_chk_acid ***/
+
+   char                       real_acid_type[TSS_ACID_TYPE_LEN+1]="";
+   OBJECT_TYPE_typ            real_obj_type = TYPE_IGNORE;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_ADDUSER, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+  /*
+   * Initialize global parameters
+   */
+
+   rc = TSS_global_init (ESA_COMP_ADDUSER, admin_params, err);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   rtt = TSS_get_global_rtt();
+   rtt_num_items  = TSS_get_global_rtt_num_items();
+
+  /*
+   *   Verify user name
+   */
+
+   spcsmb = strpbrk( user_params->user, spec_symb);
+   if ( spcsmb NE NULL ) {
+     CTSAMSG_print(ERR_INVALID_NAME, msgs, NULL, dest,
+                   TSS_USER, user_params->user);
+     rc = ESA_FATAL;
+     goto exit;
+   }
+
+  /*
+   *  Check user existance
+   */
+
+   rc = TSS_chk_acid(ESA_COMP_ADDUSER, user_params->user,
+                     TSS_USER, TYPE_USER,
+                     OBJ_NOT_EXIST, TRUE, real_acid_type,
+                     &real_obj_type, admin_params, err);
+   if (rc NE ESA_OK)
+      goto exit;
+
+  /*
+   *   Create command handle
+   */
+
+   rc = TSS_alloc_cmd_handle (ESA_COMP_ADDUSER,
+                              MAX_TSS_CMD_USER_ENTRIES,
+                              &cmd_handle, dest, msgs );
+   if ( rc NE ESA_OK )
+      goto exit;
+
+  /*
+   *   Build internal addinfo
+   */
+
+   rc = ADDINFO_alloc(func, addinfo->num_pairs,
+                      &ess_addinfo, dest, msgs);
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   ADDINFO_copy( ess_addinfo, addinfo );
+
+  /*
+   *   Add User processing
+   */
+
+   cpair=ADDINFO_search(TSS_USER_TYPE, TSS_ADDINFO_KWD_LEN,
+                        ess_addinfo->pair, ess_addinfo->num_pairs);
+   if ( cpair EQ NULL ) {
+       sprintf(internal2_msg_buf,
+               "parameter %s not found", TSS_USER_TYPE);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                     "CTSTIUS", func, internal2_msg_buf,
+                     8, __LINE__);
+       rc = ESA_FATAL;
+       goto exit;
+   }
+
+  /* BS10089 Start */
+  /*
+   *  When DFLTGRP is populated via a 'create' provisioning plan,
+   *  account creation may fail in TSS after the customer has
+   *  applied TSS R16 fix number RO93059.  This is due to the new
+   *  requirement in TSS that the user must be connected to a
+   *  group prior to setting the group as a default group.
+   *
+   *  This fix connects the user to the group by adding the GROUP
+   *  parameter to the TSS CREATE command which is issued prior to
+   *  the TSS ADD command which sets the group as a default group.
+   *
+   *  Save original user_params->def_group field.
+   *  Place NULLS in user_params->def_group field.
+   *  Do an ADDINFO_search looking for DFLTGRP.
+   *  If there, copy DFLTGRP value into user_params->def_group field.
+   *  If not there, leave NULLS in user_params->def_group field.
+   *  (We are using the user_params->def_group field instead of
+   *  another new field because the CTSTTSS macro, where the
+   *  prototype lives, is signed out now for another fix and we
+   *  did not want the customer to wait a long time for this fix.)
+   */
+
+   strcpy(def_group, user_params->def_group);
+   strcpy(user_params->def_group, "");
+   dgpair=ADDINFO_search("DFLTGRP", TSS_ADDINFO_KWD_LEN,
+                          addinfo->pair, addinfo->num_pairs);
+   if (dgpair NE NULL) {
+        if (dgpair->vallen GT 0) {
+          strcpy(user_params->def_group, dgpair->value);
+          ESA_DIAG_printf(ESA_COMP_ADDUSER, 6, "DFLTGRP=<%s>",
+                          dgpair->value);
+        }
+   } /* DFLTGRP exists */
+  /* BS10089 End */
+
+  /*
+   *  Create new user
+   */
+
+   rc = TSS_do_create(ESA_COMP_ADDUSER,   cmd_handle,
+                      user_params,                   /*IS10020*/
+                      user_params->user,  user_params->parent_oe,
+                      cpair->value,       TYPE_USER,
+                      admin_params, err );
+
+  /* BS10089 Start */
+  /*
+   *  Restore user_params->def_group value to whatever it was.
+   *  We are doing this in case the def_group field has been
+   *  set to something else (besides the DFLTGRP field from
+   *  ADDINFO).
+   */
+   strcpy(user_params->def_group, def_group);
+  /* BS10089 End */
+
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   user_added = 1;
+
+  /*
+   *   Prepare parameters to obtain user info
+   */
+
+   rc = ADDINFO_alloc(func, rtt_num_items, &get_addinfo, dest, msgs);
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   rc = TSS_rtt_2_addinfo(ESA_COMP_ADDUSER,
+                          rtt, get_addinfo, dest, msgs);
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *  Get user information
+   */
+
+   strcpy(user.user, user_params->user);
+   rc = CTSGetUsers ( GET_MANY_USERS, oe, 1, &actual_num,
+                      &have_more, &handle,
+                      1, user_params, &user, &get_addinfo, &obj_exist,
+                      admin_params, err,
+                      get_conn);                            /* CIQ#6 */
+
+   ESA_DIAG_printf(ESA_COMP_ADDUSER, 1,
+                   "user=%s rc=%d exists=%d",
+                    user.user, rc, obj_exist);
+
+   if ( (obj_exist EQ OBJ_NOT_EXIST) OR ( rc NE ESA_OK )) {
+       rc = ESA_FATAL;
+       goto exit;
+   }
+
+   /*  IS10091 - start */
+   if ( ESA_DIAG_get_debug_level(ESA_COMP_ADDUSER) GE 6 )
+   {
+     ESA_DIAG_printf(ESA_COMP_ADDUSER, 6,
+                     "input addinfo");
+     ADDINFO_dump(addinfo,1);
+
+     ESA_DIAG_printf(ESA_COMP_ADDUSER, 6,
+                     "get addinfo");
+     ADDINFO_dump(get_addinfo,1);
+
+     ESA_DIAG_printf(ESA_COMP_ADDUSER, 6,
+                     "ess addinfo");
+     ADDINFO_dump(ess_addinfo,1);
+   }
+   /*  IS10091 - end   */
+
+   rc = TSS_do_revoke_status(ESA_COMP_ADDUSER, cmd_handle, user_params,
+        /* WS10009     ess_addinfo, &user, get_addinfo, dest, msgs );*/
+        /* WS10009 */  ess_addinfo, &user, get_addinfo, dest, msgs,
+        /* WS10009 */  admin_params);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   rc = TSS_do_addinfo (ESA_COMP_ADDUSER, cmd_handle, rtt,
+                        ess_addinfo, get_addinfo, dest, msgs);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   /****************** IS10020 start **************************/
+   /*IS10020 if NOPW=Y, issue replace password to replace NOPW*/
+   params_ptr = admin_params->apiinit_handle;
+   if (params_ptr->rssparm_NOPW[0] EQ 'Y')
+   {                                                  /*IS10020*/
+    rc = TSS_do_password(ESA_COMP_ADDUSER, cmd_handle, user_params,
+                         ess_addinfo, dest, msgs );
+    if ( rc NE ESA_OK )
+       goto exit;
+   }                                                  /*IS10020*/
+   else /* (NOPW = N) password was set with add command.
+           only if interval is passed, need to issue:
+           replace password(*,interval_value)          IS10020   */
+   {                                                  /*IS10020*/
+    /*
+     *    INTERVAL field processing
+     */
+     cpair=ADDINFO_search("INTERVAL", TSS_ADDINFO_KWD_LEN,
+                          ess_addinfo->pair, ess_addinfo->num_pairs);
+     if ( cpair NE NULL )
+     {
+        ESA_DIAG_printf(ESA_COMP_ADDUSER,3,"INTERVAL exists");
+        if (cpair->vallen GT 0 )
+        {
+          cmd.type = TSS_CMD_REPLACE;
+          strcpy(cmd.param, "PASSWORD(*,");
+          strcat(cmd.param, cpair->value);
+          strcat(cmd.param, ")");
+          ESA_DIAG_printf(ESA_COMP_ADDUSER,3,"cmd=<%s>",cmd.param);
+          rc = TSS_put_cmd(ESA_COMP_ADDUSER, cmd_handle, &cmd,
+                           dest, msgs);
+        }
+     } /* INTERVAL exists */
+   }
+  /***************** end of IS10020 ********************/
+ /* IS10020 drop TSS_do_password
+   rc = TSS_do_password(ESA_COMP_ADDUSER, cmd_handle, user_params,
+                        ess_addinfo, dest, msgs );
+   if ( rc NE ESA_OK )
+      goto exit;
+ */
+   rc = TSS_do_cmd( ESA_COMP_ADDUSER, (char *)user_params->user,
+                    TYPE_USER,       TSS_EVNT_ACTION_UPDATE,
+                    cmd_handle, admin_params);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+  /*
+   *   Finish
+   */
+
+ exit:;
+
+  /*
+   *   Add process failed, after some of opereations
+   *   Here we perform cleanup, and delete this poor user
+   */
+
+   if ( ( rc NE ESA_OK ) AND user_added ) {
+
+     /*
+      *   Build and issue DELUSER command
+      */
+
+      sprintf(del_cmd.buffer, "DELETE(%s) ", user_params->user);
+      del_cmd.max_len = strlen(del_cmd.buffer);
+      del_cmd.use_len = strlen(del_cmd.buffer);
+
+      TSS_issue_cmd(ESA_COMP_ADDUSER, &del_cmd,
+                    user_params->user, TYPE_USER,
+                    TSS_EVNT_ACTION_DELETE, admin_params);
+   }
+
+   if (cmd_handle)
+      TSS_free_cmd_handle( ESA_COMP_ADDUSER,
+                           &cmd_handle, dest, msgs);
+
+   if (get_addinfo)
+      ADDINFO_free(&get_addinfo);
+
+   if (ess_addinfo)
+      ADDINFO_free(&ess_addinfo);
+
+   ESA_DIAG_exit(ESA_COMP_ADDUSER, 1, func, rc);
+
+   return rc;
+
+ }

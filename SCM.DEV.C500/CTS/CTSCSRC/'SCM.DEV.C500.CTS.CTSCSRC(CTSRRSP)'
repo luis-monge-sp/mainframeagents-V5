@@ -1,0 +1,817 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : get resource/ACL common functions (RACF) *
+ *                                                             *
+ * File Name        : ctsrrsp.c                                *
+ *                                                             *
+ * Author           : Alexander Shvartsman                     *
+ *                    Doron Cohen                              *
+ *                                                             *
+ * Creation Date    : 28/12/97                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * PS0457   ShmuelK  Feb2001  send proper command to RACF:     *
+ *                            SETROPTS WHEN(PROGRAM) REFRESH   *
+ * PS0498   ShmuelK  Jan2002  RACF REFRESH GENERIC             *
+ * WS2508   AmirH    14/09/04 Add VOLUME_LIST1 keyword as      *
+ *                            VOLUME_LIST extention            *
+ * BS2703   yonim    26/03/06 Support Multi subgroup keyword   *
+ * WS10004  AvnerL   05/06/07 Extend ICHEINTY & add SUBGROUP3  *
+ * WS10082  MauriC   07/11/22 Recompile for new ADDINFO macros *
+ **************************************************************/
+
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_API
+ #include ESA_API_CODES
+ #include ESA_CTSAMSG
+
+ #include MVS_COMP
+ #include MVS_OS_CLI
+ #include MVS_OS_MVS
+
+ #include RACF_CODES
+ #include API_ADDINFO
+ #include RACF
+ #include RACF_RES
+
+#define KEYWORD_VOLUME_LIST   "VOLUME_LIST"                 /* WS2508 */
+#define KEYWORD_VOLUME_LIST1  "VOLUME_LIST1"                /* WS2508 */
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : RACF_res_output_to_addinfo                 *
+*                                                             *
+* DESCRIPTION    : Separate information reutrned from RACF    *
+*                  in output buffer and insert it to addinfo  *
+*                  buffer                                     *
+*                                                             *
+* INPUT          : output    - output area                    *
+*                  laddinfo  - special addinfo for            *
+*                              special keywords               *
+*                  keywords  - Special keywords names         *
+*                  dest      - Vector of error msg dests      *
+*                  msgs      - Error messages buffer          *
+*                                                             *
+* OUTPUT         : addinfo   - addinfo ptr                    *
+*                                                             *
+* RETURN VALUE   : ESA_OK                                     *
+*                                                             *
+**************************************************************/
+ESA_RC RACF_res_output_to_addinfo(
+                              RACF_OUTPUT_LINE_rec_ptr      output,
+                              ADDINFO_rec_ptr               addinfo,
+                              ADDINFO_rec_ptr               laddinfo,
+                              SKWDS_typ                      kwds[1],
+                              CTSAMSG_DEST_TABLE_rec_ptr    dest,
+                              CTSAMSG_HANDLE_rec_ptr        msgs)
+{
+
+/*
+ *      Variables
+ */
+
+ int          i;
+ int          k;
+ SLIST_typ  * list_desc;       /* List description */
+ char       * wptr;
+ /*WS10082 char list_value[RCF_ADDINFO_VAL_LEN + 1];                */
+ char           list_value[ADDINFO_16K_VAL_LEN+1];         /*WS10082*/
+ int          spec_kwd     = FALSE;
+ int          spec_kwd_ind = 0;
+
+ ONE_RACF_FIELD_rec_typ racf_keyword = { 0 } ;
+ ONE_RACF_FIELD_rec_typ racf_value   = { 0 } ;
+ ONE_RACF_FIELD_rec_typ racf_aux     = { 0 } ;
+
+ char *output_char_ptr     ; /* start ptr to text from racf */
+ char *output_char_ptr_end ; /* end   ptr to text from racf */
+
+ ESA_RC inf_rc = ESA_OK;
+ ESA_RC rc_put = ESA_OK;                                    /* WS2508 */
+
+ static char func[]="RACF_res_output_to_addinfo";
+ int          VOLUME_LIST_is_full;                         /* WS2508 */
+
+/*
+ *      Initialize
+ */
+
+ ESA_DIAG_enter(PLT_COMP_API_RACF, 2,func);
+
+/*
+ *   Scan output line and seperate keywords
+ */
+
+ output_char_ptr = output->buffer;
+ output_char_ptr_end = output_char_ptr + output->used_len;
+
+ ESA_DIAG_printf(PLT_COMP_API_RACF, 3,
+                 "Extract area ptr=%x used_len=%d addinfo_ptr=%x" ,
+                  output_char_ptr, output->used_len,addinfo) ;
+
+ VOLUME_LIST_is_full = FALSE;                               /* WS2508 */
+ while( output_char_ptr LT output_char_ptr_end ) {
+
+    /**  Seperate the next keyword and value  **/
+
+    output_char_ptr = RACF_get_next_parameter(output_char_ptr,
+                            &racf_keyword, &racf_value, &racf_aux) ;
+
+    ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+                    "key:/%d/%s/ value:/%d/%s/ aux:/%d/%s/" ,
+                    racf_keyword.length, racf_keyword.value,
+                    racf_value.length,   racf_value.value,
+                    racf_aux.length,     racf_aux.value);
+
+    /**  Skip empty values  **/
+
+    if ( racf_value.length EQ 0 )
+       continue ;
+
+    /**  Check against special keywords parameter  **/
+
+    spec_kwd = FALSE;
+    if ( laddinfo NE NULL ) {
+       for (i=0; kwds[i].spc_kwd ; i++) {
+
+           ESA_DIAG_printf(PLT_COMP_API_RACF, 5,
+                           "keyword(%d)=%s", i, kwds[i].spc_kwd);
+           if ( strcmp(kwds[i].spc_kwd, racf_keyword.value) EQ 0 ) {
+              spec_kwd     = TRUE;
+              spec_kwd_ind = i;
+              break;
+           }
+       } /* for */
+    } /* special addinfo obtained */
+
+    /**  Put data to local addinfo  **/
+
+    if ( spec_kwd ) {
+
+       /** List field */
+
+       if ( (racf_aux.length NE 0 ) AND
+                         kwds[spec_kwd_ind].list_desc) {
+          /* handling TVTOC* keywords */
+          list_desc = kwds[spec_kwd_ind].list_desc;
+          k = atoi(racf_aux.value);  /* Subfield index */
+
+          ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+                          "k=%d max=%d v=%d/%s",
+                          k, list_desc->max_subfields,
+                          racf_aux.length, racf_aux.value);
+
+         /*
+          * When came the first subfield of list
+          * Verify if list was initialized
+          */
+
+          if ( k EQ 0 ) {      /* First subfield of list */
+            if ( (NOT list_desc->init_list) ) {
+                for(i=0; i LT list_desc->max_subfields; i++)
+                  list_desc->subfield[i][0] = NULL_CHAR;
+            }
+            else {      /* First item of list */
+
+              /** Create List field (TYPE_1B) **/
+
+              RCFRES_build_list_value(list_desc, list_value);
+              RCFRES_put_to_addinfo( list_desc->keyword, list_value,
+                                     TYPE_1B, addinfo, FALSE,
+                                     FALSE, dest, msgs);    /* WS2508 */
+
+              for(i=0; i LT list_desc->max_subfields; i++)
+                list_desc->subfield[i][0] = NULL_CHAR;
+            }
+          }
+          list_desc->init_list = TRUE;
+          if (kwds[spec_kwd_ind].fn)  /* Field convert function  */
+            wptr = (kwds[spec_kwd_ind].fn)(racf_value.value);
+          else
+            wptr = racf_value.value;
+
+          if (list_desc->subfield[i][0] EQ NULL_CHAR)
+            strcpy( list_desc->subfield[k], wptr );  /*copy first    */
+          else {
+            strcat( list_desc->subfield[k], ","  );
+            strcat( list_desc->subfield[k], wptr );  /*append others */
+          }
+          continue;
+       }
+
+       /**  Special simple keyword processing **/
+       /* WS2508 start */
+       if ( strcmp( racf_keyword.value, KEYWORD_VOLUME_LIST ) EQ 0 ) {
+          rc_put = ESA_OK;
+          if ( NOT VOLUME_LIST_is_full ) {
+             rc_put = RCFRES_put_to_addinfo( racf_keyword.value,
+                                 racf_value.value,
+                                 kwds[spec_kwd_ind].kwd_typ,
+                                 addinfo, TRUE , TRUE, /* overflow OK */
+                                 dest, msgs);
+             if ( rc_put EQ ESA_EOF ) {       /* value was not added  */
+                VOLUME_LIST_is_full = TRUE;   /* Set flag for next if */
+                ESA_DIAG_printf(PLT_COMP_API_RACF, 5,
+                           "VOLUME_LIST is full.");
+             }
+          } /* end if NOT VOLUME_LIST_is_full */
+
+
+          if ( VOLUME_LIST_is_full ) {
+             /* add list entry value to VOLUME_LIST1 keyword */
+             RCFRES_put_to_addinfo( KEYWORD_VOLUME_LIST1,
+                        racf_value.value,
+                        kwds[spec_kwd_ind].kwd_typ,
+                        addinfo, TRUE , FALSE, /* no overflow allowed */
+                        dest, msgs);
+          } /* end if VOLUME_LIST_is_full... */
+       }
+       else { /* not VOLUME_LIST */
+          RCFRES_put_to_addinfo( racf_keyword.value,
+                              racf_value.value,
+                              kwds[spec_kwd_ind].kwd_typ,
+                              laddinfo, TRUE , FALSE,       /* WS2508 */
+                              dest, msgs);
+       } /* end if strcmp(...); end WS2508 */
+    }
+
+    /**  Put data to regular addinfo  **/
+
+    else { /* Not a special keyword */
+      RCFRES_put_to_addinfo( racf_keyword.value,
+                             racf_value.value,
+                             TYPE_1A, addinfo, FALSE, FALSE,/* WS2508 */
+                             dest, msgs);
+    }
+ } /* loop on output line */
+
+ /*
+  * End of extract area.
+  * Check whether were initialized list,
+  * if so, build last list's entry
+  */
+
+ /** Locate list data **/
+
+ for (i=0; kwds[i].spc_kwd ; i++) {
+   if (kwds[i].list_desc) {             /* Found list description  */
+     list_desc = kwds[i].list_desc;
+     if ( NOT (list_desc->init_list) )  /* List did not initialzed */
+       continue;
+
+     /** Put last entry of list  **/
+
+     /** Create List field entry **/
+
+     RCFRES_build_list_value(list_desc, list_value);
+     RCFRES_put_to_addinfo( list_desc->keyword, list_value, TYPE_1B,
+                            addinfo, FALSE, FALSE,          /* WS2508 */
+                            dest, msgs);
+
+     for(i=0; i LT list_desc->max_subfields; i++)
+        list_desc->subfield[i][0] = NULL_CHAR;
+     list_desc->init_list = FALSE;
+   }
+ }
+
+/*
+ *  finish
+ */
+
+ exit: ;
+
+ if (ESA_DIAG_get_debug_level(PLT_COMP_API_RACF) GT 3) {
+    ESA_DIAG_printf(PLT_COMP_API_RACF, 0, "addinfo");
+    ADDINFO_dump(addinfo,0);
+ }
+
+ if (ESA_DIAG_get_debug_level(PLT_COMP_API_RACF) GT 3) {
+    ESA_DIAG_printf(PLT_COMP_API_RACF, 0, "laddinfo");
+    ADDINFO_dump(laddinfo,0);
+ }
+
+ ESA_DIAG_exit(PLT_COMP_API_RACF, 2, func, inf_rc );
+
+ return inf_rc ;
+
+} /* RACF_res_output_to_addinfo */
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : RCFRES_put_to_addinfo                      *
+*                                                             *
+* DESCRIPTION    : put data to addinfo                        *
+*                                                             *
+* INPUT          : kwd       - kwd                            *
+*                  value     - value                          *
+*                  addinfo   - addinfo                        *
+*                  allow_ins - allowed insert to addinfo      *
+*                  can_overflow - "value overflow is OK" flag *
+*                  dest      - Vector of error msg dests      *
+*                  msgs      - Error messages buffer          *
+*                                                             *
+* OUTPUT         : addinfo   - addinfo ptr                    *
+*                                                             *
+* RETURN VALUE   : ESA_OK                                     *
+*                  ESA_ERR   - Keyword value overflow while   *
+*                              can_overflow == FALSE          *
+*                  ESA_EOF   - Keyword value overflow while   *
+*                              can_overflow == TRUE   WS2508  *
+**************************************************************/
+ESA_RC RCFRES_put_to_addinfo(char             * kwd,
+                             char             * value,
+                             ADDINFO_typ        kwd_typ,
+                             ADDINFO_rec_ptr    addinfo,
+                             int                allow_ins,
+                             int   /* WS2508 */ can_overflow,
+                             CTSAMSG_DEST_TABLE_rec_ptr     dest,
+                             CTSAMSG_HANDLE_rec_ptr         msgs)
+{
+
+ ESA_RC            rc = ESA_OK;
+ ESA_RC            addval_rc;
+ ONE_FIELD_rec_ptr pair;
+
+ if ( strlen(value) EQ 0 )  /* If field is empty, do nothing */
+   goto exit;
+
+ ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+                 "Keyword=%s/%s, insert=%d, can overflow=%d",
+                 kwd, value, allow_ins, can_overflow );     /* WS2508 */
+
+ /** Locate keyword in addinfo */
+ pair = ADDINFO_search(kwd, RCF_ADDINFO_KWD_LEN,
+                       addinfo->pair, addinfo->num_pairs );
+
+ if (pair NE NULL) {       /* keyword located */
+     addval_rc = ADDINFO_addval( value,  RCF_ADDINFO_VAL_LEN,
+                                 ADDINFO_LIST_ENTRY, pair, dest, msgs );
+     if (addval_rc NE ESA_OK ) {
+        if ( can_overflow ) {                         /* WS2508 start */
+            /* Keyword overflow is OK, let the caller handle it */
+            ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+               "addval overflow, no message issued ");
+            rc = ESA_EOF;         /* Set rc as if value reaches "EOF" */
+        }
+        else { /* overflow is not acceptable, issue message */
+           rc = ESA_ERR;
+           CTSAMSG_print(RACF_ADDINFO_VAL_OVRFLW, msgs, NULL,
+                         dest, kwd, value);
+            ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+               "addval error ignored");
+        } /* end if can_overflow WS2508 */
+     }   /* end if addval_rc NE ESA_OK */
+ } /* keyword located */
+ else {            /* keyword not found */
+   if (allow_ins)  /* If allowed insert, do it. (local addinfo) */
+     ADDINFO_insert(kwd_typ, kwd, value, addinfo, RCF_ADDINFO_KWD_LEN,
+                    RCF_ADDINFO_VAL_LEN, UNIQUE);
+   else  /* Redundant keyword */
+     ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+                     "keyword %s value %s ignored", kwd, value);
+ }
+
+ exit :;
+   return rc;
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : RCFRES_build_list_value                    *
+*                                                             *
+* DESCRIPTION    : create list value with subfields separators*
+*                                                             *
+* INPUT          : list_desc - list description table         *
+*                                                             *
+* OUTPUT         : list_value- list value                     *
+*                                                             *
+* RETURN VALUE   : ESA_OK                                     *
+*                                                             *
+**************************************************************/
+void RCFRES_build_list_value(SLIST_typ  * list_desc,
+                             char       * list_value)
+{
+
+ int   i, len;
+ int   k = list_desc->max_subfields;
+ char  sep_subf[3];  /* Subfield separator   */
+
+ BUILD_STRING_SEPARATOR(sep_subf , ADDINFO_LIST_SUBFIELD)
+
+ strcpy(list_value, "");       /* Clear list value    */
+ for (i=0; i LT k; i++) {      /* List subfields loop */
+   ESA_DIAG_printf(PLT_COMP_API_RACF, 4,
+                   "i=%d v=%d/%s",
+                   i, strlen( list_desc->subfield[i] ),
+                   list_desc->subfield[i]);
+
+   strcat(list_value, list_desc->subfield[i]); /* Append subfield val */
+   strcat(list_value, sep_subf);               /* Append separator    */
+ }
+
+ /** Remove last subfield separator  **/
+
+ len = strlen(list_value);
+ if (len GT 0)
+   list_value[len-1] = NULL_CHAR;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : RCFRES_strip_val                           *
+ *                                                             *
+ * DESCRIPTION    : Remove symbols                             *
+ *                                                             *
+ * INPUT          : data      - data                           *
+ *                  c         - strip symbol                   *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ void RCFRES_strip_val(char  *data, char   c, char  mode)
+ {
+    int    len;
+    int    i;
+    char   val [RCF_ADDINFO_VAL_LEN+1];
+
+    /** Remove tailoring symbols **/
+
+    if ( (mode EQ 'B') OR         /* Both  */
+         (mode EQ 'R') )  {       /* Right */
+       len = strlen(data);
+       if (len EQ 0 )
+          goto exit;
+
+       i = len - 1;
+       for (i = len - 1; (i GT 0) AND (*(data+i) EQ c); i--);
+
+       if ( (i EQ 0) AND (*data EQ c) )
+          *data = NULL_CHAR;
+       else
+          *(data + i + 1) = NULL_CHAR;
+    }
+
+    /** Remove leading symbols **/
+
+    if ( (mode EQ 'B') OR
+         (mode EQ 'L')  )  {
+      strcpy(val, data);
+      len = strlen(val);
+      if (len EQ 0 )
+         goto exit;
+
+      for (i = 0; (i LT len) AND (val[i] EQ c); i++);
+      strcpy(data, &val[i]);
+    }
+
+   exit :;
+ }
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : RCFRES_get_resource_details                *
+*                                                             *
+* DESCRIPTION    : Separate resource name and obtain additional
+*                  information about resource                 *
+*                                                             *
+* INPUT          : resource name                              *
+*                                                             *
+* OUTPUT         : generic = Y/N                              *
+*                  volume                                     *
+* RETURN VALUE   : none                                       *
+*                                                             *
+**************************************************************/
+
+void RCFRES_get_resource_details(RESOURCE_typ          resource_in,
+                                 RESOURCE_typ          resource_out,
+                                 char                * generic,
+                                 char                * volume)
+{
+
+   static char          func[]="RCFRES_get_resource_details";
+   char               * wptr;
+   RESOURCE_typ         resource_name;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(PLT_COMP_API_RACF,1,func);
+
+   /** Set Initial Values **/
+
+   strcpy(resource_name, resource_in);
+   strcpy(generic, KWD_FLAG_OFF);
+   strcpy(volume, "");
+   strcpy(resource_out, "");
+
+   /*
+    *  Obtain resource name. After it should be
+    *  details info: (G)         - generic profile
+    *                VOL=XXXXXX  - volume info
+    */
+
+    wptr = strtok(resource_name, " ");
+    if (wptr EQ NULL)
+      goto exit;
+
+    strcpy(resource_out, wptr);
+
+    wptr = strtok(NULL, " ");
+    if (wptr EQ NULL)
+      goto exit;
+
+    /* Verify generic and volume parameters */
+
+    if (strcmp(wptr, "(G)") EQ 0 )
+      strcpy(generic, KWD_FLAG_ON);
+    else {
+      if (memcmp(wptr, "VOL=", 4) EQ 0 )
+        strcpy(volume, wptr + 4);   /* 4 - strlen of "VOL="  */
+    }
+
+  /*
+   *    Finish
+   */
+
+   exit :;
+
+   ESA_DIAG_printf(PLT_COMP_API_RACF,1,
+                   "resource=%s/%s generic=%s volume=%s",
+                    resource_in, resource_out, generic, volume);
+
+   ESA_DIAG_exit(PLT_COMP_API_RACF,1, func, ESA_OK);
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : RCFRES_build_res_addinfo                   *
+*                                                             *
+* DESCRIPTION    : Separate resource name and obtain additional
+*                  information about resource. Insert it to   *
+*                  addinfo.                                   *
+* INPUT          : resource name                              *
+*                                                             *
+* OUTPUT         : addinfo                                    *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+**************************************************************/
+
+ESA_RC RCFRES_build_res_addinfo(RES_PARAMS_rec_typ   * res_params_in,
+                              RES_PARAMS_rec_typ     * res_params_out,
+                              ADDINFO_rec_typ           ** addinfo_res,
+                              CTSAMSG_DEST_TABLE_rec_typ * dest,
+                              CTSAMSG_HANDLE_rec_typ     * msgs)
+{
+
+   ESA_RC               rc = ESA_OK;
+   static char          func[]="RCFRES_build_res_addinfo";
+   char                 volume[10];
+   char                 generic[2];
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(PLT_COMP_API_RACF,1,func);
+
+   /** Set Initial Values **/
+
+   memcpy( (char *)res_params_out,  (char *)res_params_in,
+           sizeof(RES_PARAMS_rec_typ) );
+
+   RCFRES_get_resource_details(res_params_in->resource,
+                               res_params_out->resource,
+                               generic, volume);
+
+   rc = ADDINFO_alloc(func, 10, addinfo_res, dest, msgs);
+   if (rc NE ESA_OK)
+     goto exit;
+
+   ADDINFO_insert(TYPE_1A, "GENERIC",
+                  generic, (*addinfo_res),
+                  RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN, UNIQUE);
+
+   if (strlen(volume) GT 0)
+     ADDINFO_insert(TYPE_1A, "VOLUME",
+                    volume, (*addinfo_res),
+                    RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN, UNIQUE);
+  /*
+   *    Finish
+   */
+
+   exit :;
+
+   ESA_DIAG_printf(PLT_COMP_API_RACF,1,
+                   "resource=%s/%s generic=%s volume=%s",
+                    res_params_in->resource,
+                    res_params_out->resource,
+                    generic, volume);
+
+   ESA_DIAG_exit(PLT_COMP_API_RACF,1, func, rc);
+
+   return rc;
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : RACF_refresh                               *
+*                                                             *
+* DESCRIPTION    : Check need/no REFRESH class                *
+*                                                             *
+* INPUT          : resource  type                             *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+**************************************************************/
+
+ESA_RC RACF_refresh(RESOURCE_typ                 resource_name,
+                    RESOURCE_typ                 resource_class,
+                    ADMIN_PARAMS_rec_typ       * admin_params,
+                    CTSAMSG_DEST_TABLE_rec_typ * dest,
+                    CTSAMSG_HANDLE_rec_typ     * msgs)
+{
+
+   static               char func[]="RACF_refresh";
+   ESA_RC               rc = ESA_OK;
+   char                 when_program[RCF_ADDINFO_VAL_LEN+1];
+   RESOURCE_typ         resource_name_tmp;
+   char                 volume[10];              /* ps0238 */
+   char                 generic[2];              /* ps0238 */
+   int                  generic_flag = FALSE;    /* ps0238 */
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(PLT_COMP_API_RACF,1,func);
+
+  /*
+   *  PROGRAM class handling
+   */
+
+   if (strcmp(resource_class, "PROGRAM") EQ 0) {
+      when_program[0] = NULL_CHAR;
+      RACF_get_option_value("WHEN.PROGRAM", TYPE_1A,
+                             when_program, dest, msgs);
+      if ( ( strcmp(when_program,KWD_FLAG_ON) EQ 0) AND
+           ( RACF_is_active_class(resource_class, dest, msgs )
+                                   EQ ESA_OK )        )
+      RACF_refresh_class(resource_class, "WHEN",         /*PS0457*/
+                         admin_params, dest,msgs);
+   }
+
+  /*
+   *  RACLISTed classes handling
+   */
+
+   if ( RACF_is_raclisted_class(resource_class, dest, msgs )
+                                EQ ESA_OK ) {
+     rc = RACF_refresh_class(resource_class, "RACLIST",
+                             admin_params, dest,msgs);
+     if ( rc NE ESA_OK )
+       rc = ESA_FATAL;
+     goto exit;
+   }
+
+  /*
+   *  GLOBAL classes handling
+   */
+   /*  PS0498
+   if ( RACF_is_global_class(resource_class, dest, msgs )
+                                EQ ESA_OK ) {
+     rc = RACF_refresh_class(resource_class, "GLOBAL",  PS0498 */
+   if (strcmp(resource_class, "GLOBAL") EQ 0) {       /*PS0498 */
+     rc = RACF_refresh_class(resource_name , "GLOBAL",/*PS0498 */
+                             admin_params, dest,msgs);
+     if ( rc NE ESA_OK ) /*PS0498:*/ {
+       rc = ESA_FATAL;
+     goto exit;          /*PS0498:*/ }
+   }
+
+  /* ps0238 */
+
+  /*
+   *  GENERIC classes handling
+   */
+
+   RCFRES_get_resource_details(resource_name, resource_name_tmp,
+                               generic, volume);
+   if ( strcmp(generic,KWD_FLAG_ON) EQ 0 )
+     generic_flag = TRUE;
+
+   if ( generic_flag EQ TRUE ) {
+      if ( ( RACF_is_active_class(resource_class, dest, msgs )
+                                   EQ ESA_OK ) AND
+           ( RACF_is_generic_class(resource_class, dest, msgs )
+                                   EQ ESA_OK )   )   {
+        rc = RACF_refresh_class(resource_class, "GENERIC",
+                                admin_params, dest,msgs);
+        if ( rc NE ESA_OK )
+          rc = ESA_FATAL;
+        goto exit;
+      }
+   }
+
+  /*
+   *    Finish
+   */
+
+   exit :;
+
+   ESA_DIAG_exit(PLT_COMP_API_RACF,1, func, rc );
+
+   return rc;
+
+ }
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : RCFRES_set_resource_details                *
+*                                                             *
+* DESCRIPTION    : Build resource name with additional        *
+*                  information about resource                 *
+*                                                             *
+* INPUT          : resource name                              *
+*                  addinfo                                    *
+* OUTPUT         : resoutrce name                             *
+*                                                             *
+* RETURN VALUE   : none                                       *
+*                                                             *
+**************************************************************/
+
+void RCFRES_set_resource_details(RESOURCE_typ                resource,
+                                ADDINFO_rec_typ            * addinfo,
+                                CTSAMSG_DEST_TABLE_rec_typ * dest,
+                                CTSAMSG_HANDLE_rec_typ     * msgs)
+{
+
+   static char          func[]="RCFRES_set_resource_details";
+   ONE_FIELD_rec_ptr    pair;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(PLT_COMP_API_RACF,1,func);
+
+   pair = ADDINFO_search("GENERIC", RCF_ADDINFO_KWD_LEN,
+                         addinfo->pair,
+                         addinfo->num_pairs);
+   if (pair NE NULL) {
+       if ( strcmp(pair->value,KWD_FLAG_ON) EQ 0 ) {
+         strcat(resource, " (G)");
+       }
+   }
+
+   pair = ADDINFO_search("VOLUME", RCF_ADDINFO_KWD_LEN,
+                         addinfo->pair,
+                         addinfo->num_pairs);
+   if (pair NE NULL) {
+     if ( pair->vallen GT 0) {
+         strcat(resource, " VOL=");
+         strcat(resource, pair->value);
+     }
+   }
+
+  /*
+   *    Finish
+   */
+
+   exit :;
+
+   ESA_DIAG_exit(PLT_COMP_API_RACF,1, func, ESA_OK );
+
+ }
+

@@ -1,0 +1,684 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Delete a resorce(TSS)                    *
+ *                                                             *
+ * File Name        : ctstdrs.c                                *
+ *                                                             *
+ * Author           : Alexander Shvartsman                     *
+ *                                                             *
+ * Creation Date    : 19/01/97                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------- -------------------------------- *
+ * PS0252   Guy      13/04/98 Common code changes              *
+ * IS0358   YoniMa   17/08/06 memory leak.(BS2698)             *
+ * WS10082  MauriC   14/11/22 Recompile for new ADDINFO macros *
+ **************************************************************/
+
+ /*
+  *   Standard include files
+  */
+
+ #include   <globs.h>
+ #include   STDIO
+ #include   STDLIB
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include   ESA_API
+ #include   ESA_DIAG
+ #include   ESA_CTSAMSG
+ #include   ESA_API_CODES
+ #include   API_ADDINFO
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_COMP
+
+ #include MVS_ONLINE_INTERCEPTOR
+
+ #include MVS_OS_MVS
+
+ /*
+  *   TSS include files
+  */
+
+ #include TSS
+ #include TSS_XRES
+ #include TSS_CODES
+
+/*
+ * Internal functions prototypes
+ */
+
+ static ESA_RC TSS_free_res_list(ESA_DIAG_COMP_typ     comp,
+                          TSS_GET_RES_HANDLE_typ     * get_handle,
+                          CTSAMSG_DEST_TABLE_rec_typ * dest,
+                          CTSAMSG_HANDLE_rec_typ     * msgs);
+
+ static ESA_RC TSS_revoke_res_list(ESA_DIAG_COMP_typ comp,
+                       TSS_GET_RES_HANDLE_typ     * get_handle,
+                       int                          res_has_the_owner,
+                       RES_PARAMS_rec_typ         * res_params,
+                       ADMIN_PARAMS_rec_typ       * admin_params);
+
+ static int TSS_ace_compare (const void * ace1,
+                             const void * ace2);
+
+ static ESA_RC TSS_aux_res_tests(ESA_DIAG_COMP_typ     comp,
+                          TSS_GET_RES_HANDLE_typ     * get_handle,
+                          RES_PARAMS_rec_typ         * res_params,
+                          CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                          CTSAMSG_HANDLE_rec_ptr       msgs);
+
+ static int TSS_resofs_compare (const void * res1,
+                                const void * res2);
+
+ static char internal2_msg_buf[200];
+
+/****************************************************
+ * Procedure Name: CTSDelRes
+ * Description   : Deletes a resource with it's ACL info
+ * Input         : resource, addinfo_data.
+ * Output        : None
+ * Input/Output  : None
+ * Return Value  : ESA_RC
+ ***************************************************/
+
+ ESA_RC CTSDelRes (RES_PARAMS_rec_typ   * res_params,
+             /*    ADDINFO_rec_typ      * addinfo_res,    PS0252 */
+                   ADDINFO_rec_typ      * addinfo_data,
+                   ADMIN_PARAMS_rec_typ * admin_params,
+                   ERR_STRUCT_rec_typ   * err)
+ {
+
+   static char                   func[]="CTSDelRes";
+
+  /*
+   *     Variables
+   */
+
+   ESA_RC                        rc = ESA_OK;
+   int                           res_has_the_owner = 0;
+   TSS_GET_RES_HANDLE_typ      * get_handle = NULL;
+   void                        * handle = NULL;
+   TSS_RES_ITEM_typ            * res = NULL;
+   char                        * res_name = NULL;
+   ONE_FIELD_rec_ptr             pair;
+   TSS_CMD_BUF_rec_typ           cmd = { 0, 0, "" };
+   CTSAMSG_HANDLE_rec_typ      * msgs;
+   CTSAMSG_DEST_TABLE_rec_typ  * dest;
+   char                          res_owner[TSS_USER_NAME_LEN +1]="";
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_DELRES, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   if (ESA_DIAG_get_debug_level(ESA_COMP_DELRES) GT 4) {
+
+   /*  ESA_DIAG_printf(ESA_COMP_DELRES,0, "addinfo_res");
+       ADDINFO_dump(addinfo_res,1);                       PS0252 */
+
+       ESA_DIAG_printf(ESA_COMP_DELRES,0, "addinfo_data");
+       ADDINFO_dump(addinfo_data,1);
+   }
+
+  /*
+   * Insure no delete will be done for resource type ACID
+   */
+
+   if (strcmp(res_params->restype, "ACID") EQ 0) {
+      rc = TSS_acid_restype_handling(ESA_COMP_DELRES,
+                                     res_params,
+                                     addinfo_data,
+                                     admin_params,
+                                     err);
+      if (rc NE ESA_OK) {
+        rc = ESA_FATAL;
+        goto exit;
+      }
+   }
+
+  /*
+   *  Initialize res handle
+   */
+
+   rc = TSS_init_res_handle(ESA_COMP_DELRES, &get_handle, &handle ,
+                            admin_params, err );
+   if ( rc NE ESA_OK )
+     goto exit ;
+
+   if (strcmp(res_params->restype, "ACID") NE 0) {
+     rc = TSS_get_res_list(ESA_COMP_DELRES,
+                           TSS_CMD_DEFAULT_MODE,
+                           TSS_WHOOWNS_LIST_ONLY,
+                           res_params, get_handle,
+                           TSS_SAVE_UNIQ_RES_NAME_ONLY,
+                           admin_params, err);
+     if ( rc NE ESA_OK )
+       goto exit;
+
+    /*
+     *  Select resource
+     */
+
+     rc = TSS_select_res(ESA_COMP_DELRES, get_handle, res_params,
+                         &res, &res_name);
+
+     ESA_DIAG_printf(ESA_COMP_DELRES, 1,
+                     "rc=%d res ptr=%x res_name ptr=%x",
+                     rc, res, res_name );
+  }
+  else
+    rc = ESA_ERR;            /* restype ACID is never owned */
+
+  /*
+   * Resource does not have the owner
+   */
+
+   if ( rc EQ ESA_ERR ) {
+     res_has_the_owner = 0;
+     TSS_free_res_list(ESA_COMP_DELRES , get_handle, dest, msgs);
+     rc = TSS_get_res_list(ESA_COMP_DELRES,
+                           TSS_CMD_DEFAULT_MODE,
+                           TSS_WHOHAS_LIST_ONLY,
+                           res_params, get_handle,
+                           TSS_SAVE_WHOLE_ACL,
+                           admin_params, err);
+     if ( rc NE ESA_OK )
+         goto exit;
+   }    /* Resource does not have the owner */
+
+  /*
+   * Resource has the owner
+   */
+
+   else {      /* Resource has the owner */
+     res_has_the_owner = 1;
+     strcpy(res_owner, res->owner);
+     TSS_free_res_list(ESA_COMP_DELRES , get_handle, dest, msgs);
+     pair = ADDINFO_search(TSS_RES_FORCE, TSS_ADDINFO_KWD_LEN,
+                           addinfo_data->pair,addinfo_data->num_pairs);
+     if ( pair NE NULL ) {
+       if ( strcmp(pair->value, KWD_FLAG_ON) EQ 0 ) {
+          rc = TSS_get_res_list(ESA_COMP_DELRES,
+                                TSS_CMD_DEFAULT_MODE,
+                                TSS_WHOHAS_LIST_ONLY,
+                                res_params, get_handle,
+                                TSS_SAVE_WHOLE_ACL,
+                                admin_params, err);
+          if ( rc NE ESA_OK )
+            goto exit;
+
+          rc = TSS_aux_res_tests(ESA_COMP_DELRES,
+                                 get_handle, res_params,
+                                 dest, msgs );
+          if ( rc NE ESA_OK )
+            goto exit;
+       }
+     }     /* Force */
+   }    /* Resource has the owner */
+
+  /*
+   *  Delete resource processing
+   */
+
+   rc = TSS_revoke_res_list(ESA_COMP_DELRES , get_handle,
+                            res_has_the_owner, res_params,
+                            admin_params);
+   if ( rc NE ESA_OK )
+     goto exit ;
+
+   if ( res_has_the_owner ) {
+    /*
+     *  Create command header
+     */
+
+     sprintf(cmd.buffer, "REMOVE(%s) %s(%s) ", res_owner,
+             TSS_convert_restype(res_params->restype),
+             res_params->resource);
+
+     ESA_DIAG_printf(ESA_COMP_DELRES, 1,"cmd.buffer=%s", cmd.buffer);
+
+     cmd.max_len = strlen(cmd.buffer);
+     cmd.use_len = strlen(cmd.buffer);
+
+     rc = TSS_issue_cmd(ESA_COMP_DELRES, &cmd,
+                        res_owner, TYPE_IGNORE,  /* UNKNOWN */
+                        TSS_EVNT_ACTION_UPDATE, admin_params);
+
+   }
+
+
+  /*
+   *   Finish
+   */
+
+   exit:;
+
+   if ( handle NE NULL )
+      TSS_free_res_handle(ESA_COMP_DELRES , &handle, dest, msgs);
+
+   ESA_DIAG_exit(ESA_COMP_DELRES, 1, func, rc);
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_free_res_list                          *
+ *                                                             *
+ * DESCRIPTION    : Free resource list                         *
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  get_handle- entered res handle             *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_free_res_list(ESA_DIAG_COMP_typ     comp,
+                          TSS_GET_RES_HANDLE_typ     * get_handle,
+                          CTSAMSG_DEST_TABLE_rec_typ * dest,
+                          CTSAMSG_HANDLE_rec_typ     * msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   static char func[]="TSS_free_res_list";
+   ESA_RC                      rc = ESA_OK ;
+   TSS_TRAP_RES_BUF_typ      * tmp =  get_handle->trap_buffer;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(comp, 3, func);
+
+   if ( tmp NE NULL ) {
+      if ( tmp->res_names.res_names NE NULL )
+       {
+           ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,     /*IS0358*/
+             "Free address (%x) (%d,%s)",
+             tmp->res_names.res_names, __LINE__, __FILE__ );
+           free(tmp->res_names.res_names);
+       }
+      if ( tmp->res_info.res_items NE NULL )
+       {
+           ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,     /*IS0358*/
+             "Free address (%x) (%d,%s)",
+             tmp->res_info.res_items, __LINE__, __FILE__ );
+           free(tmp->res_info.res_items);
+       }
+      if ( tmp->tmp_res_info.res_items NE NULL )
+       {
+           ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,     /*IS0358*/
+             "Free address (%x) (%d,%s)",
+             tmp->tmp_res_info.res_items, __LINE__, __FILE__ );
+           free(tmp->tmp_res_info.res_items);
+       }
+      ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,     /*IS0358*/
+          "Free address (%x) (%d,%s)",
+          tmp, __LINE__, __FILE__ );
+      free( tmp );
+      get_handle->trap_buffer = NULL;
+   }
+
+  /*
+   *   Finish
+   */
+
+   exit :;
+
+   ESA_DIAG_exit(comp, 3, func, rc);
+
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_revoke_res_list                        *
+ *                                                             *
+ * DESCRIPTION    : Delete resource processing                 *
+ *                                                             *
+ * INPUT          : trap_buff    - trap buffer                 *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_revoke_res_list(ESA_DIAG_COMP_typ   comp,
+                       TSS_GET_RES_HANDLE_typ     * get_handle,
+                       int                          res_has_the_owner,
+                       RES_PARAMS_rec_typ         * res_params,
+                       ADMIN_PARAMS_rec_typ       * admin_params)
+ {
+
+   ESA_RC                       rc = ESA_OK;
+   int                          i;
+   int                          compare;
+   static  char                 func[]="TSS_revoke_res_list";
+   char                         pending_acid[TSS_USER_NAME_LEN +1] = "";
+   TSS_ACL_ITEM_SOURCE_typ      pending_acl_source =
+                                           TSS_ACL_ITEM_SOURCE_UNKNOWN;
+   char                         pending_res_name[MAX_TSS_PARAM_LEN]="";
+   TSS_CMD_BUF_rec_typ          cmd = { 0, 0, "" };
+   TSS_RES_INFO_typ           * items;
+   TSS_RES_NAMES_AREA_typ     * res_names;
+   char                       * wrk;
+   TSS_TRAP_RES_BUF_typ       * tmp =  get_handle->trap_buffer;
+   CTSAMSG_DEST_TABLE_rec_typ * dest;
+   CTSAMSG_HANDLE_rec_typ     * msgs;
+
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   ESA_DIAG_printf(comp, 1, "list res ptr=%x resource=%s/%s",
+                   tmp, res_params->restype, res_params->resource);
+
+   if ( tmp EQ NULL )  /* Empty list */
+      goto exit;
+
+   items     = &(tmp->res_info);
+   res_names = &(tmp->res_names);
+
+   ESA_DIAG_printf(comp, 1,
+                   "alloc items=%d used=%d",
+                   items->alloc_items, items->used_items);
+
+   qsort(items->res_items,         /* sort area     */
+         items->used_items,        /* num elements  */
+         sizeof(TSS_RES_ITEM_typ), /* element size  */
+         &TSS_ace_compare);        /* compare func  */
+
+   for (i=0; i LT items->used_items; i++) {
+       wrk = res_names->res_names + items->res_items[i].ref_to_name;
+
+       ESA_DIAG_printf(comp, 2, "%d %s %s %s %s %s %d",
+                       i, res_params->restype, wrk,
+                       items->res_items[i].owner,
+                       items->res_items[i].has_owner,
+                       items->res_items[i].ace_acid,
+                       items->res_items[i].acl_source);
+
+       if ( items->res_items[i].acl_source EQ
+                                TSS_ACL_ITEM_SOURCE_UNKNOWN )
+         continue;   /* Item from whoowns */
+
+       if ( strlen(items->res_items[i].ace_acid) EQ 0 ) {
+          sprintf(internal2_msg_buf ,
+                  "Res=%s/%s acid for revoke operation is undefined",
+                   TSS_convert_restype(res_params->restype), wrk);
+
+          CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                        "CTSTDRS",func, internal2_msg_buf,
+                        0,__LINE__);
+          continue;
+       }
+
+       compare = 1;
+       if ( res_has_the_owner )
+          compare = memcmp(res_params->resource, wrk,
+                           strlen(res_params->resource) );
+       else
+          compare = strcmp(res_params->resource, wrk);
+
+       ESA_DIAG_printf(comp, 2, "compare=%d", compare);
+
+       if ( compare EQ 0 ) {
+
+         ESA_DIAG_printf(comp, 2,
+                         "pending acid=%s/%d(%s) acid=%s/%d",
+                          pending_acid, pending_acl_source,
+                          pending_res_name,
+                          items->res_items[i].ace_acid,
+                          items->res_items[i].acl_source);
+
+         if ( ( strcmp(pending_acid, items->res_items[i].ace_acid)
+                            EQ 0 ) AND
+              ( strcmp(pending_res_name, wrk )
+                            EQ 0 ) AND
+              ( pending_acl_source EQ items->res_items[i].acl_source))
+            continue;
+
+         strcpy(pending_acid, items->res_items[i].ace_acid);
+         pending_acl_source = items->res_items[i].acl_source;
+         strcpy(pending_res_name, wrk);
+
+         /*  Create command  */
+
+         sprintf(cmd.buffer, "REVOKE(%s) %s(%s) ",
+                 items->res_items[i].ace_acid,
+                 TSS_convert_restype(res_params->restype), wrk);
+
+         if ( items->res_items[i].acl_source EQ
+                               TSS_ACL_ITEM_FROM_ADMIN)
+            strcat(cmd.buffer, " ACTION(ADMIN) ");
+
+         ESA_DIAG_printf(ESA_COMP_DELRES, 1,
+                          "cmd.buffer=%s", cmd.buffer);
+
+         cmd.max_len = strlen(cmd.buffer);
+         cmd.use_len = strlen(cmd.buffer);
+
+         rc = TSS_issue_cmd(ESA_COMP_DELRES, &cmd,
+                            items->res_items[i].ace_acid,
+                            TYPE_IGNORE,  /* UNKNOWN */
+                            TSS_EVNT_ACTION_UPDATE, admin_params);
+       }
+   }
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 1, func, rc);
+   return rc;
+}
+
+/**************************************************************
+*                                                             *
+* Procedure Name   : TSS_ace_compare                          *
+*                                                             *
+* Description      : Compare routine for qsort                *
+*                                                             *
+* Input            : 1) cmd entry 1                           *
+*                    2) cmd entry 2                           *
+*                                                             *
+* Output           : None                                     *
+*                                                             *
+* Return Value     : negative - cmd1 less than cmd2           *
+*                  : zero     - cmd1 equal to  cmd2           *
+*                  : positive - cmd1 greater than cmd2        *
+*                                                             *
+**************************************************************/
+
+static int TSS_ace_compare (const void * ace1,
+                            const void * ace2)
+{
+
+  TSS_RES_ITEM_typ    * tss_ace1 = (TSS_RES_ITEM_typ    *)ace1;
+  TSS_RES_ITEM_typ    * tss_ace2 = (TSS_RES_ITEM_typ    *)ace2;
+
+  ESA_DIAG_printf(ESA_COMP_DELRES, 3, "ace1.acid=%s ace2.acid=%s",
+                  tss_ace1->ace_acid, tss_ace2->ace_acid);
+
+  return (strcmp(tss_ace1->ace_acid, tss_ace2->ace_acid) );
+
+}    /* TSS_ace_compare */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_aux_res_tests                          *
+ *                                                             *
+ * DESCRIPTION    : Select resource                            *
+ *                                                             *
+ * INPUT          : get_handle   - get res handle              *
+ *                  res_params   - resource params structure   *
+ *                  comp         - diag component              *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK , ESA_FATAL, ESA_ERR                *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_aux_res_tests(ESA_DIAG_COMP_typ     comp,
+                          TSS_GET_RES_HANDLE_typ     * get_handle,
+                          RES_PARAMS_rec_typ         * res_params,
+                          CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                          CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   ESA_RC                     rc = ESA_OK;
+   int                        i;
+   static char                func[]="TSS_aux_res_tests";
+   TSS_TRAP_RES_BUF_typ     * trap_buff = get_handle->trap_buffer;
+   TSS_RES_INFO_typ         * items;
+   TSS_RES_NAMES_AREA_typ   * res_names;
+   char                     * wrk, * prev_wrk = NULL;
+   int                        msg_header = TRUE, print_msg;
+   int                        res_len;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func);
+
+   items     = &(trap_buff->res_info);
+   res_names = &(trap_buff->res_names);
+   res_len   = strlen(res_params->resource);
+
+   ESA_DIAG_printf(comp, 5,
+                   "alloc items=%d used=%d",
+                    items->alloc_items, items->used_items);
+
+   if ( items->used_items EQ 0 ) /* Res list is empty */
+     goto exit;
+
+  /*
+   *  Sort items by offset of resource name
+   */
+
+   qsort(items->res_items,            /* sort area     */
+         items->used_items,           /* num elements  */
+         sizeof(TSS_RES_ITEM_typ),    /* element size  */
+         &TSS_resofs_compare);        /* compare func  */
+
+  /*
+   *  Check whether we have resource with longer name
+   */
+
+   for (i=0; i LT items->used_items; i++) {
+       wrk = res_names->res_names + items->res_items[i].ref_to_name;
+       ESA_DIAG_printf(comp,5, "%d %s %s %s %s %s",
+                       i, trap_buff->res_type, wrk,
+                       items->res_items[i].owner,
+                       items->res_items[i].has_owner,
+                       items->res_items[i].ace_acid);
+       if ( strlen(wrk) GT res_len ) {
+         if (memcmp(wrk, res_params->resource, res_len) EQ 0) {
+            if (msg_header)
+              CTSAMSG_print(TSS_DEL_RES_ERR,
+                            msgs, NULL, dest,
+                            res_params->resource, res_params->restype);
+            print_msg = FALSE;
+            if (prev_wrk EQ NULL)
+              print_msg = TRUE;
+            else
+              if (wrk NE prev_wrk)
+                print_msg = TRUE;
+
+            if (print_msg)
+              CTSAMSG_print(TSS_DEL_RES_ERR_FOUND_LONGER_PREFIX,
+                            msgs, NULL, dest, wrk );
+            msg_header = FALSE;
+            prev_wrk   = wrk;
+            rc         = ESA_FATAL;
+         }
+       }
+   }
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+   return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* Procedure Name   : TSS_resofs_compare                       *
+*                                                             *
+* Description      : Compare routine for qsort                *
+*                                                             *
+* Input            : 1) res item entry 1                      *
+*                    2) res item entry 2                      *
+*                                                             *
+* Output           : None                                     *
+*                                                             *
+* Return Value     : negative - res1 less than res2           *
+*                  : zero     - res1 equal to  res2           *
+*                  : positive - res1 greater than res2        *
+*                                                             *
+**************************************************************/
+
+static int TSS_resofs_compare (const void * res1,
+                               const void * res2)
+{
+
+  int     rc;
+  TSS_RES_ITEM_typ * tss_res1 = (TSS_RES_ITEM_typ *)res1;
+  TSS_RES_ITEM_typ * tss_res2 = (TSS_RES_ITEM_typ *)res2;
+
+  if ( tss_res1->ref_to_name EQ tss_res2->ref_to_name )
+     rc = 0;
+  else if ( tss_res1->ref_to_name LT tss_res2->ref_to_name )
+     rc = -1;
+  else
+     rc = 1;
+
+  return rc;
+
+}    /* TSS_resofs_compare */
+

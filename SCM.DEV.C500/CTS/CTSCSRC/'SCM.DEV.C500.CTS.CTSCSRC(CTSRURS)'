@@ -1,0 +1,944 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Update a resource (RACF)                 *
+ *                                                             *
+ * File Name        : ctsrurs.c                                *
+ *                                                             *
+ * Author           : Doron Cohen                              *
+ *                                                             *
+ * Creation Date    : 31/03/94                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * dc020395 Doron    2/3/95   Support ADDVOL,DELVOL instead of *
+ *                            detecting changes in the VOLUME  *
+ *                            list.                            *
+ * dc120695 Doron   12/6/95   Support STDDATA segment(RACF 2.1)*
+ * spr125   Alex    07/09/95  Add new additional ADDMEM,DELMEM *
+ *                            fields processing                *
+ * ps0170   Alex    03/08/97  SVFMR segment support            *
+ * ps0238   Alex    16/02/98  Refresh GENERIC                  *
+ * ps0252   Guy     13/04/98  Common code changes              *
+ * ps0391   AlexS   11/11/99  RACF 2.8 Support                 *
+ * IS0270   AvnerL  09/06/04  Support quotes on DSN (ws2517)   *
+ * IS0272   Michael 10/06/04  Update RACF 3.2.0 with old fixes *
+ * IS10174  NuritY   31/12/17 Dynamic EXECOUT support.         *
+ * WS10082  MauriC   07/11/22 Updates for new ADDINFO changes  *
+ **************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_API
+ #include ESA_API_CODES
+
+ #include MVS_OS_CLI
+
+ #include RACF_CODES
+ #include API_ADDINFO
+ #include RACF
+ #include RACF_RES
+
+ #define DELTA_NUM         3 + 4 /* 4 for TME segment, ps0391 */
+
+ /*
+  *  Delta Keyword Table
+  */
+
+ typedef struct {
+    char                  kwd[RCF_ADDINFO_KWD_LEN+1];
+    char                  addkwd[RCF_ADDINFO_KWD_LEN+1];
+    char                  delkwd[RCF_ADDINFO_KWD_LEN+1];
+    char                  addval[RCF_ADDINFO_VAL_LEN+1];
+    char                  delval[RCF_ADDINFO_VAL_LEN+1];
+    char                  oldval[RCF_ADDINFO_VAL_LEN+1];
+    ONE_FIELD_rec_typ   * pair;
+    ADDINFO_typ           add_typ;
+  } DELTA_DESC_rec_typ;
+
+
+ /*
+  *     Delta keywords description table
+  */
+
+ static DELTA_DESC_rec_typ delta[DELTA_NUM] = {
+    { "CATEGORY"     , "ADDCATEGORY"    , "DELCATEGORY"    },
+    { "MEMBER"       , "ADDMEM"         , "DELMEM"         },
+    { "TME.CHILDREN" , "TME.ADDCHILDREN", "TME.DELCHILDREN"},/*ps0391*/
+    { "TME.RESOURCE" , "TME.ADDRESOURCE", "TME.DELRESOURCE"},/*ps0391*/
+    { "TME.GROUPS"   , "TME.ADDGROUPS"  , "TME.DELGROUPS"  },/*ps0391*/
+    { "TME.ROLES"    , "TME.ADDROLES"   , "TME.DELROLES"   } /*ps0391*/
+ };
+
+ /*
+  *     RKT for UPDRES
+  *         (Mandatory Keywords Table)
+  */
+
+ static ADDINFO_RKTE_rec_typ rkt[] = {
+    "ADDCATEGORY", "DELCATEGORY",
+    "ADDMEM", "DELMEM",
+    "TME.ADDCHILDREN" , "TME.DELCHILDREN" , /*ps0391*/
+    "TME.ADDRESOURCE" , "TME.DELRESOURCE" , /*ps0391*/
+    "TME.ADDGROUPS"   , "TME.DELGROUPS"   , /*ps0391*/
+    "TME.ADDROLES"    , "TME.DELROLES"    , /*ps0391*/
+    "" };  /* a null string indicate end-of-rkt */
+
+ /*
+  *     MKT for ALTDSD
+  *         (Mandatory Keywords Table)
+  */
+
+ static ADDINFO_MKTE_rec_typ altdsd_mkt[] = {
+        "" };      /* a null string indicate end-of-mkt */
+
+ /*
+  *     MKT for RALTER
+  *         (Mandatory Keywords Table)
+  */
+ static ADDINFO_MKTE_rec_typ ralter_mkt[] = {
+        "" };      /* a null string indicate end-of-mkt */
+
+ /*
+  *     KDT for ALTDSD  COMMAND
+  *         (Keyword Decscription Table)
+  */
+
+ static ADDINFO_KDTE_rec_typ altdsd_kdt[] =      {
+
+  /*                                                            */
+  /* keyword             type   negative       value delimiters */
+  /*                             value                          */
+  /* =================== ====== ============== ================ */
+
+   {"CATEGORY"            ,KDT_IGN ,""            ,"(", ") " },
+   {"ADDCATEGORY"         ,KDT_KEY ,""            ,"(", ") " },
+   {"DELCATEGORY"         ,KDT_KEY ,"DELCATEGORY" ,"(", ") " },
+   {"ADDVOL"              ,KDT_KEY ,""            ,"(", ") " },
+   {"DELVOL"              ,KDT_KEY ,""            ,"(", ") " },
+   {"ALTVOL"              ,KDT_KEY ,""            ,"(", ") " },
+   {"AUDIT.ALL"           ,KDT_KEY ,""            ,"(", ") " },
+   {"AUDIT.FAILURES"      ,KDT_KEY ,""            ,"(", ") " },
+   {"AUDIT.NONE"          ,KDT_FLG ,""            ,"(", ") " },
+   {"AUDIT.SUCCESS"       ,KDT_KEY ,""            ,"(", ") " },
+   {"DFP.RESOWNER"        ,KDT_KEY ,"NODFP"       ,"(", ") " },
+   {"DATA"                ,KDT_KEY ,"NODATA"      ,"('", "') "},
+   {"ERASE"               ,KDT_FLG ,"NOERASE"     ,"" , " "  },
+   {"GENERIC"             ,KDT_FLG ,""            ,"" , " "  },
+   {"SET"                 ,KDT_FLG ,"NOSET"       ,"" , " "  },
+   {"GLOBALAUDIT.ALL"     ,KDT_KEY ,""            ,"(", ") " },
+   {"GLOBALAUDIT.FAILURES",KDT_KEY ,""            ,"(", ") " },
+   {"GLOBALAUDIT.NONE"    ,KDT_FLG ,""            ,"(", ") " },
+   {"GLOBALAUDIT.SUCCESS" ,KDT_KEY ,""            ,"(", ") " },
+   {"LEVEL"               ,KDT_KEY ,""            ,"(", ") " },
+   {"NOTIFY"              ,KDT_KEY ,"NONOTIFY"    ,"(" ,") " },
+   {"OWNER"               ,KDT_KEY ,"OWNER()"     ,"(", ") " },
+   {"RETPD"               ,KDT_KEY ,"RETPD(99999)","(", ") " },
+   {"SECLABEL"            ,KDT_KEY ,"NOSECLABEL"  ,"(", ") " },
+   {"SECLEVEL"            ,KDT_KEY ,"NOSECLEVEL"  ,"(", ") " },
+   {"SSIGNON.KEY"         ,KDT_IGN ,""            ,"(", ") " },
+   {"SSIGNON.KEYENCRYPT"  ,KDT_IGN ,""            ,"(", ") " },
+   {"UACC"                ,KDT_KEY ,"UACC()"      ,"(", ") " },
+   {"UNIT"                ,KDT_KEY ,""            ,"(", ") " },
+   {"VOLUME"              ,KDT_KEY ,""            ,"(", ") " },
+   {"WARNING"             ,KDT_FLG ,"NOWARNING"   ,"" , " "  },
+
+   /* ps0391 */
+   {"NOTME"               ,KDT_FLG ,""               ,"" , " "  },
+   {"TME.NO_PKB"          ,KDT_FLG ,""               ,"",   ""  },
+   {"TME.ROLES"           ,KDT_IGN ,"TME.NOROLES"    ,"(", ") " },
+   {"TME.ADDROLES"        ,KDT_KEY ,""               ,"(", ") " },
+   {"TME.DELROLES"        ,KDT_KEY ,"TME.DELROLES"   ,"(", ") " },
+
+   {""                    ,KDT_KEY ,""            ,"" , ""   }  };
+
+ /*
+  *     KDT for RALTER  COMMAND
+  *         (Keyword Decscription Table)
+  */
+
+ static ADDINFO_KDTE_rec_typ ralter_kdt[] =      {
+
+  /*                                                            */
+  /* keyword             type   negative       value delimiters */
+  /*                             value                          */
+  /* =================== ====== ============== ================ */
+
+   {"CATEGORY"            ,KDT_IGN ,""                  ,"(", ") " },
+   {"MEMBER"              ,KDT_IGN ,""                  ,"(", ") " },
+   {"SSIGNON.KEY"         ,KDT_IGN ,""                  ,"(", ") " },
+   {"SSIGNON.KEYENCRYPT"  ,KDT_IGN ,""                  ,"(", ") " },
+   {"SET"                 ,KDT_IGN ,""                  ,"" , ""   },
+
+   {"ADDCATEGORY"         ,KDT_KEY ,""                  ,"(", ") " },
+   {"DELCATEGORY"         ,KDT_KEY ,""                  ,"(", ") " },
+   {"ADDVOL"              ,KDT_KEY ,""                  ,"(", ") " },
+   {"DELVOL"              ,KDT_KEY ,""                  ,"(", ") " },
+   {"ADDMEM"              ,KDT_KEYG,""                  ,"(", ") " },
+   {"DELMEM"              ,KDT_KEYG,""                  ,"(", ") " },
+
+   {"APPLDATA"            ,KDT_KEY ,"NOAPPLDATA"        ,"('", "') "},
+   {"DATA"                ,KDT_KEY ,"NODATA"            ,"('", "') "},
+   {"GENERIC"             ,KDT_IGN ,""                  ,"" , " "  },
+   {"LEVEL"               ,KDT_KEY ,""                  ,"(", ") " },
+   {"NOTIFY"              ,KDT_KEY ,"NONOTIFY"          ,"(" ,") " },
+   {"OWNER"               ,KDT_KEY ,"OWNER()"           ,"(", ") " },
+   {"SECLABEL"            ,KDT_KEY ,"NOSECLABEL"        ,"(", ") " },
+   {"SECLEVEL"            ,KDT_KEY ,"NOSECLEVEL"        ,"(", ") " },
+   {"SINGLEDSN"           ,KDT_FLG ,"NOSINGLEDSN"       ,"" , " "  },
+   {"TIMEZONE"            ,KDT_KEY ,"NOTIMEZONE"        ,"(", ") " },
+   {"TVTOC"               ,KDT_FLG ,"NOTVTOC"           ,"" , " "  },
+   {"UACC"                ,KDT_KEY ,"UACC()"            ,"(", ") " },
+   {"WARNING"             ,KDT_FLG ,"NOWARNING"         ,"" , " "  },
+   {"WHEN.TIME"           ,KDT_KEY ,"WHEN.TIME(ANYTIME)","(",  ")" },
+   {"WHEN.DAYS"           ,KDT_KEY ,"WHEN.DAYS(ANYDAY)" ,"(",  ")" },
+
+   {"AUDIT.ALL"           ,KDT_KEY ,""                  ,"(", ") " },
+   {"AUDIT.FAILURES"      ,KDT_KEY ,""                  ,"(", ") " },
+   {"AUDIT.NONE"          ,KDT_FLG ,""                  ,"(", ") " },
+   {"AUDIT.SUCCESS"       ,KDT_KEY ,""                  ,"(", ") " },
+
+   {"GLOBALAUDIT.ALL"     ,KDT_KEY ,""                  ,"(", ") " },
+   {"GLOBALAUDIT.FAILURES",KDT_KEY ,""                  ,"(", ") " },
+   {"GLOBALAUDIT.NONE"    ,KDT_FLG ,""                  ,"(", ") " },
+   {"GLOBALAUDIT.SUCCESS" ,KDT_KEY ,""                  ,"(", ") " },
+
+   {"NODLFDATA"           ,KDT_FLG ,""                  ,"" , " "  },
+   {"DLFDATA.NO_PKB"      ,KDT_FLG ,""                  ,"",   ""  },
+   {"DLFDATA.RETAIN"      ,KDT_KEY ,""                  ,"(", ") " },
+   {"DLFDATA.JOBNAMES"    ,KDT_KEY ,""                  ,"(", ") " },
+
+   {"NOSESSION"           ,KDT_FLG ,""                  ,"" , " "  },
+   {"SESSION.NO_PKB"      ,KDT_FLG ,""                  ,"",   ""  },
+   {"SESSION.INTERVAL"    ,KDT_KEY ,"SESSION.NOINTERVAL","(", ") " },
+   {"SESSION.LOCK"        ,KDT_FLG ,"SESSION.NOLOCK"    ,"" , " "  },
+   {"SESSION.SESSKEY"     ,KDT_KEY ,"SESSION.NOSESSKEY" ,"(", ") " },
+   {"SESSION.CONVSEC"     ,KDT_KEY ,"SESSION.NOCONVSEC" ,"(", ") " },
+
+   {"SSIGNON.KEYENCRYPTED",KDT_KEY ,""                  ,"(", ") " },
+   {"SSIGNON.KEYMASKED"   ,KDT_KEY ,""                  ,"(", ") " },
+
+   {"NOSTDATA"            ,KDT_FLG ,""                  ,"" , " "  },
+   {"STDATA.NO_PKB"       ,KDT_FLG ,""                  ,"",   ""  },
+   {"STDATA.USER"         ,KDT_KEY ,"STDATA.NOUSER"     ,"(", ") " },
+   {"STDATA.GROUP"        ,KDT_KEY ,"STDATA.NOGROUP"    ,"(", ") " },
+   {"STDATA.PRIVILEGED"   ,KDT_KEY ,"STDATA.NOPRIVILEGED","(", ") " },
+   {"STDATA.TRACE"        ,KDT_KEY ,"STDATA.NOTRACE"    ,"(", ") " },
+   {"STDATA.TRUSTED"      ,KDT_KEY ,"STDATA.NOTRUSTED"  ,"(", ") " },
+
+   /* ps0170 */
+   {"NOSVFMR"             ,KDT_FLG ,""                  ,"" , " "  },
+   {"SVFMR.NO_PKB"        ,KDT_FLG ,""                  ,"",   ""  },
+   {"SVFMR.SCRIPTNAME"    ,KDT_KEY ,"SVFMR.NOSCRIPTNAME","(", ") " },
+   {"SVFMR.PARMNAME"      ,KDT_KEY ,"SVFMR.NOPARMNAME"  ,"(", ") " },
+
+   /* ps0391 */
+   {"NOTME"               ,KDT_FLG ,""                  ,"" , " "  },
+   {"TME.NO_PKB"          ,KDT_FLG ,""                  ,"",   ""  },
+   {"TME.ROLES"           ,KDT_IGN ,"TME.NOROLES"       ,"(", ") " },
+   {"TME.ADDROLES"        ,KDT_KEY ,""                  ,"(", ") " },
+   {"TME.DELROLES"        ,KDT_KEY ,"TME.DELROLES"      ,"(", ") " },
+   {"TME.CHILDREN"        ,KDT_IGN ,"TME.NOCHILDREN"    ,"(", ") " },
+   {"TME.ADDCHILDREN"     ,KDT_KEY ,""                  ,"(", ") " },
+   {"TME.DELCHILDREN"     ,KDT_KEY ,"TME.DELCHILDREN"   ,"(", ") " },
+   {"TME.GROUPS"          ,KDT_IGN ,"TME.NOGROUPS"      ,"(", ") " },
+   {"TME.ADDGROUPS"       ,KDT_KEY ,""                  ,"(", ") " },
+   {"TME.DELGROUPS"       ,KDT_KEY ,"TME.DELGROUP"      ,"(", ") " },
+   {"TME.PARENT"          ,KDT_KEY ,"TME.NOPARENT"      ,"(", ") " },
+   {"TME.RESOURCE"        ,KDT_IGN ,"TME.NORESOURCE"    ,"(", ") " },
+   {"TME.ADDRESOURCE"     ,KDT_KEY ,""                  ,"(", ") " },
+   {"TME.DELRESOURCE"     ,KDT_KEY ,"TME.DELRESOURCE"   ,"(", ") " },
+
+   {""                    ,KDT_KEY ,""                  ,"" , ""   } };
+
+ /* spr125 */
+ static void  member_fields_proc( ADDINFO_rec_ptr        addinfo);
+
+ static void  prt_list(char       *value);
+
+ static char  component[] = "CTSRURS";
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : updres                                     *
+ *                                                             *
+ * DESCRIPTION    : Update a resource                          *
+ *                                                             *
+ * INPUT          : resource, addinfo, admin                   *
+ *                                                             *
+ * OUTPUT         : err                                        *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC CTSUpdRes (RES_PARAMS_rec_typ   * res_params_ess,
+           /*      ADDINFO_rec_typ      * addinfo_res_ess,  PS0252 */
+                   ADDINFO_rec_typ      * addinfo,
+                   ADMIN_PARAMS_rec_typ * admin_params,
+                   ERR_STRUCT_rec_typ   * err)
+ {
+
+  /*
+   *    Variables
+   */
+
+   ESA_RC                  rc, chk_rc;
+   ADDINFO_rec_typ       * addinfo_res = NULL;
+   RES_PARAMS_rec_typ      res_params_tmp;
+   RES_PARAMS_rec_typ    * res_params = &res_params_tmp;
+   char                    cmd[MAX_API_ST];
+   char                    cmd_pref[MAX_API_ST];
+   char                    volume[RCF_ADDINFO_VAL_LEN+1]= NULL_STRING;
+   ADDINFO_MKTE_rec_ptr    mkt;
+   ADDINFO_KDTE_rec_ptr    kdt;
+
+   static char                func[]="CTSUpdRes";
+   CTSAMSG_HANDLE_rec_ptr     msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr dest;
+   int                        generic_flag = 0;
+   ONE_FIELD_rec_ptr          cpair, cpairf;
+   char                       msgbuf[MAX_RSS_ADDINFO_VAL_LEN+100];
+
+   /* Fields for GETRES  (needed for delta ) */
+
+   HAVE_MORE_typ          have_more = NO_MORE;
+   void                   *handle = NULL;
+   short                  actual_num ;
+   OE_typ                 oe = "";
+   ADDINFO_rec_ptr        laddinfo = NULL;
+   ADDINFO_rec_ptr        addinfo_vec[3] = { NULL, NULL, NULL };
+   RES_PARAMS_rec_typ     res;
+   ONE_FIELD_rec_ptr      gen_pair;
+   ONE_FIELD_rec_ptr      vol_pair;
+   ONE_FIELD_rec_ptr      real_pair;  /*WS10082*/
+
+   /* Delta processing */
+
+   ESA_RC            rc_add, rc_del;
+
+   int  delta_count = 0 ;
+   int  i;
+
+   char                    racf_dataset_quotes[4];  /* IS0270 */
+  #define RACF_DATASET_QUOTES "RACF_DATASET_QUOTES" /* IS0270 */
+   ESA_RC prm_rc;                                   /* IS0270 */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_UPDRES, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+  /*
+   *  Build addinfo_res from resource name
+   */
+
+   rc = RCFRES_build_res_addinfo(res_params_ess, res_params,
+                                 &addinfo_res, dest, msgs);
+   if (rc NE ESA_OK)
+     goto exit;
+
+  /*
+   *   Check that Reserved Keywords were not used
+   */
+
+   if (ADDINFO_rkt_check(func, 1, &addinfo, rkt,
+                         dest, msgs ) NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *   Check resource existance
+   */
+
+   gen_pair = ADDINFO_search("GENERIC", RCF_ADDINFO_KWD_LEN,
+                              addinfo_res->pair,
+                              addinfo_res->num_pairs);
+   if ( gen_pair NE NULL)
+      if ( strcmp(gen_pair->value,KWD_FLAG_ON) EQ 0 )
+         generic_flag = 1;
+
+
+   if ( ( generic_flag EQ 0 ) AND
+        ( strcmp(res_params->restype, "DATASET" ) EQ 0 ) ) {
+
+     vol_pair = ADDINFO_search("VOLUME", RCF_ADDINFO_KWD_LEN,
+                                addinfo_res->pair,
+                                addinfo_res->num_pairs);
+     if ( vol_pair NE NULL)
+        strcpy( volume, vol_pair->value );
+
+   }
+
+   ESA_DIAG_printf(ESA_COMP_UPDRES, 1,
+        "Checking resource %s %s existance generic=%d volume=%s",
+         res_params->restype, res_params->resource,
+         generic_flag, volume );
+
+   chk_rc = RACF_chk_res(res_params->restype, res_params->resource,
+                         volume,
+                         generic_flag, OBJ_EXIST, TRUE, dest, msgs);
+   if ( chk_rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   /*
+    *  Prepare command (dataset profile / general profile)
+    */
+
+   if (strcmp(res_params->restype,"DATASET") EQ 0) {
+    prm_rc = admin_params->cs_func.rssprm_get_opt_ptr      /* is0270 */
+                                (admin_params->rss_name,   /* is0270 */
+                                RACF_DATASET_QUOTES,       /* is0270 */
+                                1,                         /* is0270 */
+                                racf_dataset_quotes,       /* is0270 */
+                                OPT_TRUE,                  /* is0270 */
+                                OPT_FALSE);                /* is0270 */
+    if (prm_rc NE ESA_OK)                                  /* is0270 */
+      racf_dataset_quotes[0] = 'N';             /* Default=N  is0270 */
+                                                           /* is0270 */
+    if ( racf_dataset_quotes[0] EQ 'Y')                    /* is0270 */
+      sprintf(cmd_pref,"ALTDSD '%s' ",res_params->resource);/* is0270*/
+    else                                                   /* is0270 */
+       sprintf(cmd_pref,"ALTDSD %s ",res_params->resource);
+       kdt = altdsd_kdt;
+       mkt = altdsd_mkt;
+       ESA_DIAG_printf(ESA_COMP_UPDRES, 1, "ALTDSD kdt=%x mkt=%x",
+                     kdt, mkt );
+   }
+   else {
+       sprintf(cmd_pref,"RALTER %s %s ", res_params->restype,
+               res_params->resource);
+       kdt = ralter_kdt;
+       mkt = ralter_mkt;
+       ESA_DIAG_printf(ESA_COMP_UPDRES, 1, "RALTER kdt=%x mkt=%x",
+                     kdt, mkt );
+   }
+   ESA_DIAG_printf(ESA_COMP_UPDRES, 1,
+                   "Command header prepared (%s)", cmd_pref);
+
+   /*
+    *   Check if any of the delta keywords were specified
+    */
+
+   delta_count=0;
+   for (i=0; i LT (DELTA_NUM - 1) ; i++) {
+       delta[i].pair = ADDINFO_search(delta[i].kwd,
+                                      RCF_ADDINFO_KWD_LEN,
+                                      addinfo->pair,
+                                      addinfo->num_pairs );
+       ESA_DIAG_printf(ESA_COMP_UPDRES, 2,
+              "Delta %d: '%s' at %X", i, delta[i].kwd, delta[i].pair);
+       if (delta[i].pair NE NULL) {
+          delta_count++;
+          delta[i].add_typ = delta[i].pair->add_typ;
+
+          if ( (delta[i].add_typ NE TYPE_1B ) AND
+               (delta[i].add_typ NE TYPE_2B )   ) {
+             sprintf(msgbuf, "Invalid type=%d for list keyword=%s",
+                     delta[i].add_typ, delta[i].kwd);
+             CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                           component, func, msgbuf, 0, __LINE__);
+          }
+       }
+   }
+   ESA_DIAG_printf(ESA_COMP_UPDRES, 1,
+                   "Delta keywords count = %d", delta_count);
+
+  /*
+   *   Handle PTKTDATA class
+   */
+
+   if (strcmp(res_params->restype,"PTKTDATA") EQ 0) {
+
+       /*
+        *   Alloc a local output addinfo buffer
+        */
+
+        if (ADDINFO_alloc(func, 10, &laddinfo,
+                          dest, msgs) NE ESA_OK) {
+           rc = ESA_FATAL;
+           goto exit;
+        }
+
+       /*
+        *   set local addinfo for SSIGNON parameters
+        *
+        *   SSIGNON.KEY        - is the secured signon application key
+        *   SSIGNON.KEYENCRYPT - is a flag whther to encrypt
+        *                        the application key or use masking.
+        */
+
+        cpairf = ADDINFO_search("SSIGNON.KEYENCRYPT",
+                                RCF_ADDINFO_KWD_LEN,
+                                addinfo->pair,
+                                addinfo->num_pairs);
+        cpair  = ADDINFO_search("SSIGNON.KEY",
+                                RCF_ADDINFO_KWD_LEN,
+                                addinfo->pair,
+                                addinfo->num_pairs);
+        if (cpair NE NULL) {
+           if (cpairf NE NULL) {
+              if (strcmp(cpairf->value, KWD_FLAG_ON) EQ 0)
+                 ADDINFO_insert(TYPE_1A, "SSIGNON.KEYENCRYPTED",
+                                cpair->value, laddinfo,
+                                RCF_ADDINFO_KWD_LEN,
+                                RCF_ADDINFO_VAL_LEN,
+                                UNIQUE);
+              else ADDINFO_insert(TYPE_1A, "SSIGNON.KEYMASKED",
+                                cpair->value, laddinfo,
+                                RCF_ADDINFO_KWD_LEN,
+                                RCF_ADDINFO_VAL_LEN,
+                                UNIQUE);
+           } /* flag specified */
+           else ADDINFO_insert(TYPE_1A, "SSIGNON.KEYMASKED",
+                               cpair->value, laddinfo,
+                               RCF_ADDINFO_KWD_LEN,
+                               RCF_ADDINFO_VAL_LEN,
+                               UNIQUE);
+        } /* key specified */
+   } /* PTKTDATA resrouce */
+
+  /*
+   *   For non PTKTDATA resource - Process Delta keywords
+   */
+
+   else if ( delta_count GT 0 ) {
+ /*0*/
+       /*
+        *   Build a local output addinfo buffer for getres
+        */
+
+ /*1*/  if (ADDINFO_alloc(func, DELTA_NUM, &laddinfo,
+                          dest, msgs) NE ESA_OK) {
+           rc = ESA_FATAL;
+           goto exit;
+ /*1*/  }
+
+        for (i=0; i LT (DELTA_NUM - 1); i++)   {      /* ps0071 */
+            ADDINFO_insert(TYPE_1B, delta[i].kwd,"", laddinfo,
+                           RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                           UNIQUE);
+        }                                             /* ps0071 */
+
+ /*1*/  if ( ESA_DIAG_get_debug_level(ESA_COMP_UPDRES) GT 0) {
+           ESA_DIAG_printf(ESA_COMP_UPDRES, 1, "addinfo_res");
+           ADDINFO_dump(addinfo_res,1);
+           ESA_DIAG_printf(ESA_COMP_UPDRES, 1, "laddinfo");
+           ADDINFO_dump(laddinfo,1);
+ /*1*/  }
+
+       /*
+        *   Obatain Current resource record
+        */
+
+        ESA_DIAG_printf(ESA_COMP_UPDRES, 1,
+                        "Obtaining resource %s %s details",
+                        res_params->restype , res_params->resource);
+        rc = CTSGetRes(GET_MANY_RESOURCES, oe, 1, &actual_num,
+                      &have_more, &handle, res_params, addinfo_res,
+                      &res, &laddinfo, admin_params, err );
+
+ /*1*/  if (rc NE ESA_OK) {
+           rc = ESA_FATAL;
+           goto exit;
+ /*1*/  }
+
+        if ( ESA_DIAG_get_debug_level(ESA_COMP_UPDRES) GT 0)
+           ADDINFO_dump(laddinfo,1);
+
+       /*
+        *    Analyze differance between old and new value
+        */
+
+ /*1*/  for (i=0; i LT (DELTA_NUM -1); i++) {
+
+            /* Calculate Added and Deleted items */
+
+ /*2*/      if (delta[i].pair NE NULL) {
+               ESA_DIAG_printf(ESA_COMP_UPDRES, 1,
+                               "Analyzing list differance for %s",
+                                delta[i].kwd);
+
+     /*WS10082 strcpy (delta[i].oldval, laddinfo->pair[i].value);  */
+               real_pair = get_pairi(laddinfo->pair[i]);  /*WS10082*/
+               strcpy (delta[i].oldval, real_pair->value);/*WS10082*/
+
+               rc_add = ADDINFO_list_diff(delta[i].pair->value,
+                                     delta[i].oldval,
+                                     delta[i].addval,
+                                     ADDINFO_LIST_ENTRY,
+                                     ADDINFO_LIST_ENTRY);
+
+               rc_del = ADDINFO_list_diff(delta[i].oldval,
+                                     delta[i].pair->value,
+                                     delta[i].delval,
+                                     ADDINFO_LIST_ENTRY,
+                                     ADDINFO_LIST_ENTRY);
+
+ /*3*/         if ((rc_del NE ESA_OK) OR (rc_add NE ESA_OK)) {
+                  CTSAMSG_print(RACF_LISTDIFF,   msgs, NULL, dest,
+                                delta[i].pair->value);
+                  rc = ESA_FATAL;
+                  goto exit;
+ /*3*/         } /* if */
+
+ /*2*/      } /* if a delta keyword was specified */
+ /*1*/  } /* for */
+
+       /*
+        *   If for certain keywords items were both added
+        *   and deleted, then delete the deleted items
+        */
+
+        ADDINFO_empty(laddinfo);
+        for (i=0; i LT (DELTA_NUM -1); i++)    {         /* ps0071 */
+            if ( (delta[i].pair NE NULL)         AND
+                 (*delta[i].addval NE NULL_CHAR) AND
+ /*1*/           (*delta[i].delval NE NULL_CHAR)    ) {
+               ADDINFO_insert(TYPE_1B, delta[i].delkwd,
+                              delta[i].delval, laddinfo,
+                              RCF_ADDINFO_KWD_LEN,
+                              RCF_ADDINFO_VAL_LEN,
+                              UNIQUE);
+ /*1*/      }
+        }                                                /* ps0071 */
+
+ /*1*/  if (laddinfo->num_pairs GT 0) {
+
+           ESA_DIAG_printf(ESA_COMP_UPDRES, 1,
+                           "Deleting deleted list items");
+           strcpy(cmd, cmd_pref);
+
+           /* spr125 */
+           if ( strcmp( res_params->restype, "PROGRAM" ) EQ 0 )
+              member_fields_proc( laddinfo );
+
+           rc = racfcmd(func, EXECOUT_DDNAME,admin_params->admin_uname,
+                        cmd, MAX_OK_RC_4,
+                        1, &laddinfo, mkt, kdt,          /* IS10174 */
+                        admin_params,                    /* IS10174 */
+                        CMDOUT_YES, RACF_YES);
+            /* IS10174  1, &laddinfo, mkt, kdt, dest, msgs,   */
+           if (rc NE ESA_OK)
+              goto exit;
+           ADDINFO_empty(laddinfo);
+
+ /*1*/  }
+
+       /*
+        *   Add/delete the reminaing items
+        */
+
+        for (i=0; i LT (DELTA_NUM-1); i++)         {       /* ps0071 */
+ /*1*/      if (delta[i].pair NE NULL) {
+
+               /*   Add items */
+
+ /*2*/          if (*delta[i].addval NE NULL_CHAR) {
+                   ADDINFO_insert(TYPE_1B, delta[i].addkwd,
+                              delta[i].addval, laddinfo,
+                              RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                              UNIQUE);
+ /*2*/          }
+
+               /*   Delete items */
+
+ /*2*/          else if (*delta[i].delval NE NULL_CHAR) {
+                       ADDINFO_insert(TYPE_1B,delta[i].delkwd,
+                              delta[i].delval, laddinfo,
+                              RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                              UNIQUE);
+ /*2*/          }
+ /*1*/   } /* if keyword was specified */
+        }                                                  /* ps0071 */
+ /*1*/  if (laddinfo->num_pairs GT 0) {                    /* ps0071 */
+           /* spr125 */                                    /* ps0071 */
+           if (strcmp(res_params->restype,"PROGRAM") EQ 0) /* ps0071 */
+              member_fields_proc( laddinfo );              /* ps0071 */
+        }                                                  /* ps0071 */
+
+ /*0*/ } /* delta keywords should be updated */
+
+
+ /*
+  *  Handle specil NO_PKB flags for addinfo_concat
+  */
+
+  ADDINFO_insert_cond("NOSESSION"      , KWD_FLAG_ON, addinfo,
+                      "SESSION.NO_PKB" , KWD_FLAG_ON,
+                      RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                      laddinfo );
+  ADDINFO_insert_cond("NODLFDATA"      , KWD_FLAG_ON, addinfo,
+                      "DLFDATA.NO_PKB" , KWD_FLAG_ON,
+                      RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                      laddinfo );
+  ADDINFO_insert_cond("NOSTDATA"       , KWD_FLAG_ON, addinfo,
+                      "STDATA.NO_PKB"  , KWD_FLAG_ON,
+                      RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                      laddinfo );
+
+ /* ps0170 */
+  ADDINFO_insert_cond("NOSVFMR"        , KWD_FLAG_ON, addinfo,
+                      "SVFMR.NO_PKB"   , KWD_FLAG_ON,
+                      RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                      laddinfo );
+ /* ps0391 */
+  ADDINFO_insert_cond("NOTME"          , KWD_FLAG_ON, addinfo,
+                      "TME.NO_PKB"     , KWD_FLAG_ON,
+                      RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                      laddinfo );
+
+ /*
+  *  Issue command
+  */
+
+  ESA_DIAG_printf(ESA_COMP_UPDRES, 1, "Issuing main command");
+
+  addinfo_vec[0] = laddinfo;
+  addinfo_vec[1] = addinfo_res;
+  addinfo_vec[2] = addinfo;
+
+  strcpy(cmd, cmd_pref);
+
+  if ( ESA_DIAG_get_debug_level(ESA_COMP_UPDRES) GT 0) {
+     ESA_DIAG_printf(ESA_COMP_UPDRES, 1, "kdt=%x mkt=%x",
+                     kdt, mkt );
+
+     ESA_DIAG_printf(ESA_COMP_UPDRES, 1, "laddinfo");
+     ADDINFO_dump(laddinfo,1);
+     ESA_DIAG_printf(ESA_COMP_UPDRES, 1, "addinfo_res");
+     ADDINFO_dump(addinfo_res,1);
+     ESA_DIAG_printf(ESA_COMP_UPDRES, 1, "addinfo");
+     ADDINFO_dump(addinfo,1);
+  }
+
+  /* spr125                                       removed ps0071
+  if (strcmp(res_params->restype,"PROGRAM") EQ 0) removed ps0071
+     member_fields_proc( laddinfo );              removed ps0071
+  */
+
+  rc = racfcmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+               cmd, MAX_OK_RC_4,
+               3, addinfo_vec, mkt, kdt,                 /* IS10174 */
+               admin_params,                             /* IS10174 */
+               CMDOUT_YES, RACF_YES);
+    /* IS10174 3, addinfo_vec, mkt, kdt, dest, msgs,    */
+
+ /*
+  *   Refresh based on resource class
+  */
+
+  if ( rc EQ ESA_OK )
+   RACF_refresh(res_params_ess->resource,      /* ps0239 */
+                res_params_ess->restype,       /* ps0239 */
+                admin_params, dest,msgs);      /* ps0239 */
+
+ /*
+  *   Finish
+  */
+
+  exit:;
+
+  ADDINFO_free(&laddinfo);
+  ADDINFO_free(&addinfo_res);
+
+  ESA_DIAG_exit(ESA_COMP_UPDRES, 1, func, rc );
+  return rc;
+
+ }
+
+ /* spr125 */
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : member_fields_proc                         *
+ *                                                             *
+ * DESCRIPTION    : Special ADDMEM, DELMEM processing          *
+ *                                                             *
+ * INPUT          : addinfo                                    *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ static void  member_fields_proc( ADDINFO_rec_ptr        addinfo)
+ {
+
+   static char func[] = "member_fields_proc";
+   ONE_FIELD_rec_ptr    mem_pair;
+   int                  i;
+   /* WS10082N char                 temp_val[2*RCF_ADDINFO_VAL_LEN+1];*/
+   char                 temp_val[2*ADDINFO_16K_VAL_LEN+1];/* WS10082N */
+   char                 *wptr0;
+   char                 *wptr1, *wptr2;
+   char                 *temp;           /* ps0071 */
+   char                 len;
+   static char mem_fields[2][10] = { "ADDMEM", "DELMEM" } ;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_UPDRES, 1, func);
+
+  /*
+   *  Search interesting fields ( ADDMEM, DELMEM )
+   *  if found start processing.
+   */
+
+   for ( i=0; i LT 2; i++ )  {
+
+      mem_pair = ADDINFO_search(mem_fields[i], RCF_ADDINFO_KWD_LEN,
+                                addinfo->pair,
+                                addinfo->num_pairs);
+
+      ESA_DIAG_printf(ESA_COMP_UPDRES, 1,
+                      "field=%s ptr=%x", mem_fields[i], mem_pair);
+
+     /*
+      *  Interesting field found
+      */
+
+      if ( mem_pair NE NULL) {
+         ESA_DIAG_printf(ESA_COMP_UPDRES, 1,
+                         "field=%s", mem_pair->keyword);
+         prt_list(mem_pair->value);
+
+         temp  = mem_pair->value;                          /* ps0071 */
+         wptr0 = mem_pair->value;                          /* ps0071 */
+         wptr1 = strstr( temp, "******" );                 /* ps0071 */
+         while ( wptr1 ) {                                 /* ps0071 */
+
+            ESA_DIAG_printf(ESA_COMP_UPDRES, 1,            /* ps0071 */
+                            ">> field=%s",                 /* ps0071 */
+                            mem_pair->keyword);            /* ps0071 */
+            prt_list(mem_pair->value);                     /* ps0071 */
+
+           /*
+            *   If not found ****** string - not need
+            *   special processing
+            */
+           /*                                              rem ps0071
+            * wptr1 = strstr( mem_pair->value, "******" ); rem ps0071
+            * if ( wptr1 EQ NULL )                         rem ps0071
+            *    continue;                                 rem ps0071
+            */
+
+           /*
+            *   Found ****** string. Special processing.
+            *   1. Move part before ****** string
+            */
+
+            len   = wptr1 - wptr0 ;
+            temp  = wptr1;                                 /* ps0071 */
+            temp += 6;  /* ******   */                     /* ps0071 */
+            temp += 2;  /* 2 quotes */                     /* ps0071 */
+            memcpy( temp_val, mem_pair->value, len);
+            temp_val[len]=NULL_CHAR;
+
+           /*
+            *   2. Add string '******' with quates.
+            */
+
+            strcat( temp_val, "'******'" );
+
+           /*
+            *   3. Move part after ****** string
+            */
+
+            wptr1++;
+            wptr2 = strchr( wptr1, '/' );
+            if ( wptr2 NE NULL )
+               strcat( temp_val, wptr2 );
+
+            ESA_DIAG_printf(ESA_COMP_UPDRES, 1, "Result");
+            prt_list(temp_val);
+
+           /*
+            *   Update addinfo
+            */
+
+            ADDINFO_updval (temp_val, RCF_ADDINFO_VAL_LEN, mem_pair);
+            wptr1 = strstr( temp, "******" );            /* ps0071 */
+            ESA_DIAG_printf(ESA_COMP_UPDRES, 1,          /* ps0071 */
+                            "temp=%x wptr1=%x",          /* ps0071 */
+                            temp, wptr1 );               /* ps0071 */
+         }                                               /* ps0071 */
+      }
+   }
+
+   /*
+    *   Finish
+    */
+
+    ESA_DIAG_exit(ESA_COMP_UPDRES, 1, func, ESA_OK );
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : prt_list                                   *
+ *                                                             *
+ * DESCRIPTION    : List ADDMEM, DELMEM fields for debug       *
+ *                                                             *
+ * INPUT          : field value                                *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ static void prt_list(char       *value)
+ {
+
+   char   temp_val[2*RCF_ADDINFO_VAL_LEN+1];
+   char   sep_str[3];
+   char   *token;
+   int    i=0;
+
+   if ( ESA_DIAG_get_debug_level(ESA_COMP_UPDRES) EQ 0)
+       goto exit;
+
+   sep_str[0] = ADDINFO_LIST_ENTRY;
+   sep_str[1] = ADDINFO_LIST_SUBFIELD,
+   sep_str[2] = NULL_CHAR;
+
+   strcpy(temp_val, value);
+   token = strtok(temp_val, sep_str);
+   while (token) {
+      i++;
+      ESA_DIAG_printf(ESA_COMP_UPDRES, 1,
+                      "%d token=%s", i, token);
+      token  = strtok(NULL, sep_str);
+   }
+
+   exit :;
+ }

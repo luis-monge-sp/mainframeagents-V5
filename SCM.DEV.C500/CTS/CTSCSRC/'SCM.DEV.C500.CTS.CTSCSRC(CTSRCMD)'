@@ -1,0 +1,5219 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Issue a RACF command functions           *
+ *                                                             *
+ * File Name        : racfcmd                                  *
+ *                                                             *
+ * Author           : Doron Cohen                              *
+ *                                                             *
+ * Creation Date    : 30/03/94                                 *
+ *                                                             *
+ * Description      : Racf command issue                       *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+  * WSAR1001 Alex     29/04/96     Change password suppresiion
+  *                                option for Add Get RACF options
+  * WSAR1003 Alex     06/05/96     Add ignore_no_addinfo flag
+  * ps0039   Alex     06/05/96     fix new list processing
+  * ps0238   Alex     16/02/98     SETROPTS for GENERIC class res
+  * ps0292   AS       03/08/98     Digital certificate support
+  * ps0320   Guy      22/10/98     Modified two ENUM names
+  * sas750   AvnerL   23/11/09     Clear SAS/C 7.5 warnings.
+  * IS10076  NuritY   31/01/13     Support Custom Fields.
+  * IS10100A NuritY   14/10/13     Support RACF command limitations.
+  * SAS2IBMT SeligT   09/10/16     SAS/C to IBM C Conversion Project
+  * SAS2IBMN NuritY   02/02/17     Abend S0C4 because a field was
+  *                                not initialized.
+  * IS10147A SeligT   29/05/17     Add support for password phrase
+  * IS10174  NuritY   15/01/18 Dynamic EXECOUT support.
+  * IS10183  ThomaS   06/05/21 Don't print passwords in diag
+  * WS10081  ThomaS   04/07/21 Support MFA
+  * IS10185  AvnerL   22/08/22 Recomp with CTSRRCF
+  * BS10122  ThomaS   23/03/23 RACF_Build_MAP fails
+  * WS10082  MauriC   24/11/22 Update per ADDINFO new structure
+  * WS10082N NuritY   20/09/23 Update per ADDINFO new structure
+  * WS10082A AvnerL   28/09/23 Allow length of 16K
+  **************************************************************/
+#include   <globs.h>
+
+/*
+ *   Standard include files
+ */
+
+#include   STDIO
+#include   STDLIB
+#include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ /* IS10174 #include ESA_CTSAMSG     */
+ #include ESA_API_CODES
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_CODES
+ #include MVS_COMP
+
+ /*
+  *   ESA include files
+  */
+
+ #include RACF
+ #include RACF_RES
+ #include RACF_CODES
+
+ static char component[]="CTSRCMD";        /* ps0292 */
+
+ /* ps0292 */
+ static ESA_RC Dig_cert_complete_info(ESA_DIAG_COMP_typ    comp,
+                               int                         serial,
+                               char                      * kwd,
+                               char                      * user,
+                               ADDINFO_rec_ptr             addinfo,
+                               ADDINFO_rec_ptr             laddinfo,
+                               CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                               CTSAMSG_HANDLE_rec_ptr      msgs);
+/* WS10081 - start */
+/*==============================================================*/
+/*      prototypes for internal routines                        */
+/*==============================================================*/
+ static ESA_RC  RACF_Save_Org(ESA_DIAG_COMP_typ   comp,
+                      RACF_MFA_TRANMAP            MAP,
+                      ADDINFO_rec_ptr             laddinfo,
+                      RACF_Factor                 org_factors[],
+                      char                        *org_factors_list,
+                      char                        *org_factors_list_usr,
+                      int                         *org_factor_index,
+                      char                        *org_policies,
+                      char                        *org_pwfallback,
+                      char                        *org_enable,
+                      CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                      CTSAMSG_HANDLE_rec_ptr      msgs);
+
+ static ESA_RC RACF_Build_MFA_cmd (ESA_DIAG_COMP_typ     comp,
+                      RACF_MFA_TRANMAP            MAP,
+                      char                        *id,
+                      char                        *tran,
+                      char                        *cmd,
+                      char                        act,
+                      int                         this_cmd,
+                      int                         num_cmds,
+                      RACF_Factor                 *factor,
+                      char                        *delfactor,
+                      char                        *addpolicy,
+                      char                        *delpolicy,
+                      char                        pwfallback,
+                      RACF_Factor                 org_factors[],
+                      char                        *org_factors_list,
+                      int                         org_factor_index,
+                      char                        *org_policies,
+                      char                        org_pwfallback,
+                      char                        org_enable,
+                      char                        *rcmd,
+                      ADMIN_PARAMS_rec_typ        *admin_params);
+
+ static ESA_RC  Remove_Dups  (ESA_DIAG_COMP_typ   comp,
+                      char                       *inlist,
+                      char                       *outlist,
+                      char                        insep,
+                      char                        outsep,
+                      CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                      CTSAMSG_HANDLE_rec_ptr      msgs);
+
+ static ESA_RC  RACF_Get_Next_TAG_Name (ESA_DIAG_COMP_typ comp,
+                      char                       *tags,
+                      char                      **pname,
+                      int                        *lname,
+                      CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                      CTSAMSG_HANDLE_rec_ptr      msgs);
+
+ static ESA_RC  RACF_Find_Org_TAG   (ESA_DIAG_COMP_typ    comp,
+                      char                       *tags,
+                      char                       *name,
+                      int                         lname,
+                      char                      **ptag,
+                      int                        *ltag,
+                      char                       *blnk,
+                      CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                      CTSAMSG_HANDLE_rec_ptr      msgs);
+
+ static ESA_RC  RACF_Org_TAGs2rcmd  (ESA_DIAG_COMP_typ    comp,
+                      char                       *tags,
+                      char                       *rcmd,
+                      CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                      CTSAMSG_HANDLE_rec_ptr      msgs);
+
+ static ESA_RC  RACF_Prep_TAGs_cmd    (ESA_DIAG_COMP_typ    comp,
+                      RACF_Factor                *factor,
+                      RACF_Factor                *org_factor,
+                      char                       *cmd,
+                      char                       *rcmd,
+                      int                        *anycmd,
+                      CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                      CTSAMSG_HANDLE_rec_ptr      msgs);
+/*==============================================================*/
+/* WS10081 - end   */
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : racfcmd                                    *
+ *                                                             *
+ * DESCRIPTION    : Issue a RACF command                       *
+ *                                                             *
+ * INPUT          :                                            *
+ *                                                             *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ * ===> ATTENTION : If the addinfo may comntain CSDATA         *
+ *                  parameters, RACF_do_AddAlt_cmd should be   *
+ *                  called to prepare and issue the commands   *
+ *                  instead of this function.                  *
+ *                  See comments for RACF_do_AddAlt_cmd        *
+ *                  below for more details.                    *
+ *                                                             *
+ *                                                             *
+ * ddn parameter:                                * IS10174 *   *
+ * ==============                                              *
+ * When gout_flag is not CMDOUT_YES, ddn should be a variable  *
+ * containing the ddname, and not a literal. When racfcmd      *
+ * does not handle the output (according to gout_flag and      *
+ * command execution results), it will return the ddname to    *
+ * the caller. The ddname will be in the same format (with     *
+ * or without DD:) as the input ddname.                        *
+ *                                                             *
+ **************************************************************/
+ ESA_RC racfcmd (char                      *func,
+                 char                      *ddn,
+                 USER_typ                   admin_uname,
+                 char                      *cmd,
+   /* ps0320 */  CMD_RC_typ                 max_ok_rc,
+                 short                      numaddi,
+                 ADDINFO_rec_ptr           *addinfo,
+                 ADDINFO_MKTE_rec_ptr       mkt,
+                 ADDINFO_KDTE_rec_ptr       kdt,
+  /* IS10174 */  ADMIN_PARAMS_rec_typ     * admin_params,
+   /* ps0320 */  CMDOUT_typ                 gout_flag,
+ /* WSAR1003 */  RACF_FLAG_typ              ignore_no_addinfo)
+  /* IS10174     CTSAMSG_DEST_TABLE_rec_ptr dest,                   */
+  /* IS10174     CTSAMSG_HANDLE_rec_ptr     msgs,                   */
+{
+
+  /*
+   *    Local Variables
+   */
+
+   static char fn[]="racfcmd";
+
+   ESA_RC rc = ESA_OK, output_rc, build_rc, check_rc;
+   ESA_RC rem_rc;
+
+   short  output_len;
+   char   output_buffer[8192];
+   char   exec_cmd[8192];
+   char   buffer[8192] = NULL_STRING;                   /* IS10183 */
+   char   * ps = NULL;                                  /* IS10183 */
+   char   * pse= NULL;                                  /* IS10183 */
+   char   * str= NULL;                                  /* IS10183 */
+   int    psworpsp = FALSE;                             /* IS10183 */
+   int    initial_cmd_len ;
+   int    coff, clen, i;
+   int    tso_rc;
+   int    setropts_flag = 0; /* WSAR1001 */
+   char   *pass_str;
+   char   *work;
+   /* IS10174 char   *ddnx;                                           */
+   char    ddnx[9];                                       /* IS10174 */
+
+   CTSAMSG_HANDLE_rec_typ     * msgs;                     /* IS10174  */
+   CTSAMSG_DEST_TABLE_rec_typ * dest;                     /* IS10174  */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(PLT_COMP_API_RACF,1,fn);
+
+   msgs = admin_params->ctsamsg_handle;                   /* IS10174  */
+   dest = admin_params->ctsamsg_dest;                     /* IS10174  */
+
+  /*
+   *    Check that mandatory keywords were specified
+   */
+
+   check_rc = ADDINFO_mkt_check(func,numaddi,addinfo,mkt,kdt,
+                                dest, msgs);
+
+   if (check_rc NE ESA_OK)
+   {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *    Build remaining Command
+   */
+
+   initial_cmd_len = strlen(cmd);
+   build_rc = ADDINFO_concat(func, cmd, numaddi, addinfo, kdt,
+                             dest, msgs);
+   if (build_rc NE ESA_OK)
+   {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *    Do not issue the command if no additional info specified
+   */
+
+   if (  (numaddi NE 0) AND
+         (initial_cmd_len EQ strlen(cmd) )  AND
+         (ignore_no_addinfo EQ RACF_YES)      )  /* WSAR1003 */
+     goto exit;
+
+  /*
+   *    Activate Shell
+   */
+   /* IS10174 - start  */
+   /*
+   ddnx = ddn;
+   work = strstr( ddn, "DD:" );  * used to be DDN:          SAS2IBMT *
+   if ( work NE NULL )
+     ddnx = work + 3;             *  used to be 4           SAS2IBMT *
+   */
+   if (strncmp(ddn, "DD:", 3) NE 0)
+     strcpy(ddnx, ddn);
+   else
+     strcpy(ddnx, ddn+3);
+   /* IS10174 - end    */
+
+   sprintf(exec_cmd, "%%CTSACMD %s %s %s", ddnx, admin_uname, cmd);
+   /* IS10183 - start */
+   if (   (strstr(cmd, "PASSWORD(" ) EQ 0)  OR
+          (strstr(cmd, "PHRASE("   ) EQ 0)  )
+    {
+     psworpsp = TRUE;
+     strcpy(buffer,cmd);
+     ps = strstr(buffer,"PASSWORD(");
+
+     if (ps NE NULL) str = ps+9;
+     else
+      {
+       ps = strstr(buffer,"PHRASE(");
+       if (ps NE NULL) str = ps+7;
+      }
+
+     if (ps NE NULL)
+     {
+       pse =  strstr(str,")");
+       if (pse NE NULL)
+       {
+        for (ps=str; ps LT pse; ps++)
+            *ps = '*';
+        ESA_DIAG_printf(PLT_COMP_API_RACF,1,
+            "Calling ESA_CLI_exec_wait admin_uname=%s cmd=%s",
+            admin_uname, buffer);
+       }
+     }
+    }
+   else
+   /* IS10183 - end   */
+   ESA_DIAG_printf(PLT_COMP_API_RACF,1,
+            "Calling ESA_CLI_exec_wait admin_uname=%s cmd=%s",
+            admin_uname, cmd);                           /* SAS2IBMT */
+   /* IS10174 - start */
+   /*
+   rc = ESA_CLI_exec_wait(ddn, exec_cmd, &tso_rc, dest, msgs);
+   ESA_DIAG_printf(PLT_COMP_API_RACF,1,
+                   "Executor rc=%d tso_rc=%d max_ok_rc=%d",
+                    rc, tso_rc, max_ok_rc);
+   */
+   rc = ESA_CLI_exec_wait(ddnx, exec_cmd, &tso_rc, admin_params);
+   ESA_DIAG_printf(PLT_COMP_API_RACF,1,
+                   "Executor rc=%d ddn = %s tso_rc=%d max_ok_rc=%d",
+                    rc, ddnx, tso_rc, max_ok_rc);
+   /* IS10174 - end    */
+   if (rc EQ ESA_OK)
+   {
+      if ( tso_rc LE max_ok_rc )      /* if (tso_rc LT 8)  */
+         rc = ESA_OK;                 /* if (tso_rc LT 4)  */
+
+     /*
+      * else if (tso_rc LT 8)
+      *    rc = ESA_ERR;
+      */
+
+      else
+        rc = ESA_FATAL;
+   }
+   else
+     rc = ESA_FATAL;
+
+  /*
+   *    Obtain output
+   */
+
+   if ( ( gout_flag EQ CMDOUT_YES) OR
+        ( ( rc NE ESA_OK ) AND ( gout_flag EQ CMDOUT_ERR ) )  )
+   {
+      output_len =  sizeof(output_buffer);
+      /* IS10174
+      output_rc = ESA_CLI_get_output(ddn, output_buffer, &output_len,
+                                     dest, msgs );
+      ESA_DIAG_printf(PLT_COMP_API_RACF,1,
+        "Shell Output ddn=%s len=%d rc=%d", ddn, output_len, output_rc);
+      */
+      output_rc = ESA_CLI_get_output(ddnx, output_buffer, /* IS10174 */
+                                     &output_len,         /* IS10174 */
+                                     admin_params);       /* IS10174 */
+
+      ESA_DIAG_printf(PLT_COMP_API_RACF,1,               /* IS10174 */
+                     "Shell Output ddn=%s len=%d rc=%d", /* IS10174 */
+                      ddnx, output_len, output_rc);      /* IS10174 */
+      /* SAS2IBMT - start */
+      /* IS10183  - start */
+      if (psworpsp)
+      {
+        strncpy(buffer,output_buffer,output_len);
+        *(buffer+output_len)=NULL_CHAR;
+        ps = strstr(buffer,"PASSWORD(");
+
+        if (ps NE NULL) str = ps+9;
+        else
+         {
+          ps = strstr(buffer,"PHRASE(");
+          if (ps NE NULL) str = ps+7;
+         }
+
+        if (ps NE NULL)
+         {
+          pse =  strstr(str,")");
+          if (pse NE NULL)
+          {
+           for (ps=str; ps LT pse; ps++)
+               *ps = '*';
+           ESA_DIAG_printf(PLT_COMP_API_RACF,1,
+           "Shell Output buffer=%.*s", output_len, buffer);
+          }
+         }
+      }
+      else
+      /* IS10183  - end   */
+      ESA_DIAG_printf(PLT_COMP_API_RACF,1,
+        "Shell Output buffer=%.*s", output_len, output_buffer);
+      /* SAS2IBMT - end   */
+
+     /*
+      *    Issue output messages
+      */
+
+      if (output_rc EQ ESA_OK)
+      {
+         for (coff = 0; coff LT output_len; coff += clen )
+         {
+               clen = strlen(&output_buffer[coff])+1;
+
+               /* suppress newline markers */
+               if ( (clen GT 2) AND
+                    (output_buffer[coff+clen-2] EQ '\n'))
+                  output_buffer[coff+clen-2] = NULL_CHAR;
+
+/* WSAR1001 */ if ( strstr(&output_buffer[coff],"SETROPTS" ) NE NULL)
+/* WSAR1001 */    setropts_flag = 1;
+
+               /* suppress password text */
+
+/* WSAR1001 */ if ( setropts_flag EQ 0 )
+               {
+                 pass_str = strstr(&output_buffer[coff],"PASSWORD(");
+                 if (pass_str NE NULL)
+                    for ( i=9; (pass_str[i] NE ')') AND
+                               (pass_str[i] NE NULL_CHAR); i++ )
+                       pass_str[i] = '*';
+                 /* IS10147A start */
+                 pass_str = strstr(&output_buffer[coff],"PHRASE('");
+                 if (pass_str NE NULL) {
+                    i = 8;
+                    for (;;) {
+                      if ((pass_str[i]   EQ QUOTE_CHAR) AND
+                          (pass_str[i+1] EQ ')')) break;
+                      pass_str[i] = '*';
+                      i++;
+                    }
+                 }
+                 /* IS10147A end */
+               }
+
+               CTSAMSG_print(RACF_OUTPUT_LINE,   msgs, NULL, dest,
+                             &output_buffer[coff] );
+         }   /* for */
+      }
+      else
+      {
+         CTSAMSG_print(RACF_OUTPUT_ERR,   msgs, NULL, dest);
+         rc = ESA_ERR;
+      }
+
+     /*
+      *    Remove output file
+      */
+
+      /* IS10174 rem_rc = ESA_CLI_delete_output( ddn, dest, msgs ); */
+      rem_rc = ESA_CLI_delete_output(ddnx, admin_params); /* IS10174 */
+      if ( rem_rc NE ESA_OK )
+         rc = ESA_ERR;
+
+  }   /* get output */
+  /* IS10174 - start */
+  else   /*  output not processed - return the ddname */
+  {
+    if (strncmp(ddn, "DD:", 3) EQ 0)
+      i = 3;
+    else
+      i = 0;
+
+    if (strcmp(ddn+i, ddnx) NE 0)    /* if ddname was changed...  */
+       strcpy(ddn+i, ddnx);          /* return the new ddname     */
+  }
+  /* IS10174 - end   */
+
+  /*
+   *    Finish
+   */
+
+ exit:;
+
+   ESA_DIAG_exit(PLT_COMP_API_RACF,1, fn, rc );
+
+   return rc;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : RACF_revoke_date                           *
+ *                                                             *
+ * DESCRIPTION    : Converts ESS date format to RACF           *
+ *                  revoke/resume date format                  *
+ *                                                             *
+ * INPUT          : esa_date (YYYYMMDD)                        *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : racf_date                                  *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+ ESA_RC RACF_revoke_date( char                       * esa_date,
+                          char                       * racf_date,
+                          CTSAMSG_DEST_TABLE_rec_typ * dest,
+                          CTSAMSG_HANDLE_rec_typ     * msgs    )
+ {
+
+   char   racf_date_dd[3], racf_date_mm[3], racf_date_yy[3];
+   ESA_RC rc;
+   static char func[]="RACF_revoke_date";
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(PLT_COMP_API_RACF,4,func);
+
+  /*
+   *    If string is in correct len , convert !
+   */
+
+   if (strlen(esa_date) EQ 8) {
+
+      memcpy(racf_date_yy, esa_date+2,2);
+      racf_date_yy[2] = NULL_CHAR;
+
+      memcpy(racf_date_mm, esa_date+4,2);
+      racf_date_mm[2] = NULL_CHAR;
+
+      memcpy(racf_date_dd, esa_date+6,2);
+      racf_date_dd[2] = NULL_CHAR;
+
+      sprintf(racf_date,"%s/%s/%s", racf_date_mm, racf_date_dd,
+              racf_date_yy);
+
+      rc = ESA_OK;
+
+   }
+
+  /*
+   *    String is in incorrect len , can not convert !
+   */
+
+   else {
+      CTSAMSG_print(API_ERRDATE,   msgs, NULL, dest, esa_date);
+      rc = ESA_ERR;
+   }
+
+  /*
+   *    Finish
+   */
+
+   ESA_DIAG_exit(PLT_COMP_API_RACF,4, func, rc );
+
+   return rc;
+
+ }
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : RACF_is_raclisted_class                    *
+*                                                             *
+* DESCRIPTION    : Check if class is raclisted                *
+*                                                             *
+* INPUT          : resource  type                             *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+**************************************************************/
+ESA_RC RACF_is_raclisted_class(
+                             RESOURCE_typ                 restype,
+                             CTSAMSG_DEST_TABLE_rec_typ * dest,
+                             CTSAMSG_HANDLE_rec_typ     * msgs)
+{
+
+   static      char func[]="RACF_is_raclisted_class";
+   ESA_RC      rc = ESA_OK;
+   char        *token;
+   char        separator[3];
+   /*WS10082 char raclst[RCF_ADDINFO_VAL_LEN+1]; *raclisted classes */
+   char raclst[ADDINFO_16K_VAL_LEN+1]; /*raclisted classes WS10082A */
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(PLT_COMP_API_RACF,1,func);
+
+   BUILD_STRING_SEPARATOR(separator, ADDINFO_LIST_ENTRY)
+
+  /*
+   *    Get RACLISTed classes list
+   */
+
+   rc = RACF_get_option_value("RACLIST", TYPE_1B, raclst, dest, msgs);
+   if ( rc NE ESA_OK ) {        /* Obtain parameter failed */
+     rc = ESA_FATAL;
+     goto exit;
+   }
+
+  /*
+   *   Check if reauested restype is raclisted
+   */
+
+   token = strtok(raclst, separator );
+   while ( token ) {
+      ESA_DIAG_printf(PLT_COMP_API_RACF,4,
+                      "raclisted class=%s requested class=%s",
+                      token, restype);
+      if ( strcmp(token, restype) EQ 0 )   /* class is raclisted */
+         goto exit;
+
+      token = strtok(NULL, separator );
+   }
+
+   rc = ESA_ERR;   /* class is not raclisted */
+
+  /*
+   *    Finish
+   */
+
+ exit :;
+
+   ESA_DIAG_exit(PLT_COMP_API_RACF,1, func, rc );
+
+   return rc;
+
+ }
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : RACF_is_global_class                       *
+*                                                             *
+* DESCRIPTION    : Check if class is global                   *
+*                                                             *
+* INPUT          : resource  type                             *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+**************************************************************/
+ESA_RC RACF_is_global_class( RESOURCE_typ                 restype,
+                             CTSAMSG_DEST_TABLE_rec_typ * dest,
+                             CTSAMSG_HANDLE_rec_typ     * msgs)
+{
+
+   static      char func[]="RACF_is_global_class";
+   ESA_RC      rc = ESA_OK;
+   char        *token;
+   char        separator[3];
+   /*WS10082A char globlst[RCF_ADDINFO_VAL_LEN+1]; *global classes*/
+   char globlst[ADDINFO_16K_VAL_LEN+1]; /*global classes WS10082A*/
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(PLT_COMP_API_RACF,1,func);
+
+   BUILD_STRING_SEPARATOR(separator, ADDINFO_LIST_ENTRY)
+
+  /*
+   *    Get GLOBAL classes list
+   */
+
+   rc = RACF_get_option_value("GLOBAL", TYPE_1B, globlst, dest, msgs );
+   if ( rc NE ESA_OK ) {        /* Obtain parameter failed */
+     rc = ESA_FATAL;
+     goto exit;
+   }
+
+  /*
+   *   Check if requested restype is global
+   */
+
+   token = strtok(globlst, separator );
+   while ( token ) {
+      ESA_DIAG_printf(PLT_COMP_API_RACF,4,
+                      "global class=%s requested class=%s",
+                      token, restype);
+      if ( strcmp(token, restype) EQ 0 )  /* class is global */
+         goto exit;
+
+      token = strtok(NULL, separator );
+   }
+
+   rc = ESA_ERR;   /* class is not global */
+
+  /*
+   *    Finish
+   */
+
+ exit :;
+
+   ESA_DIAG_exit(PLT_COMP_API_RACF,1, func, rc );
+
+   return rc;
+
+ }
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : RACF_is_generic_class                      *
+*                                                             *
+* DESCRIPTION    : Check if class is generic                  *
+*                                                             *
+* INPUT          : resource  type                             *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+**************************************************************/
+ESA_RC RACF_is_generic_class( RESOURCE_typ                 restype,
+                              CTSAMSG_DEST_TABLE_rec_typ * dest,
+                              CTSAMSG_HANDLE_rec_typ     * msgs)
+{
+
+   static      char func[]="RACF_is_generic_class";
+   ESA_RC      rc = ESA_OK;
+   char        *token;
+   char        separator[3];
+   /*WS10082A char genrlst[RCF_ADDINFO_VAL_LEN+1]; *generic classes */
+   char genrlst[ADDINFO_16K_VAL_LEN+1]; /*generic classes WS10082A  */
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(PLT_COMP_API_RACF,1,func);
+
+   BUILD_STRING_SEPARATOR(separator, ADDINFO_LIST_ENTRY)
+
+  /*
+   *    Get GENERIC classes list
+   */
+
+   rc = RACF_get_option_value("GENERIC", TYPE_1B, genrlst, dest, msgs);
+   if ( rc NE ESA_OK ) {        /* Obtain parameter failed */
+     rc = ESA_FATAL;
+     goto exit;
+   }
+
+  /*
+   *   Check if requested restype is global
+   */
+
+   token = strtok(genrlst, separator );
+   while ( token ) {
+      ESA_DIAG_printf(PLT_COMP_API_RACF,4,
+                      "generic class=%s requested class=%s",
+                      token, restype);
+      if ( strcmp(token, restype) EQ 0 )  /* class is global */
+         goto exit;
+
+      token = strtok(NULL, separator );
+   }
+
+   rc = ESA_ERR;   /* class is not generic */
+
+  /*
+   *    Finish
+   */
+
+ exit :;
+
+   ESA_DIAG_exit(PLT_COMP_API_RACF,1, func, rc );
+
+   return rc;
+
+ }
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : RACF_is_active_class                       *
+*                                                             *
+* DESCRIPTION    : Check if class is active                   *
+*                                                             *
+* INPUT          : resource  type                             *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+**************************************************************/
+ESA_RC RACF_is_active_class(RESOURCE_typ                 restype,
+                            CTSAMSG_DEST_TABLE_rec_typ * dest,
+                            CTSAMSG_HANDLE_rec_typ     * msgs)
+{
+
+   static      char func[]="RACF_is_active_class";
+   ESA_RC      rc = ESA_OK;
+   char        *token;
+   char        separator[3];
+   /*WS10082A char genrlst[RCF_ADDINFO_VAL_LEN+1]; *generic classes */
+   char genrlst[ADDINFO_16K_VAL_LEN+1]; /*generic classes WS10082A  */
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(PLT_COMP_API_RACF,1,func);
+
+   BUILD_STRING_SEPARATOR(separator, ADDINFO_LIST_ENTRY)
+
+  /*
+   *    Get GENERIC classes list
+   */
+
+   rc = RACF_get_option_value("CLASSACT", TYPE_1B, genrlst, dest, msgs);
+   if ( rc NE ESA_OK ) {        /* Obtain parameter failed */
+     rc = ESA_FATAL;
+     goto exit;
+   }
+
+  /*
+   *   Check if requested restype is active
+   */
+
+   token = strtok(genrlst, separator );
+   while ( token ) {
+      ESA_DIAG_printf(PLT_COMP_API_RACF,4,
+                      "generic class=%s requested class=%s",
+                      token, restype);
+      if ( strcmp(token, restype) EQ 0 )  /* class is global */
+         goto exit;
+
+      token = strtok(NULL, separator );
+   }
+
+   rc = ESA_ERR;   /* class is not active */
+
+  /*
+   *    Finish
+   */
+
+ exit :;
+
+   ESA_DIAG_exit(PLT_COMP_API_RACF,1, func, rc );
+
+   return rc;
+
+ }
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : RACF_refresh_class                         *
+*                                                             *
+* DESCRIPTION    : SETROPTS qualifier(class) REFRESH command  *
+*                                                             *
+* INPUT          : resource  type                             *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+**************************************************************/
+
+ESA_RC RACF_refresh_class(RESOURCE_typ                 restype,
+                          char                       * qualifier,
+                          ADMIN_PARAMS_rec_typ       * admin_params,
+                          CTSAMSG_DEST_TABLE_rec_typ * dest,
+                          CTSAMSG_HANDLE_rec_typ     * msgs)
+{
+
+   static               char func[]="RACF_raclist_refresh_class";
+   ESA_RC               rc = ESA_OK;
+   char                 cmd[MAX_API_ST];
+
+  /*
+   *     MKT for SETROPTS REFRESH
+   *         (Mandatory Keywords Table)
+   */
+
+   ADDINFO_MKTE_rec_typ mkt[] = {
+         ""         /* a null string indicate end-of-mkt */
+   };
+
+  /*
+   *     KDT for SETROPTS REFRESH
+   *         (Keyword Decscription Table)
+   */
+
+   ADDINFO_KDTE_rec_typ kdt[] =      {
+      {""                     ,KDT_FLG ,""            ,""   ,"" }
+   };
+
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(PLT_COMP_API_RACF,1,func);
+
+  /*
+   *   Build command
+   */
+
+   ESA_DIAG_printf(PLT_COMP_API_RACF,1, "resource class=%s", restype);
+   sprintf(cmd, "SETROPTS %s(%s) REFRESH", qualifier, restype);
+
+  /*
+   *  Issue command
+   */
+
+   rc = racfcmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+                cmd, MAX_OK_RC_0,
+                0, NULL, mkt, kdt,
+                admin_params,CMDOUT_YES, RACF_YES);      /* IS10174 */
+   /* IS10174   dest, msgs, CMDOUT_YES, RACF_YES);                  */
+
+
+  /*
+   *    Finish
+   */
+
+   ESA_DIAG_exit(PLT_COMP_API_RACF,1, func, rc );
+
+   return rc;
+
+ }
+
+ /* ps0292 */
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : RACF_Dig_cert_add                         *
+ *                                                             *
+ * DESCRIPTION     : Add cerificate                            *
+ *                                                             *
+ * INPUT           : 1.addinfo       - ptr to addinfo          *
+ *                   2.user_params   - user_params struct      *
+ *                                                             *
+ * OUTPUT          : none                                      *
+ *                                                             *
+ * RETURN VALUE    : none                                      *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC RACF_Dig_cert_add(ESA_DIAG_COMP_typ           comp,
+                          USER_PARAMS_rec_typ       * user_params,
+                          ADDINFO_rec_ptr             addinfo,
+                          ADDINFO_rec_ptr             laddinfo,
+                          ADMIN_PARAMS_rec_typ      * admin_params,
+                          CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                          CTSAMSG_HANDLE_rec_ptr      msgs)
+ {
+
+   static char func[]="RACF_Dig_cert_add";
+   int                  digtcert_updated = FALSE;
+   char                 sep_entry[3]; /* Entries separator    */
+   char                 sep_subf[3];  /* Subfield separator   */
+   char                *token;
+   char                 cmd[MAX_API_ST];
+   /*WS10082A char      value [RCF_ADDINFO_VAL_LEN+1];         */
+   char                 value [ADDINFO_16K_VAL_LEN+1]; /*WS10082A*/
+   /*WS10082A char      entry [RCF_ADDINFO_VAL_LEN+1];           */
+   char                 entry [ADDINFO_16K_VAL_LEN+1]; /*WS10082A*/
+   /*WS10082A char      result[RCF_ADDINFO_VAL_LEN+1];           */
+   char                 result[ADDINFO_16K_VAL_LEN+1]; /*WS10082A*/
+   char                 dsname[RCF_ADDINFO_VAL_LEN+1];
+   char                 trstfg[RCF_ADDINFO_VAL_LEN+1];
+   void                *entry_handle;
+   void                *subf_handle;
+   ESA_RC               rc = ESA_OK;
+   ONE_FIELD_rec_ptr    pair = NULL;
+
+   /*  MKT for ADDUSER  */
+
+ static ADDINFO_MKTE_rec_typ mkt[] = {
+    "" };      /* a null string indicate end-of-mkt */
+
+   /*  KDT for RACDCERT COMMAND  */
+
+   static ADDINFO_KDTE_rec_typ racdcert_kdt[] =      {
+   {"ID"                 ,KDT_KEY ,""             ,"(",  ")"   },
+   {"ADD"                ,KDT_KEY ,""             ,"('",  "')" },
+   {"TRUST"              ,KDT_FLG ,"NOTRUST"      ,"",   ""    },
+   {""                   ,KDT_FLG ,""             ,"" ,  ""    } };
+
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(comp, 1, func );
+
+   BUILD_STRING_SEPARATOR(sep_entry, ADDINFO_LIST_ENTRY)
+   BUILD_STRING_SEPARATOR(sep_subf , ADDINFO_LIST_SUBFIELD)
+
+   pair = ADDINFO_search("DCERT.ADD", RCF_ADDINFO_KWD_LEN,
+                         addinfo->pair,
+                         addinfo->num_pairs);
+   ESA_DIAG_printf(comp,1, "DCERT.ADD pair=%X", pair);
+   if (pair EQ NULL)
+      goto exit;
+
+   if (pair->vallen EQ 0)
+      goto exit;
+
+   /*  Separate obtained field */
+
+   strcpy(value, pair->value);
+
+   /*
+    *  DCERT.ADD list field processing
+    *  each entry : Data set name # trust flag
+    */
+
+   /*  Get entry */
+
+   token = RACF_strtok(value, sep_entry, &entry_handle, result);
+
+   ESA_DIAG_printf(comp,1,
+                   "start token=%x result=%s", token, result);
+
+   while ( strlen(result) GT 0 ) {
+      strcpy(entry, result);            /* copy current entry   */
+
+      ESA_DIAG_printf(comp,1,  "Entry=%s", entry);
+
+      ADDINFO_empty(laddinfo);
+
+      /* Separate current entry to subfields */
+
+      token  = RACF_strtok(entry, sep_subf, &subf_handle, dsname);
+      if (token)
+        RACF_strtok(NULL, sep_subf, &subf_handle, trstfg);
+      else
+        strcpy(trstfg, KWD_FLAG_OFF);
+
+      ESA_DIAG_printf(comp,1,
+                      "dsname=%s trust flag=%s",  dsname, trstfg);
+
+      /* Insert ID field to local addinfo */
+
+      ADDINFO_insert(TYPE_1A, "ID", user_params->user,
+                  laddinfo, RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                  UNIQUE);
+
+      /* Insert ADD field to local addinfo */
+
+      ADDINFO_insert(TYPE_1A, "ADD", dsname,
+                  laddinfo, RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                  UNIQUE);
+
+      /* Insert TRUST field to local addinfo */
+
+      ADDINFO_insert(TYPE_1A, "TRUST", trstfg,
+                  laddinfo, RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                  UNIQUE);
+
+      /*   Build and issue RACFDCERT ADD command   */
+
+      strcpy(cmd,"RACDCERT ");
+      ESA_DIAG_printf(comp, 1,
+                      "Command header prepared (%s)", cmd);
+      if ( ESA_DIAG_get_debug_level(comp) GE 1 )
+         ADDINFO_dump(laddinfo, 1);
+      rc = racfcmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+                   cmd, MAX_OK_RC_0,
+                   1, &laddinfo, mkt, racdcert_kdt,      /* IS10174 */
+                   admin_params,                         /* IS10174 */
+                   CMDOUT_YES, RACF_NO);
+       /* IS10174  1, &laddinfo, mkt, racdcert_kdt, dest, msgs, */
+      digtcert_updated = TRUE;
+      if (rc NE ESA_OK)
+        goto exit;
+
+      /*  Get next entry */
+
+      token = RACF_strtok(NULL, sep_entry, &entry_handle, result);
+
+   }
+
+   exit :;
+
+  /*
+   *  DIGTCERT class refresh
+   */
+
+   ESA_DIAG_printf(comp, 1, "digtcert_updated=%d", digtcert_updated);
+
+   if (digtcert_updated) {
+     if ( RACF_is_raclisted_class("DIGTCERT",dest,msgs) EQ ESA_OK) {
+      rc = RACF_refresh_class("DIGTCERT","RACLIST",
+                               admin_params,dest,msgs);
+      if ( rc NE ESA_OK )
+        rc = ESA_FATAL;
+     }
+   }
+
+   ESA_DIAG_exit(comp, 1, func, rc);
+
+   return rc;
+
+ }
+
+ /* ps0292 */
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : RACF_Dig_cert_upd                         *
+ *                                                             *
+ * DESCRIPTION     : Upd cerificate                            *
+ *                                                             *
+ * INPUT           : 1.addinfo       - ptr to addinfo          *
+ *                   2.user_params   - user_params struct      *
+ *                                                             *
+ * OUTPUT          : none                                      *
+ *                                                             *
+ * RETURN VALUE    : none                                      *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC RACF_Dig_cert_upd(ESA_DIAG_COMP_typ           comp,
+ /* SAS2IBMT typedef and prototype changed for IBM C
+                          RACF_ACCESS_PROG            racfprg,       */
+                          ASM_RTN_TYP               * racfprg,
+                          USER_PARAMS_rec_typ       * user_params,
+                          ADDINFO_rec_ptr             addinfo,
+                          ADDINFO_rec_ptr             laddinfo,
+                          ADMIN_PARAMS_rec_typ      * admin_params,
+                          CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                          CTSAMSG_HANDLE_rec_ptr      msgs)
+ {
+
+   static char func[]="RACF_Dig_cert_upd";
+   int                  digtcert_updated = FALSE;
+   int                  pending_serial  = 0;
+   int                  current_serial  = 0;
+   char                 cmd[MAX_API_ST];
+   char                *wptr;
+   ESA_RC               rc = ESA_OK;
+   ADDINFO_rec_ptr      dgt_laddinfo = NULL;
+   ONE_FIELD_rec_ptr    pair = NULL;
+
+   /*  MKT for ADDUSER  */
+
+   static ADDINFO_MKTE_rec_typ mkt[] = {
+    "" };      /* a null string indicate end-of-mkt */
+
+   /*  KDT for RACDCERT COMMAND  */
+
+   static ADDINFO_KDTE_rec_typ racdcert_kdt[] =      {
+   {"ID"                 ,KDT_KEY ,""             ,"(",  ")"     },
+   {"TRUST"              ,KDT_FLG ,"NOTRUST"      ,"",   ""      },
+   {"DCERT.*"            ,KDT_IGN ,""                 ,""  , " " },
+   {"NOALTER"            ,KDT_FLG ,""                 ,""  , " " },
+   {"ALTER.NO_PKB"       ,KDT_FLG ,""                 ,"",   ""  },
+   {"ALTER.SERIALNUMBER" ,KDT_KEY ,""             ,"(" ,   ")"   },
+   {"ALTER.ISSUERSDN"    ,KDT_KEY ,""             ,"('",  "')"   },
+   {"NODELETE"           ,KDT_FLG ,""                 ,""  , " " },
+   {"DELETE.NO_PKB"      ,KDT_FLG ,""                 ,"",   ""  },
+   {"DELETE.SERIALNUMBER",KDT_KEY ,""             ,"(" ,   ")"   },
+   {"DELETE.ISSUERSDN"   ,KDT_KEY ,""             ,"('",  "')"   },
+   {""                   ,KDT_FLG ,""             ,"" ,  ""    } };
+
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(comp, 1, func );
+
+   while (pair = ADDINFO_get_next(addinfo, pair)) {
+
+     ESA_DIAG_printf(comp,1,
+                     "keyword=%s value=%s", pair->keyword, pair->value);
+
+     /* Delete All Digital certificate info */
+
+     if ( (strcmp(pair->keyword, "NODCERT") EQ 0) AND
+          (strcmp(pair->value, KWD_FLAG_ON) EQ 0)   ) {
+        pending_serial = 0;
+        ESA_DIAG_printf(comp,1,  "Full Delete Mode");
+        ADDINFO_empty(laddinfo);
+
+        /* Remove all Digital Certificates */
+
+        while ( (rc = RACF_Dig_cert_get_info(comp, racfprg,
+                                      &pending_serial,
+                                      user_params->user,
+                                      laddinfo, &dgt_laddinfo,
+                        /* IS10076    dest, msgs) )         */
+                                      admin_params) )   /* IS10076 */
+                                                  EQ ESA_OK ) {
+           ESA_DIAG_printf(comp,1, "Serial=%d", pending_serial);
+           rc = Dig_cert_complete_info(comp, pending_serial,
+                                  "DELETE", user_params->user,
+                                  laddinfo, laddinfo, dest, msgs);
+           if (rc NE ESA_OK)
+              break;
+
+           /*   Build and issue RACFDCERT DELETE command   */
+
+           strcpy(cmd,"RACDCERT ");
+           ESA_DIAG_printf(comp, 1,
+                           "Command header prepared (%s)", cmd);
+           if ( ESA_DIAG_get_debug_level(comp) GE 1 )
+                ADDINFO_dump(laddinfo, 1);
+           rc = racfcmd(func, EXECOUT_DDNAME,
+                        admin_params->admin_uname,
+                        cmd, MAX_OK_RC_0,
+                        1, &laddinfo, mkt, racdcert_kdt, /* IS10174 */
+                        admin_params,                    /* IS10174 */
+                        CMDOUT_YES, RACF_NO);
+            /* IS10174  1, &laddinfo, mkt, racdcert_kdt, dest, msgs, */
+           digtcert_updated = TRUE;
+           if (rc NE ESA_OK)
+             break;
+           ADDINFO_empty(laddinfo);
+        }
+
+        ESA_DIAG_printf(comp, 1,
+                        "Dig_cert_get_info ended with rc=%d", rc);
+
+        if (rc EQ ESA_EOF)
+          rc = ESA_OK;
+        goto exit;
+     }      /* NODCERT=Y */
+     /* None Digital certificate info */
+     else if (memcmp(pair->keyword, "DCERT.", 6) NE 0)
+       continue;
+
+     /* Check current serial */
+
+     wptr = strrchr(pair->keyword, '.');
+     if (wptr EQ NULL)    /* Index not found */
+        continue;
+
+     ESA_DIAG_printf(comp,1, "Current serial=%s", wptr+1);
+     current_serial = atoi(wptr + 1);
+
+     ESA_DIAG_printf(comp,1,
+                     "pending_serial=%d current_serial=%d",
+                      pending_serial, current_serial);
+
+    /*
+     * If current serial less than pending, skip record
+     * because processing for this serial already done
+     */
+
+     if (current_serial LE pending_serial)
+         continue;
+
+     /* Check DCERT.SERIAL.# field or First field with DCERT. prfx */
+
+     if (memcmp(pair->keyword, "DCERT.SERIAL.", 13) EQ 0) {
+
+       ADDINFO_empty(laddinfo);
+       pending_serial = current_serial;
+
+       /* Delete Digital certificate */
+
+       if (strcmp(pair->value, KWD_FLAG_OFF) EQ 0) {
+           rc = Dig_cert_complete_info(comp, pending_serial,
+                                       "DELETE", user_params->user,
+                                       addinfo, laddinfo, dest, msgs);
+           if (rc NE ESA_OK)
+              goto exit;
+
+           /*   Build and issue RACFDCERT DELETE command   */
+
+           strcpy(cmd,"RACDCERT ");
+           ESA_DIAG_printf(comp, 1,
+                           "Command header prepared (%s)", cmd);
+           if ( ESA_DIAG_get_debug_level(comp) GE 1 )
+               ADDINFO_dump(laddinfo, 1);
+           rc = racfcmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+                        cmd, MAX_OK_RC_0,
+                        1, &laddinfo, mkt, racdcert_kdt, /* IS10174 */
+                        admin_params,                    /* IS10174 */
+                        CMDOUT_YES, RACF_NO);
+             /* IS10174 1, &laddinfo, mkt, racdcert_kdt, dest, msgs, */
+           digtcert_updated = TRUE;
+           if (rc NE ESA_OK)
+              goto exit;
+           else
+              continue;
+       }    /* Delete digital certificate */
+     }      /* DCERT.SERIAL.# field handling */
+
+     /* Check DCERT.TRUST.# field */
+
+     if (memcmp(pair->keyword, "DCERT.TRUST.", 12) EQ 0) {
+
+        ADDINFO_empty(laddinfo);
+        pending_serial = current_serial;
+
+        /* Update Digital certificate */
+
+        rc = Dig_cert_complete_info(comp, pending_serial,
+                                    "ALTER", user_params->user,
+                                    addinfo, laddinfo, dest, msgs);
+        if (rc NE ESA_OK)
+          goto exit;
+
+        /*   Build and issue RACFDCERT ALTER command   */
+
+        strcpy(cmd,"RACDCERT ");
+        ESA_DIAG_printf(comp, 1,
+                        "Command header prepared (%s)", cmd);
+        if ( ESA_DIAG_get_debug_level(comp) GE 1 )
+          ADDINFO_dump(laddinfo, 1);
+        rc = racfcmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+                     cmd, MAX_OK_RC_0,
+                     1, &laddinfo, mkt, racdcert_kdt,    /* IS10174 */
+                     admin_params,                       /* IS10174 */
+                     CMDOUT_YES, RACF_NO);
+         /* IS10174  1, &laddinfo, mkt, racdcert_kdt, dest, msgs,  */
+        digtcert_updated = TRUE;
+        if (rc NE ESA_OK)
+           goto exit;
+        else
+           continue;
+     }    /* Update digital certificate */
+   } /* while (pair = ADDINFO_get_next(addinfo, pair)) */
+
+  /*
+   *  DIGTCERT class refresh
+   */
+
+   exit :;
+
+   ESA_DIAG_printf(comp, 1, "digtcert_updated=%d", digtcert_updated);
+
+   if (digtcert_updated) {
+     if ( RACF_is_raclisted_class("DIGTCERT",dest,msgs) EQ ESA_OK) {
+      rc = RACF_refresh_class("DIGTCERT","RACLIST",
+                              admin_params,dest,msgs);
+      if ( rc NE ESA_OK )
+        rc = ESA_FATAL;
+     }
+   }
+
+   ESA_DIAG_exit(comp, 1, func, rc);
+
+   return rc;
+
+ }
+
+/* ps0292 */
+/**************************************************************
+*                                                             *
+* Subroutine name : RACF_strtok                               *
+*                                                             *
+* DESCRIPTION     : strtok                                    *
+*                                                             *
+* INPUT           : sptr        - ptr to string               *
+*                   charset     - ptr to char set             *
+*                   handle      - ptr to handle               *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ptr to current token                      *
+*                                                             *
+**************************************************************/
+
+/* SAS2IBMA static char * RACF_strtok(char     *  sptr, */
+char * RACF_strtok(char       *  sptr,     /* drop the static sas750 */
+                          char         *  charset,
+                          void         ** handle,
+                          char         *  result)
+{
+
+    char    *rptr;                  /* Return ptr          */
+    int     len;                    /* Item length         */
+    int     k;                      /* Work var            */
+
+    *result = '\0';                 /* Clear result field  */
+
+    if ( !sptr )                    /* Get ptr from handle */
+      sptr = (char *)(*handle);
+
+    if ( !sptr ) {                  /* End-of-string */
+      rptr = sptr;
+      goto exit;
+    }
+
+    k = strspn(sptr, charset);      /* How many symbols            */
+    if ( k > 0 ) {                  /* Field missing. Result empty */
+       rptr = sptr;
+       strcpy(result, "");
+       *handle = rptr + 1;
+       return rptr;
+    }
+
+    rptr  = strpbrk(sptr, charset); /* Search end-of-item */
+    if (!rptr) { /* No characters from charset occurs in string */
+      strcpy(result, sptr);         /* Copy until end-of-string     */
+      *handle = rptr;
+      rptr    = sptr;
+      goto exit;
+    }
+
+    len    = rptr - sptr;           /* End-of-item found   */
+    memcpy( result, sptr, len );    /* Copy item to result */
+    *(result + len) = '\0';
+
+    *rptr   = '\0';           /* Set end-of-string */
+    *handle = rptr + 1;       /* Keep ptr for the next strtok */
+    rptr    = sptr;           /* Start ptr to string */
+
+   exit :;
+     return rptr;
+
+}     /* RACF_strtok */
+
+/* ps0292 */
+/**************************************************************
+*                                                             *
+* Subroutine name : Dig_cert_complete_info                    *
+*                                                             *
+* DESCRIPTION     : Add mandatory fields : SERIAL_NUMBER,     *
+*                   ISSUERSDN                                 *
+*                                                             *
+* INPUT           : kwd         - main keyword                *
+*                   r_kwd       - relaited keyword            *
+*                   addinfo     - addinfo                     *
+*                   laddinfo    - local addinfo               *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+
+ static ESA_RC Dig_cert_complete_info(ESA_DIAG_COMP_typ    comp,
+                               int                         serial,
+                               char                      * kwd,
+                               char                      * user,
+                               ADDINFO_rec_ptr             addinfo,
+                               ADDINFO_rec_ptr             laddinfo,
+                               CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                               CTSAMSG_HANDLE_rec_ptr      msgs)
+ {
+
+   static char func[]="Dig_cert_complete_info";
+   char msg_buf[200] = "";
+   char                 kwdm  [RCF_ADDINFO_KWD_LEN+1];
+   char                 kwdc  [RCF_ADDINFO_KWD_LEN+1];
+   ESA_RC               rc = ESA_OK;
+   ONE_FIELD_rec_ptr    cpair = NULL;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(comp, 1, func );
+
+   /* Insert ID field to local addinfo */
+
+   ADDINFO_insert(TYPE_1A, "ID", user, laddinfo, RCF_ADDINFO_KWD_LEN,
+                  RCF_ADDINFO_VAL_LEN, UNIQUE);
+
+   /* Create NODELETE/NOALTER info */
+
+   sprintf(kwdm, "NO%s",  kwd);
+   ADDINFO_insert(TYPE_1A, kwdm, KWD_FLAG_OFF,
+                  laddinfo, RCF_ADDINFO_KWD_LEN,
+                  RCF_ADDINFO_VAL_LEN, UNIQUE);
+   sprintf(kwdc, "%s.NO_PKB", kwd);
+   ADDINFO_insert_cond(kwdm, KWD_FLAG_ON, laddinfo,
+                       kwdc, KWD_FLAG_ON,
+                       RCF_ADDINFO_KWD_LEN,
+                       RCF_ADDINFO_VAL_LEN, laddinfo);
+
+   /* Insert SERIAL NUMBER and ISSUER NAME */
+
+   sprintf(kwdc, "DCERT.SERIAL_NUMBER.%d", serial);
+   cpair = ADDINFO_search(kwdc, RCF_ADDINFO_KWD_LEN, addinfo->pair,
+                         addinfo->num_pairs);
+   if (cpair EQ NULL) {
+     sprintf(msg_buf,  "Unable to locate field=%s", kwdc);
+     CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                   component,func, msg_buf, 16,__LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+   }
+
+   sprintf(kwdc, "%s.SERIALNUMBER", kwd );
+   ESA_DIAG_printf(comp, 1, "%s/%s - inserted", kwdc, cpair->value);
+   ADDINFO_insert(TYPE_1A, kwdc, cpair->value,  laddinfo,
+                  RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN, UNIQUE);
+
+   sprintf(kwdc, "DCERT.ISSUER_NAME.%d", serial);
+   cpair = ADDINFO_search(kwdc, RCF_ADDINFO_KWD_LEN, addinfo->pair,
+                         addinfo->num_pairs);
+   if (cpair EQ NULL) {
+       sprintf(msg_buf,  "Unable to locate field=%s", kwd);
+       CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                     component,func, msg_buf, 16,__LINE__);
+       rc = ESA_FATAL;
+       goto exit;
+   }
+
+   sprintf(kwdc, "%s.ISSUERSDN", kwd);
+   ESA_DIAG_printf(comp, 1, "%s/%s - inserted", kwdc, cpair->value);
+   ADDINFO_insert(TYPE_1A, kwdc, cpair->value,  laddinfo,
+                  RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN, UNIQUE);
+
+   /* Check, if we can add TRUST field */
+
+   sprintf(kwdc, "DCERT.TRUST.%d", serial);
+   cpair = ADDINFO_search(kwdc, RCF_ADDINFO_KWD_LEN, addinfo->pair,
+                         addinfo->num_pairs);
+   if (cpair EQ NULL)
+       goto exit;
+
+   strcpy(kwdc, "TRUST");
+   ESA_DIAG_printf(comp, 1, "%s/%s - inserted", kwdc, cpair->value);
+   ADDINFO_insert(TYPE_1A, kwdc, cpair->value,  laddinfo,
+                  RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN, UNIQUE);
+
+   exit :;
+   ESA_DIAG_exit(comp, 1, func, rc);
+
+   return rc;
+
+ }
+
+/* IS10100A - start  */
+/**************************************************************
+*                                                             *
+* Subroutine name : RACF_do_AddAlt_cmd                        *
+*                                                             *
+* DESCRIPTION     : Prepare and issue the commands.           *
+*                   If the addinfo contains more than 85      *
+*                   CSDATA parameters (limited by RACF),      *
+*                   aplit the addinfo and issue multiple      *
+*                   commands.                                 *
+*                   - If ALT command is requested, issue      *
+*                     multiple commands using the addinfos    *
+*                     created by the split.                   *
+*                   - If ADD command is requested, issue      *
+*                     and ADD command with the primary        *
+*                     attributes and ALT commands for all     *
+*                     other addinfos created by the aplit.    *
+*                                                             *
+* INPUT           : type        - U(ser) / G(roup)            *
+*                   id          - user/group id               *
+*                   cmd         - ADD / ALT                   *
+*                   addinfo     - addinfo                     *
+*                   laddinfo    - local addinfo.              *
+*                   mkt, etc    - parameters required for     *
+*                                 racfcmd.                    *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+* WHEN TO USE:      This function should be called to prepare *
+*                   and issue the command when the addinfo    *
+*                   may contain CSDATA informtion. This is    *
+*                   required becasue RACF command is limited  *
+*                   to 85 CSDATA pramateres so if the         *
+*                   addinfo contains more than 85 CSDATA      *
+*                   parameters we will issue multiple         *
+*                   commands.                                 *
+*                                                             *
+**************************************************************/
+
+ESA_RC RACF_do_AddAlt_cmd(ESA_DIAG_COMP_typ   comp,
+                          char                   type,
+                          char                  *id,
+                          char                  *act,
+                          ADDINFO_rec_ptr        addinfo,
+                          ADDINFO_rec_ptr        laddinfo,
+                          ADDINFO_MKTE_rec_ptr   mkt,
+                          ADDINFO_KDTE_rec_ptr   kdt,
+                          CMDOUT_typ             gout_flag,
+                          RACF_FLAG_typ          ignore_no_addinfo,
+                          CMD_RC_typ             cmd_max_ok_rc,
+                          ADMIN_PARAMS_rec_typ  *admin_params)
+{
+
+  #define CSDATA_CMD_LIMIT  85
+  #define CSDATA_PREFIX     "CSDATA."
+
+  static char func[]="RACF_do_AddAlt_cmd";
+  ESA_RC    rc = ESA_OK;
+  int       gen_ent_num = 0;
+  int       prefix_ent_num = 0;
+  /* SAS2IBMN - start  */
+  /*
+  int       csdata_addinfo_num;
+  int       csdata_lastai_entnum;
+  */
+  int       csdata_addinfo_num = 0;
+  int       csdata_lastai_entnum = 0;
+  /* SAS2IBMN - end    */
+  int       i;
+  int       cmd_prefix_len;
+  char      cmd[MAX_API_ST];
+  ADDINFO_rec_ptr     gen_addinfo[3] = { NULL, NULL, NULL };
+  ADDINFO_rec_ptr    *csdata_addinfo = NULL;
+  RACF_PARAMS_rec_typ  *params_ptr = NULL;
+  RACF_CUSTOM_FIELDS_block_ptr cf_block;
+  char      msg[400];
+
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+
+  /*
+   *   Initialization
+   */
+
+  ESA_DIAG_enter(comp, 1, func );
+  msg[0] = NULL_CHAR;
+
+  ESA_DIAG_printf(comp, 1,
+                  "Input: type=%.1s  act=%s  id=%s",
+                  &type, act, id);
+
+  ESA_DIAG_printf(comp, 5,
+                  "Input: addinfo=%8X    laddinfo=%8X",
+                  addinfo, laddinfo);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  if ( ( (type NE 'U')  AND  (type NE 'G') )  OR   /* validate type, */
+       (act EQ NULL)   OR                          /* action,        */
+       ( (act NE NULL)  AND  (strcmp(act, "ADD") NE 0)  AND
+         (strcmp(act, "ALT") NE 0) )  OR
+       ( id EQ NULL ) )                            /* and id.        */
+  {
+    rc = ESA_ERR;
+    sprintf(msg,
+            "type (%.1s) or command (%s) are missing or incorrect",
+            &type, act);
+    goto exit;
+  }
+
+  strcpy(cmd, act);
+
+  params_ptr = admin_params->apiinit_handle;
+  switch (type)
+  {
+    case 'U':
+      cf_block = params_ptr->p_user_CFields;
+      strcat(cmd, "USER ");
+      break;
+    case 'G':
+      cf_block = params_ptr->p_group_CFields;
+      strcat(cmd, "GROUP ");
+      break;
+  }
+
+  strcat(cmd, id);
+  strcat(cmd, " ");
+  cmd_prefix_len = strlen(cmd);
+
+  ESA_DIAG_printf(comp, 5,
+                  "command prefix = %s",cmd);
+
+  /*
+   *   If addinfo exists and contains more than 85 fields,
+   *       -- and -
+   *   custom fields block exists and contains more than 85 fields,
+   *   then there is a chance we will have to split the addinfo.
+   */
+
+  gen_addinfo[0] = laddinfo;
+
+  if ( (addinfo NE NULL)  AND
+       (addinfo->num_pairs GT CSDATA_CMD_LIMIT)  AND
+       (cf_block NE NULL)  AND
+       (cf_block->used_fields_count GT CSDATA_CMD_LIMIT) )
+  {
+    ADDINFO_count_by_prefix(addinfo, CSDATA_PREFIX,
+                            &prefix_ent_num, &gen_ent_num,
+                            FALSE, FALSE);
+
+    ESA_DIAG_printf(comp, 5,
+                "There are %d prefix entries and %d general entries",
+                prefix_ent_num, gen_ent_num);
+
+    /*  If there are more than 85 csdata parameters, split into */
+    /*  blocks of 85. The other (general) parameters wlll be    */
+    /*  split into a separate addinfo.                          */
+    if (prefix_ent_num GT CSDATA_CMD_LIMIT)
+    {
+      /*   Allocate the addinfo for the general parameters    */
+      rc = ADDINFO_alloc(func, gen_ent_num, &gen_addinfo[1],
+                         dest, msgs);
+      ESA_DIAG_printf(comp, 5,
+                  "ADDINFO_alloc rc = %d,  general_addinfo = %8X",
+                  rc, gen_addinfo[1]);
+      if (rc NE ESA_OK)
+        goto exit;
+
+      /*  Calculate the number of csdata_addinfo required    */
+      csdata_addinfo_num = prefix_ent_num / CSDATA_CMD_LIMIT;
+      csdata_lastai_entnum = prefix_ent_num % CSDATA_CMD_LIMIT;
+      if (csdata_lastai_entnum EQ 0)
+        csdata_lastai_entnum = CSDATA_CMD_LIMIT;
+      else
+        csdata_addinfo_num++;
+
+      ESA_DIAG_printf(comp, 5,
+                "Need %d csdata addinfos.  Last with %d entries.",
+                csdata_addinfo_num, csdata_lastai_entnum);
+
+      /*  Allocate the csdata addinfo vector                 */
+      csdata_addinfo = (ADDINFO_rec_ptr *)malloc(
+                   sizeof(ADDINFO_rec_ptr) * csdata_addinfo_num);
+      ESA_DIAG_printf(comp, 5,
+                     "csdata_addinfo_vec = %8X", csdata_addinfo);
+
+      if (csdata_addinfo EQ NULL)
+      {
+        ESA_DIAG_printf(comp, 1,
+                        "malloc for addinfo ptr vector failed");
+        CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                      "ADDINFO pointers vector",
+                      sizeof(ADDINFO_rec_ptr) * csdata_addinfo_num);
+        rc = ESA_ERR;
+        goto exit;
+      }
+
+      /* Allocate csdata addinfo.                                  */
+      /* 1. Allocate all except last because last might be shorter */
+      for (i = 0; i LT (csdata_addinfo_num - 1); i++)
+      {
+        rc = ADDINFO_alloc(func, CSDATA_CMD_LIMIT, &csdata_addinfo[i],
+                           dest, msgs);
+        ESA_DIAG_printf(comp, 5,
+                "ADDINFO_alloc rc = %d, csdata_addinfo(%d) = %8X",
+                 rc, i, csdata_addinfo[i]);
+
+        if (rc NE ESA_OK)
+          goto exit;
+      }
+
+      /* 2. Allocate the last.                                     */
+      rc = ADDINFO_alloc(func, csdata_lastai_entnum,
+                         &csdata_addinfo[i], dest, msgs);
+      ESA_DIAG_printf(comp, 5,
+                "ADDINFO_alloc rc = %d, csdata_addinfo(%d) = %8X",
+                 rc, i, csdata_addinfo[i]);
+
+      if (rc NE ESA_OK)
+        goto exit;
+
+      /*
+       *  Split the input addinfo according to the prefix fill
+       *  the general and prefix addinfo(s).
+       */
+      rc = ADDINFO_split_by_prefix(addinfo, gen_addinfo[1],
+                                   csdata_addinfo,
+                                   csdata_addinfo_num,
+                                   CSDATA_PREFIX);
+      ESA_DIAG_printf(comp, 5,
+                      "ADDINFO_split_by_prefix rc = %d",
+                      rc);
+      if (rc NE ESA_OK)
+      {
+        if (rc EQ ESA_ERR)
+        {
+          sprintf(msg,
+              "ADDINFO_split_by_prefix failed - output exhausted");
+          goto exit;
+        }
+        if (rc EQ ESA_FATAL)
+        {
+          sprintf(msg,
+            "ADDINFO_split_by_prefix failed - see PRTDBG for details");
+          goto exit;
+        }
+      }
+
+      if ( ESA_DIAG_get_debug_level(ESA_COMP_UPDUSER) GE 5 )
+      {
+        ESA_DIAG_printf(comp, 5,
+                      "After split: General addinfo");
+        ADDINFO_dump(gen_addinfo[1], 1);
+        for (i = 0; i LT csdata_addinfo_num; i++)
+        {
+          ESA_DIAG_printf(comp, 5,
+                          "After split: CSDATA addinfo number %d", i);
+          ADDINFO_dump(csdata_addinfo[i], 1);
+        }
+      }
+
+      /*  Use the first prefix addinfo in the first command      */
+      gen_addinfo[2] = csdata_addinfo[0];
+    }
+    else
+      gen_addinfo[1] = addinfo;
+  }
+  else
+    gen_addinfo[1] = addinfo;
+
+
+  /*
+   *  Issue the command(s)
+   */
+
+  /*  Issue the first (primary) command             */
+  ESA_DIAG_printf(comp, 5,
+         "Execute primary command:  %s,  addinfo = %8X / %8X / %8X",
+          cmd, gen_addinfo[0], gen_addinfo[1], gen_addinfo[2]);
+  rc = racfcmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+               cmd, cmd_max_ok_rc,
+               gen_addinfo[2] EQ NULL ? 2 : 3,
+               gen_addinfo, mkt, kdt, admin_params,      /* IS10174 */
+               gout_flag, ignore_no_addinfo);
+   /* IS10174  gen_addinfo, mkt, kdt, dest, msgs,   */
+  ESA_DIAG_printf(comp, 5,
+                  "racfcmd rc = %d", rc);
+
+  if (rc NE ESA_OK)
+    goto exit;
+
+
+  if (csdata_addinfo_num > 1)
+  {
+    if (strncmp(cmd, "ADD", 3) EQ 0)
+      strncpy(cmd, "ALT", 3);
+
+    for (i = 1; i LT csdata_addinfo_num; i++)
+    {
+      cmd[cmd_prefix_len] = NULL_CHAR;  /* leave only command & id */
+
+      ESA_DIAG_printf(comp, 5,
+         "Execute secondary command: %s,  csdata_addinfo[%d] = %8X",
+         cmd, i, csdata_addinfo[i]);
+      rc = racfcmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+                    cmd, cmd_max_ok_rc,
+                    1, &csdata_addinfo[i],
+                    mkt, kdt, admin_params,              /* IS10174 */
+                    gout_flag, RACF_YES);
+         /* IS10174 mkt, kdt, dest, msgs,  */
+      ESA_DIAG_printf(comp, 5,
+                      "racfcmd rc = %d", rc);
+
+     if (rc NE ESA_OK)
+       break;
+    }
+  }
+
+  /*
+   *   Return
+   */
+
+ exit :;
+
+  /*
+   *  Free all allocated areas
+   */
+
+  if (gen_addinfo[1] NE addinfo)
+    ADDINFO_free(&gen_addinfo[1]);
+
+  if (csdata_addinfo NE NULL)
+  {
+    for (i = 0; i LT csdata_addinfo_num; i++)
+    {
+      ADDINFO_free(&csdata_addinfo[i]);
+    }
+    free(csdata_addinfo);
+  }
+
+  if (rc NE ESA_OK  AND  msg[0] NE NULL_CHAR)
+    CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                  component, func, msg, rc, __LINE__);
+
+  ESA_DIAG_exit(comp, 1, func, rc);
+
+  return rc;
+
+}
+/*  WS10081 - start  */
+/**************************************************************
+*                                                             *
+* Subroutine name : RACF_MFA_cmd                              *
+*                                                             *
+* DESCRIPTION     : Prepare and issue the commands for MFA.   *
+*                   Since only a single factor can appear in  *
+*                   a command, we need to issue multiple cmds *
+*                   if there are multiple factors.            *
+*                   MFA.factor-name.OOBPOLICY includes        *
+*                   policies that are added automatically     *
+*                   when the factor is added.                 *
+*                   MFA.POLICIES includes policies added or   *
+*                   deleted due to connect/disconnect of user *
+*                   to policy entitlement.                    *
+*                   Only 10 factors are allowed per user, so  *
+*                   if there are both ADD and DEL commands    *
+*                   for factors we should order them so that  *
+*                   when there are already 10 we issue a DEL. *
+*                   There is a similar problem with policies: *
+*                   maximum 10 are allowed per user.          *
+*                   This problem will be handled by the       *
+*                   following method:                         *
+*                   In each command that adds a factor,       *
+*                   the same number of policies that are added*
+*                   from OOBPOLICY, will be taken from the DEL*
+*                   list of MFA.POLICIES and deleted in the   *
+*                   same command. If no such policies to      *
+*                   delete, or not enough, we just take what  *
+*                   is there. In case of exceeding the 10     *
+*                   policies, RACF will tell and fail the     *
+*                   command.                                  *
+*                   When the MFA.factor-name.ACTIVE or        *
+*                   MFA.factor-name.TAG.tag-name appear, we   *
+*                   must validate that the corresponding      *
+*                   factor is added in the requeste. If not,  *
+*                   we need to verifty that the factor already*
+*                   exists, otherwise we have to fail the     *
+*                   transaction. If we don't fail the         *
+*                   transaction, the command that adds the    *
+*                   parameter to the factor will also add the *
+*                   factor but we don't want to add a deleted *
+*                   factor about which IIQ is not synced with.*
+*                                                             *
+*                   Before arriving to this function we should*
+*                   issue a get user to retreive the list of  *
+*                   factors.                                  *
+*                   (Relevant for UPD user but not for ADD    *
+*                   (INSERT) user).                           *
+*                   This should be incorporated in the        *
+*                   CTSUpdUser_ChkOrGet_User function.        *
+*                                                             *
+* INPUT           : userid      - user id                     *
+*                   act         - UpdUsr or AddUsr            *
+*                   addinfo     - addinfo                     *
+*                   laddinfo    - laddinfo with existing      *
+*                                 factors & policies          *
+*                   admin_params                              *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+* WHEN TO USE:      This function should be called to prepare *
+*                   and issue the MFA commands for ADD and    *
+*                   UPD user transactions.                    *
+**************************************************************/
+
+EXT ESA_RC RACF_MFA_cmd(ESA_DIAG_COMP_typ        comp,
+                    char                        *id,
+                    char                        *act,
+                    ADDINFO_rec_ptr             addinfo,
+                    ADDINFO_rec_ptr             laddinfo,
+                    ADMIN_PARAMS_rec_typ        *admin_params)
+{
+
+  static char func[]="RACF_MFA_cmd";
+  ESA_RC    rc = ESA_OK;
+  int       i = 0;
+  int       pairs_left = 0;
+  int       j = 0;
+  int       num_cmds = 0;
+  int       this_cmd = 0;
+  int       factor_exists = FALSE;
+  int       we_have_tag   = FALSE;
+  int       we_have_active= FALSE;
+  int       found         = FALSE;
+  int       blanks_found  = FALSE;
+  int       any_cmd_ok    = FALSE;
+  int       next_command  = 0;
+  int       factor_len    = 0;
+  char      sublistsep[2] = {ADDINFO_LIST_SUBFIELD, NULL_CHAR};
+  char      outlist[POLICIES_SIZE] = { NULL_CHAR };
+  ADDINFO_rec_ptr     gen_addinfo[3] = { NULL, NULL, NULL };
+  RACF_PARAMS_rec_typ  *params_ptr = NULL;
+  char      msg[400];
+  ONE_FIELD_rec_ptr    pair = NULL;
+  ONE_FIELD_rec_ptr   apair = NULL;
+  /* WS10082 ONE_FIELD_rec_ptr  ppair =null;          */
+  ONE_FIELD_rec_ptr   p_pair =NULL; /* ws10082 */
+  ONE_FIELD_rec_ptr   fpair = NULL;
+  ONE_FIELD_rec_ptr  efpair = NULL;
+  ONE_FIELD_rec_ptr  eppair = NULL;
+  ONE_FIELD_rec_ptr  epair  = NULL;
+  ONE_FIELD_rec_ptr   tpair = NULL;
+  char      add_factor_list[1000] = { NULL_CHAR };
+  char      copy_add_factor_list[1000] = { NULL_CHAR };
+  char      del_factor_list[1000] = { NULL_CHAR };
+  int       num_add_factors = 0;
+  int       num_del_factors = 0;
+  int       num_chg_factors = 0;
+  int       next_del_factor = 0;
+  int       left_add_factors = 0;
+  int       left_del_factors = 0;
+  int       left_chg_factors = 0;
+  char      add_policy_list[1000] = { NULL_CHAR };
+  char      del_policy_list[1000] = { NULL_CHAR };
+  int       num_existing_factors  = 0;
+  int       total_existing_factors  = 0;
+  int       num_existing_policies  = 0;
+  int       num_policies_add       = 0;
+  int       num_del_policies           = 0;
+  int       orig_num_del_policies      = 0;
+  int       num_policies_to_leave      = 0;
+  int       num_general_policies_add   = 0;
+  int       total_num_oob_policies_add = 0;
+  int       number_of_commands        = 0;
+  char      generalYN                 = NULL_CHAR;
+  char      OP[4] =  { NULL_CHAR };
+  char      list[MAX_RSS_ADDINFO_VAL_LEN] = { NULL_CHAR };
+  char     *ptr      = NULL;
+  char     *last_ptr = NULL;
+  char     *from     = NULL;
+  char     *to       = NULL;
+  char     *factor   = NULL;
+  char     *ptag_name= NULL;
+  int      tl = 0;
+  int      l1 = 0;
+  char    *p1 = NULL;
+  char     *pl = NULL;
+  char     *p = NULL;
+  char     *ptr_add_policies = NULL;
+  char     *ptr_del_policies = NULL;
+  char   keyword[MAX_RSS_ADDINFO_KWD_LEN + 1]  = { NULL_CHAR };
+  char   keyword1[MAX_RSS_ADDINFO_KWD_LEN + 1] = { NULL_CHAR };
+  char   keywordb[MAX_RSS_ADDINFO_KWD_LEN + 1] = { NULL_CHAR };
+  char   user_factor_name[35 + 1]              = { NULL_CHAR };
+  char   IBM_factor_name[20 + 1]               = { NULL_CHAR };
+  char   TAG_name[20 + 1]                      = { NULL_CHAR };
+  char   TAG_value[1024 + 1]                   = { NULL_CHAR };
+  char   next                                  = NULL_CHAR;
+  char   listsep[2] = {ADDINFO_LIST_ENTRY, NULL_CHAR};
+
+  RACF_Factor Add_Factors[MAX_FACTORS];      /* includes also SET */
+  RACF_Factor Chg_Factors[MAX_FACTORS];
+  RACF_Factor Org_Factors[MAX_FACTORS]; /* before picture from RACF */
+  char  Org_Factors_List[MAX_FACTORS*MAX_FACTOR_NAME_SIZE +1] =
+        { NULL_CHAR };
+  char  Org_Factors_List_Usr[MAX_FACTORS*MAX_FACTOR_NAME_SIZE+1] =
+        { NULL_CHAR };
+  char  Del_Factors_Array[MAX_FACTORS][MAX_FACTOR_NAME_SIZE+1] =
+        { NULL_CHAR };
+  char         cmd[MAX_FACTORS*2 + 1][MAX_API_ST];
+  char        rcmd[MAX_FACTORS*2 + 1][MAX_API_ST];
+  char        Dup_Factors[MAX_FACTORS*21] = { NULL_CHAR };
+  int         add_factor_index = -1;
+  int         chg_factor_index = -1;
+  int         org_factor_index = -1;
+  int         cmd_index        = -1;
+  /* no need for Del_Factors becuase there are no corresponding
+     attributes as in Add factor to be added to the command.
+     The list to delete is in del_factor_list                  */
+  char        Add_Policies[POLICIES_SIZE] = { NULL_CHAR }; /*also SET*/
+  char        Del_Policies[POLICIES_SIZE] = { NULL_CHAR };
+  char        Dup_Policies[POLICIES_SIZE] = { NULL_CHAR };
+  char        Org_Policies[POLICIES_SIZE] = { NULL_CHAR };
+  char        PWFALLBACK = NULL_CHAR;
+  char        Org_PWFALLBACK = NULL_CHAR; /* before status from RACF */
+  char        Org_ENABLE     = NULL_CHAR; /* before status from RACF */
+  char        fallback   = NULL_CHAR;
+  char        mfa_enable_req = NULL_CHAR;  /* what IIQ set */
+  RACF_MFA_TRANMAP             MAP;
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+
+  /*
+   *   Initialization
+   */
+
+  ESA_DIAG_enter(comp, 1, func );
+  msg[0] = NULL_CHAR;
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  ESA_DIAG_printf(comp, 5,
+                  "Input:  act=%s  id=%s",
+                   act, id);
+
+  ESA_DIAG_printf(comp, 5,
+                  "Input: addinfo=%8X    laddinfo=%8X",
+                  addinfo, laddinfo);
+
+  for (i = 0; i LT MAX_FACTORS; i++)
+   Del_Factors_Array[i][0] = NULL_CHAR;
+ /*-------------------------------------------------------------------*/
+ if (ESA_DIAG_get_debug_level(comp) GE 6)
+ {
+  pairs_left = 0;
+  pair = ADDINFO_prefix_search("MFA.", RCF_ADDINFO_KWD_LEN,
+                                TRUE,    /* include NULL value */
+                                addinfo->pair, addinfo->num_pairs);
+  ESA_DIAG_printf(comp,5,
+                  "addinfo MFA. attributes:\n");
+  while (pair NE NULL)
+  {
+   ESA_DIAG_printf(comp,5,
+                  "keyword = <%s>\n"
+                  "value   = <%s>\n",
+                  pair->keyword,
+                  pair->value);
+   /* WS10082N
+   pairs_left = addinfo->num_pairs - (pair - addinfo->pair) - 1; */
+   pairs_left = addinfo->num_pairs - (pair->index + 1); /* WS10082N */
+   if (pairs_left EQ 0) break;
+   pair = ADDINFO_prefix_search("MFA.", RCF_ADDINFO_KWD_LEN,
+                                TRUE,   /* find also empty */
+                                ppair(pair), pairs_left); /* WS10082N */
+                  /* WS10082    pair+1, pairs_left);                 */
+  }
+
+ }
+ /*-------------------------------------------------------------------*/
+ pair = ADDINFO_search("MFA.ENABLE", RCF_ADDINFO_KWD_LEN,
+                        addinfo->pair,
+                        addinfo->num_pairs);
+ if (pair NE NULL)
+ {
+  if (strcmp(pair->value, "Y") EQ 0)
+    mfa_enable_req = 'Y';
+  else
+  if (strcmp(pair->value, "N") EQ 0)
+    mfa_enable_req = 'N';
+ }
+ /*-------------------------------------------------------------------*/
+  /* Handle MFA.ENABLE=N for user update  */
+  if (strcmp(act,"UpdUsr")  EQ 0)
+  {
+  /* if MFA.ENABLE = N, we need to issue ALU <userid> NOMFA */
+   if (mfa_enable_req EQ 'N')
+   {
+     /* no other MFA attributes are alloawed to be set with
+        MFA.ENABLE=N */
+     pairs_left = 0;
+     pair = ADDINFO_prefix_search("MFA.", RCF_ADDINFO_KWD_LEN,
+                                   TRUE,    /* include NULL value */
+                                   addinfo->pair, addinfo->num_pairs);
+     while (pair NE NULL)
+     {
+      if (  (strncmp(pair->keyword,"MFA.MAP",    7) NE 0) AND
+            (strncmp(pair->keyword,"MFA.ENABLE",10) NE 0) )
+      {
+       CTSAMSG_print(RACF_MFA_DISABLE_NOT_ALONE, msgs, NULL, dest,
+                     act, id);
+       rc = ESA_FATAL;
+       goto exit;
+      }
+      /* WS10082N
+      pairs_left = addinfo->num_pairs - (pair - addinfo->pair) - 1; */
+      pairs_left = addinfo->num_pairs - (pair->index +1);  /*WS10082N*/
+      if (pairs_left EQ 0) break;
+      pair = ADDINFO_prefix_search("MFA.", RCF_ADDINFO_KWD_LEN,
+                                   TRUE,   /* find also empty */
+                                  ppair(pair), pairs_left); /*WS10082N*/
+                  /* WS10082       pair+1, pairs_left);              */
+     }
+    /* Build ALU <userid> NOMFA */
+    rc =  RACF_Build_MFA_cmd(comp,
+                NULL,
+                id,
+                act,
+                cmd[0],
+                'N',
+                1,
+                1,
+                NULL,
+                NULL,
+                NULL,
+                NULL,
+                NULL_CHAR,
+                NULL,
+                NULL,
+                0,
+                NULL,
+                NULL_CHAR,
+                NULL_CHAR,
+                NULL,
+                admin_params);
+    if (rc NE ESA_OK)
+     goto exit;
+    rc = racfcmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+                 cmd[0], MAX_OK_RC_0,
+                 0,
+                 NULL, NULL, NULL, admin_params,
+                 CMDOUT_YES, RACF_NO);
+    ESA_DIAG_printf(comp, 5,
+                    "racfcmd rc = %d", rc);
+    if (rc NE ESA_OK)
+     CTSAMSG_print(RACF_MFA_CMD_FAILURE, msgs, NULL, dest,
+             act, id, rc);
+    goto exit;
+   }
+  }
+ /*------------------------------------------------------------------*/
+ /* Build the MAP 3-D array                */
+ rc =  RACF_Build_MAP (comp,
+                  MAP,
+                  addinfo,
+                  dest,
+                  msgs);
+ if (rc NE ESA_OK)
+ {
+   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+          dest, component, func,
+          "RACF_Build_MAP failed",
+          rc, __LINE__);
+   rc = ESA_FATAL;
+   goto exit;
+ }
+/*-------------------------------------------------------------------*/
+ rc = RACF_Save_Org(comp,
+                      MAP,
+                      laddinfo,
+                      Org_Factors,
+                      Org_Factors_List,
+                      Org_Factors_List_Usr,
+                      &org_factor_index,
+                      Org_Policies,
+                      &Org_PWFALLBACK,
+                      &Org_ENABLE,
+                      dest,
+                      msgs);
+/*-------------------------------------------------------------------*/
+ if ( (Org_ENABLE NE 'Y') AND (mfa_enable_req NE 'Y') )
+ {
+    CTSAMSG_print(RACF_MFA_ENABLE_MISSING, msgs, NULL, dest, act, id);
+   rc = ESA_FATAL;
+   goto exit;
+ }
+/*-------------------------------------------------------------------*/
+  /* Extract MFA.PWFALLBACK */
+  pair  = ADDINFO_search("MFA.PWFALLBACK",
+                         RCF_ADDINFO_KWD_LEN,
+                         addinfo->pair,
+                         addinfo->num_pairs);
+
+  if (pair NE NULL)
+  {
+   ESA_DIAG_printf(comp,5,
+   "MFA.PWFALLBACK = %C, Org_PWFALLBACK = %C",
+     pair->value[0]), Org_PWFALLBACK;
+   PWFALLBACK = pair->value[0];
+  }
+  if (Org_PWFALLBACK EQ PWFALLBACK)
+     PWFALLBACK = NULL_CHAR;
+/*-----------------------------------------------------------------*/
+  /* count how many factors already exist in RACF for the user*/
+  num_existing_factors = 0;
+  if (  (laddinfo NE NULL)  AND
+     (strcmp(act,"UpdUsr")  EQ 0) )
+  {
+
+   efpair = ADDINFO_search("MFA.FACTORS", RCF_ADDINFO_KWD_LEN,
+                          laddinfo->pair,
+                          laddinfo->num_pairs);
+   if (efpair NE NULL)
+   {
+    num_existing_factors = 0;
+    ptr = efpair->value;
+    while (ptr NE NULL)
+    {
+      num_existing_factors++;
+      ptr = strchr(ptr+1, ADDINFO_LIST_ENTRY);
+    }
+   }
+  }
+/*-------------------------------------------------------------------*/
+  /* count how many policies already exist in RACF for the user*/
+  num_existing_policies = 0;
+  if (  (laddinfo NE NULL)  AND
+     (strcmp(act,"UpdUsr")  EQ 0) )
+  {
+   eppair = ADDINFO_search("MFA.POLICIES", RCF_ADDINFO_KWD_LEN,
+                          laddinfo->pair,
+                          laddinfo->num_pairs);
+   if (eppair NE NULL)
+   {
+    ptr = eppair->value;
+    while (ptr NE NULL)
+    {
+      num_existing_policies++;
+      ptr = strchr(ptr+1, ADDINFO_LIST_ENTRY);
+    }
+   }
+  }
+/*-------------------------------------------------------------------*/
+  /* Extract MFA.POLICIES into Add_Policies & Del_Policies */
+
+  pair  = ADDINFO_search("MFA.POLICIES",
+                         RCF_ADDINFO_KWD_LEN,
+                         addinfo->pair,
+                         addinfo->num_pairs);
+
+  if ( (pair NE NULL) AND (pair->value[0] NE NULL_CHAR) )
+  {
+    ESA_DIAG_printf(comp,5,
+    "MFA.POLICIES = <%s>", pair->value);
+  /*
+   *     The for loop below iterates 3 times.
+   *     There can be 1 or 2 operations of ADD/DEL/SET.
+   *     We can have one of the above, or both ADD & DEL.
+   *     If there is SET it must be just SET.
+   *     So when i EQ 1 then it is the first iteration and we
+   *     expect to find some list.
+   *     When i EQ 3 then if we find a 3rd list it is an error.
+   */
+
+   last_ptr = NULL;
+   for (i=1; i LE 3; i++)
+    {
+      list[0]=NULL_CHAR;
+      rc = ADDINFO_list_getnextvalue(
+                           pair,ADDINFO_LIST_SUBFIELD,
+                           list, &last_ptr);
+
+      ESA_DIAG_printf(comp, 5,
+       "list getnextvalue i=%d rc=%d last=%p list=<%s>",
+        i,rc, last_ptr,list);
+      if ( ( rc NE ESA_OK ) OR ( list[0] EQ NULL_CHAR ) )
+      {
+        if (i EQ 1) /* 1st time should have found a list */
+        {
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                 dest, component, func,
+                 "MFA.POLICIES found but is empty",
+                 16, __LINE__);
+          rc = ESA_FATAL;
+          goto exit;
+        }
+
+        rc = ESA_OK;
+        break;   /* get out */
+      }
+
+      if (i EQ 3)
+      {
+        /*
+         *     We should only have maximum 2 lists
+         */
+
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+              dest, component, func,
+              "MFA.POLICIES has more than 2 lists",
+              16, __LINE__);
+         rc = ESA_FATAL;
+         goto exit;
+      }
+
+      ESA_DIAG_printf(comp, 5,
+        "delimiter after operation = %x",
+         *(list+3));
+
+      if (*(list+3) NE ADDINFO_LIST_ENTRY)
+      {
+       /*  After the operation (ADD/DEL/SET) there must be
+           list entry seperator, so we have an error      */
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                dest, component, func,
+         "ADDINFO_LIST_ENTRY seperator not found in List",
+                16, __LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+      }
+      /* we now have a value which we copy to Add_Policies or
+         Del_Policies */
+      memcpy(OP,list,3);
+
+      if (  (memcmp(OP,"ADD",3) EQ 0) OR
+            (memcmp(OP,"SET",3) EQ 0)  )
+      {
+       if (  (memcmp(OP,"SET",3) EQ 0)  AND
+             (strcmp(act,"UpdUsr")  EQ 0)  )
+       {
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                dest, component, func,
+                "SET operation in MFA.POLICIES is invalid for UPD USER",
+                16, __LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+       }
+       /* Duplicates are allowed by RACF MFA command but we count the
+          number of expected resultant policies and fail the transaction
+          if it exceeds 10.
+          Duplicates mislead the counting so they need removal.
+       */
+       rc = Remove_Dups(comp,
+                        list+4,
+                        outlist,
+                        ADDINFO_LIST_ENTRY,
+                        ADDINFO_LIST_ENTRY,
+                        dest,
+                        msgs);
+       if (rc NE ESA_OK)
+       {
+        sprintf(msg,
+              "%s %s: Remove_Dups from ADD policies",act, id);
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+               dest, component, func, msg, rc, __LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+       }
+
+       strcpy(Add_Policies,outlist);
+       outlist[0] = NULL_CHAR;
+       rc = ADDINFO_list_diff(Add_Policies, Org_Policies, outlist,
+                              ADDINFO_LIST_ENTRY,ADDINFO_LIST_ENTRY);
+       if (rc NE ESA_OK)
+       {
+        sprintf(msg,
+              "%s %s: ADDINFO_list_diff failed",act, id);
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+               dest, component, func, msg, rc, __LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+       }
+       /* outlist includes only policies that do not already exist */
+       ESA_DIAG_printf(comp,5,
+       "Add_Policies=<%s>, Org_Policies=<%s>, Neto Add policies=<%s>",
+        Add_Policies     , Org_Policies     , outlist);
+       num_general_policies_add = 0;
+       strcpy(Add_Policies,outlist);
+       ESA_DIAG_printf(comp,5,
+       "Add_Policies after outlist copied = <%s>",Add_Policies);
+       if (Add_Policies[0] NE NULL_CHAR)
+       {
+        ptr = Add_Policies;
+        while (ptr NE NULL)
+        {
+          num_general_policies_add++;
+          ptr = strchr(ptr+1, ADDINFO_LIST_ENTRY);
+        }
+       }
+       continue; /* to next iteration to extract the next policies
+                    list */
+      }
+
+      if (memcmp(OP,"DEL",3) EQ 0)
+      {
+       /* Duplicates are allowed by RACF MFA command but we count the
+          number of expected resultant policies and fail the transaction
+          if it exceeds 10.
+          Duplicates mislead the counting so they need removal.
+       */
+       rc = Remove_Dups(comp,
+                        list+4,
+                        outlist,
+                        ADDINFO_LIST_ENTRY,
+                        ADDINFO_LIST_ENTRY,
+                        dest,
+                        msgs);
+       if (rc NE ESA_OK)
+       {
+        sprintf(msg,
+              "%s %s: Remove_Dups from DEL policies",act, id);
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+               dest, component, func, msg, rc, __LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+       }
+       strcpy(Del_Policies,outlist);
+       outlist[0] = NULL_CHAR;
+       rc = ADDINFO_list_match(Del_Policies, Org_Policies, outlist,
+                              ADDINFO_LIST_ENTRY,ADDINFO_LIST_ENTRY);
+       if (rc NE ESA_OK)
+       {
+        sprintf(msg,
+              "%s %s: ADDINFO_list_match failed",act, id);
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+               dest, component, func, msg, rc, __LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+       }
+       /* outlist includes only policies to del that already exist */
+       ESA_DIAG_printf(comp,5,
+       "Del_Policies=<%s>, Org_Policies=<%s>, Neto Del policies=<%s>",
+        Del_Policies     , Org_Policies     , outlist);
+       num_del_policies = 0;
+       strcpy(Del_Policies,outlist);
+       if (Del_Policies[0] NE NULL_CHAR)
+       {
+        ptr = Del_Policies;
+        while (ptr NE NULL)
+        {
+          num_del_policies++;
+          ptr = strchr(ptr+1, ADDINFO_LIST_ENTRY);
+        }
+       }
+       orig_num_del_policies = num_del_policies;
+      } /* end of DEL operation */
+    }
+    if (Add_Policies[0] NE NULL_CHAR AND
+        Del_Policies[0] NE NULL_CHAR)
+    {
+     Dup_Policies[0] = NULL_CHAR;
+     rc = ADDINFO_list_match (Add_Policies, Del_Policies,
+                              Dup_Policies, ADDINFO_LIST_ENTRY, ',');
+     if (rc NE ESA_OK)
+     {
+      sprintf(msg,
+            "%s %s: ADDINFO_list_match failed",act, id);
+      CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+             dest, component, func, msg, rc, __LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+     }
+     if (Dup_Policies[0] NE NULL_CHAR)
+     {
+      CTSAMSG_print(RACF_MFA_SAME_ADD_AND_DEL, msgs, NULL, dest,
+           act, id, "Policies", Dup_Policies, rc);
+      rc = ESA_FATAL;
+      goto exit;
+     }
+    }
+  } /* end of MFA.POLICIES */
+
+  /*----------------------------------------------------------------*/
+  /* Extract MFA.FACTORS                                                  */
+  pair  = ADDINFO_search("MFA.FACTORS",
+                         RCF_ADDINFO_KWD_LEN,
+                         addinfo->pair,
+                         addinfo->num_pairs);
+  if (pair NE NULL)
+  {
+    ESA_DIAG_printf(comp,5,
+    "MFA.FACTORS = <%s>", pair->value);
+  /*
+   *     The for loop below iterates 3 times.
+   *     There can be 1 or 2 operations of ADD/DEL/SET.
+   *     We can have one of the above, or both ADD & DEL.
+   *     If there is SET it must be just SET.
+   *     So when i EQ 1 then it is the first iteration and we
+   *     expect to find some list.
+   *     When i EQ 3 then if we find a 3rd list it is an error.
+   */
+
+   last_ptr = NULL;
+   for (i=1; i LE 3; i++)
+   {
+     list[0]=NULL_CHAR;
+     rc = ADDINFO_list_getnextvalue(
+                          pair,ADDINFO_LIST_SUBFIELD,
+                          list, &last_ptr);
+
+     ESA_DIAG_printf(comp, 5,
+      "list getnextvalue i=%d rc=%d last=%p list=<%s>",
+       i,rc, last_ptr,list);
+       if ( ( rc NE ESA_OK ) OR ( list[0] EQ NULL_CHAR ) )
+       {
+         if (i EQ 1) /* 1st time should have found a list */
+         {
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                 dest, component, func,
+                 "MFA.FACTOR found but is empty",
+                 16, __LINE__);
+          rc = ESA_FATAL;
+          goto exit;
+         }
+
+         rc = ESA_OK;
+         break;   /* get out */
+       }
+
+       if (i EQ 3)
+       {
+         /*
+          *     We should only have maximum 2 lists
+          */
+
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+               dest, component, func,
+               "MFA.FACTOR has more than 2 lists",
+               16, __LINE__);
+          rc = ESA_FATAL;
+          goto exit;
+       }
+
+       ESA_DIAG_printf(comp, 5,
+        "delimiter after operation = %x",
+         *(list+3));
+
+       if (*(list+3) NE ADDINFO_LIST_ENTRY)
+       {
+        /*
+         *     After the operation (ADD/DEL/SET) there must be
+         *     list entry seperator, so we have an error
+         */
+
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                 dest, component, func,
+          "ADDINFO_LIST_ENTRY seperator not found in List",
+                 16, __LINE__);
+         rc = ESA_FATAL;
+         goto exit;
+       }
+
+       memcpy(OP,list,3);
+
+       if (  (memcmp(OP,"ADD",3) EQ 0) OR
+             (memcmp(OP,"SET",3) EQ 0)  )
+       {
+        if (  (memcmp(OP,"SET",3) EQ 0)  AND
+              (strcmp(act,"UpdUsr")  EQ 0)  )
+        {
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                 dest, component, func,
+                 "SET operation in MFA.FACTORS is invalid for UPD USER",
+                 16, __LINE__);
+         rc = ESA_FATAL;
+         goto exit;
+        }
+        /* Duplicates are allowed by RACF MFA command but we count the
+           number of expected resultant factors and fail the transaction
+           if it exceeds 10.
+           Duplicates mislead the counting so they need removal.
+        */
+        rc = Remove_Dups(comp,
+                         list+4,
+                         outlist,
+                         ADDINFO_LIST_ENTRY,
+                         ADDINFO_LIST_ENTRY,
+                         dest,
+                         msgs);
+        if (rc NE ESA_OK)
+        {
+         sprintf(msg,
+               "%s %s: Remove_Dups from ADD factors",act, id);
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                dest, component, func, msg, rc, __LINE__);
+         rc = ESA_FATAL;
+         goto exit;
+        }
+        total_num_oob_policies_add = 0;
+        strcpy(add_factor_list,outlist);
+        outlist[0] = NULL_CHAR;
+        rc = ADDINFO_list_diff(add_factor_list, Org_Factors_List_Usr,
+                               outlist,
+                               ADDINFO_LIST_ENTRY,ADDINFO_LIST_ENTRY);
+        if (rc NE ESA_OK)
+        {
+         sprintf(msg,
+               "%s %s: ADDINFO_list_diff failed",act, id);
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                dest, component, func, msg, rc, __LINE__);
+         rc = ESA_FATAL;
+         goto exit;
+        }
+        /* outlist includes only factors to add that do not already
+           exist */
+        ESA_DIAG_printf(comp,5,
+        "add_factor_list=<%s>,Org_Factors_List_Usr=<%s>, "
+        "Neto Add factors=<%s>",
+         add_factor_list     ,Org_Factors_List_Usr , outlist);
+        strcpy(add_factor_list,outlist);
+        strcpy(copy_add_factor_list,outlist);
+        factor = strtok(add_factor_list,listsep);
+        add_factor_index = -1;
+        /* handle each factor in ADD/SET list */
+        while (factor NE NULL)
+        {
+         add_factor_index++;
+         ESA_DIAG_printf(comp, 5,
+                "Handling Factor = <%s>\n", factor);
+         memcpy(Add_Factors[add_factor_index].eyec,"FACT",4);
+         p = RACF_Trans_Factor_Usr2IBM(comp,
+                           MAP,
+                           factor,
+                           id,
+                           act,
+                           dest,
+                           msgs);
+         if (p EQ NULL)
+         {
+           rc = ESA_FATAL;
+           goto exit;
+         }
+         strcpy(Add_Factors[add_factor_index].IBM_name,p);
+         strcpy(Add_Factors[add_factor_index].name,factor);
+         Add_Factors[add_factor_index].active = NULL_CHAR;
+         Add_Factors[add_factor_index].TAGs_add[0] = NULL_CHAR;
+         Add_Factors[add_factor_index].TAGs_del[0] = NULL_CHAR;
+         Add_Factors[add_factor_index].policies_add[0] = NULL_CHAR;
+         Add_Factors[add_factor_index].policies_del[0] = NULL_CHAR;
+         /* construct MFA.<factor-name>.ACTIVE  */
+         keyword[0] = NULL_CHAR;
+         strcat(keyword,"MFA.");
+         strcat(keyword,factor);
+         strcat(keyword,".ACTIVE");
+         /* search MFA.<factor-name>.ACTIVE  */
+         apair = ADDINFO_search(keyword, RCF_ADDINFO_KWD_LEN,
+                            addinfo->pair,
+                            addinfo->num_pairs);
+         ESA_DIAG_printf(comp, 5,
+                      "keyword <%s> : %s",
+                      keyword,
+                      apair NE NULL ? "Found"
+                                   : "Not found");
+         if (apair NE NULL)
+            Add_Factors[add_factor_index].active = apair->value[0];
+         else
+            Add_Factors[add_factor_index].active = NULL_CHAR;
+         ESA_DIAG_printf(comp, 5,
+                      "active = %c",
+                      Add_Factors[add_factor_index].active);
+
+         /* construct MFA.<factor-name>.OOBPOLICY keyword */
+         Add_Factors[add_factor_index].policies_add[0] = NULL_CHAR;
+         Add_Factors[add_factor_index].policies_del[0] = NULL_CHAR;
+         keyword[0] = NULL_CHAR;
+         strcat(keyword,"MFA.");
+         strcat(keyword,factor);
+         strcat(keyword,".OOBPOLICY");
+     /*  pair = ADDINFO_search(keyword,RCF_ADDINFO_KWD_LEN,ws10082*/
+         p_pair=ADDINFO_search(keyword,RCF_ADDINFO_KWD_LEN,/*ws10082*/
+                               addinfo->pair,
+                               addinfo->num_pairs);
+         ESA_DIAG_printf(comp, 5,
+                      "keyword <%s> : %s",
+                      keyword,
+                   /* pair NE NULL ? "Found"    ws10082 */
+                      p_pair NE NULL ? "Found" /* ws10082 */
+                                   : "Not found");
+         /* if (ppair NE NULL)  ws10082 */
+         if (p_pair NE NULL) /* ws10082 */
+         ESA_DIAG_printf(comp, 5,
+                      "keyword <%s> value : %s",
+                      keyword,
+               /*     ppair->value);  ws10082 */
+                      p_pair->value); /* ws10082 */
+
+         outlist[0] = NULL_CHAR;
+      /* if ((Del_Policies[0] NE NULL_CHAR)AND(ppair NE NULL))ws10082*/
+         if ((Del_Policies[0] NE NULL_CHAR) AND             /*ws10082*/
+             (p_pair NE NULL))                              /*ws10082*/
+         {
+    /*rc=ADDINFO_list_match(Del_Policies,ppair->value,outlist,ws10082*/
+/*WS10082*/rc = ADDINFO_list_match(Del_Policies,p_pair->value,outlist,
+                               ADDINFO_LIST_ENTRY,ADDINFO_LIST_ENTRY);
+          if (rc NE ESA_OK)
+          {
+           sprintf(msg,
+                 "%s %s: ADDINFO_list_match failed",act, id);
+           CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                  dest, component, func, msg, rc, __LINE__);
+           rc = ESA_FATAL;
+           goto exit;
+          }
+          /* outlist includes OOBPOLICY policies that are also in DEL
+             list */
+          if (outlist[0] NE NULL_CHAR)
+          {
+           CTSAMSG_print(RACF_MFA_SAME_ADD_AND_DEL, msgs, NULL, dest,
+                act, id, "Policies", outlist, rc);
+           rc = ESA_FATAL;
+           goto exit;
+          }
+         }
+
+         outlist[0] = NULL_CHAR;
+    /* rc=ADDINFO_list_diff(Add_Policies,ppair->value,outlist,ws10082*/
+/*WS10082*/rc=ADDINFO_list_diff(Add_Policies,p_pair->value,outlist,
+                                ADDINFO_LIST_ENTRY,ADDINFO_LIST_ENTRY);
+         if (rc NE ESA_OK)
+         {
+          sprintf(msg,
+                "%s %s: ADDINFO_list_diff failed",act, id);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                 dest, component, func, msg, rc, __LINE__);
+          rc = ESA_FATAL;
+          goto exit;
+         }
+         /* outlist includes only policies that do not appear in
+            OOBPOLICY */
+         ESA_DIAG_printf(comp,5,
+           "Add_Policies = <%s>, OOB_Policies = <%s>, "
+           "Neto Add policies = <%s>",
+           /* Add_Policies,ppair->value,outlist);            ws10082*/
+           Add_Policies , p_pair->value , outlist);        /*ws10082*/
+         num_general_policies_add = 0;
+         strcpy(Add_Policies,outlist);
+         ESA_DIAG_printf(comp,5,
+         "Add_Policies after outlist copied = <%s>",Add_Policies);
+         if (Add_Policies[0] NE NULL_CHAR)
+         {
+          ptr = Add_Policies;
+          while (ptr NE NULL)
+          {
+            num_general_policies_add++;
+            ptr = strchr(ptr+1, ADDINFO_LIST_ENTRY);
+          }
+         }
+
+         outlist[0] = NULL_CHAR;
+      /*rc=ADDINFO_list_diff(ppair->value,Org_Policies,outlist,ws10082*/
+/*WS10082*/rc = ADDINFO_list_diff(p_pair->value, Org_Policies, outlist,
+                                ADDINFO_LIST_ENTRY,ADDINFO_LIST_ENTRY);
+         if (rc NE ESA_OK)
+         {
+          sprintf(msg,
+                "%s %s: ADDINFO_list_diff failed",act, id);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                 dest, component, func, msg, rc, __LINE__);
+          rc = ESA_FATAL;
+          goto exit;
+         }
+         /* outlist includes only policies that do not already exist */
+         ESA_DIAG_printf(comp,5,
+         "OOB_Policies = <%s>, Org_Policies = <%s>, "
+         "Neto OOB policies = <%s>",
+         /* ppair->value , Org_Policies , outlist); ws10082*/
+         p_pair->value , Org_Policies , outlist); /*ws10082*/
+         strcpy(Add_Factors[add_factor_index].policies_add , outlist);
+         p1 = Add_Factors[add_factor_index].policies_add;
+         num_policies_add = 0;
+         while ( (p1 NE NULL) AND (p1[0] NE NULL_CHAR) )
+         {
+          num_policies_add++;
+          p1 = strchr(p1+1, ADDINFO_LIST_ENTRY);
+         }
+         total_num_oob_policies_add += num_policies_add;
+         if (num_policies_add GT 0)  /* OOB policies for this factor */
+            if (num_del_policies GT 0) /* non factor related policies */
+            {
+             if (num_del_policies LE num_policies_add)
+             {
+              /* add them all to this factor's command */
+              strcpy(Add_Factors[add_factor_index].policies_del,
+                     Del_Policies);
+              ESA_DIAG_printf(comp, 5,
+                        "at #1 num_del_policies zeroed");
+              num_del_policies = 0;
+              Del_Policies[0] = NULL_CHAR;
+             }
+             else
+             /* (num_del_policies GT num_policies_add)            */
+             /* copy only amount of num_policies_add to this factor's
+                cmd */
+             {
+              num_policies_to_leave=num_del_policies - num_policies_add;
+              for (j = 1; j LE num_policies_to_leave; j++)
+              {
+               p1 = strchr(Del_Policies,ADDINFO_LIST_ENTRY);
+               if (p1 EQ NULL)
+               {
+                sprintf(msg,
+                "%s %s: Unable to locate seperator in Del_Policies "
+                "list = <%s>",
+                id,act,Del_Policies);
+                CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                              component,func, msg, 16,__LINE__);
+                rc = ESA_FATAL;
+                goto exit;
+               }
+                strcpy(Add_Factors[add_factor_index].policies_del,p1+1);
+                num_del_policies = num_policies_to_leave;
+                *p1 = NULL_CHAR;
+                if (num_del_policies EQ 0)
+                 ESA_DIAG_printf(comp, 5,
+                        "at #2 num_del_policies zeroed");
+              }
+             }
+            }
+         /*-----------------------------------------------------------*/
+         /* Extract the tags of this factor from user provided addinfo
+            and construct lists of tagname:value elements in the Factor
+            struct TAGs_add and TAGs_del. The lists elements are
+            separated by commas.
+         */
+
+         /* construct MFA.<factor-name>.TAG keyword prefix */
+         Add_Factors[add_factor_index].TAGs_add[0] = NULL_CHAR;
+         Add_Factors[add_factor_index].TAGs_del[0] = NULL_CHAR;
+         keyword[0] = NULL_CHAR;
+         strcat(keyword,"MFA.");
+         strcat(keyword,factor);
+         strcat(keyword,".TAG");
+         tpair = ADDINFO_prefix_search(keyword, RCF_ADDINFO_KWD_LEN,
+                                     TRUE,    /* include NULL value */
+                                     addinfo->pair, addinfo->num_pairs);
+         ESA_DIAG_printf(comp, 5,
+                      "keyword prefix <%s> : %s",
+                      keyword,
+                      tpair NE NULL ? "Found"
+                                   : "Not found");
+         while (tpair NE NULL)
+         {
+          p1 = tpair->keyword-1;
+          for (j = 1; j LE 3; j++)
+          {
+            p1 = strchr(p1+1, '.');
+            if (p1 EQ NULL) break;
+          }
+          if (p1 NE NULL)
+            ESA_DIAG_printf(comp, 5,
+                        "tag-name : %s", p1);
+          else
+          {
+           sprintf(msg,
+           "%s %s: Unable to locate tag name in = <%s>",
+           act,id,tpair->keyword);
+           CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                         component,func, msg, 16,__LINE__);
+           rc = ESA_FATAL;
+           goto exit;
+          }
+
+          p1++;   /* now pointing to tag-name */
+          if (tpair->value NE NULL)
+          {
+            if (strchr(p1, ' ') EQ NULL)
+               blanks_found = FALSE;
+            else
+               blanks_found = TRUE;
+            if (Add_Factors[add_factor_index].TAGs_add[0] NE NULL_CHAR)
+               strcat(Add_Factors[add_factor_index].TAGs_add,
+               sublistsep);
+            if (blanks_found)
+               strcat(Add_Factors[add_factor_index].TAGs_add, "\"");
+            strcat(Add_Factors[add_factor_index].TAGs_add, p1);
+            strcat(Add_Factors[add_factor_index].TAGs_add, ":");
+            strcat(Add_Factors[add_factor_index].TAGs_add,
+                   tpair->value);
+            if (blanks_found)
+               strcat(Add_Factors[add_factor_index].TAGs_add, "\"");
+          }
+          else
+          {
+            if (Add_Factors[add_factor_index].TAGs_del[0] NE NULL_CHAR)
+               strcat(Add_Factors[add_factor_index].TAGs_del, ",");
+            strcat(Add_Factors[add_factor_index].TAGs_del, p1);
+          }
+          /* WS10082N
+          pairs_left = addinfo->num_pairs - (tpair - addinfo->pair) - 1;
+          */
+          pairs_left = addinfo->num_pairs-(tpair->index+1); /*WS10082N*/
+          if (pairs_left EQ 0) break;
+          /* find next tag of current factor */
+          tpair = ADDINFO_prefix_search(keyword, RCF_ADDINFO_KWD_LEN,
+                                       TRUE,   /* find also empty */
+                        /*ws10082*/    ppair(tpair), pairs_left);
+                        /* WS10082     tpair+1, pairs_left);        */
+
+         }  /* while of tags */
+         /* point to next factor */
+         factor = strtok(NULL,listsep);
+        }   /* while factors of ADD/SET list*/
+
+        continue;  /* to the next factors list in the for loop */
+       } /* end of ADD/SET factors */
+
+       if (memcmp(OP,"DEL",3) EQ 0)
+       {
+        if (strcmp(act,"AddUsr") EQ 0)
+        {
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+               dest, component, func,
+               "DEL operation in MFA.FACTORS is invalid for ADD USER",
+                16, __LINE__);
+         rc = ESA_FATAL;
+         goto exit;
+        }
+        /* Duplicates are allowed by RACF MFA command but we count the
+           number of expected resultant factors and fail the transaction
+           if it exceeds 10.
+           Duplicates mislead the counting so they need removal.
+        */
+        rc = Remove_Dups(comp,
+                         list+4,
+                         outlist,
+                         ADDINFO_LIST_ENTRY,
+                         ADDINFO_LIST_ENTRY,
+                         dest,
+                         msgs);
+        if (rc NE ESA_OK)
+        {
+         sprintf(msg,
+               "%s %s: Remove_Dups from DEL factors",act, id);
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                dest, component, func, msg, rc, __LINE__);
+         rc = ESA_FATAL;
+         goto exit;
+        }
+        strcpy(del_factor_list,outlist);
+        num_del_factors = 0;
+        from = del_factor_list;
+        while ( (from NE NULL) AND (from[0] NE NULL_CHAR) )
+        {
+         num_del_factors++;
+         to = strchr(from+1,ADDINFO_LIST_ENTRY);
+         if (to NE NULL)
+         {
+           factor_len = to - from;
+           memcpy(user_factor_name,from,factor_len);
+           *(user_factor_name + factor_len) = NULL_CHAR;
+           from = to + 1;   /* for next iteration of this while */
+         }
+         else
+         {
+          strcpy(user_factor_name,from);
+          from  +=  strlen(from);  /* this will point to the null char
+                                      and next iteration of the while
+                                      will stop */
+         }
+         p = RACF_Trans_Factor_Usr2IBM(comp,
+                           MAP,
+                           user_factor_name,
+                           id,
+                           act,
+                           dest,
+                           msgs);
+         if (p EQ NULL)
+         {
+           rc = ESA_FATAL;
+           goto exit;
+         }
+         strcpy(Del_Factors_Array[num_del_factors-1],p);
+        }
+        continue;  /* the for loop */
+       }  /* end of DEL handling of factors */
+
+       /*     The operation is not one of ADD/DEL/SET */
+           sprintf(msg,
+           "%s %s: Invalid operation %s in MFA.FACTORS = <%s>",
+           id,act,OP,pair->value);
+           CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                         component,func, msg, 16,__LINE__);
+       rc = ESA_FATAL;
+       goto exit;
+   }   /* end of for loop */
+  }
+  for (i = 0; i LT MAX_FACTORS; i++)
+  {
+   if (Del_Factors_Array[i][0] EQ NULL_CHAR)
+    break;
+   for (j = 0; j LE add_factor_index; j++)
+    if (strcmp(Del_Factors_Array[i], Add_Factors[j].IBM_name) EQ 0)
+    {
+     if (Dup_Factors[0] NE NULL_CHAR)
+      strcat(Dup_Factors,",");
+     strcat(Dup_Factors, Del_Factors_Array[i]);
+    }
+  }
+
+  if (Dup_Factors[0] NE NULL_CHAR)
+  {
+   CTSAMSG_print(RACF_MFA_SAME_ADD_AND_DEL, msgs, NULL, dest,
+          act, id, "Factors",Dup_Factors, rc);
+   rc = ESA_FATAL;
+   goto exit;
+  }
+  /*  The handling of MFA.FACTORS is finished, together with each
+      factor's related attribute. The data is now in a Factor
+      structure per factor. */
+
+  /*  Now we need to locate the following attributes which do not have a
+      corresponding factor in MFA.FACTORS:
+       MFA.factor-name.ACTIVE
+      MFA.factor-name.TAG.tag-name
+      If the factor is not added by this transaction then it must aleady
+      exist in RACF for the user, otherwise the command will add
+      non-existing factors, probably due to IIQ/IDN not synched with
+      RACF.
+  */
+  keyword[0] = NULL_CHAR;
+  strcat(keyword,"MFA.");
+  pairs_left = 0;
+  pair = ADDINFO_prefix_search(keyword, RCF_ADDINFO_KWD_LEN,
+                                TRUE,    /* include NULL value */
+                                addinfo->pair, addinfo->num_pairs);
+  while (pair NE NULL)
+  {
+   we_have_active = FALSE;
+   we_have_tag = FALSE;
+   /* WS10082N
+   pairs_left = addinfo->num_pairs - (pair - addinfo->pair) - 1; */
+   pairs_left = addinfo->num_pairs - (pair->index + 1); /* WS10082N */
+   if (pairs_left EQ 0) break;
+   /* we need to skip the non relevant attributes   */
+   if (  (memcmp(pair->keyword,"MFA.MAP.",8)         EQ 0)  OR
+         (memcmp(pair->keyword,"MFA.FACTORS",11)     EQ 0)  OR
+         (memcmp(pair->keyword,"MFA.POLICIES",12)    EQ 0)  OR
+         (memcmp(pair->keyword,"MFA.PWFALLBACK",14)  EQ 0)  OR
+         (memcmp(pair->keyword,"MFA.ENABLE",10)      EQ 0)  )
+      goto next_attribute;
+
+   /* we need to handle only attributes with ACTIVE or TAG in 3rd place */
+   p1 = pair->keyword;
+   for (j = 1; j LE 2; j++)
+   {
+       p1 = strchr(p1+1, '.');
+       if (p1 EQ NULL) break;
+   }
+
+   if (p1 EQ NULL) goto next_attribute;
+   if (memcmp(p1+1,"TAG.",4) EQ 0)
+   {
+     ptag_name = p1 + 1 + 4;
+     we_have_tag = TRUE;
+     factor_len = p1 - pair->keyword - 4;
+   }
+   else if (memcmp(p1+1,"ACTIVE",6) EQ 0)
+   {
+     we_have_active = TRUE;
+     factor_len = p1 - pair->keyword - 4;
+   }
+   else goto next_attribute;
+
+   ESA_DIAG_printf(comp, 5,
+      "Found a keyword with TAG/ACTIVE: <%s>\n"
+      "factor len = %d\n",
+      pair->keyword,factor_len);
+
+   /* extract the factor name */
+   user_factor_name[0] = NULL_CHAR;
+   memcpy(user_factor_name,pair->keyword + 4,factor_len);
+   user_factor_name[factor_len] = NULL_CHAR;
+
+   ESA_DIAG_printf(comp, 5,
+      "factor name for translation: <%s>\n",
+      user_factor_name);
+
+   /* translate the factor name from user name to IBM name */
+   IBM_factor_name[0] = NULL_CHAR;
+   p = RACF_Trans_Factor_Usr2IBM(comp,
+                     MAP,
+                     user_factor_name,
+                     id,
+                     act,
+                     dest,
+                     msgs);
+   if (p EQ NULL)
+   {
+     rc = ESA_FATAL;
+     goto exit;
+   }
+   strcpy(IBM_factor_name,p);
+   /* check if the factor is added or deleted via MFA.FACTORS in addinfo
+      from IIQ/IDN                                                    */
+   p1 = NULL;
+   if (copy_add_factor_list[0] NE NULL_CHAR)
+      p1 = ADDINFO_list_search(copy_add_factor_list,user_factor_name,
+                       ADDINFO_LIST_ENTRY);
+   if (p1 NE NULL) goto next_attribute; /* factor already handled with
+                                           related attributes */
+
+   p1 = NULL;
+   if (del_factor_list[0] NE NULL_CHAR)
+     p1 = ADDINFO_list_search(del_factor_list,user_factor_name,
+                       ADDINFO_LIST_ENTRY);
+   if (p1 NE NULL) goto next_attribute; /* factor is to be deleted,
+                                           ignore any other changes to
+                                           it */
+   ESA_DIAG_printf(comp, 5,
+      "Keyword <%s> being changed without factor itself in "
+      "MFA.FACTORS\n",
+      pair->keyword);
+
+   if  (strcmp(act,"UpdUsr")  NE 0)
+   {
+     CTSAMSG_print(RACF_MFA_ATT_ALONE_FAILURE, msgs, NULL, dest,
+           act, id, pair->keyword, rc);
+     rc = ESA_FATAL;
+     goto exit;
+   }
+   /* check if the factor already exists in RACF */
+   fpair = ADDINFO_search("MFA.FACTORS", RCF_ADDINFO_KWD_LEN,
+                          laddinfo->pair,
+                          laddinfo->num_pairs);
+   p1 = NULL;
+   if ( (fpair NE NULL) AND (fpair->value[0] NE NULL_CHAR) )
+    p1 = ADDINFO_list_search(fpair->value,IBM_factor_name,
+                      ADDINFO_LIST_ENTRY);
+   if (p1 EQ NULL)
+   {
+     CTSAMSG_print(RACF_MFA_NON_EXIST_FACT_FAIL, msgs, NULL, dest,
+           act, id, pair->keyword, user_factor_name, IBM_factor_name,
+           rc);
+     rc = ESA_FATAL;
+     goto exit;
+   }
+   /* factor exists in RACF for the user. Need to copy parameter to a
+      Factor structure (new or existing)   */
+
+   ESA_DIAG_printf(comp, 5,
+      "Keyword <%s> being changed; the factor exists in RACF\n",
+      pair->keyword);
+   /* Does the factor exist in allocated structures (could be due to
+      previous independent attribute for existing factor)? */
+
+   found = FALSE;
+   for (i = 0; i LE chg_factor_index; i++)
+   {
+    if (strcmp(Chg_Factors[i].name,user_factor_name) EQ 0)
+    {
+     found = TRUE;
+     break;
+    }
+   }
+   if (found)
+   {
+   ESA_DIAG_printf(comp, 5,
+      "Keyword <%s> being changed; the factor exists in Chg_Factors\n",
+      pair->keyword);
+    if (we_have_active)
+       Chg_Factors[i].active = pair->value[0];
+    if (we_have_tag)
+     if ( (pair->value NE NULL) AND
+        (pair->value[0] NE NULL_CHAR) )
+     {
+       if (Chg_Factors[i].TAGs_add[0] NE NULL_CHAR)
+          strcat(Chg_Factors[i].TAGs_add, ",");
+       strcat(Chg_Factors[i].TAGs_add, ptag_name);
+       strcat(Chg_Factors[i].TAGs_add, ":");
+       strcat(Chg_Factors[i].TAGs_add, pair->value);
+     }
+     else
+     {
+       if (Chg_Factors[i].TAGs_del[0] NE NULL_CHAR)
+          strcat(Chg_Factors[i].TAGs_del, ",");
+       strcat(Chg_Factors[i].TAGs_del, ptag_name);
+     }
+    goto next_attribute;
+   }
+   /* not already allocated in Chg_Factors */
+   chg_factor_index++;
+   ESA_DIAG_printf(comp, 5,
+      "Allocating Chg_Factors for attribute change of Factor = "
+      "<%s> <%s>\n",
+      IBM_factor_name,user_factor_name);
+   memcpy(Chg_Factors[chg_factor_index].eyec,"FACT",4);
+   strcpy(Chg_Factors[chg_factor_index].name,user_factor_name);
+   strcpy(Chg_Factors[chg_factor_index].IBM_name,IBM_factor_name);
+
+   Chg_Factors[chg_factor_index].TAGs_add[0] = NULL_CHAR;
+   Chg_Factors[chg_factor_index].TAGs_del[0] = NULL_CHAR;
+   Chg_Factors[chg_factor_index].policies_add[0] = NULL_CHAR;
+   Chg_Factors[chg_factor_index].policies_del[0] = NULL_CHAR;
+
+   if (we_have_active)
+      Chg_Factors[chg_factor_index].active = pair->value[0];
+   if (we_have_tag)
+    if ( (pair->value NE NULL) AND (pair->value[0] NE NULL_CHAR) )
+    {
+      if (Chg_Factors[chg_factor_index].TAGs_add[0] NE NULL_CHAR)
+         strcat(Chg_Factors[chg_factor_index].TAGs_add, sublistsep);
+      if (strchr(pair->value, ' ') EQ NULL)
+         blanks_found = FALSE;
+      else
+         blanks_found = TRUE;
+      if (blanks_found)
+         strcat(Chg_Factors[chg_factor_index].TAGs_add, "\"");
+      strcat(Chg_Factors[chg_factor_index].TAGs_add, ptag_name);
+      strcat(Chg_Factors[chg_factor_index].TAGs_add, ":");
+      strcat(Chg_Factors[chg_factor_index].TAGs_add, pair->value);
+      if (blanks_found)
+         strcat(Chg_Factors[chg_factor_index].TAGs_add, "\"");
+    }
+    else
+    {
+      if (Chg_Factors[chg_factor_index].TAGs_del[0] NE NULL_CHAR)
+         strcat(Chg_Factors[chg_factor_index].TAGs_del, ",");
+      strcat(Chg_Factors[chg_factor_index].TAGs_del, ptag_name);
+    }
+
+   next_attribute:
+   ESA_DIAG_printf(comp, 5,
+      "At next_attribute: pairs_left = %d\n",
+      pairs_left);
+   pair = ADDINFO_prefix_search(keyword, RCF_ADDINFO_KWD_LEN,
+                                TRUE,   /* find also empty */
+                                ppair(pair), pairs_left); /*WS10082N*/
+                   /* WS10082N  pair+1, pairs_left);  */
+  }
+ /*-----------------------------------------------------------------*/
+ num_chg_factors = chg_factor_index + 1;
+ num_add_factors = add_factor_index + 1;
+ left_add_factors = num_add_factors;
+ left_del_factors = num_del_factors;
+ left_chg_factors = num_chg_factors;
+ total_existing_factors = num_existing_factors;
+ ESA_DIAG_printf(comp, 5,
+  "num existing factors = %d, num add factors = %d, "
+  "num del factors = %d\n "
+  "total expected final factors = %d\n",
+  num_existing_factors, num_add_factors, num_del_factors,
+  num_existing_factors + num_add_factors - num_del_factors);
+
+ if (num_existing_factors + num_add_factors - num_del_factors  GT 10)
+ {
+     CTSAMSG_print(RACF_MFA_EXCEED_TEN_FAILURE, msgs, NULL, dest,
+           act, id, "Factors", num_existing_factors, num_del_factors,
+           num_add_factors);
+    rc = ESA_FATAL;
+    goto exit;
+ }
+ /*-----------------------------------------------------------------*/
+ ESA_DIAG_printf(comp, 5,
+  "num_existing_policies = %d, total_num_oob_policies_add = %d\n"
+  "num_general_policies_add = %d, orig_num_del_policies = %d\n"
+  "num_del_policies = %d\n"
+  "total_expected_final_policies = %d\n",
+   num_existing_policies, total_num_oob_policies_add,
+   num_general_policies_add, orig_num_del_policies,num_del_policies,
+   num_existing_policies + total_num_oob_policies_add +
+   num_general_policies_add - orig_num_del_policies);
+
+ if (num_existing_policies + total_num_oob_policies_add +
+     num_general_policies_add - orig_num_del_policies GT 10)
+ {
+     CTSAMSG_print(RACF_MFA_EXCEED_TEN_FAILURE, msgs, NULL, dest,
+           act, id, "Policies", num_existing_policies,
+           orig_num_del_policies,
+           total_num_oob_policies_add + num_general_policies_add);
+    rc = ESA_FATAL;
+    goto exit;
+ }
+ /*----------------------------------------------------------------*/
+ /* add all general add/del policies to the last Add_Factors  */
+ if (add_factor_index GT -1)
+ {
+   ESA_DIAG_printf(comp, 5,
+     "Adding all general add/del policies to the last Add_Factors");
+  if (num_general_policies_add GT 0)
+  {
+   if (Add_Factors[add_factor_index].policies_add[0] NE NULL_CHAR)
+    strcat(Add_Factors[add_factor_index].policies_add, listsep);
+   strcat(Add_Factors[add_factor_index].policies_add, Add_Policies);
+   num_general_policies_add = 0;
+   Add_Policies[0] = NULL_CHAR;
+  }
+  if (num_del_policies GT 0)
+  {
+   if (Add_Factors[add_factor_index].policies_del[0] NE NULL_CHAR)
+    strcat(Add_Factors[add_factor_index].policies_del, listsep);
+   strcat(Add_Factors[add_factor_index].policies_del, Del_Policies);
+   num_del_policies = 0;
+   Del_Policies[0] = NULL_CHAR;
+  }
+ }
+ /* If there were no Add_Factors to add the general add/del policies to,
+    then add all general add/del policies to the last Chg_Factors  */
+ if ( (add_factor_index EQ -1) AND
+      (chg_factor_index GT -1) )
+ {
+  if (num_general_policies_add GT 0)
+  {
+   if (Chg_Factors[chg_factor_index].policies_add[0] NE NULL_CHAR)
+    strcat(Chg_Factors[chg_factor_index].policies_add, listsep);
+   strcat(Chg_Factors[chg_factor_index].policies_add, Add_Policies);
+   num_general_policies_add = 0;
+   Add_Policies[0] = NULL_CHAR;
+  }
+  if (num_del_policies GT 0)
+  {
+   if (Chg_Factors[chg_factor_index].policies_del[0] NE NULL_CHAR)
+    strcat(Chg_Factors[chg_factor_index].policies_del, listsep);
+   strcat(Chg_Factors[chg_factor_index].policies_del, Del_Policies);
+   num_del_policies = 0;
+   Del_Policies[0] = NULL_CHAR;
+  }
+ }
+ /* replace separators in policies lists in factor struct with comma */
+ for (i = 0; i LE add_factor_index; i++)
+ {
+  p = Add_Factors[i].policies_add;
+  while ( (p NE NULL) AND (p[0] NE NULL_CHAR) )
+  {
+   p = strchr(p,ADDINFO_LIST_ENTRY);
+   if (p NE NULL)
+     *p = ',';
+  }
+  p = Add_Factors[i].policies_del;
+  while ( (p NE NULL) AND (p[0] NE NULL_CHAR) )
+  {
+   p = strchr(p,ADDINFO_LIST_ENTRY);
+   if (p NE NULL)
+     *p = ',';
+  }
+ }
+
+ for (i = 0; i LE chg_factor_index; i++)
+ {
+  p = Chg_Factors[i].policies_add;
+  while ( (p NE NULL) AND (p[0] NE NULL_CHAR) )
+  {
+   p = strchr(p,ADDINFO_LIST_ENTRY);
+   if (p NE NULL)
+     *p = ',';
+  }
+  p = Chg_Factors[i].policies_del;
+  while ( (p NE NULL) AND (p[0] NE NULL_CHAR) )
+  {
+   p = strchr(p,ADDINFO_LIST_ENTRY);
+   if (p NE NULL)
+     *p = ',';
+  }
+ }
+ /* replace separators in policies lists Org/Add/DEL_Policies with
+    commas */
+ p = Add_Policies;
+ while ( (p NE NULL) AND (p[0] NE NULL_CHAR) )
+ {
+  p = strchr(p,ADDINFO_LIST_ENTRY);
+  if (p NE NULL)
+    *p = ',';
+ }
+ p = Org_Policies;
+ while ( (p NE NULL) AND (p[0] NE NULL_CHAR) )
+ {
+  p = strchr(p,ADDINFO_LIST_ENTRY);
+  if (p NE NULL)
+    *p = ',';
+ }
+ p = Del_Policies;
+ while ( (p NE NULL) AND (p[0] NE NULL_CHAR) )
+ {
+  p = strchr(p,ADDINFO_LIST_ENTRY);
+  if (p NE NULL)
+    *p = ',';
+ }
+ /*------------------------------------------------------------------*/
+ if (ESA_DIAG_get_debug_level(comp) GE 4)
+ {
+  for (i = 0; i LE add_factor_index; i++)
+  {
+   ESA_DIAG_printf(comp, 0,
+     "Add_Factors[%d]:\n ",
+     i);
+   ESA_DIAG_printf(comp, 0,
+     "name              = %s\n ",
+     Add_Factors[i].name);
+   ESA_DIAG_printf(comp, 0,
+     "IBM_name          = %s\n ",
+     Add_Factors[i].IBM_name);
+   ESA_DIAG_printf(comp, 0,
+     "active            = %c\n ",
+     Add_Factors[i].active);
+   ESA_DIAG_printf(comp, 0,
+     "policies_add      = %s\n ",
+     Add_Factors[i].policies_add);
+   ESA_DIAG_printf(comp, 0,
+     "policies_del      = %s\n ",
+     Add_Factors[i].policies_del);
+   ESA_DIAG_printf(comp, 0,
+     "TAGs_add          = %s\n ",
+     Add_Factors[i].TAGs_add);
+   ESA_DIAG_printf(comp, 0,
+     "TAGs_del          = %s\n ",
+     Add_Factors[i].TAGs_del);
+  }
+  for (i = 0; i LE chg_factor_index; i++)
+  {
+   ESA_DIAG_printf(comp, 0,
+     "Chg_Factors[%d]:\n ",
+     i);
+   ESA_DIAG_printf(comp, 0,
+     "name              = %s\n ",
+     Chg_Factors[i].name);
+   ESA_DIAG_printf(comp, 0,
+     "IBM_name          = %s\n ",
+     Chg_Factors[i].IBM_name);
+   ESA_DIAG_printf(comp, 0,
+     "active            = %c\n ",
+     Chg_Factors[i].active);
+   ESA_DIAG_printf(comp, 0,
+     "policies_add      = %s\n ",
+     Chg_Factors[i].policies_add);
+   ESA_DIAG_printf(comp, 0,
+     "policies_del      = %s\n ",
+     Chg_Factors[i].policies_del);
+   ESA_DIAG_printf(comp, 0,
+     "TAGs_add          = %s\n ",
+     Chg_Factors[i].TAGs_add);
+   ESA_DIAG_printf(comp, 0,
+     "TAGs_del          = %s\n ",
+     Chg_Factors[i].TAGs_del);
+  }
+  for (i = 0; i LE org_factor_index; i++)
+  {
+   ESA_DIAG_printf(comp, 0,
+     "Org_Factors[%d]:\n ",
+     i);
+   ESA_DIAG_printf(comp, 0,
+     "name              = %s\n ",
+     Org_Factors[i].name);
+   ESA_DIAG_printf(comp, 0,
+     "IBM_name          = %s\n ",
+     Org_Factors[i].IBM_name);
+   ESA_DIAG_printf(comp, 0,
+     "active            = %c\n ",
+     Org_Factors[i].active);
+   ESA_DIAG_printf(comp, 0,
+     "policies_add      = %s\n ",
+     Org_Factors[i].policies_add);
+   ESA_DIAG_printf(comp, 0,
+     "policies_del      = %s\n ",
+     Org_Factors[i].policies_del);
+   ESA_DIAG_printf(comp, 0,
+     "TAGs_add          = %s\n ",
+     Org_Factors[i].TAGs_add);
+   ESA_DIAG_printf(comp, 0,
+     "TAGs_del          = %s\n ",
+     Org_Factors[i].TAGs_del);
+  }
+ }
+ /*---------------------------------------------------------------*/
+ /* now we need to:
+    decide in which order to build and issue the RACF commands.
+     call the RACF_Build_MFA_cmd routine per command
+     issue each command.
+   All policies were distributed among add or chg factors
+   (if any factors).
+   The minimum number commands is the number of factors that we have
+   to add+del+change becuase each factor needs a command of its own.
+   Additionally, add and del policies can't appear in the same command,
+   and we assume that the same is true for tags and deltags.
+   The strategy of dividing to commands will be as follows:
+   Each factor in Add_Factors and Chg_Factors may need 2 commands in
+   case it has both add and del policies or add and del tags.
+   We will combine add policies with add tags and del policies with del
+   tags. If there is only one type of each (one add and another del) we
+   can combine them in the same command.
+ */
+
+ fallback = PWFALLBACK;
+ /* handle the Chg.Factors  */
+ for (i = 1; i LE num_chg_factors; i++)
+ {
+  j = i - 1;
+   ESA_DIAG_printf(comp, 5,
+     "Handling Chg factor index  %d\n ",j);
+  num_cmds = 1;
+  if ( (Chg_Factors[j].policies_add[0] NE NULL_CHAR) AND
+       (Chg_Factors[j].policies_del[0] NE NULL_CHAR) )
+       num_cmds = 2;
+  /*
+  if ( (Chg_Factors[j].TAGs_add[0] NE NULL_CHAR) AND
+       (Chg_Factors[j].TAGs_del[0] NE NULL_CHAR) )
+       num_cmds = 2;
+  */
+  for (this_cmd = 1; this_cmd LE num_cmds; this_cmd++)
+  {
+   ESA_DIAG_printf(comp, 5,
+     "Handling Chg factor index = %d, this_cmd = %d, num_cmds = %d\n ",
+      j,this_cmd,num_cmds);
+   cmd_index++;
+   cmd[cmd_index][0] = NULL_CHAR;
+   rc =  RACF_Build_MFA_cmd(comp,
+                 MAP,
+                 id,
+                 act,
+                 cmd[cmd_index],
+                 'C',
+                 this_cmd,
+                 num_cmds,
+                &Chg_Factors[j],
+                 NULL,               /*      delfactor    */
+                 NULL,               /*      addpolicy    */
+                 NULL,               /*      delpolicy    */
+                 fallback,           /*      pwfallback   */
+                 Org_Factors,
+                 Org_Factors_List,
+                 org_factor_index,
+                 Org_Policies,
+                 Org_PWFALLBACK,
+                 Org_ENABLE,
+                 rcmd[cmd_index],
+                 admin_params);
+   if (rc NE ESA_OK)
+    goto exit;
+   if (cmd[cmd_index][0] NE NULL_CHAR)
+    fallback = NULL_CHAR;
+  }
+ }
+ /* handle the Add_Factors and Del_Factor_Array */
+ while (left_add_factors OR left_del_factors)
+ {
+   ESA_DIAG_printf(comp, 5,
+     "Some factors left:\n ");
+   ESA_DIAG_printf(comp, 5,
+     "left_add_factors = %d  left_del_factors = %d \n ",
+      left_add_factors, left_del_factors);
+  if (  (total_existing_factors LT 10)   AND
+        (left_add_factors)    )
+  {
+   j = num_add_factors - left_add_factors;
+   ESA_DIAG_printf(comp, 5,
+     "Handling Add factor index  %d\n ",j);
+   num_cmds = 1;
+   if ( (Add_Factors[j].policies_add[0] NE NULL_CHAR) AND
+        (Add_Factors[j].policies_del[0] NE NULL_CHAR) )
+        num_cmds = 2;
+   /*
+   if ( (Add_Factors[j].TAGs_add[0] NE NULL_CHAR) AND
+        (Add_Factors[j].TAGs_del[0] NE NULL_CHAR) )
+        num_cmds = 2;
+   */
+
+   for (this_cmd = 1; this_cmd LE num_cmds; this_cmd++)
+   {
+    ESA_DIAG_printf(comp, 5,
+     "Handling Add factor index = %d, this_cmd = %d, num_cmds = %d\n ",
+      j,this_cmd,num_cmds);
+    cmd_index++;
+    cmd[cmd_index][0] = NULL_CHAR;
+    rc =  RACF_Build_MFA_cmd(comp,
+                  MAP,
+                  id,
+                  act,
+                  cmd[cmd_index],
+                  'F',
+                  this_cmd,
+                  num_cmds,
+                 &Add_Factors[j],
+                  NULL,               /*      delfactor    */
+                  NULL,               /*      addpolicy    */
+                  NULL,               /*      delpolicy    */
+                  fallback,           /*      pwfallback   */
+                  Org_Factors,
+                  Org_Factors_List,
+                  org_factor_index,
+                  Org_Policies,
+                  Org_PWFALLBACK,
+                  Org_ENABLE,
+                  rcmd[cmd_index],
+                  admin_params);
+    if (rc NE ESA_OK)
+     goto exit;
+    if (cmd[cmd_index][0] NE NULL_CHAR)
+     fallback = NULL_CHAR;
+   }
+   total_existing_factors++;
+   left_add_factors--;
+   continue;
+  }
+  /* reached 10 factors or no more add factors */
+  ptr_add_policies = NULL;
+  ptr_del_policies = NULL;
+  if ( (left_add_factors EQ 0) AND (left_del_factors GT 0)  )
+  {
+    ESA_DIAG_printf(comp, 5,
+   "No left_add_factors and %d left_del_factors \n ",left_del_factors);
+
+   if (num_del_policies GT 0)
+   {
+     ptr_del_policies = Del_Policies;
+     num_del_policies = 0;
+   }
+   else
+   {
+   if (num_general_policies_add GT 0)
+     ptr_add_policies = Add_Policies;
+     num_general_policies_add = 0;
+   }
+  }
+
+  if (left_del_factors GT 0)
+  {
+   ESA_DIAG_printf(comp, 5,
+    "Handling Del factor index  %d\n ",
+     num_del_factors - left_del_factors);
+   cmd_index++;
+   cmd[cmd_index][0] = NULL_CHAR;
+   rc =  RACF_Build_MFA_cmd(comp,
+                   MAP,
+                   id,
+                   act,
+                   cmd[cmd_index],
+                   'D',
+                   1,
+                   1,
+                   NULL,
+                   Del_Factors_Array[num_del_factors-left_del_factors],
+                   ptr_add_policies,   /*      addpolicy    */
+                   ptr_del_policies,   /*      delpolicy    */
+                   fallback,           /*      pwfallback   */
+                   Org_Factors,
+                   Org_Factors_List,
+                   org_factor_index,
+                   Org_Policies,
+                   Org_PWFALLBACK,
+                   Org_ENABLE,
+                   rcmd[cmd_index],
+                   admin_params);
+   if (rc NE ESA_OK)
+    goto exit;
+   if (cmd[cmd_index][0] NE NULL_CHAR)
+    fallback = NULL_CHAR;
+   left_del_factors--;
+   total_existing_factors--;
+  }
+ } /* end while */
+ /*-----------------------------------------------------------------*/
+ /* If any policies remain and or PWFALLBACK we need      */
+ /* to issue general command(s)                           */
+
+ while (  (cmd_index LE (MAX_FACTORS*2 + 1) ) AND
+          ( (fallback NE NULL_CHAR)  OR
+            (num_del_policies GT 0)  OR
+            (num_general_policies_add GT 0) ) )
+ {
+  ptr_add_policies = NULL;
+  ptr_del_policies = NULL;
+  if (num_del_policies GT 0)
+  {
+   ESA_DIAG_printf(comp, 5,
+    "Handling General del: num_del_policies = %d, fallback = %c \n",
+    num_del_policies,fallback);
+    ptr_del_policies = Del_Policies;
+    num_del_policies = 0;
+  }
+  else
+  if (num_general_policies_add GT 0)
+  {
+   ESA_DIAG_printf(comp, 5,
+    "Handling General add: num_general_policies_add = %d, "
+    "fallback = %c \n",
+    num_general_policies_add,fallback);
+    ptr_add_policies = Add_Policies;
+    num_general_policies_add  = 0;
+  }
+  else
+  if (fallback NE NULL_CHAR)
+  {
+   ESA_DIAG_printf(comp, 5,
+    "Handling General fallback only: fallback =  %c \n",
+    fallback);
+  }
+  cmd_index++;
+  cmd[cmd_index][0] = NULL_CHAR;
+  rc =  RACF_Build_MFA_cmd(comp,
+                  MAP,
+                  id,
+                  act,
+                  cmd[cmd_index],
+                  'G',
+                  1,
+                  1,
+                  NULL,
+                  NULL,
+                  ptr_add_policies,   /*      addpolicy    */
+                  ptr_del_policies,   /*      delpolicy    */
+                  fallback,           /*      pwfallback   */
+                  Org_Factors,
+                  Org_Factors_List,
+                  org_factor_index,
+                  Org_Policies,
+                  Org_PWFALLBACK,
+                  Org_ENABLE,
+                  rcmd[cmd_index],
+                  admin_params);
+  if (rc NE ESA_OK)
+   goto exit;
+  if (cmd[cmd_index][0] NE NULL_CHAR)
+   fallback = NULL_CHAR;
+ }
+ /*-------------------------------------------------------------------*/
+ /* issue the MFA commands                                            */
+ /*-------------------------------------------------------------------*/
+ any_cmd_ok = FALSE;
+ for (i = 0; i LE cmd_index; i++)
+ {
+  if (cmd[i][0] EQ NULL_CHAR) continue;
+  fallback = NULL_CHAR;
+  rc = racfcmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+              cmd[i], MAX_OK_RC_0,
+              0,
+              NULL, NULL, NULL, admin_params,
+              CMDOUT_YES, RACF_NO);
+  ESA_DIAG_printf(comp, 5,
+                 "racfcmd rc = %d", rc);
+  if (rc NE ESA_OK)
+   if (any_cmd_ok AND *act EQ 'U') goto rollback;
+   else
+   {
+    CTSAMSG_print(RACF_MFA_CMD_FAILURE, msgs, NULL, dest,
+           act, id, rc);
+    goto exit;
+   }
+  any_cmd_ok = TRUE;
+ }
+ goto exit;
+ /*------------------------------------------------------------------*/
+ /* roll back all successful MFA commands in reverse order           */
+ /*------------------------------------------------------------------*/
+ rollback:
+ CTSAMSG_print(RACF_MFA_CMD_ROLLBACK, msgs, NULL, dest, act, id, rc);
+
+ for (i = i-1; i GE 0; i--)
+ {
+  if (rcmd[i][0] EQ NULL_CHAR) continue;
+   ESA_DIAG_printf(comp, 5,
+                   "rollback cmd = <%s>", rcmd[i]);
+   rc = racfcmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+                rcmd[i], MAX_OK_RC_0,
+                0,
+                NULL, NULL, NULL, admin_params,
+                CMDOUT_YES, RACF_NO);
+   ESA_DIAG_printf(comp, 5,
+                   "racfcmd rc = %d", rc);
+   if (rc NE ESA_OK)
+   {
+    CTSAMSG_print(RACF_MFA_CMD_ROLLBACK_FAIL, msgs, NULL, dest,
+             act, id, rc);
+    rc = ESA_FATAL;
+    goto exit;
+   }
+   if (strcmp(rcmd[i] + strlen(rcmd[i]) - 5,"NOMFA") EQ 0)
+    break;
+ }
+ rc = ESA_FATAL;
+ goto exit;
+ /*-----------------------------------------------------------------*/
+
+ exit :;
+
+  ESA_DIAG_exit(comp, 1, func, rc);
+
+  return rc;
+
+}
+/***********************************************************************
+*                                                                      *
+* Subroutine name : RACF_Build_MFA_cmd                                 *
+* DESCRIPTION     : Build an MFA command                               *
+* INPUT           : comp        - component                            *
+*                   MAP         - translation map of user factor name  *
+*                                 to IBM factor name                   *
+*                   id          - user id                              *
+*                   tran        - AddUsr/UpdUsr                        *
+*                   cmd         - area for the output command          *
+*                   act         - 'F' Factor (ADD) provided in factor  *
+*                               - 'C' Factor (CHG) provided in factor  *
+*                               - 'D' Delfactor provided in the        *
+*                                 delfactor parameter                  *
+*                               - 'N' NOMFA                            *
+*                               - 'G' like general 'Y' but when        *
+*                                 only general parameters provided     *
+*                   this_cmd    - 1 or 2                               *
+*                                 1 of 1: build add & del (there is 1  *
+*                                         of each of policies and tags)*
+*                                 1 of 2: build delete policies & tags *
+*                                 2 of 2: build add    policies & tags *
+*                   num_cmds      1 or 2  number of commands needed    *
+*                   factor      - a factor struct                      *
+*                   delfactor   - factor name to delete                *
+*                   addpolicy   - list of policies to add              *
+*                   delpolicy   - list of policies to del              *
+*                   pwfallback  - Y/N                                  *
+*                   admin_params                                       *
+*                                                                      *
+* OUTPUT          : none                                               *
+*                                                                      *
+* RETURN VALUE    : ESA_RC                                             *
+*                                                                      *
+* WHEN TO USE:      This function should be called to prepare          *
+*                   an MFA command text.                               *
+***********************************************************************/
+
+static ESA_RC RACF_Build_MFA_cmd (ESA_DIAG_COMP_typ  comp,
+                      RACF_MFA_TRANMAP            MAP,
+                      char                        *id,
+                      char                        *tran,
+                      char                        *cmd,
+                      char                        act,
+                      int                         this_cmd,
+                      int                         num_cmds,
+                      RACF_Factor                 *factor,
+                      char                        *delfactor,
+                      char                        *addpolicy,
+                      char                        *delpolicy,
+                      char                        fallback,
+                      RACF_Factor                 org_factors[],
+                      char                        *org_factors_list,
+                      int                         org_factor_index,
+                      char                        *org_policies,
+                      char                        org_pwfallback,
+                      char                        org_enable,
+                      char                        *rcmd,
+                      ADMIN_PARAMS_rec_typ        *admin_params)
+{
+
+  static char func[]="RACF_Build_MFA_cmd";
+  ESA_RC    rc = ESA_OK;
+  int        i = 0;
+  int    anycmd = FALSE;
+  int    org_factor_found = FALSE;
+  char   msg[200] = { NULL_CHAR };
+  char   pre[20] = { NULL_CHAR };
+  char   policy[20+1] = { NULL_CHAR };
+  char  outlist[POLICIES_SIZE] = { NULL_CHAR };
+  char  *plist = NULL;
+  char  *ptags = NULL;
+  char      sublistsep[2] = {ADDINFO_LIST_SUBFIELD, NULL_CHAR};
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+  ESA_DIAG_enter(comp, 1, func );
+
+  org_factor_found = FALSE;
+  if (factor NE NULL)
+   for (i = 0; i LE org_factor_index; i++)
+   {
+     if (strcmp(factor->IBM_name, org_factors[i].IBM_name) EQ 0)
+     {
+       org_factor_found = TRUE;
+       ESA_DIAG_printf(comp, 5,
+                 "factor = <%s> found in org_factors i = %d",
+                  factor->IBM_name, i);
+       ESA_DIAG_printf(comp, 5,
+                 "org_factors[i].active = %c",
+                  org_factors[i].active);
+       break;
+     }
+   }
+  else if (delfactor NE NULL)
+   for (i = 0; i LE org_factor_index; i++)
+   {
+     if (strcmp(delfactor, org_factors[i].IBM_name) EQ 0)
+     {
+       org_factor_found = TRUE;
+       ESA_DIAG_printf(comp, 5,
+                 "delfactor = <%s> found in org_factors i = %d",
+                  delfactor, i);
+       ESA_DIAG_printf(comp, 5,
+                 "org_factors[i].active = %c",
+                  org_factors[i].active);
+       break;
+     }
+   }
+  strcpy(pre, "ALU ");
+  strcat(pre, id);
+  strcat(pre, " MFA(");
+  switch (act)
+  {
+   case('F'):
+   case('C'):
+      strcpy(cmd,pre);
+      strcpy(rcmd,pre);
+      if (fallback NE NULL_CHAR)
+       if (fallback EQ 'Y')
+        {
+         strcat(cmd, "PWFALLBACK ");
+         strcat(rcmd, "NOPWFALLBACK ");
+         anycmd = TRUE;
+        }
+       else
+       if (fallback EQ 'N')
+        {
+         strcat(cmd, "NOPWFALLBACK ");
+         strcat(rcmd, "PWFALLBACK ");
+         anycmd = TRUE;
+        }
+
+      strcat(cmd, "FACTOR(");
+      strcat(cmd, factor->IBM_name);
+      strcat(cmd, ")");
+      if (act EQ 'F') anycmd = TRUE;
+      if (org_factor_found)
+      {
+       strcat(rcmd, "FACTOR(");
+       strcat(rcmd, factor->IBM_name);
+       strcat(rcmd, ")");
+      }
+      else
+      {
+       strcat(rcmd, "DELFACTOR(");
+       strcat(rcmd, factor->IBM_name);
+       strcat(rcmd, ")");
+      }
+      if (this_cmd EQ 1)
+       if (factor->active NE NULL_CHAR)
+        if ( (org_factor_found AND
+             (org_factors[i].active NE factor->active) )
+              OR
+             (NOT org_factor_found) )
+         if (factor->active EQ 'Y')
+         {
+          anycmd = TRUE;
+          strcat(cmd, " ACTIVE");
+          if (org_factor_found)
+           strcat(rcmd, " NOACTIVE");
+         }
+         else
+         if (factor->active EQ 'N')
+         {
+          anycmd = TRUE;
+          strcat(cmd, " NOACTIVE");
+          if (org_factor_found)
+           strcat(rcmd, " ACTIVE");
+         }
+
+      if ( (this_cmd EQ 1) AND (num_cmds EQ 1) )
+      {
+       if (factor->policies_add[0] NE NULL_CHAR)
+       {
+         anycmd = TRUE;
+         strcat(cmd, " ADDPOLICY(");
+         strcat(cmd, factor->policies_add);
+         strcat(cmd, ")");
+         strcat(rcmd, " DELPOLICY(");
+         strcat(rcmd, factor->policies_add );
+         strcat(rcmd, ")");
+       }
+
+       /* build commands for tags */
+       rc = RACF_Prep_TAGs_cmd(comp,
+                                factor,
+              org_factor_found? &org_factors[i] : NULL,
+                                cmd,
+                                rcmd,
+                                &anycmd,
+                                dest,
+                                msgs);
+       if (rc NE ESA_OK)
+       {
+          sprintf(msg,
+          "%s %s failed: RACF_Prep_TAGs_cmd   rc = %d",
+          id,tran,rc);
+          CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                        component,func, msg, 16,__LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+       }
+
+       if (factor->policies_del[0] NE NULL_CHAR)
+       {
+         strcat(cmd, " DELPOLICY(");
+         strcat(cmd, factor->policies_del);
+         strcat(cmd, ")");
+         anycmd = TRUE;
+         strcat(rcmd, " ADDPOLICY(");
+         strcat(rcmd, factor->policies_del);
+         strcat(rcmd, ")");
+       }
+      }
+
+      if ( (this_cmd EQ 1) AND (num_cmds EQ 2) )
+      {
+       if (factor->policies_del[0] NE NULL_CHAR)
+       {
+         anycmd = TRUE;
+         strcat(cmd, " DELPOLICY(");
+         strcat(cmd, factor->policies_del);
+         strcat(cmd, ")");
+         strcat(rcmd, " ADDPOLICY(");
+         strcat(rcmd, factor->policies_del);
+         strcat(rcmd, ")");
+       }
+       /* build commands for tags */
+       rc = RACF_Prep_TAGs_cmd(comp,
+                                factor,
+              org_factor_found? &org_factors[i] : NULL,
+                                cmd,
+                                rcmd,
+                                &anycmd,
+                                dest,
+                                msgs);
+       if (rc NE ESA_OK)
+       {
+          sprintf(msg,
+          "%s %s failed: RACF_Build_TAGs_rcmd  rc = %d",
+          id,tran,rc);
+          CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                        component,func, msg, 16,__LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+       }
+      }
+
+      if ( (this_cmd EQ 2) AND (num_cmds EQ 2) )
+      {
+       if (factor->policies_add[0] NE NULL_CHAR)
+       {
+         anycmd = TRUE;
+         strcat(cmd, " ADDPOLICY(");
+         strcat(cmd, factor->policies_add);
+         strcat(cmd, ")");
+         strcat(rcmd, " DELPOLICY(");
+         strcat(rcmd, factor->policies_add);
+         strcat(rcmd, ")");
+       }
+       /*
+       if (factor->TAGs_add[0] NE NULL_CHAR)
+       {
+         anycmd = TRUE;
+         strcat(cmd, " TAGS(");
+         strcat(cmd, factor->TAGs_add);
+         strcat(cmd, ")");
+         /@ todo: add rcmd to delete the tags that were added @/
+       }
+       */
+      }
+      break;
+   case('N'):
+      anycmd = TRUE;
+      strcpy(cmd, "ALU ");
+      strcat(cmd, id);
+      strcat(cmd, " NOMFA");
+      break;
+   case('D'):
+      strcpy(cmd,pre);
+      strcpy(rcmd,pre);
+      if ( (fallback NE NULL_CHAR) AND (org_pwfallback NE fallback) )
+       if (fallback EQ 'Y')
+        {
+         anycmd = TRUE;
+         strcat(cmd, "PWFALLBACK ");
+         strcat(rcmd, "NOPWFALLBACK ");
+        }
+       else
+       if (fallback EQ 'N')
+        {
+         anycmd = TRUE;
+         strcat(cmd, "NOPWFALLBACK ");
+         strcat(rcmd, "PWFALLBACK ");
+        }
+
+      if (org_factor_found)
+      {
+       anycmd = TRUE;
+       strcat(cmd, "DELFACTOR(");
+       strcat(cmd, delfactor);
+       strcat(cmd, ")");
+       strcat(rcmd, "FACTOR(");
+       strcat(rcmd, delfactor);
+       strcat(rcmd, ")");
+       ESA_DIAG_printf(comp, 5,
+                 "org_factors[i].active = %c",
+                  org_factors[i].active);
+       if (org_factors[i].active EQ 'Y')
+        strcat(rcmd, " ACTIVE");
+       else
+       if (org_factors[i].active EQ 'N')
+        strcat(rcmd, " NOACTIVE");
+       if (org_factors[i].TAGs_add[0] NE NULL_CHAR)
+       {
+        rc = RACF_Org_TAGs2rcmd(comp,org_factors[i].TAGs_add,
+                                rcmd,dest,msgs);
+        if (rc NE ESA_OK)
+        {
+           sprintf(msg,
+           "%s %s failed: RACF_Org_TAGs2rcmd rc = %d",
+           id,tran,rc);
+           CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                         component,func, msg, 16,__LINE__);
+         rc = ESA_FATAL;
+         goto exit;
+        }
+       }
+      }
+
+      if ( (addpolicy NE NULL) AND (addpolicy[0] NE NULL_CHAR) )
+      {
+        anycmd = TRUE;
+        strcat(cmd, " ADDPOLICY(");
+        strcat(cmd, addpolicy);
+        strcat(cmd, ")");
+        strcat(rcmd, " DELPOLICY(");
+        strcat(rcmd, addpolicy);
+        strcat(rcmd, ")");
+      }
+
+      if ( (delpolicy NE NULL) AND (delpolicy[0] NE NULL_CHAR) )
+      {
+        anycmd = TRUE;
+        strcat(cmd, " DELPOLICY(");
+        strcat(cmd, delpolicy);
+        strcat(cmd, ")");
+        strcat(rcmd, " ADDPOLICY(");
+        strcat(rcmd, delpolicy);
+        strcat(rcmd, ")");
+      }
+      break;
+   case('G'):
+      strcpy(cmd,pre);
+      strcpy(rcmd,pre);
+   general:
+      if (fallback NE NULL_CHAR)
+       if (fallback EQ 'Y')
+        {
+         strcat(cmd, "PWFALLBACK ");
+         strcat(rcmd, "NOPWFALLBACK ");
+         anycmd = TRUE;
+        }
+       else
+       if (fallback EQ 'N')
+        {
+         strcat(cmd, "NOPWFALLBACK ");
+         strcat(rcmd, "PWFALLBACK ");
+         anycmd = TRUE;
+        }
+      if ( (addpolicy NE NULL) AND (addpolicy[0] NE NULL_CHAR) )
+      {
+        anycmd = TRUE;
+        strcat(cmd, " ADDPOLICY(");
+        strcat(cmd, addpolicy);
+        strcat(cmd, ")");
+        strcat(rcmd, " DELPOLICY(");
+        strcat(rcmd, addpolicy);
+        strcat(rcmd, ")");
+      }
+
+      if ( (delpolicy NE NULL) AND (delpolicy[0] NE NULL_CHAR) )
+      {
+        anycmd = TRUE;
+        strcat(cmd, " DELPOLICY(");
+        strcat(cmd, delpolicy);
+        strcat(cmd, ")");
+        strcat(rcmd, " ADDPOLICY(");
+        strcat(rcmd, delpolicy);
+        strcat(rcmd, ")");
+      }
+      break;
+   default:
+           sprintf(msg,
+           "%s %s failed: Invalid action %c",
+           id,tran,act);
+           CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                         component,func, msg, 16,__LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+  }
+  if (act NE 'N')
+     strcat(cmd, ")");
+  exit :;
+
+  if (anycmd)
+  {
+   if (org_enable EQ 'N')
+   {
+    strcpy(rcmd, "ALU ");
+    strcat(rcmd, id);
+    strcat(rcmd, " NOMFA");
+   }
+   ESA_DIAG_printf(comp, 5,
+                 "MFA cmd = <%s>\n",cmd);
+   ESA_DIAG_printf(comp, 5,
+                 "MFA rcmd = <%s>\n",rcmd);
+  }
+  else
+  {
+    cmd[0] = NULL_CHAR;
+    rcmd[0] = NULL_CHAR;
+   ESA_DIAG_printf(comp, 5,
+                 "nothing to do");
+  }
+
+  ESA_DIAG_exit(comp, 1, func, rc);
+  return rc;
+}
+/**************************************************************
+*                                                             *
+* Subroutine name : RACF_Trans_Factor_Usr2IBM                 *
+* DESCRIPTION     : Translate user factor name to IBM name    *
+* INPUT           : user_factor_name  - user factor name      *
+*                 : MAP         - MAP 3d array                *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : pointer to IBM name or NULL               *
+*                                                             *
+* WHEN TO USE:      This function should be called to         *
+*                   translate a user name factor to IBM name  *
+*                   based on MFA.MAP.user-name.IBM-name       *
+*                   attributes saved into a MAP 3d array      *
+**************************************************************/
+EXT char  * RACF_Trans_Factor_Usr2IBM (ESA_DIAG_COMP_typ comp,
+                      RACF_MFA_TRANMAP            MAP,
+                      char                        *user_factor_name,
+                      char                        *id,
+                      char                        *act,
+                      CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                      CTSAMSG_HANDLE_rec_ptr      msgs)
+{
+ ESA_RC    rc = ESA_OK;
+ int j = 0;
+ char *IBM_factor_name = NULL;
+ static char func[]="RACF_Trans_Factor_Usr2IBM";
+
+ ESA_DIAG_enter(comp, 1, func );
+ for (j = 0; j LT MAX_FACTORS; j++)
+ {
+  if (MAP[j][0] EQ NULL) break;
+  if (strcmp(user_factor_name,MAP[j][0]) EQ 0)
+  {
+     IBM_factor_name = MAP[j][1];
+     ESA_DIAG_printf(comp, 6,
+              "User factor name = <%s> \n",
+              user_factor_name);
+     ESA_DIAG_printf(comp, 6,
+              "IBM factor returned from MAP = <%s> \n",
+              IBM_factor_name);
+     break;
+  }
+ }
+
+ if (IBM_factor_name EQ NULL)
+   if (memcmp(user_factor_name,"AZF",3) EQ 0)
+      IBM_factor_name = user_factor_name;
+
+ if (IBM_factor_name EQ NULL)
+ {
+  CTSAMSG_print(RACF_MFA_TRANS_FAILURE, msgs, NULL, dest,
+           act, id, user_factor_name, user_factor_name, rc);
+  rc = ESA_FATAL;
+ }
+ ESA_DIAG_exit(comp, 1, func, rc);
+ return IBM_factor_name;
+}
+/**************************************************************
+*                                                             *
+* Subroutine name : RACF_Trans_Factor_IBM2Usr                 *
+* DESCRIPTION     : Translate IBM factor name to user name    *
+* INPUT           : IBM_factor_name                           *
+*                 : MAP         - MAP 3d array                *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : pointer to user name or NULL              *
+*                                                             *
+* WHEN TO USE:      This function should be called to         *
+*                   translate an IBM name factor to user name *
+*                   based on MFA.MAP.user-name.IBM-name       *
+*                   attributes save into a MAP 3d array       *
+**************************************************************/
+EXT char  * RACF_Trans_Factor_IBM2Usr (ESA_DIAG_COMP_typ comp,
+                      RACF_MFA_TRANMAP            MAP,
+                      char                        *IBM_factor_name,
+                      CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                      CTSAMSG_HANDLE_rec_ptr      msgs)
+{
+ ESA_RC    rc = ESA_OK;
+ int j = 0;
+ char *user_factor_name = NULL;
+ static char func[]="RACF_Trans_Factor_IBM2Usr";
+
+ ESA_DIAG_enter(comp, 1, func );
+ for (j = 0; j LT MAX_FACTORS; j++)
+ {
+  if (MAP[j][1] EQ NULL) break;
+  if (strcmp(IBM_factor_name,MAP[j][1]) EQ 0)
+  {
+     user_factor_name = MAP[j][0];
+     ESA_DIAG_printf(comp, 6,
+              "IBM factor name = <%s> \n",
+              IBM_factor_name);
+     ESA_DIAG_printf(comp, 6,
+              "User factor name from MAP = <%s> \n",
+              user_factor_name);
+     break;
+  }
+ }
+
+ if (user_factor_name EQ NULL)
+      user_factor_name = IBM_factor_name;
+
+ if (user_factor_name EQ NULL) rc = ESA_FATAL;
+ ESA_DIAG_exit(comp, 1, func, rc);
+ return user_factor_name;
+}
+/**************************************************************
+*                                                             *
+* Subroutine name : RACF_Build_MAP                            *
+* DESCRIPTION     : Build the 3d array translation map        *
+*                   1st column is user name                   *
+*                   2nd column is IBMr name                   *
+* INPUT           : Pointer to empty MAP 3 d array            *
+* OUTPUT          : MAP is filled                             *
+*                                                             *
+* RETURN VALUE    : rc                                        *
+*                                                             *
+* WHEN TO USE:      This function should be called to         *
+*                   build the translation map 3d array,       *
+*                   based on MFA.MAP.user-name.IBM-name       *
+*                   attributes.                               *
+**************************************************************/
+EXT ESA_RC  RACF_Build_MAP(ESA_DIAG_COMP_typ      comp,
+                      RACF_MFA_TRANMAP            MAP,
+                      ADDINFO_rec_ptr             addinfo,
+                      CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                      CTSAMSG_HANDLE_rec_ptr      msgs)
+{
+ static char func[]="RACF_Build_MAP";
+ ESA_RC    rc = ESA_OK;
+ ONE_FIELD_rec_ptr    pair = NULL;
+ int       i = 0;
+ int       pairs_left = 0;
+ int       l1 = 0;
+ char     *p1 = NULL;
+
+ ESA_DIAG_enter(comp, 1, func );
+
+ for (i = 0; i LT MAX_FACTORS; i++)
+ {
+   MAP[i][0][0] = NULL_CHAR;
+   MAP[i][1][0] = NULL_CHAR;
+ }
+
+ pair = ADDINFO_prefix_search("MFA.MAP.", RCF_ADDINFO_KWD_LEN,
+                                TRUE,   /* include NULL value */
+                                addinfo->pair, addinfo->num_pairs);
+ i = 0;
+ while (pair NE NULL)
+ {
+   p1 = strchr(pair->keyword + 8, '.');     /* dot between names     */
+   l1 = p1 - (pair->keyword + 8);           /* user factor name len  */
+   strncat(MAP[i][0],pair->keyword + 8,l1); /* copy user factor name */
+   strcat(MAP[i][1],p1 + 1);                /* copy IBM factor name  */
+
+   /* Ws10082N
+   pairs_left = addinfo->num_pairs - (pair - addinfo->pair) - 1; */
+   pairs_left = addinfo->num_pairs - (pair->index + 1); /* WS10082N */
+   if (pairs_left EQ 0) break;
+   i++;
+   pair = ADDINFO_prefix_search("MFA.MAP.", RCF_ADDINFO_KWD_LEN,
+                                TRUE, /* find also entries with empty
+                                         values */
+                                ppair(pair), pairs_left); /*WS10082N*/
+               /* WS10082N      pair+1, pairs_left);                */
+ }
+ if (MAP[0][0] EQ NULL)
+     ESA_DIAG_printf(comp, 5,
+                  "MFA.MAP entries not found in addinfo\n");
+ else
+ if (ESA_DIAG_get_debug_level(comp) GE 5)
+  for (i = 0; i LT MAX_FACTORS; i++)
+  {
+   if (MAP[i][0][0] EQ NULL_CHAR) break;
+     ESA_DIAG_printf(comp, 0,
+                  "MAP <%s>.<%s>\n",
+                  MAP[i][0], MAP[i][1]);
+  }
+ exit:
+ ESA_DIAG_exit(comp, 1, func, rc);
+ return rc;                                                /* BS10122 */
+}
+/**************************************************************
+*                                                             *
+* Subroutine name : RACF_Save_Org                             *
+* DESCRIPTION     : Build the original "before" picture       *
+*                   of the user's MFA parameters as returned  *
+*                   from RACF for roll back purposes          *
+* INPUT           : laddinfo                                  *
+* OUTPUT          : org_factors                               *
+*                   org_factor_list                           *
+*                   org_factor_list_usr                       *
+*                   org_factor_index                          *
+*                   org_pwfallback                            *
+*                   org_policies                              *
+*                   org_enable                                *
+* RETURN VALUE    : rc                                        *
+*                                                             *
+* WHEN TO USE:      Before issuing commands that change       *
+*                   MFA parameters we save the original       *
+*                   picture to enable roll back in case       *
+*                   a command failes after command(s)         *
+*                   succeeded.                                *
+**************************************************************/
+static ESA_RC  RACF_Save_Org(ESA_DIAG_COMP_typ    comp,
+                      RACF_MFA_TRANMAP            MAP,
+                      ADDINFO_rec_ptr             laddinfo,
+                      RACF_Factor                 org_factors[],
+                      char                        *org_factors_list,
+                      char                        *org_factors_list_usr,
+                      int                         *org_factor_index,
+                      char                        *org_policies,
+                      char                        *org_pwfallback,
+                      char                        *org_enable,
+                      CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                      CTSAMSG_HANDLE_rec_ptr      msgs)
+{
+ static char func[]="RACF_Save_Org";
+ ESA_RC               rc          = ESA_OK;
+ char                *ptr         = NULL;
+ ONE_FIELD_rec_ptr    pair        = NULL;
+ ONE_FIELD_rec_ptr    apair       = NULL;
+ ONE_FIELD_rec_ptr    tpair       = NULL;
+ char                *factor      = NULL;
+ char                *active      = NULL;
+ char                *tag         = NULL;
+ char                *tnext       = NULL;
+ int                  tags_len    = 0;
+ int                  act_len     = 0;
+ int                  num_factors = 0;
+ int                  i           = 0;
+ int                  fl          = 0;
+ int                  al          = 0;
+ int                  tl          = 0;
+ char   IBM_factor_name[20 + 1]   = { NULL_CHAR };
+ char                 msg[200]    = { NULL_CHAR };
+  char   listsep[2] = {ADDINFO_LIST_ENTRY, NULL_CHAR};
+
+ ESA_DIAG_enter(comp, 1, func );
+ if (laddinfo NE NULL)
+ {
+  ESA_DIAG_printf(comp,5,
+                  "laddinfo Original MFA attributes:\n");
+  pair = ADDINFO_search("MFA.PWFALLBACK", RCF_ADDINFO_KWD_LEN,
+                         laddinfo->pair,
+                         laddinfo->num_pairs);
+  if (pair NE NULL)
+  {
+   *org_pwfallback = pair->value[0];
+   ESA_DIAG_printf(comp,5,
+                  "MFA.PWFALLBACK value   = <%s>\n",
+                  pair->value);
+
+  if (pair->value[0] NE NULL_CHAR)
+   *org_enable = 'Y';
+  else
+   *org_enable = 'N';
+  ESA_DIAG_printf(comp,5,
+                  "org_enable value   = <%c>\n",
+                  *org_enable);
+  }
+
+  pair = ADDINFO_search("MFA.POLICIES", RCF_ADDINFO_KWD_LEN,
+                         laddinfo->pair,
+                         laddinfo->num_pairs);
+  if (pair NE NULL)
+  {
+   strcpy(org_policies,pair->value);
+   ESA_DIAG_printf(comp,5,
+                  "MFA.POLICEIS value   = <%s>\n",
+                  org_policies);
+  }
+  org_factors_list[0] = NULL_CHAR;
+  org_factors_list_usr[0] = NULL_CHAR;
+  pair = ADDINFO_search("MFA.FACTORS", RCF_ADDINFO_KWD_LEN,
+                         laddinfo->pair,
+                         laddinfo->num_pairs);
+  if (pair NE NULL)
+  {
+   ESA_DIAG_printf(comp,5,
+                  "MFA.FACTORS value   = <%s>\n",
+                  pair->value);
+   strcpy(org_factors_list,pair->value);
+   ptr = org_factors_list;
+   while ( (ptr NE NULL) AND (ptr[0] NE NULL_CHAR) )
+   {
+    ptr = strchr(ptr,ADDINFO_LIST_ENTRY);
+    if (ptr NE NULL)
+      *ptr = ',';
+   }
+   ptr = pair->value;
+   num_factors = 0;
+   if (ptr[0] NE NULL_CHAR)
+    while (ptr NE NULL)
+    {
+      ptr = strchr(ptr+1, ADDINFO_LIST_ENTRY);
+      num_factors++;
+    }
+
+   if (num_factors GT 0)
+   {
+    apair = ADDINFO_search("MFA.ACTIVE", RCF_ADDINFO_KWD_LEN,
+                      laddinfo->pair,
+                      laddinfo->num_pairs);
+    if (apair NE NULL)
+     ESA_DIAG_printf(comp, 4,
+            "apair->vallen = %d",apair->vallen);
+    tpair = ADDINFO_search("MFA.TAGS", RCF_ADDINFO_KWD_LEN,
+                      laddinfo->pair,
+                      laddinfo->num_pairs);
+    factor = pair->value;
+    active = apair->value;
+    act_len= apair->vallen;
+    tag    = tpair->value;
+    tags_len= tpair->vallen;
+    if ( (tpair NE NULL) AND (tags_len GT 0) )
+    {
+     ESA_DIAG_printf(comp, 4,
+            "TAGs = %s",tag);
+    }
+
+    for (i = 1; i LE num_factors; i++)
+    {
+     (*org_factor_index)++;
+     ptr = strchr(factor, ADDINFO_LIST_ENTRY);
+     if (ptr NE NULL)
+       fl = ptr - factor;
+     else
+       fl = strlen(factor);
+     strncpy(org_factors[*org_factor_index].IBM_name,factor,fl);
+     strcpy(org_factors[*org_factor_index].name,
+            RACF_Trans_Factor_IBM2Usr(comp,
+                                 MAP,
+                                 org_factors[*org_factor_index].IBM_name,
+                                 dest,
+                                 msgs));
+     if (org_factors_list_usr[0] NE NULL_CHAR)
+      strcat(org_factors_list_usr,listsep);
+     strcat(org_factors_list_usr,org_factors[*org_factor_index].name);
+     factor = ptr + 1;
+     ESA_DIAG_printf(comp, 4,
+            "Factor returned by RACF = <%s>\n",
+                  org_factors[*org_factor_index].IBM_name);
+     memcpy(org_factors[*org_factor_index].eyec,"FACT",4);
+     ESA_DIAG_printf(comp, 4,
+            "ACTIVE returned by RACF = <%s>\n",
+                  active);
+     if (apair NE NULL)   /* apair is returned by RACF */
+     {
+      ptr = strchr(active, ADDINFO_LIST_ENTRY);
+      if (ptr NE NULL)
+       al = ptr - active;
+      else
+       al = strlen(active);
+
+      ESA_DIAG_printf(comp, 4,
+            "Current ACTIVE returned by RACF =(%d) <%.*s>\n",
+                  al,al,active);
+      if (  (al EQ 16) AND
+            (strncmp(active,"FFFFFFFFFFFFFFFF",16) EQ 0) )
+       org_factors[*org_factor_index].active = 'N';
+      else
+       org_factors[*org_factor_index].active = 'Y';
+
+      ESA_DIAG_printf(comp, 4,
+                 "ACTIVE : value <%c>",
+                 org_factors[*org_factor_index].active);
+      active = ptr + 1;
+      if ( (tpair NE NULL) AND (tags_len GT 0) )
+      {
+       tnext = strchr(tag, ADDINFO_LIST_ENTRY);
+       if (tnext NE NULL)
+        tl = tnext - tag;
+       else
+        tl = strlen(tag);
+       ESA_DIAG_printf(ESA_COMP_GTUSERS, 4,
+           "This factor's tag(s) = %.*s",  tl, tag);
+
+       if (tl NE strlen("NOTAGS")  OR
+            strncmp("NOTAGS", tag, tl) NE 0 )
+       {
+        memcpy(org_factors[*org_factor_index].TAGs_add ,tag, tl);
+        org_factors[*org_factor_index].TAGs_add[tl] = NULL_CHAR;
+       }
+       else
+        org_factors[*org_factor_index].TAGs_add[0] = NULL_CHAR;
+
+       tag = tag + tl + 1;
+      }
+     }
+    }
+   }
+  }
+ }
+ exit:
+ ESA_DIAG_exit(comp, 1, func, rc);
+ return rc;                                                /* BS10122 */
+}
+/**************************************************************
+*                                                             *
+* Subroutine name : Remove_Dups                               *
+* DESCRIPTION     : remove duplicates in a list               *
+* INPUT           : inlist                                    *
+*                   insep                                     *
+*                   outsep                                    *
+* OUTPUT          : outlist                                   *
+* RETURN VALUE    : rc                                        *
+*                                                             *
+* WHEN TO USE:      To remove duplicates from a list          *
+**************************************************************/
+static ESA_RC  Remove_Dups  (ESA_DIAG_COMP_typ           comp,
+                      char                       *inlist,
+                      char                       *outlist,
+                      char                        insep,
+                      char                        outsep,
+                      CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                      CTSAMSG_HANDLE_rec_ptr      msgs)
+{
+ static char func[]="Remove_Dups";
+ ESA_RC      rc    = ESA_OK;
+ int         i     = 0;
+ char       *pl    = NULL;
+ char       *ps    = NULL;
+ char       *pe    = NULL;
+ char  olistsep[2] = { NULL_CHAR };
+ char  element[50] = { NULL_CHAR };
+ char  myoutlist[50] = { NULL_CHAR };
+
+ ESA_DIAG_enter(comp, 1, func );
+
+ olistsep[0] = outsep;
+ olistsep[1] = NULL_CHAR;
+
+ *outlist = NULL_CHAR;
+
+ ESA_DIAG_printf(comp, 4, "inlist = <%s>", inlist);
+
+ if ( (inlist EQ NULL) OR (*inlist EQ NULL_CHAR) )
+  goto exit;
+
+ ps = inlist;
+ /* For each element in the list check if it appears in the following
+    sublist. if it doesn't appear then copy to outlist. Otherwise skip
+    to next element
+ */
+ do
+ {
+  element[0]=NULL_CHAR;
+  pe = strchr(ps, insep);
+  if (pe EQ NULL)  /* this is the last element, we need it */
+  {
+   ESA_DIAG_printf(comp, 4,
+                "last element = <%s>", ps);
+
+   if (outlist[0] NE NULL_CHAR)
+    strcat(outlist,olistsep);
+   strcat(outlist,ps);
+  }
+  else
+  {
+   strncat(element,ps,pe-ps);
+   element[pe-ps] = NULL_CHAR;
+   ESA_DIAG_printf(comp, 4,
+                "element = <%s>", element);
+   myoutlist[0] = NULL_CHAR;
+   rc = ADDINFO_list_diff(element, pe+1, myoutlist,
+                          insep,outsep);
+   if (rc NE ESA_OK)
+   {
+    rc = ESA_FATAL;
+    goto exit;
+   }
+
+   if (myoutlist[0] NE NULL_CHAR)
+   {
+    ESA_DIAG_printf(comp, 4,
+                "element = <%s> not found in inlist", element);
+    /* the element doesn't appear again */
+    if (outlist[0] NE NULL_CHAR)
+     strcat(outlist,olistsep);
+
+    strcat(outlist,element);
+    ESA_DIAG_printf(comp, 4,
+                "outlist after element copied = <%s>",outlist);
+   }
+   else
+    ESA_DIAG_printf(comp, 4,
+                "element = <%s> was found in inlist", element);
+  ps = pe+1;
+  }
+ } while(pe NE NULL);
+
+ ESA_DIAG_printf(comp, 4,
+                "Final outlist = <%s>",outlist);
+ exit:
+ ESA_DIAG_exit(comp, 1, func, rc);
+ return rc;
+}
+/**************************************************************
+*                                                             *
+* Subroutine name : RACF_Org_TAGs2rcmd                        *
+* DESCRIPTION     : Add original tags to rcmd for roll back   *
+*                   Must enclose name:value which contains    *
+*                   blank with double quotes                  *
+* INPUT           : tags                                      *
+*                   rcmd                                      *
+* OUTPUT          : rcmd                                      *
+* RETURN VALUE    : rc                                        *
+*                                                             *
+* WHEN TO USE:      When rcmd (roll back command) is prepared *
+**************************************************************/
+static ESA_RC  RACF_Org_TAGs2rcmd  (ESA_DIAG_COMP_typ    comp,
+                             char                *tags,
+                             char                *rcmd,
+                      CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                      CTSAMSG_HANDLE_rec_ptr      msgs)
+{
+ static char func[]   ="RACF_Org_TAGs2rcmd";
+ ESA_RC      rc       = ESA_OK;
+ int         tl       = 0;
+ char       *p        = NULL;
+ char       *subsep   = NULL;
+ char       *blank    = NULL;
+ char       *ptags    = NULL;
+
+ ESA_DIAG_enter(comp, 1, func );
+
+ ESA_DIAG_printf(comp, 4,
+                "TAGs = <%s>",tags);
+ strcat(rcmd, " TAGS(");
+
+ if (strchr(tags, ' ') EQ NULL)
+ {
+  /* no blanks at all */
+  p = rcmd + strlen(rcmd);
+  strcat(rcmd, tags);
+  do
+  {
+   p = strchr(p,ADDINFO_LIST_SUBFIELD);
+   if (p NE NULL)
+     *p = ',';
+  } while (p NE NULL);
+ }
+ else
+ {
+  ptags = tags;
+  do
+  {
+   subsep = strchr(ptags, ADDINFO_LIST_SUBFIELD);
+
+   if (subsep NE NULL)
+    tl =  subsep - ptags;
+   else
+    tl = strlen(ptags);
+
+   blank = strchr(ptags, ' ');
+   if ( (blank NE NULL) AND (blank LT (ptags + tl)) )
+   {
+    /* blank in this tag */
+    strcat(rcmd,"\"");
+    strncat(rcmd,ptags,tl);
+    strcat(rcmd,"\"");
+   }
+   else
+   {
+    strncat(rcmd,ptags,tl);
+   }
+   ptags = ptags + tl;
+   if (*ptags EQ ADDINFO_LIST_SUBFIELD)
+     *ptags = ',';
+  } while (*ptags NE NULL_CHAR);
+ }
+
+ strcat(rcmd, ")");
+
+ exit:
+ ESA_DIAG_printf(comp, 4,
+                "rcmd = <%s>",rcmd);
+ ESA_DIAG_exit(comp, 1, func, rc);
+ return rc;
+}
+/**************************************************************
+*                                                             *
+* Subroutine name : RACF_Find_Org_TAG                         *
+* DESCRIPTION     : Find tag by name in original tags         *
+*                   Must enclose name:value which contains    *
+*                   blank with double quotes                  *
+* INPUT           : tags   original tags                      *
+*                   name   start of tag name to find          *
+*                   lname  tag name len                       *
+*                   ptag   where to return pointer to tag     *
+*                   ltag   where to return tag len            *
+*                   blnk   where to return indication if      *
+*                          value includes blank               *
+* OUTPUT            ptag   where to return pointer to tag     *
+*                   ltag   where to return tag len            *
+*                   blnk   where to return indication if      *
+*                          value includes blank               *
+* RETURN VALUE    : rc                                        *
+*                                                             *
+* WHEN TO USE:      1. Filter non existing delete tag         *
+*                   2. For preparing roll back command        *
+**************************************************************/
+static ESA_RC  RACF_Find_Org_TAG   (ESA_DIAG_COMP_typ    comp,
+                      char                       *tags,
+                      char                       *name,
+                      int                         lname,
+                      char                      **ptag,
+                      int                        *ltag,
+                      char                       *blnk,
+                      CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                      CTSAMSG_HANDLE_rec_ptr      msgs)
+{
+ static char func[]   ="RACF_Find_Org_TAG";
+ ESA_RC      rc       = ESA_OK;
+ int         tl       = 0;
+ int         found    = FALSE;
+ int         tags_len = 0;
+ char       *p        = NULL;
+ char       *s        = NULL;
+ char       *b        = NULL;
+ char       *subsep   = NULL;
+ char       *blank    = NULL;
+ char       *ptags    = NULL;
+ char       tag_name[21] = { NULL_CHAR };
+
+ ESA_DIAG_enter(comp, 1, func );
+
+ memcpy(tag_name,name,lname);
+ tag_name[lname] = NULL_CHAR;
+ ESA_DIAG_printf(comp, 4,
+                "Name to find = %s in TAGs = <%s>",tag_name,tags);
+ *ptag = NULL;
+ *ltag = 0;
+ *blnk = FALSE;
+ tags_len = strlen(tags);
+ p = tags;
+ found = FALSE;
+
+ do
+ {
+  p = strstr(p,tag_name);
+  if (p EQ NULL)
+     break;
+  if (*(p + lname) EQ ':')
+   if ( (p EQ tags) OR
+        ( (p GT tags) AND (*(p-1) EQ ADDINFO_LIST_SUBFIELD) ) )
+   {
+    found = TRUE;
+    break;
+   }
+  p++;
+ } while (p LT tags + tags_len);
+
+ if (found)
+ {
+  *ptag = p;
+  s = strchr(p,ADDINFO_LIST_SUBFIELD);
+  if (s NE NULL)
+   *ltag = s - p;           /* there is another tag following */
+  else
+   *ltag = strlen(p);       /* no tag follows the found tag   */
+
+  ESA_DIAG_printf(comp, 4,
+                "TAG found = <%.*s>",*ltag, p);
+
+  /* find if there is a blank in the tag */
+  b = strchr(p, ' ');
+  if (b EQ NULL)
+   *blnk = FALSE;
+  else
+  if (b GT (p + *ltag) )
+   *blnk = FALSE;   /* the blank is not in this tag */
+  else
+   *blnk = TRUE;
+ }
+
+ exit:
+ ESA_DIAG_printf(comp, 4,
+                "found = %d, tag = <%.*s>",found, *ltag, p);
+ ESA_DIAG_exit(comp, 1, func, rc);
+ return rc;
+}
+/**************************************************************
+*                                                             *
+* Subroutine name : RACF_Get_Next_TAG_Name                    *
+* DESCRIPTION     : Locate the next tag  and  return pointer  *
+*                   it's name and the name's length           *
+* INPUT           : tags   original tags                      *
+*                   pname  where to return pointer to the tag *
+*                          name                               *
+*                   lname  where to return tag name len       *
+* OUTPUT            pname  where to return pointer to the tag *
+*                          name                               *
+*                   lname  where to return tag name len       *
+* RETURN VALUE    : rc                                        *
+*                                                             *
+* WHEN TO USE:      1. Filter non existing delete tag         *
+*                   2. For preparing roll back command        *
+**************************************************************/
+static ESA_RC  RACF_Get_Next_TAG_Name   (ESA_DIAG_COMP_typ    comp,
+                      char                       *tags,
+                      char                      **pname,
+                      int                        *lname,
+                      CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                      CTSAMSG_HANDLE_rec_ptr      msgs)
+{
+ static char func[]   ="RACF_Get_Next_TAG_Name";
+ ESA_RC      rc       = ESA_OK;
+ int         tags_len = 0;
+ int         ltag     = 0;
+ char       *p        = NULL;
+ char       *s        = NULL;
+ char       *c        = NULL;
+
+ ESA_DIAG_enter(comp, 1, func );
+
+ ESA_DIAG_printf(comp, 4,
+                "TAGs = <%s>",tags);
+ *pname = NULL;
+ *lname = 0;
+ tags_len = strlen(tags);
+ p = tags;
+
+ s = strchr(tags,ADDINFO_LIST_SUBFIELD);
+ if (s NE NULL)
+  ltag = s - tags;        /* there is another tag following */
+ else
+  ltag = strlen(tags);    /* no other tag follows           */
+
+ if ( (*tags EQ '"') AND (*(tags + ltag - 1) EQ '"') )
+  p++;
+
+ c = strchr(p,':');
+ if (c EQ NULL)
+    goto exit;
+ *pname = p;
+ *lname = c - p;
+
+ exit:
+ ESA_DIAG_printf(comp, 4,
+                "Next TAG name = <%.*s>",*lname, *pname);
+ ESA_DIAG_exit(comp, 1, func, rc);
+ return rc;
+}
+/**************************************************************
+*                                                             *
+* Subroutine name : RACF_Prep_TAGs_cmd                        *
+* DESCRIPTION     : Build cmd & roll back commands for tags   *
+* INPUT           : factor                                    *
+*                   org_factor                                *
+*                   cmd                                       *
+*                   rcmd                                      *
+*                   anycmd                                    *
+*                                                             *
+* OUTPUT            cmd                                       *
+*                   rcmd                                      *
+* RETURN VALUE    : rc                                        *
+*                                                             *
+* WHEN TO USE:      For preparing tag commands                *
+*                                                             *
+**************************************************************/
+static ESA_RC  RACF_Prep_TAGs_cmd    (ESA_DIAG_COMP_typ    comp,
+                      RACF_Factor                *factor,
+                      RACF_Factor                *org_factor,
+                      char                       *cmd,
+                      char                       *rcmd,
+                      int                        *anycmd,
+                      CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                      CTSAMSG_HANDLE_rec_ptr      msgs)
+{
+
+ static char func[]   ="RACF_Prep_TAGs_cmd";
+ ESA_RC      rc       = ESA_OK;
+ int         tags_len = 0;
+ char       *name     = NULL;
+ char       *tags     = NULL;
+ char       *ptags    = NULL;
+ char       *s        = NULL;
+ int         lname    = 0;
+ int         ltag     = 0;
+ char        blnk     = NULL_CHAR;
+ char        DELTAGS[20*21];
+ int         first_tag = TRUE;
+ int         more      = FALSE;
+
+ ESA_DIAG_enter(comp, 1, func );
+ DELTAGS[0] = NULL_CHAR;
+
+ if (factor->TAGs_add[0] NE NULL_CHAR)
+ {
+   *anycmd = TRUE;
+   strcat(cmd, " TAGS(");
+   ptags = cmd + strlen(cmd);
+   strcat(cmd, factor->TAGs_add);
+   strcat(cmd, ")");
+
+   do
+   {
+    ptags = strchr(ptags,ADDINFO_LIST_SUBFIELD);
+    if (ptags NE NULL)
+      *ptags = ',';
+   } while (ptags NE NULL);
+
+ }
+ if (factor->TAGs_del[0] NE NULL_CHAR)
+ {
+   *anycmd = TRUE;
+   strcat(cmd, " DELTAGS(");
+   strcat(cmd, factor->TAGs_del);
+   strcat(cmd, ")");
+ }
+ /* pepare roll back (rcmd) commands.
+    for each added tag (new or changed):
+     if it already exists (changed), add original tag to roll back TAGS
+     else, (new) add it's name to roll back DELTAGS
+ */
+ tags = factor->TAGs_add;
+ if (tags[0] EQ NULL_CHAR)
+  goto after_add;
+ do
+ {
+  rc = RACF_Get_Next_TAG_Name (comp,
+                               tags,
+                               &name,
+                               &lname,
+                               dest,
+                               msgs);
+  if (rc NE ESA_OK)
+   goto exit;
+
+  if (name NE NULL)
+  {
+   ptags = NULL;
+   if (org_factor NE NULL)
+   {
+    rc = RACF_Find_Org_TAG(
+                            comp,
+                            org_factor->TAGs_add,
+                            name,
+                            lname,
+                           &ptags,
+                           &ltag,
+                           &blnk,
+                            dest,
+                            msgs);
+    if (rc NE ESA_OK)
+     goto exit;
+   }
+
+   if (ptags EQ NULL)
+   {
+    /* new tag, should be added to DELTAGS for roll back */
+    if (DELTAGS[0] NE NULL_CHAR)
+     strcat(DELTAGS,",");
+    strncat(DELTAGS,name,lname);
+   }
+   else
+    /* tag exists, roll back should restore original tag */
+   {
+    if (first_tag)
+     strcat(rcmd," TAGS(");
+    else
+     strcat(rcmd,",");
+
+    if (blnk)
+     strcat(rcmd,"\"");
+    strncat(rcmd,ptags,ltag);
+    if (blnk)
+     strcat(rcmd,"\"");
+    first_tag = FALSE;
+   }
+
+   /* check if any more tags to add */
+   more = FALSE;
+   s = strchr(tags,ADDINFO_LIST_SUBFIELD);
+   if (s NE NULL)
+   {
+    more = TRUE;
+    tags = s +1;
+   }
+  }
+ } while (more);
+
+ after_add:
+ /* for each deleted tag, add the original tag to roll back TAGS */
+ name = factor->TAGs_del;
+ ESA_DIAG_printf(comp, 4,
+                "after add: name = <%s>",name);
+ if (name[0] EQ NULL_CHAR)
+  goto after_del;
+ more = FALSE;
+ do
+ {
+   s = strchr(name,',');
+   if (s EQ NULL)
+    lname = strlen(name);
+   else
+    lname =  s - name;
+
+   rc = RACF_Find_Org_TAG(
+                           comp,
+                           org_factor->TAGs_add,
+                           name,
+                           lname,
+                          &ptags,
+                          &ltag,
+                          &blnk,
+                           dest,
+                           msgs);
+   if (rc NE ESA_OK)
+    goto exit;
+
+   if (ptags NE NULL)
+   {
+    if (first_tag)
+     strcat(rcmd," TAGS(");
+    else
+     strcat(rcmd,",");
+
+    if (blnk)
+     strcat(rcmd,"\"");
+    strncat(rcmd,ptags,ltag);
+    if (blnk)
+     strcat(rcmd,"\"");
+    first_tag = FALSE;
+   }
+
+   more = FALSE;
+   if (s NE NULL)
+   {
+    more = TRUE;
+    name = s +1;
+   }
+ } while (more);
+
+ after_del:
+ if (NOT first_tag)
+   strcat(rcmd,")");
+ if (DELTAGS[0] NE NULL_CHAR)
+ {
+  strcat(rcmd," DELTAGS(");
+  strcat(rcmd,DELTAGS);
+  strcat(rcmd,")");
+ }
+ ESA_DIAG_printf(comp, 4,
+                "cmd = <%s>",cmd);
+ ESA_DIAG_printf(comp, 4,
+                "rcmd = <%s>",rcmd);
+ exit:
+ ESA_DIAG_exit(comp, 1, func, rc);
+ return rc;
+}
+/*  WS10081 - end    */

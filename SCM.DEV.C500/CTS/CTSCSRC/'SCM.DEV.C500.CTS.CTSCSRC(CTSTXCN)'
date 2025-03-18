@@ -1,0 +1,1385 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Service TSS extractor functions (connect)*
+ *                                                             *
+ * File Name        : ctstxcn                                  *
+ *                                                             *
+ * Author           : Alexander Shvartsman                     *
+ *                                                             *
+ * Creation Date    : 18/03/97                                 *
+ *                                                             *
+ * Description      : TSS  service functions                   *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * PS0378   AS       01/04/99 Bypass Illegal user/group names  *
+ * ps0380   AS       05/05/99 Download fails, when acid deleted*
+ *                            during the download              *
+ * IS0358   YoniMa   17/08/06 memory leak.(BS2698)             *
+ * IS10027  AL&SK    25/01/09 memory leak S878 at BOFA(BS10015)*
+ *                            added proc TSS_do_pair_pos       *
+ *                            memory size printed heX in diag  *
+ * IS10086  NuritY   30/05/13 Support TSS R15. (IS10043)       *
+ * WS10082  MauriC   14/11/22 Recompile for new ADDINFO macros *
+ ***************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDIO
+ #include   STDLIB
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_CTSAMSG
+ #include ESA_API
+ #include ESA_API_CODES
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_COMP
+ #include MVS_OS_MVS
+ #include API_ADDINFO
+
+ /*
+  *   TSS include files
+  */
+
+ #include TSS
+ #include TSS_XCNN
+ #include TSS_CODES
+
+ static char component[] = "CTSTXCN";
+
+ static char *tss_reserved[] = { "*AUDIT*"   ,     /* ps0378 */
+                                 "*APPCLU*"  ,     /* ps0378 */
+                                 "*RDT*"     ,     /* ps0378 */
+                                 "*NDT*"     ,     /* ps0378 */
+                                 "*FDT*"     ,     /* ps0378 */
+                                 "*STC*"     ,     /* ps0378 */
+                                 "*DLF*"     ,     /* ps0378 */
+                                 "*ALL*"     ,     /* ps0378 */
+                                 NULL };           /* ps0378 */
+
+ static char internal2_msg_buf[200] = "";          /* ps0378 */
+ /* The program TSS_is_reserved added by PS0378 */
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_is_reserved                            *
+ *                                                             *
+ * DESCRIPTION    : Check if User/Group name is a reserved     *
+ *                  word ( by TSS )                            *
+ * INPUT          : comp          - diag component             *
+ *                  acid          - acid name                  *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : TRUE/ FALSE                                *
+ *                                                             *
+ **************************************************************/
+
+ static int TSS_is_reserved (ESA_DIAG_COMP_typ            comp,
+                             char                        *acid,
+                             CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                             CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   int                       rc = FALSE;
+   int                       i;
+   static char               func[]="TSS_is_reserved";
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func);
+
+   ESA_DIAG_printf(comp,5, "acid=%s", acid);
+
+   for (i=0; tss_reserved[i]; i++) {
+      if (strcmp(tss_reserved[i], acid) EQ 0) {
+        rc = TRUE;
+        sprintf(internal2_msg_buf,
+                "Processing for record %s bypassed - ACID ignored",
+                acid);
+        CTSAMSG_print(ERR_INTERNAL2,
+                      msgs, NULL, dest,
+                      component, func,
+                      internal2_msg_buf,
+                      4, __LINE__);
+        break;
+      }
+   }
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_printf(comp,5, "acid=%s rc=%d", acid, rc);
+   ESA_DIAG_exit(comp, 5, func, ESA_OK);
+
+   return rc;
+
+}     /*  TSS_alloc_cnn_trap_handle  */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_alloc_cnn_trap_handle                  *
+ *                                                             *
+ * DESCRIPTION    : Allocate user cnn handle (connection)      *
+ *                                                             *
+ * INPUT          : comp          - diag component             *
+ *                  max_entries   - max cmd entries            *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : trap_handle   - command trap handle        *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK, ESA_FATAL - err               *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_alloc_cnn_trap_handle (ESA_DIAG_COMP_typ comp,
+                        int                          max_entries,
+                        TSS_TRAP_CNN_BUF_rec_typ   **trap_handle,
+                        CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                        CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   ESA_RC                    rc = ESA_OK;
+   static char               func[]="TSS_alloc_cnn_trap_handle";
+   TSS_TRAP_CNN_BUF_rec_typ *tmp_trap_handle = NULL;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func);
+
+  /*
+   *  Allocate trap handle structure
+   */
+
+   tmp_trap_handle =(TSS_TRAP_CNN_BUF_rec_typ *) malloc(
+                                sizeof(TSS_TRAP_CNN_BUF_rec_typ));
+   if (tmp_trap_handle EQ NULL ) {
+       CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                     "user trap handle",
+                      sizeof(TSS_TRAP_CNN_BUF_rec_typ));
+       rc = ESA_FATAL;
+       OS_MVS_btrace();
+       goto exit;
+   }
+
+   ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,                 /*IS0358*/
+      "malloc (%6X) bytes at address (%x) (%d,%s)",       /*IS10027*/
+       sizeof(TSS_TRAP_CNN_BUF_rec_typ),
+       tmp_trap_handle, __LINE__, __FILE__ );
+   ESA_DIAG_printf(comp,5, "user trap handle ptr=%x", tmp_trap_handle);
+
+  /*
+   *  Allocate data buffer
+   */
+
+   tmp_trap_handle->max_expected_entries = max_entries;
+
+   ESA_DIAG_printf(comp,5, "trap buffer entries=%d",
+                   tmp_trap_handle->max_expected_entries);
+
+   tmp_trap_handle->c_data = (TSS_TRAP_CNN_DATA_typ *)malloc(
+                              sizeof(TSS_TRAP_CNN_DATA_typ) *
+             /*IS10027*/      tmp_trap_handle->max_expected_entries);
+             /*IS10027*       tmp_trap_handle->max_expected_entries);*/
+
+   if (tmp_trap_handle->c_data EQ NULL ) {
+       CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                  "trap data buffer",
+                  sizeof(TSS_TRAP_CNN_DATA_typ) *
+                  tmp_trap_handle->allocated_entries );
+       rc = ESA_FATAL;
+       OS_MVS_btrace();
+       ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,         /*IS0358*/
+       "malloc fails for trap(%x) * entries(%x) (%d,%s)",
+       sizeof(TSS_TRAP_CNN_DATA_typ),
+       tmp_trap_handle->max_expected_entries,  __LINE__, __FILE__ );
+       ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,       /*IS0358*/
+        "Free address (%x) (%d,%s)",
+         tmp_trap_handle, __LINE__, __FILE__ );
+       free(tmp_trap_handle);
+       goto exit;
+   }
+
+   ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,                 /*IS0358*/
+    "malloc (%6X) bytes at address (%x) (%d,%s)",         /*IS10027*/
+  /*IS10027 "malloc (%d) bytes at address (%x) (%d,%s)",           */
+    sizeof(TSS_TRAP_CNN_DATA_typ)*tmp_trap_handle->max_expected_entries,
+    tmp_trap_handle->c_data, __LINE__, __FILE__ );
+   ESA_DIAG_printf(comp,5,
+                   "allocated trap data buffer ptr=%x",
+                   tmp_trap_handle->c_data);
+
+   tmp_trap_handle->allocated_entries = max_entries;
+   tmp_trap_handle->used_entries      = 0;
+
+   *trap_handle = tmp_trap_handle;
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc;
+
+}     /*  TSS_alloc_cnn_trap_handle  */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_realloc_cnn_trap_buffer                *
+ *                                                             *
+ * DESCRIPTION    : RE Allocate cnn trap buffer                *
+ *                                                             *
+ * INPUT          : cmd_handle    -  trap_handle               *
+ *                  incr          -  increment value           *
+ *                  comp          -  diag component            *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK, ESA_FATAL - err               *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_realloc_cnn_trap_buffer(ESA_DIAG_COMP_typ       comp,
+                               TSS_TRAP_CNN_BUF_rec_typ    *trap_handle,
+                               int                          incr,
+                               CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                               CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   ESA_RC                     rc = ESA_OK;
+   TSS_TRAP_CNN_DATA_typ    * tmp = NULL;
+   static char            func[]="TSS_realloc_cnn_trap_buffer";
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func);
+
+   ESA_DIAG_printf(comp, 5,"incr=%d", incr );
+
+   if ( (trap_handle->used_entries + incr) GE
+         trap_handle->allocated_entries  ) {
+
+    /*
+     *  RE Allocate trap data buffer
+     */
+
+     if ( incr EQ 1 )
+        trap_handle->allocated_entries +=
+                                   trap_handle->max_expected_entries;
+     else
+        trap_handle->allocated_entries += incr;
+
+
+     ESA_DIAG_printf(comp,5, "trap buffer entries=%d",
+                     trap_handle->allocated_entries);
+
+     tmp = trap_handle->c_data;
+     ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,                /*IS0358*/
+      "Before realloc (%6X) bytes at address (%x) (%d,%s)", /*IS10027*/
+      sizeof(TSS_TRAP_DATA_typ)*trap_handle->allocated_entries,
+      trap_handle->c_data, __LINE__, __FILE__ );
+     trap_handle->c_data = (TSS_TRAP_CNN_DATA_typ *)realloc(
+                            trap_handle->c_data,
+                            sizeof(TSS_TRAP_DATA_typ) *
+                            trap_handle->allocated_entries );
+
+     if (trap_handle->c_data EQ NULL ) {
+         CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                    "trap data buffer",
+                    sizeof(TSS_TRAP_DATA_typ) *             /*IS10027*/
+      /*IS10027     sizeof(TSS_TRAP_BUF_rec_typ) *                   */
+                    trap_handle->allocated_entries );
+         ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,         /*IS0358*/
+          "realloc fails for trap(%x) * entries(%x) (%d,%s)",
+          sizeof(TSS_TRAP_DATA_typ),
+          trap_handle->allocated_entries,  __LINE__, __FILE__ );
+         rc = ESA_FATAL;
+         OS_MVS_btrace();
+         trap_handle->c_data = tmp;
+         goto exit;
+     }
+
+     ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,                /*IS0358*/
+      "After realloc (%6X) bytes at address (%x) (%d,%s)", /*IS10027*/
+      sizeof(TSS_TRAP_DATA_typ)*trap_handle->allocated_entries,
+      trap_handle->c_data, __LINE__, __FILE__ );
+     ESA_DIAG_printf(comp, 5,
+                     "re-allocated cmd buffer ptr=%x",
+                      trap_handle->c_data);
+
+   }         /* realloc trap data buffer */
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc;
+
+}     /* TSS_realloc_cnn_trap_buffer */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_free_cnn_trap_handle                   *
+ *                                                             *
+ * DESCRIPTION    : Free trap handle                           *
+ *                                                             *
+ * INPUT          : trap_handle   -  trap handle               *
+ *                  comp          -  diag component            *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ void TSS_free_cnn_trap_handle(ESA_DIAG_COMP_typ        comp,
+                           TSS_TRAP_CNN_BUF_rec_typ   **trap_handle,
+                           CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                           CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   static char               func[]="TSS_free_cnn_trap_handle";
+   TSS_TRAP_CNN_BUF_rec_typ *tmp_trap_handle = *trap_handle;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func);
+
+  /*
+   *  Free trap buffer
+   */
+
+   ESA_DIAG_printf(comp,5, "trap buffer ptr=%x",
+                   tmp_trap_handle->c_data);
+
+   if (tmp_trap_handle->c_data NE NULL )
+    {
+     ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,                /*IS0358*/
+      "Free address (%x) (%d,%s)",
+      tmp_trap_handle->c_data, __LINE__, __FILE__ );
+       free(tmp_trap_handle->c_data);
+    }
+
+  /*
+   *  Free trap handle
+   */
+
+   ESA_DIAG_printf(comp,5, "trap handle ptr=%x", tmp_trap_handle);
+
+   ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,                /*IS0358*/
+      "Free address (%x) (%d,%s)",
+      tmp_trap_handle, __LINE__, __FILE__ );
+   free(tmp_trap_handle);
+   *trap_handle = NULL;
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 5, func, ESA_OK);
+
+}      /* TSS_free_cnn_trap_handle */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_save_user_cnn_list                     *
+ *                                                             *
+ * DESCRIPTION    : Put users connections info                 *
+ *                                                             *
+ * INPUT          : trap_handle    -    trap handle            *
+ *                  user_acid      -    user acid              *
+ *                  ug_acid        -    ug   acid              *
+ *                  comp           -    diag component         *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK  , ESA_FATAL - err             *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_save_user_cnn_list (ESA_DIAG_COMP_typ   comp,
+                         TSS_TRAP_CNN_BUF_rec_typ  *trap_handle,
+                         char                      *user_acid,
+                         char                      *ug_acid,
+                         CTSAMSG_DEST_TABLE_rec_ptr dest,
+                         CTSAMSG_HANDLE_rec_ptr     msgs)
+ {
+
+   ESA_RC              rc = ESA_OK;
+   static char         func[]="TSS_save_user_cnn_list";
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp,10, func);
+
+   if (TSS_is_reserved (comp, user_acid, dest, msgs) OR  /* ps0378 */
+       TSS_is_reserved (comp, ug_acid,   dest, msgs)  )  /* ps0378 */
+      goto exit;                                         /* ps0378 */
+
+   if (TSS_realloc_cnn_trap_buffer(comp,trap_handle,1,dest,msgs)
+                           NE ESA_OK)
+      goto exit;
+
+   strcpy((char *)
+          &trap_handle->c_data[trap_handle->used_entries].user_acid,
+          (char *) user_acid);
+
+   strcpy((char *)
+          &trap_handle->c_data[trap_handle->used_entries].ug_acid,
+          (char *) ug_acid);
+
+   trap_handle->c_data[trap_handle->used_entries].used = 0;
+   trap_handle->c_data[trap_handle->used_entries].relative_profile[0]=
+                                                      NULL_CHAR;
+   trap_handle->c_data[trap_handle->used_entries].relative_pos[0]    =
+                                                      NULL_CHAR;
+   trap_handle->c_data[trap_handle->used_entries].expires[0]         =
+                                                      NULL_CHAR;
+   trap_handle->c_data[trap_handle->used_entries].pos =
+                                                TSS_CNN_POS_UNDEFINED;
+   trap_handle->used_entries++;
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp,10, func, rc);
+
+   return rc;
+
+}     /* TSS_save_user_cnn_list */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_save_ug_cnn_list                       *
+ *                                                             *
+ * DESCRIPTION    : Put ug    connections info                 *
+ *                                                             *
+ * INPUT          : trap_handle    -    trap handle            *
+ *                  ug_acid        -    ug   acid              *
+ *                  user_acid      -    user acid              *
+ *                  expiration     -    expiration             *
+ *                  comp           -    diag component         *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK  , ESA_FATAL - err             *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_save_ug_cnn_list (ESA_DIAG_COMP_typ     comp,
+                         TSS_TRAP_CNN_BUF_rec_typ  *trap_handle,
+                         char                      *ug_acid,
+                         char                      *user_acid,
+                         char                      *expiration,
+                         CTSAMSG_DEST_TABLE_rec_ptr dest,
+                         CTSAMSG_HANDLE_rec_ptr     msgs)
+ {
+
+   ESA_RC              rc = ESA_OK;
+   static char         func[]="TSS_save_ug_cnn_list";
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp,10, func);
+
+   if (TSS_is_reserved (comp, user_acid, dest, msgs) OR  /* ps0378 */
+       TSS_is_reserved (comp, ug_acid,   dest, msgs)  )  /* ps0378 */
+      goto exit;                                         /* ps0378 */
+
+   if (TSS_realloc_cnn_trap_buffer(comp,trap_handle,1,dest,msgs)
+                           NE ESA_OK)
+      goto exit;
+
+   strcpy((char *)
+          &trap_handle->c_data[trap_handle->used_entries].user_acid,
+          (char *) user_acid);
+
+   strcpy((char *)
+          &trap_handle->c_data[trap_handle->used_entries].ug_acid,
+          (char *) ug_acid);
+
+   strcpy((char *)
+          &trap_handle->c_data[trap_handle->used_entries].expires,
+          (char *) expiration);
+
+   trap_handle->c_data[trap_handle->used_entries].used = 0;
+   trap_handle->c_data[trap_handle->used_entries].relative_profile[0]=
+                                                      NULL_CHAR;
+   trap_handle->c_data[trap_handle->used_entries].relative_pos[0]    =
+                                                      NULL_CHAR;
+   trap_handle->c_data[trap_handle->used_entries].pos =
+                                                TSS_CNN_POS_UNDEFINED;
+   trap_handle->used_entries++;
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp,10, func, rc);
+
+   return rc;
+
+}     /* TSS_save_user_cnn_list */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_cnn_trap_buf_dmp                       *
+ *                                                             *
+ * DESCRIPTION    : Dump trap buffer                           *
+ *                                                             *
+ * INPUT          : trap_handle  - trap handle                 *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ void TSS_cnn_trap_buf_dump(ESA_DIAG_COMP_typ       comp,
+                          TSS_TRAP_CNN_BUF_rec_typ *trap_handle)
+ {
+
+   int                  i;
+   static char          func[]="TSS_cnn_trap_buf_dump";
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 0, func);
+
+   ESA_DIAG_printf(comp,0,
+           "trap handle: alloc entries=%d used=%d",
+            trap_handle->allocated_entries,
+            trap_handle->used_entries);
+
+   for (i=0; i LT trap_handle->used_entries; i++)
+       ESA_DIAG_printf(comp,0,
+      "%d user=%s group=%s rel_prof=%s relat_pos=%s expires=%s pos=%d",
+      trap_handle->c_data[i].used,
+      trap_handle->c_data[i].user_acid,
+      trap_handle->c_data[i].ug_acid,
+      trap_handle->c_data[i].relative_profile,
+      trap_handle->c_data[i].relative_pos,
+      trap_handle->c_data[i].expires,
+      trap_handle->c_data[i].pos);
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 0, func, ESA_OK);
+
+}     /* TSS_cnn_trap_buf_dmp  */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_locate_user_cnn_info                   *
+ *                                                             *
+ * DESCRIPTION    : Locate user's connection info              *
+ *                                                             *
+ * INPUT          : cnn_data     - trap handle (connection)    *
+ *                  user_acid    - user_acid                   *
+ *                                                             *
+ * OUTPUT         : located_data - ptr to user cnn data        *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ TSS_TRAP_CNN_DATA_typ *  TSS_locate_user_cnn_info(
+                          ESA_DIAG_COMP_typ            comp,
+                          TSS_TRAP_CNN_BUF_rec_typ   * cnn_data,
+                          char                       * user_acid,
+                          CTSAMSG_DEST_TABLE_rec_typ * dest,
+                          CTSAMSG_HANDLE_rec_typ     * msgs)
+ {
+
+  static char func[] = "TSS_locate_user_cnn_info";
+  int         i;
+  TSS_TRAP_CNN_DATA_typ * located_data = NULL;
+
+ /*
+  *  Initialize
+  */
+
+  ESA_DIAG_enter(comp, 5, func );
+
+  for (i=0; i LT cnn_data->used_entries; i++ ) {
+    ESA_DIAG_printf(comp, 10, "%d. Requested acid=%s current=%s",
+                    i, user_acid, cnn_data->c_data[i].user_acid);
+    if ( strcmp(user_acid, cnn_data->c_data[i].user_acid) EQ 0 ) {
+        located_data = &(cnn_data->c_data[i]);
+        goto exit;
+    }
+  }
+
+ /*
+  *  Finish
+  */
+
+ exit : ;
+
+  ESA_DIAG_printf(comp, 5, "Located data_ptr=%x", located_data);
+
+  ESA_DIAG_exit(comp, 5, func, ESA_OK);
+
+  return located_data;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_locate_ug_cnn_info                     *
+ *                                                             *
+ * DESCRIPTION    : Locate ug's connection info                *
+ *                                                             *
+ * INPUT          : cnn_data     - trap handle (connection)    *
+ *                  ug_acid      - ug   acid                   *
+ *                                                             *
+ * OUTPUT         : located_data - ptr to user cnn data        *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ TSS_TRAP_CNN_DATA_typ *  TSS_locate_ug_cnn_info(
+                          ESA_DIAG_COMP_typ            comp,
+                          TSS_TRAP_CNN_BUF_rec_typ   * cnn_data,
+                          char                       * ug_acid,
+                          CTSAMSG_DEST_TABLE_rec_typ * dest,
+                          CTSAMSG_HANDLE_rec_typ     * msgs)
+ {
+
+  static char func[] = "TSS_locate_ug_cnn_info";
+  int         i;
+  TSS_TRAP_CNN_DATA_typ * located_data = NULL;
+
+ /*
+  *  Initialize
+  */
+
+  ESA_DIAG_enter(comp, 5, func );
+
+  for (i=0; i LT cnn_data->used_entries; i++ ) {
+    ESA_DIAG_printf(comp, 10, "%d. Requested acid=%s current=%s",
+                    i, ug_acid, cnn_data->c_data[i].ug_acid);
+    if ( strcmp(ug_acid, cnn_data->c_data[i].ug_acid) EQ 0 ) {
+        located_data = &(cnn_data->c_data[i]);
+        goto exit;
+    }
+  }
+
+ /*
+  *  Finish
+  */
+
+ exit : ;
+
+  ESA_DIAG_printf(comp, 5, "Located data_ptr=%x", located_data);
+
+  ESA_DIAG_exit(comp, 5, func, ESA_OK);
+
+  return located_data;
+
+}
+
+ /**************************************************************
+ * IS10027 altered the prologue comments for this procedure    *
+ *                                                             *
+ * PROCEDURE NAME : TSS_create_cnn_relative_info               *
+ *                                                             *
+ * DESCRIPTION    : Pupulate CNN buffer - for each connection  *
+ *                  specify relative TOP, AFTER, BOTTOM        *
+ *                                                             *
+ * INPUT          : cnn_data    - trap handle points to buffer *
+ *                                                             *
+ * OUTPUT         : buffer of cnn entries - now populared with *
+ *                  relative position                          *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ * IS10027                                                     *
+ **************************************************************/
+
+ void TSS_create_cnn_relative_info(ESA_DIAG_COMP_typ        comp,
+                               TSS_TRAP_CNN_BUF_rec_typ   * cnn_data)
+ {
+
+  static char func[] = "TSS_create_cnn_relative_info";
+  int         i;
+
+ /*
+  *  Initialize
+  */
+
+  ESA_DIAG_enter(comp, 5, func );
+
+  for(i=0; i LT cnn_data->used_entries; i++ ) {
+      cnn_data->c_data[i].pos = i+1;
+      if ( i EQ 0 ) {
+        strcpy( cnn_data->c_data[i].relative_pos,
+                TSS_CNN_REL_POS_TOP);
+        strcpy( cnn_data->c_data[i].relative_profile, "");
+      }
+      else {
+        strcpy( cnn_data->c_data[i].relative_pos,
+                TSS_CNN_REL_POS_AFTER );
+        strcpy( cnn_data->c_data[i].relative_profile,
+                     cnn_data->c_data[i-1].ug_acid);
+      }
+  }
+
+ /*
+  * Correct last entry
+  */
+
+  if (cnn_data->used_entries GT 1) {
+     i = cnn_data->used_entries;
+     strcpy( cnn_data->c_data[i].relative_pos,
+             TSS_CNN_REL_POS_BOTTOM);
+     strcpy( cnn_data->c_data[i].relative_profile, "");
+  }
+
+ /*
+  *  Finish
+  */
+
+ exit : ;
+
+  ESA_DIAG_exit(comp, 5, func, ESA_OK);
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_do_pair_cnn                            *
+ *                                                             *
+ * DESCRIPTION    : acids list processing (get info)           *
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  user_acid - user acid                      *
+ *                  ug_acid   - ug acid                        *
+ *                  pair_info - pair connect info              *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : user_info  - user connection info          *
+ *                  ug_info    - ug connection info            *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_do_pair_cnn(ESA_DIAG_COMP_typ           comp,
+                        char                      * user_acid,
+                        char                      * ug_acid,
+                        TSS_TRAP_CNN_DATA_typ     * pair_info,
+                        TSS_TRAP_CNN_BUF_rec_typ ** user_info,
+                        TSS_TRAP_CNN_BUF_rec_typ ** ug_info,
+                        ADMIN_PARAMS_rec_typ      * admin_params,
+                        ERR_STRUCT_rec_typ        * err)
+{
+
+ static char func[]="TSS_do_pair_cnn";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                       rc   = ESA_OK ;
+ CTSAMSG_HANDLE_rec_typ     * msgs;
+ CTSAMSG_DEST_TABLE_rec_typ * dest;
+ TSS_TRAP_CNN_BUF_rec_typ   * user_data = NULL;
+ TSS_TRAP_CNN_BUF_rec_typ   * ug_data   = NULL;
+ TSS_TRAP_CNN_DATA_typ      * located_data;
+
+ /*
+  *  Initialize
+  */
+
+  ESA_DIAG_enter(comp, 3, func );
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  strcpy( pair_info->user_acid, user_acid);
+  strcpy( pair_info->ug_acid,   ug_acid);
+  pair_info->used = 0;
+  pair_info->relative_profile[0]= NULL_CHAR;
+  pair_info->relative_pos[0]    = NULL_CHAR;
+  pair_info->expires[0]         = NULL_CHAR;
+  pair_info->pos                = TSS_CNN_POS_UNDEFINED;
+
+  /*  Get User connection info  */
+
+  rc = TSS_get_user_connections(comp,
+                                TSS_CMD_DEFAULT_MODE,  /* ps0380 */
+                                user_acid, &user_data,
+                                admin_params, err );
+  if ( rc NE ESA_OK )
+    goto exit;
+
+  /*  Get Group connection info */
+
+  rc = TSS_get_ug_connections(comp,
+                              TSS_CMD_DEFAULT_MODE,  /* ps0380 */
+                              ug_acid, &ug_data,
+                              admin_params, err );
+  if ( rc NE ESA_OK )
+    goto exit;
+
+ /*
+  *   Extract UG info
+  */
+
+  located_data = TSS_locate_user_cnn_info(comp, ug_data, user_acid,
+                                          dest, msgs);
+  if (located_data)
+    strcpy(pair_info->expires, located_data->expires);
+
+ /*
+  *   Extract USER info
+  */
+
+  located_data = TSS_locate_ug_cnn_info(comp, user_data, ug_acid,
+                                        dest, msgs);
+  if (located_data) {
+    pair_info->pos = located_data->pos;
+    strcpy( pair_info->relative_pos, located_data->relative_pos);
+    strcpy( pair_info->relative_profile,
+            located_data->relative_profile);
+  }
+
+ exit : ;
+
+  *user_info = user_data;
+  *ug_info   = ug_data;
+
+  ESA_DIAG_printf(comp,2,"user_info + ug_info are set with=<%x> <%x>",
+                  user_info, ug_info);                    /*IS10027*/
+
+  ESA_DIAG_exit(comp, 3, func, rc);
+
+  return rc ;
+
+}
+
+ /********************* IS10027 ********************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_do_pair_pos  created IS10027           *
+ *                                                             *
+ * DESCRIPTION    : Determine user-group (connection) existence*
+ *                  and its position among all user connections*
+ * INPUT          : comp      - diag component                 *
+ *                  user_acid - user acid                      *
+ *                  ug_acid   - ug acid                        *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : pair  position (in user-connections)       *
+ *                  TSS_CNN_POS_UNDEFINED if pair doesnt exist *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_do_pair_pos(ESA_DIAG_COMP_typ           comp,
+                        char                      * user_acid,
+                        char                      * ug_acid,
+                        int                       * position,
+                        ADMIN_PARAMS_rec_typ      * admin_params,
+                        ERR_STRUCT_rec_typ        * err)
+{
+
+ static char func[]="TSS_do_pair_pos";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                       rc   = ESA_OK ;
+ CTSAMSG_HANDLE_rec_typ     * msgs;
+ CTSAMSG_DEST_TABLE_rec_typ * dest;
+ TSS_TRAP_CNN_BUF_rec_typ   * user_data = NULL;
+ TSS_TRAP_CNN_DATA_typ      * located_data;
+
+ /*
+  *  Initialize
+  */
+
+  ESA_DIAG_enter(comp, 3, func );
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  * position                   = TSS_CNN_POS_UNDEFINED;
+
+  /*  Get User connection info  */
+
+  rc = TSS_get_user_connections(comp,
+                                TSS_CMD_DEFAULT_MODE,  /* ps0380 */
+                                user_acid, &user_data,
+                                admin_params, err );
+  if ( rc NE ESA_OK )
+    goto exit;
+
+ /*
+  *   Extract USER info
+  */
+
+  located_data = TSS_locate_ug_cnn_info(comp, user_data, ug_acid,
+                                        dest, msgs);
+  if (located_data) {
+    * position     = located_data->pos;
+  }
+
+   ESA_DIAG_printf(comp, 2,
+      "User=%s Group=%s Position=%d user_info=<%x>",
+      user_acid, ug_acid, *position, user_data);
+
+  if ( user_data ) {
+     TSS_free_cnn_trap_handle( comp,
+        &user_data, dest, msgs);
+  }
+ exit : ;
+
+
+  ESA_DIAG_printf(comp,2,"user_data is set with=<%x> position=%d",
+                  user_data, *position );
+
+  ESA_DIAG_exit(comp, 3, func, rc);
+
+  return rc ;
+
+} /* end of IS10027 */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_pre_set_cnn_proc                       *
+ *                                                             *
+ * DESCRIPTION    : pre set connection proc                    *
+ *                                                             *
+ * INPUT          : comp        - diag component               *
+ *                  u2ug_params - connection parameters        *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : user_info  - user connection info          *
+ *                  ug_info    - ug connection info            *
+ *                  pair       - pair connection info          *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_pre_set_cnn_proc(ESA_DIAG_COMP_typ      comp,
+                        U2UG_PARAMS_rec_typ       * u2ug_params,
+                        TSS_TRAP_CNN_DATA_typ     * pair_info,
+                        TSS_TRAP_CNN_BUF_rec_typ ** user_info,
+                        TSS_TRAP_CNN_BUF_rec_typ ** ug_info,
+                        ADMIN_PARAMS_rec_typ      * admin_params,
+                        ERR_STRUCT_rec_typ        * err)
+{
+
+ ESA_RC      rc = ESA_OK;
+ static char func[]="TSS_pre_set_cnn_proc";
+
+ /*** For TSS_chk_acid ***/
+
+ char             real_acid_type[TSS_ACID_TYPE_LEN+1]="";
+ OBJECT_TYPE_typ  real_obj_type = TYPE_IGNORE;
+
+ /*
+  *  Initialize
+  */
+
+  ESA_DIAG_enter(comp, 3, func );
+
+  /*
+   * Initialize global parameters
+   */
+
+   rc = TSS_global_init (comp, admin_params, err);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   /*  Check user existance */
+
+   rc = TSS_chk_acid(comp, u2ug_params->user,
+                     TSS_USER, TYPE_USER,
+                     OBJ_EXIST, TRUE, real_acid_type, &real_obj_type,
+                     admin_params, err);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   /*  Check ug existance */
+
+   rc = TSS_chk_acid(comp, u2ug_params->group,
+                      TSS_GROUP, TYPE_GROUP,
+                      OBJ_EXIST, TRUE, real_acid_type, &real_obj_type,
+                      admin_params, err);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   rc = TSS_do_pair_cnn(comp, u2ug_params->user, u2ug_params->group,
+                        pair_info, user_info, ug_info,
+                        admin_params, err);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   ESA_DIAG_printf(comp, 2,
+      "User=%s Group=%s pos=%d user_info=<%x> ug_info=<%x>",/*IS10027*/
+      u2ug_params->user, u2ug_params->group,
+      pair_info->pos, user_info, ug_info );                 /*IS10027*/
+
+  exit :;
+
+  ESA_DIAG_exit(comp, 3, func, rc);
+
+  return rc ;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_merge_cnn_info                         *
+ *                                                             *
+ * DESCRIPTION    : Merge info from addinfo                    *
+ *                                                             *
+ * INPUT          : comp        - diag component               *
+ *                  pair_info   - connection parameters        *
+ *                  addinfo     - addinfo ptr                  *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : pair_info  - user connection info          *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ESA_RC TSS_merge_cnn_info(ESA_DIAG_COMP_typ        comp,
+                          TSS_TRAP_CNN_DATA_typ  * pair_info,
+                          ADDINFO_rec_typ        * addinfo)
+{
+
+ ESA_RC      rc = ESA_OK;
+ static char func[]="TSS_merge_cnn_info";
+ ONE_FIELD_rec_ptr     tmp_pair = NULL;
+
+ /*
+  *  Initialize
+  */
+
+  ESA_DIAG_enter(comp, 3, func );
+
+ /*
+  * pair_info->relative_pos[0]     = NULL_CHAR;
+  * pair_info->relative_profile[0] = NULL_CHAR;
+  * pair_info->expires[0]          = NULL_CHAR;
+  */
+
+ /*
+  *  Get Relative position
+  */
+
+  tmp_pair=ADDINFO_search( TSS_CNN_RELATIVE_POS,
+                           TSS_ADDINFO_KWD_LEN,
+                           addinfo->pair, addinfo->num_pairs);
+
+  ESA_DIAG_printf(comp, 1,"%s=%x", TSS_CNN_RELATIVE_POS, tmp_pair);
+
+  if ( tmp_pair NE NULL ) {
+    ESA_DIAG_printf(comp, 1,"%s=%s",
+                    TSS_CNN_RELATIVE_POS, tmp_pair->value);
+    strcpy(pair_info->relative_pos, tmp_pair->value);
+  }
+
+ /*
+  *  Get Relative profile
+  */
+
+  tmp_pair=ADDINFO_search( TSS_CNN_RELATIVE_PROFILE,
+                           TSS_ADDINFO_KWD_LEN,
+                           addinfo->pair, addinfo->num_pairs);
+
+  ESA_DIAG_printf(comp, 1,"%s=%x",
+                  TSS_CNN_RELATIVE_PROFILE, tmp_pair);
+
+  if ( tmp_pair NE NULL ) {
+    ESA_DIAG_printf(comp, 1,"%s=%s",
+                    TSS_CNN_RELATIVE_PROFILE, tmp_pair->value);
+    strcpy(pair_info->relative_profile, tmp_pair->value);
+
+   /*
+    *  Obtained RELATIVE_PROFILE PARAMETER
+    *  but does not obtained RELATIVE_POS parameter
+    *  Assumed RELATIVE_POS = "AFTER"
+    */
+
+    if ( strlen(pair_info->relative_pos) EQ 0 )
+       strcpy(pair_info->relative_pos, TSS_CNN_REL_POS_AFTER);
+  }
+
+ /*
+  *  Get expiration parameter
+  */
+
+  tmp_pair=ADDINFO_search( TSS_CNN_EXPIRES,
+                           TSS_ADDINFO_KWD_LEN,
+                           addinfo->pair, addinfo->num_pairs);
+
+  ESA_DIAG_printf(comp, 3,"%s=%x", TSS_CNN_EXPIRES, tmp_pair);
+
+  if ( tmp_pair NE NULL ) {
+     ESA_DIAG_printf(comp, 3,"%s=%s",
+                     TSS_CNN_EXPIRES, tmp_pair->value);
+     strcpy(pair_info->expires, tmp_pair->value);
+  }
+
+
+  exit :;
+
+  ESA_DIAG_exit(comp, 3, func, rc);
+
+  return rc ;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_aux_conn_proc                          *
+ *                                                             *
+ * DESCRIPTION    : Add additional parameters to cnn command   *
+ *                                                             *
+ * INPUT          : cmd       -   cmd buffer                   *
+ *                  pair_info -   pair connection info         *
+ *                  user_info -   user connection info         *
+ *                                                             *
+ * OUTPUT         : cmd       -   cmd buffer                   *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_aux_conn_proc(ESA_DIAG_COMP_typ           comp,
+                          char                      * cmd,
+                          TSS_TRAP_CNN_DATA_typ     * pair_info,
+                          TSS_TRAP_CNN_BUF_rec_typ  * user_info,
+                          CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                          CTSAMSG_HANDLE_rec_ptr      msgs)
+ {
+
+   static char func[] = "TSS_aux_conn_proc";
+
+  /*
+   * Vars
+   */
+
+   ESA_RC               rc = ESA_OK;
+   int                  i;
+   int                  found;
+   char                 date_format[20];
+   char                 tss_date[20];
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(comp, 1, func);
+
+  /*
+   * Determine place of connection
+   */
+
+   if ( strlen(pair_info->relative_pos) GT 0 ) {
+
+    /*
+     *   TOP  position
+     */
+
+     if (strcmp(pair_info->relative_pos,
+                                   TSS_CNN_REL_POS_TOP) EQ 0 ) {
+       if (user_info->used_entries GT 0 ) {
+         if (pair_info->pos NE 1 ) {         /* Already TOP */
+           strcat(cmd, " BEFORE(");
+           strcat(cmd, user_info->c_data[0].ug_acid);
+           strcat(cmd, ") ");
+         }
+         else {      /* Update TOP in place, when not single conn */
+            if (user_info->used_entries GT 1 ) {
+              strcat(cmd, " BEFORE(");
+              strcat(cmd, user_info->c_data[1].ug_acid);
+              strcat(cmd, ") ");
+            }
+         }
+       }
+     }
+
+    /*
+     *   AFTER existing position
+     */
+
+     else if ( (strcmp(pair_info->relative_pos,
+                                 TSS_CNN_REL_POS_AFTER) EQ 0) OR
+               (strcmp(pair_info->relative_pos,
+                                 TSS_CNN_REL_POS_BEFORE) EQ 0) ) {
+       if ( strlen(pair_info->relative_profile) EQ 0) {
+          CTSAMSG_print(TSS_REL_PROFILE_EMPTY, msgs, NULL, dest,
+                        pair_info->relative_pos);
+          rc = ESA_FATAL;
+          goto exit;
+       }
+
+       ESA_DIAG_printf(comp, 3,"%s=%s %s=%s",
+               TSS_CNN_RELATIVE_POS , pair_info->relative_pos,
+               TSS_CNN_RELATIVE_PROFILE, pair_info->relative_profile);
+
+       found = 0;
+       for (i=0; i LT user_info->used_entries; i++) {
+
+         ESA_DIAG_printf(comp, 3,"%d.Requested profile=%s Current=%s",
+                         i, pair_info->relative_profile,
+                         user_info->c_data[i].ug_acid);
+
+         if (strcmp(user_info->c_data[i].ug_acid,
+                    pair_info->relative_profile) EQ 0 ) {
+           found = 1;
+           break;
+         }
+       }
+       if ( NOT found ) {
+          CTSAMSG_print(TSS_REL_PROFILE_NOT_FOUND, msgs, NULL, dest,
+                        pair_info->relative_pos,
+                        pair_info->relative_profile);
+          rc = ESA_FATAL;
+          goto exit;
+       }
+       else {
+         if (strcmp(pair_info->relative_pos,
+                    TSS_CNN_REL_POS_AFTER) EQ 0)
+             strcat(cmd, " AFTER(");
+         else if (strcmp(pair_info->relative_pos,
+                    TSS_CNN_REL_POS_BEFORE) EQ 0)
+             strcat(cmd, " BEFORE(");
+
+          strcat(cmd, pair_info->relative_profile);
+          strcat(cmd, ") ");
+       }
+     } /* TSS_CNN_REL_POS_AFTER */
+
+    /*
+     *   BOTTOM position
+     */
+
+     else if (strcmp(pair_info->relative_pos,
+                                 TSS_CNN_REL_POS_BOTTOM) EQ 0) {
+         /* Nothing */
+     }
+   }    /*  TSS_CNN_RELATIVE_POS */
+
+   ESA_DIAG_printf(comp, 3,"%s=%s", TSS_CNN_EXPIRES,
+                   pair_info->expires);
+
+   if ( strlen(pair_info->expires) EQ 0 )
+      goto exit;
+
+  /*
+   *    Get TSS RSS Option "DATE" ( format of date )
+   */
+
+   rc = TSS_get_global_parameter(comp,  TSS_GLOBAL_DATE_FORMAT,
+                                 date_format, dest, msgs);
+   if ( rc NE ESA_OK ) {
+      strcpy( date_format, TSS_DATE_FORMAT_DEFAULT);
+      rc = ESA_OK;
+   }
+
+   ESA_DIAG_printf(comp, 3, "date format=%s", date_format);
+
+  /*
+   *   Convert date (ess_addinfo)
+   */
+
+   rc = TSS_ConvertDateESS2TSS( comp, date_format,
+                                pair_info->expires,
+                                tss_date, dest, msgs );
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   ESA_DIAG_printf(comp, 3,
+                   "date format=%s rss_date=%s tss_date=%s",
+                    date_format, pair_info->expires, tss_date);
+
+   /* IS10086 strcat(cmd, " EXPIRE("); */
+   strcat(cmd, " EXPIRES("); /* EXPIRE has been changed to EXPIRES
+   IS10086                      in one of the previous TSS releases.*/
+   strcat(cmd, tss_date);
+   strcat(cmd, ") ");
+
+  /*
+   *   Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 1, func, rc);
+   return rc;
+ }
+

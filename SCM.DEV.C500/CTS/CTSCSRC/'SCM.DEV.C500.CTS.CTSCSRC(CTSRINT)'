@@ -1,0 +1,405 @@
+/**************************************************************
+*                                                             *
+* Title            : RACF interception function               *
+*                                                             *
+* File Name        : ctsrint.c                                *
+*                                                             *
+* Author           : Doron Cohen                              *
+*                                                             *
+* Creation Date    : 20/05/97                                 *
+*                                                             *
+**************************************************************/
+
+/**************************************************************
+* Mod.Id   Who      When     Description                      *
+* -------- -------- -------  -------------------------------- *
+* ps0089   Doron    20/5/97  Initial                          *
+* ps0295   Guy      16/8/98  Changes for common code 3.0.0 GA *
+* bs2369   Doron    08/12/98 Connection interceptions sent    *
+*                            twice and in case of Add Group   *
+* ws2372   Yonatan  29/06/00 send user update per password    *
+*                            interception                     *
+* IS10100  NuritY   29/07/13 Support CTSA internal custom     *
+*                            fields (CTSACFs) and revoke      *
+*                            reason.                          *
+* SAS2IBMN NuritY   05/02/17 SAS/C to IBM C Conversion Project*
+* WS10064  MeirS    04/10/17 Support Phrase.                  *
+ * IS10182  AvnerL   17/07/19  S0C4/S0C1 due to DIAG vsprintf  *
+**************************************************************/
+
+#include <globs.h>
+
+/*
+ *   Standard header files
+ */
+
+#include STRING
+#include STDIO
+#include STDLIB
+#include CTYPE
+
+/*
+ *   Common code header files
+ */
+
+#include ESA_API
+#include ESA_DIAG
+#include ESA_API_CODES
+
+/*
+ *   Platform header files
+ */
+
+#include MVS_CODES
+#include MVS_INTERCEPTOR
+#include RACF                                         /* IS10100 */
+
+/* IS10100 - start */
+
+static char comp[]= "CTSRINT";
+
+/**************************************************************
+*                                                             *
+* Subroutine name : CTSCINT_RACF_event                        *
+*                                                             *
+* DESCRIPTION     : Notify of RACF event to Control-SA        *
+*                                                             *
+* INPUT           :                                           *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+
+ESA_RC CTSCINT_RACF_event (char                   type,
+                           char                         * group,
+                           char                         * user,
+                           ACTION_typ                     action,
+                           int                            msg_flag,
+                           INTERCEPT_RSS_PARAMS_rec_typ * rss_parm,
+/* ps0295 */               ADMIN_PARAMS_rec_typ         * admin_params,
+/* ws2372 */               char                         * o_program,
+/* IS10100 */              INTERCEPT_EVENT_rec_typ      * evt)
+
+{
+
+  static char func[] = "CTSCINT_RACF_event";
+  ESA_RC      rc = ESA_OK ;
+  RACF_CTSACF_ACT_typ  is_act;           /* IS10100                */
+  char        cf_name[9];                /* IS10100                */
+
+  ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, 1, func);
+
+  /* IS10100 - start */
+  /*
+   *  Handle revoke reason when a user is revoked, or when a user
+   *  user is updated and the update contains revoke or resume.
+   *
+   *  This should be done before the event is written to the queue
+   *  in order to set the revoke reason for the user before it
+   *  is read by the CD.
+   */
+   if ( (rc EQ ESA_OK) AND
+        (type EQ 'U')  AND
+        ( (action EQ ACT_UPDATE) OR (action EQ ACT_REVOKE) )  AND
+        ( (evt->update_type EQ 'V') OR (evt->update_type EQ 'S') ) )
+   {
+     /* Check id revoke reason is required                         */
+     rc = RACF_IsAct_CTSACF_Feature(ESA_COMP_RSS_INTERCEPT,
+                                    type, LOCKED_ACCOUNT,
+                                    &is_act, cf_name, admin_params);
+     if (rc EQ ESA_OK  AND  is_act EQ ACT_YES)         /* if req'd */
+     {
+       /*   Update revoke reason for the user and issue the           */
+       /*   appropriate messages.                                     */
+       /*                                                             */
+       /*   We do not get the return code because we have nothing     */
+       /*   to do if the update failed.                               */
+       RACF_Update_Revoke_Reason(ESA_COMP_RSS_INTERCEPT,
+                                 user, evt->action,
+                                 evt->update_type,
+                                 evt->revoke_reason, cf_name,
+                                 admin_params);
+     }
+   }
+  /* IS10100 - end   */
+
+  /*
+   *  Write event asis
+   */
+  /*
+     WS10064 start
+  rc = CTSCINT_write_event (type, group, user, action,
+                            msg_flag, rss_parm, admin_params);
+  */                                            /* ps0295 */
+  rc = CTSCINT_write_event (type, group, user, action,
+                            msg_flag, rss_parm, admin_params,
+                            evt->passphrase);
+  /* WS10064 end   */
+  /*
+   * If user action is 'add', internally generate a
+   * 'connection updated' for the default group connection
+   */
+
+   if ( (rc EQ ESA_OK) AND
+        (action EQ ACT_ADD) AND (type EQ 'U')  )
+      /* WS10064 start - adding PassPhrase parameter
+      rc = CTSCINT_write_event ( 'C', group, user, ACT_UPDATE,
+                                 msg_flag, rss_parm, admin_params);
+      */                                             /* ps0295 */
+      rc = CTSCINT_write_event ( 'C', group, user, ACT_UPDATE,
+                                 msg_flag, rss_parm, admin_params,
+                                 evt->passphrase);
+      /* WS10064 end   */
+  /*
+   *  If user action is 'update' internally generate a
+   *  'connection updated' for the group specified in the evt.
+   */
+
+   if ( (rc EQ ESA_OK) AND (action EQ ACT_UPDATE) AND
+        (type EQ 'U')  AND                             /* BS2369 */
+        (strcmp(group, NULL_STRING) NE 0) )
+
+      rc = CTSCINT_write_event ( 'C', group, user, ACT_UPDATE,
+      /* WS10064                  msg_flag, rss_parm, admin_params); */
+      /* WS10064 */               msg_flag, rss_parm, admin_params,
+                                 evt->passphrase);   /* WS10064      */
+                                                     /* ps0295 */
+  /*  ws2372
+   * If user action is password update, generate a
+   * user update, only if the password update was not
+   * generated by altuser.
+   */
+
+  ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,2,          /* ws2372 */
+       "rc=%d  action=%c  o_program=%s ",            /* ws2372 */
+       rc, action, o_program );                      /* ws2372 */
+
+   if ( (rc EQ ESA_OK) AND
+        (action EQ ACT_PWD_UPD) AND (type EQ 'U')
+        AND (memcmp(o_program,"ALTUSER ",8) NE 0) )
+
+      rc = CTSCINT_write_event ( 'U', group, user, ACT_UPDATE,
+      /* WS10064                 msg_flag, rss_parm, admin_params);  */
+                                                     /* ws2372 */
+      /* WS10064 */               msg_flag, rss_parm, admin_params,
+      /* WS10064 */               evt->passphrase);
+   /* WS10064 start */
+   if ( (rc EQ ESA_OK) AND
+        (action EQ ACT_PWPH_UPD) AND (type EQ 'U')
+        AND (memcmp(o_program,"ALTUSER ",8) NE 0) )
+
+      rc = CTSCINT_write_event ( 'U', evt->passphrase,
+                                 user, ACT_UPDATE,
+                                 msg_flag, rss_parm, admin_params,
+                                 evt->passphrase);
+   /* WS10064 end   */
+  exit:
+
+  ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT,1, func, rc );
+
+  return rc;
+
+}  /*  CTSCINT_RACF_event  */
+
+/* IS10100 - start */
+/********************************************************************
+ *
+ * Procedure Name : CTSCINT_RACF_Init
+ *
+ * Description    : Perform specific RACF tasks for Online and
+ *                  Offline interceptors Initialization:
+ *                  - Allocate area for RACF_PARAMS and prepare
+ *                    the CTSACF blocks. Chain RACF_PARAMS on
+ *                    admin_params.
+ *
+ * Input          :
+ *
+ * Output         : None.
+ *
+ * Input/Output   : admin_params.
+ *
+ * Return Value   : ESA_RC:
+ *                  - ESA_OK - OK
+ *                  - ESA_ERR - CTSACF Fields initialization failed.
+ *                              No tables were created.
+ *                  - ESA_FATAL - Severe error.
+ *
+ *
+ * Side Effects   :
+ *
+ ********************************************************************/
+
+ ESA_RC CTSCINT_RACF_Init(ESA_DIAG_COMP_typ      comp,
+                          ADMIN_PARAMS_rec_typ  *admin_params)
+{
+
+  char          func[] = "CTSCINT_RACF_Init";
+  ESA_RC        rc = ESA_OK ;
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+  char                         errmsg[81] = "";
+
+  RACF_PARAMS_rec_typ        * params_ptr = NULL;
+  RACF_CTSACF_block_ptr        p_u_ctsacfs = NULL;
+  RACF_CTSACF_block_ptr        p_g_ctsacfs = NULL;
+  int                          msg_issued = FALSE;
+
+  /*
+   *  Initialization
+   */
+  admin_params->cs_func.DIAG_enter_ptr(comp, 1, func);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  /*
+   *  Allocate RACF_PARAMs ares
+   */
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+  ESA_DIAG_printf(comp, 5,                        /*IS10182*/
+                "Allocating <%d> bytes for RACF_PARAMS ",
+                 sizeof(RACF_PARAMS_rec_typ));
+  params_ptr = malloc(sizeof(RACF_PARAMS_rec_typ));
+
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+  ESA_DIAG_printf(comp, 5,                           /*IS10182*/
+                "RACF_PARAMS allocated at %X", params_ptr);
+
+  if (params_ptr EQ NULL)
+  {
+    sprintf(errmsg, "RACF_PARAMS in comp=%s fn=%s", comp, func);
+    /* SAS2IBMN admin_params->cs_func.MSG_printf_ptr (
+                  ERR_MALLOC, errmsg, sizeof(RACF_PARAMS_rec_typ));*/
+       CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,     /* SAS2IBMN */
+                errmsg, sizeof(RACF_PARAMS_rec_typ));  /* SAS2IBMN */
+    rc = ESA_FATAL;
+    goto exit;
+  }
+
+  memset(params_ptr, 0X00, sizeof(RACF_PARAMS_rec_typ));
+
+  /*
+   *  Create the CTSACF blocks.
+   */
+
+  rc = RACF_Init_Custom_Fields(comp, NULL, NULL,
+                               &p_u_ctsacfs, &p_g_ctsacfs,
+                               &msg_issued, admin_params);
+  /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+  ESA_DIAG_printf(comp, 5,                          /*IS10182*/
+                "Init CTSACF:  rc=%d  u=%8X  g=%8X",
+                rc, p_u_ctsacfs, p_g_ctsacfs);
+
+  if (rc LT ESA_ERR)               /* blocks created successfully... */
+  {
+    params_ptr->p_u_ctsacfs = p_u_ctsacfs;               /* hang...  */
+    params_ptr->p_g_ctsacfs = p_g_ctsacfs;               /*  ...them */
+    rc = ESA_OK;
+  }
+  else
+    if (rc EQ ESA_ERR)  /* If failed to creatd CTSACF blocks...      */
+      rc = ESA_OK;      /* ... contniue without them.                */
+
+  /*
+   *  If all OK, chain the blocks on RACF_PARAMS and chain
+   *  RACF_PARAMS on admin_params.
+   *  Else, free all allocated blocks.
+   */
+  if (rc EQ ESA_OK)
+    admin_params->apiinit_handle = params_ptr;
+  else
+  {
+    RACF_Free_CTSACF_Block(comp, p_u_ctsacfs, admin_params);
+    RACF_Free_CTSACF_Block(comp, p_g_ctsacfs, admin_params);
+
+    if (params_ptr NE NULL)
+      free(params_ptr);
+
+    admin_params->apiinit_handle = NULL;
+  }
+
+  /*
+   *  Return
+   */
+ exit:
+  admin_params->cs_func.DIAG_exit_ptr(comp, 1, func, rc);
+  return rc;
+
+}  /* CTSCINT_RACF_Init */
+
+/********************************************************************
+ *
+ * Procedure Name : CTSCINT_RACF_Term
+ *
+ * Description    : Perform specific RACF tasks for Online and
+ *                  Offline interceptors termination:
+ *                  - Free the CTSACF blocks and the RACF_PARAMS
+ *                    area.
+ *
+ * Input          :
+ *
+ * Output         : None.
+ *
+ * Input/Output   : admin_params.
+ *
+ * Return Value   : ESA_RC:
+ *                  - ESA_OK - OK
+ *                  - ESA_ERR - CTSACF Fields initialization failed.
+ *                              No tables were created.
+ *                  - ESA_FATAL - Severe error.
+ *
+ *
+ * Side Effects   :
+ *
+ ********************************************************************/
+
+ ESA_RC CTSCINT_RACF_Term(ESA_DIAG_COMP_typ      comp,
+                          ADMIN_PARAMS_rec_typ  *admin_params)
+{
+
+  char          func[] = "CTSCINT_RACF_Term";
+  ESA_RC        rc = ESA_OK ;
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+  RACF_PARAMS_rec_typ        * params_ptr = NULL;
+
+  /*
+   *  Initialization
+   */
+  admin_params->cs_func.DIAG_enter_ptr(comp, 1, func);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  /*
+   *  Free CTSACF blocks and RACF_PARAMS
+   */
+  params_ptr = admin_params->apiinit_handle;
+  if (params_ptr NE NULL)
+  {
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+    ESA_DIAG_printf(comp, 5,                       /*IS10182*/
+                 "Free CTSACF blocks: u=%8X    g=%8X",
+                 params_ptr->p_u_ctsacfs, params_ptr->p_g_ctsacfs);
+    RACF_Free_CTSACF_Block(comp, params_ptr->p_u_ctsacfs,
+                           admin_params);
+    RACF_Free_CTSACF_Block(comp, params_ptr->p_g_ctsacfs,
+                           admin_params);
+
+    /*IS10182 admin_params->cs_func.DIAG_printf_ptr(comp, 5,*/
+    ESA_DIAG_printf(comp, 5,                    /*IS10182*/
+                 "Free RACF_PARAMS at %8X", params_ptr);
+    admin_params->apiinit_handle = NULL;
+    free(params_ptr);
+  }
+
+  /*
+   *  Return
+   */
+  admin_params->cs_func.DIAG_exit_ptr(comp, 1, func, rc);
+  return rc;
+
+}  /* CTSCINT_RACF_Term */
+/* IS10100 - end   */

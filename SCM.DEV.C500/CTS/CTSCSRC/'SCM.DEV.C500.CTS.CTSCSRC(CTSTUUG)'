@@ -1,0 +1,258 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Update a user group (TSS)                *
+ *                                                             *
+ * File Name        : ctstuug.c                                *
+ *                                                             *
+ * Author           : Alex Shvartsman                          *
+ *                                                             *
+ * Creation Date    : 08/06/96                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ *                   dd/mm/yy                                  *
+ * IS10091  NuritY   06/06/13 Add Diags.  (WS10035)            *
+ * WS10082  MauriC   14/11/22 Recompile for new ADDINFO macros *
+ *                                                             *
+ **************************************************************/
+
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_API
+ #include ESA_API_CODES
+
+ #include MVS_ONLINE_INTERCEPTOR
+
+ #include API_ADDINFO
+
+ #include TSS
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : updug                                      *
+ *                                                             *
+ * DESCRIPTION    : Update a user group                        *
+ *                                                             *
+ * INPUT          : ug, addinfo, admin                         *
+ *                                                             *
+ * OUTPUT         : err                                        *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC CTSUpdUG (UG_PARAMS_rec_typ    * ug_params,
+                  ADDINFO_rec_typ      * addinfo,
+                  ADMIN_PARAMS_rec_typ * admin_params,
+                  ERR_STRUCT_rec_typ   * err)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                     rc     = ESA_OK;
+   static char                func[]="CTSUpdUG";
+   CTSAMSG_HANDLE_rec_ptr     msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr dest;
+   ADDINFO_rec_ptr            get_addinfo = NULL;
+   ADDINFO_rec_ptr            ess_addinfo = NULL;
+   TSS_CMD_HANDLE_typ        *cmd_handle  = NULL;
+
+  /*
+   *  Get UG parameters
+   */
+
+   TSS_RTT_rec_typ          * rtt;
+   short                      rtt_num_items;
+   OBJ_EXISTS_typ             obj_exist  = OBJ_NOT_EXIST;
+   HAVE_MORE_typ              have_more  = NO_MORE;
+   void                     * handle     = NULL;
+   short                      actual_num = 0;
+   UG_PARAMS_rec_typ          ug;
+   OE_typ                     oe = "";
+
+   /*** For TSS_chk_acid ***/
+
+   char                       real_acid_type[TSS_ACID_TYPE_LEN+1]="";
+   OBJECT_TYPE_typ            real_obj_type = TYPE_IGNORE;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_UPDUG, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+  /*
+   * Initialize global parameters
+   */
+
+   rc = TSS_global_init (ESA_COMP_UPDUG, admin_params, err);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   rtt = TSS_get_global_rtt();
+   rtt_num_items  = TSS_get_global_rtt_num_items();
+
+  /*
+   *  Check ug existance
+   */
+
+   rc = TSS_chk_acid(ESA_COMP_UPDUG, ug_params->group,
+                     TSS_GROUP, TYPE_GROUP,
+                     OBJ_EXIST, TRUE, real_acid_type, &real_obj_type,
+                     admin_params, err);
+   if (rc NE ESA_OK)
+      goto exit;
+
+  /*
+   *   Create command handle
+   */
+
+   rc = TSS_alloc_cmd_handle (ESA_COMP_UPDUG,
+                              MAX_TSS_CMD_GROUP_ENTRIES,
+                              &cmd_handle, dest, msgs );
+   if ( rc NE ESA_OK )
+      goto exit;
+
+  /*
+   *   Build internal addinfo
+   */
+
+   rc = ADDINFO_alloc(func, addinfo->num_pairs,
+                      &ess_addinfo, dest, msgs);
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   ADDINFO_copy( ess_addinfo, addinfo );
+
+  /*
+   *   Update ug processing
+   */
+
+  /*
+   *   Prepare parameters to obtain ug info
+   */
+
+   rc = ADDINFO_alloc(func, rtt_num_items, &get_addinfo, dest, msgs);
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   rc = TSS_rtt_2_addinfo(ESA_COMP_UPDUG,
+                          rtt, get_addinfo, dest, msgs);
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *  Get ug information
+   */
+
+   strcpy(ug.group, ug_params->group);
+   rc = CTSGetUGs ( GET_MANY_GROUPS, oe, 1, &actual_num,
+                    &have_more, &handle,
+                    1, ug_params, &ug, &get_addinfo, &obj_exist,
+                    admin_params, err );
+
+   ESA_DIAG_printf(ESA_COMP_UPDUG, 1,
+                   "ug=%s rc=%d exists=%d",
+                    ug.group, rc, obj_exist);
+
+   if ( (obj_exist EQ OBJ_NOT_EXIST) OR ( rc NE ESA_OK )) {
+       rc = ESA_FATAL;
+       goto exit;
+   }
+
+  /*
+   *  Check whether need MOVE operation
+   *  If YES, do it now
+   *  after that all additional changes
+   */
+
+   /*  IS10091 - start */
+   if ( ESA_DIAG_get_debug_level(ESA_COMP_UPDUG) GE 6 )
+   {
+     ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+                     "input addinfo");
+     ADDINFO_dump(addinfo,1);
+
+     ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+                     "get addinfo");
+     ADDINFO_dump(get_addinfo,1);
+
+     ESA_DIAG_printf(ESA_COMP_UPDUG, 6,
+                     "IIQ/IDN addinfo");
+     ADDINFO_dump(ess_addinfo,1);
+   }
+   /*  IS10091 - end */
+
+
+   rc = TSS_check_moving(ESA_COMP_UPDUG, TSS_UG_TYPE,
+                         rtt, ug_params->group,
+                         ug_params->parent_oe, ess_addinfo, ug.group,
+                         ug.parent_oe, get_addinfo, TYPE_GROUP,
+                         admin_params,err);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   rc = TSS_do_addinfo (ESA_COMP_UPDUG, cmd_handle, rtt,
+                        ess_addinfo, get_addinfo, dest, msgs);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   rc = TSS_do_cmd( ESA_COMP_UPDUG, (char *)ug_params->group,
+                    TYPE_GROUP, TSS_EVNT_ACTION_UPDATE,
+                    cmd_handle, admin_params);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+  /*
+   *   Finish
+   */
+
+ exit:;
+
+   if (cmd_handle)
+      TSS_free_cmd_handle( ESA_COMP_UPDUG,
+                           &cmd_handle, dest, msgs);
+
+   if (get_addinfo)
+      ADDINFO_free(&get_addinfo);
+
+   if (ess_addinfo)
+      ADDINFO_free(&ess_addinfo);
+
+   ESA_DIAG_exit(ESA_COMP_UPDUG, 1, func, rc);
+
+   return rc;
+
+ }

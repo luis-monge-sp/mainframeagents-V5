@@ -1,0 +1,1963 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Issuing TSS  commands                    *
+ *                                                             *
+ * File Name        : ctstcmd                                  *
+ *                                                             *
+ * Author           : Alexander Shvartsman                     *
+ *                                                             *
+ * Creation Date    : 16/06/96                                 *
+ *                                                             *
+ * Description      : TSS  issuing command                     *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * BS2429   YB       13/09/00 notify connection update         *
+ * PS0426   YB       12/10/00 REMOVE REFERENCES TO SUBSYS_NAME *
+ * BS2550   BP       13/02/03 Resource download problem when   *
+ *                        the resource owner is named TSSXXXXX *
+ * BS2673   AH       02/05/04 Transactions fails but processed *
+ *                            as succeeded (Fixing BS2550)     *
+ * BS2676   AH       10/05/04 Delete resource with owner       *
+ *                            TSSxxxxx fails                   *
+ * IS0358   YoniMa   17/08/06 memory leak.(BS2698)             *
+ * BS10052  NuritY   28/09/16 When delete connection, send 3   *
+ *                            notifications to match CTSTSSX   *
+ *                            procesisng.                      *
+ * SAS2IBMN NuritY   05/10/16 SAS/C to IBM Conversion.         *
+ * SAS2IBMT SeligT   09/10/16 SAS/C to IBM C Conversion Project*
+ * IS10147A SeligT   10/07/17 Add support for password phrase  *
+ * BS10085  SeligT   09/04/18 Add VERBOSE to LIST command      *
+ * BS10109  NuritY   14/09/20 Abend S0C4 when length of line   *
+ *                            returned from TSS > 133.         *
+ * IS10183  ThomaS   13/05/21 Don't print password in clear    *
+ * WS10082A AvnerL   12/11/23 Remove API_ADDINFO               *
+ ***************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDIO
+ #include   STDLIB
+ #include   STRING
+
+ #include   CTYPE                                  /*bs2550*/
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_CTSAMSG
+ #include ESA_API
+ #include ESA_INIT            /* for #def ALL_RSS */
+ #include ESA_API_CODES
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_COMP
+ #include MVS_OS_MVS
+ /*WS10082A #include API_ADDINFO --- not used */
+ #include API_AUTH
+
+ /*
+  *   TSS include files
+  */
+
+ #include TSS
+ #include TSS_CODES
+
+ #include MVS_ONLINE_INTERCEPTOR
+ #define  INSTAL_PARAM_NAME  "CTSA_ID"  /* PS0426 */
+
+ /*
+  *   Assembler prog invoke tss and pass command
+  */
+
+  /* SAS2IBMT
+  extern int ctsscmd( int    *debug,    // Debug level   //
+                      char   *mode,     // mode          //
+                      char   *command,  // command       //
+                      int    *cmd_len,  // cmd length    //
+                      char   *handle,   // 12 byte       //
+                      void   *rt_buf,   // ret buffer    //
+                      int    *rc,       // rc            //
+                      int    *reason);  // reason code   */
+  extern int ctsscmd();                                   /* SAS2IBMT */
+
+ static ESA_RC TSS_change_password_detected(char     *cmd);
+
+ static char * HidePasswordText(char       *cmd);
+
+ static char component[] = "CTSTCMD";
+
+ static char internal2_msg_buf[200];
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_strip_val                              *
+ *                                                             *
+ * DESCRIPTION    : Strip string                               *
+ *                                                             *
+ * INPUT          : data      - data                           *
+ *                  c         - strip symbol                   *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ void TSS_strip_val(char  *data, char   c, char  mode)
+ {
+    int    len;
+    int    i;
+    char   val[MAX_TSS_PARAM_LEN];
+
+   /*
+    * Remove tailoring symbols
+    */
+
+    if ( (mode EQ TSS_STRIP_BOTH) OR
+         (mode EQ TSS_STRIP_RIGHT) )  {
+       len = strlen(data);
+       if (len EQ 0 )
+          goto exit;
+
+       i = len - 1;
+       for (i = len - 1; (i GT 0) AND (*(data+i) EQ c); i--);
+
+       if ( (i EQ 0) AND (*data EQ c) )
+          *data = NULL_CHAR;
+       else
+          *(data + i + 1) = NULL_CHAR;
+    }
+
+   /*
+    * Remove leading symbols
+    */
+
+    if ( (mode EQ TSS_STRIP_BOTH) OR
+         (mode EQ TSS_STRIP_LEFT)  )  {
+      strcpy(val, data);
+      len = strlen(val);
+      if (len EQ 0 )
+         goto exit;
+
+      for (i = 0; (i LT len) AND (val[i] EQ c); i++);
+      strcpy(data, &val[i]);
+    }
+
+   exit :;
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_change_password_detected               *
+ *                                                             *
+ * DESCRIPTION    : Determine whether command includes change  *
+ *                  password                                   *
+ * INPUT          : ptr to command                             *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - yes includes, otherwise - ESA_ERR *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_change_password_detected(char     *cmd)
+ {
+
+     ESA_RC   rc;
+     char     *work;
+     char     *workp;                                     /* IS10147A */
+     static   char pswd_text[]  = "PASSWORD(";
+     static   char pswd_text1[] = "PASSWORD(*)";
+     static   char pswd_text2[] = "PASSWORD(*,";
+     static   char pswd_text3[] = "PASSWORD(NOPW)";
+     static   char pswd_text4[] = "PHRASE(";              /* IS10147A */
+     static   char pswd_text5[] = "PHRASE(*)";            /* IS10147A */
+     static   char pswd_text6[] = "PHRASE(*,";            /* IS10147A */
+
+
+     work = strstr(cmd, pswd_text);
+     workp = strstr(cmd, pswd_text4);                     /* IS10147A */
+     /* IS10147A if ( work EQ NULL )                                  */
+     if ( ( work EQ NULL ) AND ( workp EQ NULL ) )        /* IS10147A */
+          rc = ESA_ERR;  /* command does not include change password */
+     else {
+        if ( (memcmp(work, pswd_text1, strlen(pswd_text1)) EQ 0) OR
+             (memcmp(work, pswd_text2, strlen(pswd_text2)) EQ 0) OR
+             (memcmp(workp,pswd_text5, strlen(pswd_text5)) EQ 0) OR /*IS10147A*/
+             (memcmp(workp,pswd_text6, strlen(pswd_text6)) EQ 0) OR /*IS10147A*/
+             (memcmp(work, pswd_text3, strlen(pswd_text3)) EQ 0)  )
+          rc = ESA_ERR;  /* command does not include change password */
+        else
+          rc = ESA_OK;   /* command includes change password */
+     }
+
+     return rc;
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : HidePasswordText                           *
+ *                                                             *
+ * DESCRIPTION    : Change password text to *****              *
+ *                                                             *
+ * INPUT          : ptr to command                             *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ptr to command                             *
+ *                                                             *
+ **************************************************************/
+
+ static char * HidePasswordText(char       *cmd_p)
+ {
+     char     *work;
+     char     *workp;                                     /* IS10147A */
+     int      len;
+     int      i = 0;
+     static   char cmd[MAX_TSS_API_ST];
+     static   char pswd_text[] = "PASSWORD(";
+     static   char pswd_text4[] = "PHRASE(";              /* IS10147A */
+
+
+     strcpy( cmd, cmd_p);
+     work = strstr(cmd, pswd_text);
+     workp = strstr(cmd, pswd_text4);                     /* IS10147A */
+     /* IS10147A if ( work EQ NULL )                                  */
+     if ( ( work EQ NULL ) AND ( workp EQ NULL ) )        /* IS10147A */
+          goto exit;
+
+     if ( work NE NULL ) {                                /* IS10147A */
+       work += strlen(pswd_text);
+       len = strlen(work);
+
+      /*
+       *    Hide PASSWORD text loop
+       */
+
+       while ( ( *work NE ')'       ) AND
+               ( *work NE ','       ) AND
+               ( *work NE BLANK     ) AND
+               ( *work NE NULL_CHAR ) AND
+               (  i LT len          )   )  {
+          *work = '*';
+          i++;
+          work++;
+       }
+     }                                                    /* IS10147A */
+
+     if ( workp NE NULL ) {                               /* IS10147A */
+       workp += strlen(pswd_text4);                       /* IS10147A */
+       len = strlen(workp);                               /* IS10147A */
+       i = 0;                                             /* IS10147A */
+
+      /*
+       *    Hide PHRASE text loop
+       */
+
+       while ( ( *workp NE ')'       ) AND                /* IS10147A */
+               ( *workp NE ','       ) AND                /* IS10147A */
+               ( *workp NE NULL_CHAR ) AND                /* IS10147A */
+               (  i LT len          )   )  {              /* IS10147A */
+          *workp = '*';                                   /* IS10147A */
+          i++;                                            /* IS10147A */
+          workp++;                                        /* IS10147A */
+       }                                                  /* IS10147A */
+     }                                                    /* IS10147A */
+
+     exit :;
+
+       /* Remove trailing blanks from the end of a line */
+
+       TSS_strip_val( cmd, ' ', TSS_STRIP_RIGHT );
+
+       return cmd;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : tsscmd_examine_rc                          *
+ *                                                             *
+ * DESCRIPTION    : tsscmd_messages                            *
+ *                                                             *
+ * INPUT          : cmd                                        *
+ *                  rc after tsscmd                            *
+ *                  reason after tsscmd                        *
+ *                  r15                                        *
+ *                                                             *
+ * OUTPUT         : rc                                         *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC tsscmd_examine_rc( char               *cmd,
+                          int                        tss_rc,
+                          int                        tss_reason,
+                          int                        r15,
+                          CTSAMSG_DEST_TABLE_rec_ptr dest,
+                          CTSAMSG_HANDLE_rec_ptr     msgs)
+ {
+
+     ESA_RC rc;
+
+     switch ( r15 ) {
+         case  0 :  /* OK */
+                   rc = ESA_OK;
+                   break;
+         case  4 :  /* end-of-messages */
+                   rc = ESA_EOF;
+                   break;
+         case  8 :  /* TSS is not active */
+                   CTSAMSG_print(TSS_NOT_ACTIVE, msgs, NULL, dest);
+                   rc = ESA_FATAL;
+                   break;
+         case 12 :  /* Buffer overflow   */
+                   if ( cmd )
+                     CTSAMSG_print(TSS_BUF_OVERFLOW,
+                                   msgs,NULL,dest,
+                                   HidePasswordText(cmd));
+                   rc = ESA_ERR;
+                   break;
+         default :  /* Other errors      */
+                   if ( cmd ) {
+                     CTSAMSG_print(TSS_CMD_RESULT_ERR,
+                                   msgs,NULL,dest,
+                                   HidePasswordText(cmd));
+                     CTSAMSG_print(TSS_CMD_RESULT_ERR_RC,
+                                   msgs,NULL,dest,tss_rc,tss_reason);
+                   }
+                   rc = ESA_FATAL;
+                   break;
+     }
+
+     return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : tsscmd_examine_rec                         *
+ *                                                             *
+ * DESCRIPTION    : check obtained record from TSS             *
+ *                                                             *
+ *    This function gets one TSS command output line and       *
+ *    identify the command result based on it's contents       *
+ *                                                             *
+ * INPUT          : record                                     *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - 1. Record does not include TSS    *
+ *                              message ID                     *
+ *                           2. TSS Information message ID     *
+ *                           3. On weak QUITE mode, error msg  *
+ *                              ID that should be ignored      *
+ *                                                             *
+ *                  ESA_FATAL - TSS Error message that does not*
+ *                              fall into one of the obove.    *
+ *                                                Amir BS2673  *
+ **************************************************************/
+
+ static ESA_RC tsscmd_examine_rec(ESA_DIAG_COMP_typ      comp,
+                                  char                 * record,
+                                  TSS_CMD_MODE_typ       mode)
+ {
+
+     ESA_RC                    rc = ESA_OK;
+     int                       i;
+     int                       a = 0;             /* bs2550 */
+     int                       found;
+     /* Messages that are OK:
+      *   TSS0314E ACID DOES NOT EXIST
+      */
+     static   const char      *weak_quiet_ok[] = {
+                                                  "TSS0314E",
+                                                  NULL
+                                                 };
+
+     char                      buffer[MAX_TSS_API_ST];
+     char                     *token;
+
+     /* func_succeeded is the suffix of the TSS0300I message id:  */
+     /*   TSS0300I TSS function FUNCTION SUCCESSFUL               */
+     /*                                                           */
+     /* func_failed_msg is the suffix of the TSS0301I message id: */
+     /*   TSS0301I TSS function FUNCTION FAILED, RETURN CODE = XX */
+     /*                                               BS2673 Amir */
+     static const char       *func_succeeded_msg = "0300I"; /*BS2673*/
+     /* static const char       *func_failed_msg = "0301I";   BS2673*/
+
+     strcpy(buffer, record);
+
+     ESA_DIAG_printf(comp,4,"mode=%d rec=%s", mode, record);
+
+     /*** For QUIET mode does not matter what was obtained ***/
+
+     /* If command mode is QUITE return with ESA_OK */
+     if ( mode EQ TSS_CMD_QUIET_MODE )
+       goto exit;
+
+     token = strtok(buffer, " "); /* Get first word */
+     if ( NOT token )
+        goto exit;
+
+     ESA_DIAG_printf(comp, 8,"token=%s", token);
+
+
+    /* BS2673 Start ( + reordering of code ) */
+    /* Check first word may be TSS message: prefix "TSS" and 8 chars */
+     if ( (strlen(token) NE 8 ) OR
+          (memcmp(token, "TSS", 3) NE 0 ) ) {
+        rc = ESA_OK;  /* Not TSS message so it's OK */
+        goto exit;
+     }
+
+     /* Check if it's TSS0300I message - Command succeeded     */
+     if ( memcmp(token+3, func_succeeded_msg,5) EQ 0) {
+        rc = ESA_OK;
+        goto exit;
+     }
+
+     /* Check if it's TSS0301I message - Command failed
+     if ( memcmp(token+3, func_failed_msg,5) EQ 0) {
+        rc = ESA_FATAL;
+        goto exit;
+     } */
+
+     /* bs2550 - begin */
+     /* If command mode is not QUITE and the caller is
+      * is a resource function, we should distinguish between a
+      * first token that is a TSS message ID and a valid ACID name with
+      * similare format in HOWOWNS command output. .Amir.
+     */
+     if ((mode EQ TSS_CMD_DEFAULT_MODE ) &&
+         ( (comp EQ ESA_COMP_GETRES ) ||
+           (comp EQ ESA_COMP_ADDRES ) || /* BS2676 */
+           (comp EQ ESA_COMP_DELRES ) || /* BS2676 */
+           (comp EQ ESA_COMP_UPDRES ) )  /* BS2676 */
+     ) {
+        ESA_DIAG_printf(comp,4,"mode=%d rec=%s",mode,record);
+
+        /* Check for format TSSnnnnx where nnnn is a number       */
+        /* x is a valid TSS message ID suffix ( E/A/I/W )         */
+        if( isdigit( *(token+3) ) && isdigit( *(token+4) )
+                  && isdigit( *(token+5) ) && isdigit( *(token+6) ) )
+			     {
+           if( *(token+7) == 'E' || *(token+7) == 'A'   ||
+               *(token+7) == 'W' || *(token+7) == 'I' )
+						     {
+              /* Skip null characters */
+              while( isspace( *(buffer + strlen(token) + 1 + a)))
+                 a ++;
+
+              /* Check if it's HOWOWNS output. For example:
+               *   TSS  WHOOWNS DSN(DBFILE)
+               *   TSSKUKU1 OWNS DATASET  DBFILE
+               *   TSS0300I  WHOOWNS  FUNCTION SUCCESSFUL
+               */
+              if( memcmp(buffer + strlen(token) + 1 + a,
+                         "OWNS", 4) == 0) {
+							          rc = ESA_OK;
+                 goto exit;
+              }
+              else {
+                 /* Continue with message processing */
+						        }
+           }
+           else { /* x not a valid message suffix - ignore record */
+							       rc = ESA_OK;
+              goto exit;
+           }
+			     } /* end if isdigit */
+        else { /* nnnn not a valid number - ignore record */
+							    rc = ESA_OK;
+           goto exit;
+	       }
+		   } /* end if TSS_CMD_DEFAULT_MODE & ESA_COMP_GETRES */
+     /*  end - BS2550  */
+
+     /* If it's weak QUITE mode, check for error message IDs
+      * that should be ignored.
+      * (currently only TSS0314E is listed)
+      */
+     if ( mode EQ TSS_CMD_WEAK_QUIET_MODE ) {
+        found = FALSE;
+        /* Search for matching message ID */
+        for(i=0; weak_quiet_ok[i]; i++) {
+           if (strcmp(token, weak_quiet_ok[i]) EQ 0 ) {
+              found = TRUE;
+              break;
+           }
+        }
+        if (found) {
+           rc = ESA_OK;
+           goto exit;
+        }
+        else {
+           /* Continue processing message ID */
+        }
+     }
+     else {
+        /* Continue processing message ID */
+     } /* end if mode EQ TSS_CMD_WEAK_QUIET_MODE */
+
+     /* It's a TSS message. Test it's suffix */
+     if( *(token+7) == 'I' ) {
+       rc = ESA_OK;
+     }
+     else { /* TSS Error/Warning message */
+       rc = ESA_FATAL;
+     }
+    /* BS2673 end */
+
+   exit:;
+
+     ESA_DIAG_printf(comp,4,"mode=%d rc=%d", mode, rc); /*bs2550*/
+     return rc;
+
+ } /* end tsscmd_examine_rec */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_send_cmd                               *
+ *                                                             *
+ * DESCRIPTION    : Send cmd to TSS                            *
+ *                                                             *
+ * INPUT          : comp        - diag component               *
+ *                  cmd         - command                      *
+ *                  cmd_handle  - command handle               *
+ *                  ret_buf     - return buffer                *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_send_cmd(ESA_DIAG_COMP_typ             comp,
+                     TSS_CMD_MODE_typ              mode,
+                     TSS_CMD_BUF_rec_typ         * cmd,
+                     char                        * cmd_handle,
+                     int                           print_cmd,
+                     CTSAMSG_DEST_TABLE_rec_ptr    dest,
+                     CTSAMSG_HANDLE_rec_ptr        msgs)
+ {
+
+  /*
+   *    Local Variables
+   */
+
+   static char func[]="TSS_send_cmd";
+
+   ESA_RC               rc   = ESA_OK;
+   ESA_RC               rc_p = ESA_OK;
+   char                 tsscmd_mode[TSS_CMD_MODE_LEN] = TSSCMD_CMD_MODE;
+   int                  cmd_len;
+   int                  debug;
+   int                  tss_rc;
+   int                  tss_reason;
+   char                 exec_cmd[MAX_TSS_API_ST];
+   char                 tmp_handle[TSS_CMD_HANDLE_LEN];
+   TSS_CMD_BUF_rec_typ  ret_buf;
+   int                  r15;
+   time_t               t;                                /* IS10147A */
+   int                  random_number;                    /* IS10147A */
+   char                 random_pswd[6];                   /* IS10147A */
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 4, func);
+
+   /***  Set Initial values  ***/
+
+   memset( cmd_handle, '\x0', sizeof(cmd_handle) );
+   debug = ESA_DIAG_get_debug_level(comp); /* Debug level */
+   /* allow diag in assembler as well  IS0358
+   if ( debug LT 10 )
+       debug = 0;              IS0358 ends      */
+
+  /*
+   *    Prepare command and parameters
+   *    to activate TSS
+   */
+
+   sprintf(exec_cmd, "TSS %s", cmd->buffer);
+
+  /*    IS10147A start
+   *    If this is a CREATE command which contains a PHRASE keyword
+   *    but no PASSWORD keyword, add a random PASSWORD keyword
+   */
+
+   if ((strstr(exec_cmd, "CREATE(")    NE 0)  AND
+       (strstr(exec_cmd, " PHRASE(")   NE 0)  AND
+       (strstr(exec_cmd, " PASSWORD(") EQ 0)) {
+      srand((unsigned) time(&t));
+      random_number = rand();
+      sprintf(random_pswd, "%d", random_number);
+      strcat(exec_cmd, " PASSWORD(R");
+      strcat(exec_cmd, random_pswd);
+      /* strcat(exec_cmd, ",,EXPIRED) "); do not do this */
+      strcat(exec_cmd, ") ");
+      ESA_DIAG_printf(ESA_COMP_ADDUSER, 6,
+        /* IS10183    "cmd with random password=%s", exec_cmd);    */
+                      "cmd with random password=%s",    /* IS10183 */
+                      HidePasswordText(exec_cmd));      /* IS10183 */
+   }
+  /*    IS10147A end                                                */
+
+   cmd_len = strlen(exec_cmd);
+
+   if (print_cmd)
+     CTSAMSG_print(TSS_OUTPUT_LINE, msgs, NULL, dest,
+                   HidePasswordText(exec_cmd));
+   /* IS10183
+   ESA_DIAG_printf(comp,4,"cmd=%s", exec_cmd);  */
+   ESA_DIAG_printf(comp,4,"cmd=%s",                     /* IS10183 */
+                   HidePasswordText(exec_cmd));         /* IS10183 */
+
+   /***  Activate TSS - CMD mode  ***/
+
+   /* SAS2IBMT
+   r15 = ctsscmd( &debug, tsscmd_mode, exec_cmd, &cmd_len,           */
+   r15 = (*(ASM_RTN_TYP *)&ctsscmd)                       /* SAS2IBMT */
+                ( &debug, tsscmd_mode, exec_cmd, &cmd_len,
+                  cmd_handle, NULL, &tss_rc, &tss_reason);
+
+   ESA_DIAG_printf(comp,4, "mode=%s rc=%d/%d reason=%d",
+                   tsscmd_mode, r15, tss_rc, tss_reason);
+
+   rc = tsscmd_examine_rc(exec_cmd, tss_rc, tss_reason, r15,
+                          dest, msgs );
+
+   /*** Examine output  ***/
+
+   if ( rc EQ ESA_OK ) {
+     memcpy(tmp_handle, cmd_handle, sizeof(tmp_handle) );
+     rc_p = TSS_get_output(comp, tmp_handle, &ret_buf, dest, msgs);
+     if ( rc_p EQ ESA_FATAL)
+       goto exit;
+     while (rc_p NE ESA_EOF) {
+          rc = tsscmd_examine_rec(comp, ret_buf.buffer, mode);
+          rc_p = TSS_get_output(comp, tmp_handle, &ret_buf, dest, msgs);
+          if ( rc_p EQ ESA_FATAL)
+              goto exit;
+          if ( rc NE ESA_OK )
+             break;
+     }
+   }    /* examine output */
+
+   /*** Issue err messages  ***/
+
+   if ( rc NE ESA_OK ) {
+     if (NOT print_cmd)
+       CTSAMSG_print(TSS_OUTPUT_LINE, msgs, NULL, dest,
+                     HidePasswordText(exec_cmd));
+
+     memcpy(tmp_handle, cmd_handle, sizeof(tmp_handle) );
+     rc_p = TSS_get_output(comp, tmp_handle, &ret_buf, dest, msgs);
+     if ( rc_p EQ ESA_FATAL)
+       goto exit;
+     while (rc_p NE ESA_EOF) {
+          CTSAMSG_print(TSS_OUTPUT_LINE, msgs, NULL, dest,
+                        HidePasswordText(ret_buf.buffer));
+          rc_p = TSS_get_output(comp, tmp_handle, &ret_buf, dest, msgs  );
+          if ( rc_p EQ ESA_FATAL)
+              goto exit;
+     }
+     rc = ESA_FATAL;      /* ESA_ERR; */
+   }     /*** Issue err messages  ***/
+
+  exit :;
+
+   ESA_DIAG_exit(comp, 4, func, rc);
+
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_get_output                             *
+ *                                                             *
+ * DESCRIPTION    : Get TSS output                             *
+ *                                                             *
+ * INPUT          : comp        - diag component               *
+ *                  cmd_handle  - command handle               *
+ *                  ret_buf     - return buffer                *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_get_output(ESA_DIAG_COMP_typ             comp,
+                       char                        * cmd_handle,
+                       TSS_CMD_BUF_rec_typ         * ret_buf,
+                       CTSAMSG_DEST_TABLE_rec_ptr    dest,
+                       CTSAMSG_HANDLE_rec_ptr        msgs)
+ {
+
+  /*
+   *    Local Variables
+   */
+
+   static char func[]="TSS_get_output";
+
+   ESA_RC     rc = ESA_OK;
+   char       tsscmd_mode[TSS_CMD_MODE_LEN] = TSSCMD_GET_MESSAGE;
+   int        debug;
+   int        tss_rc;
+   int        tss_reason;
+   int        r15;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 6, func);
+
+   debug = ESA_DIAG_get_debug_level(comp); /* Debug level */
+   /* allow diag in assembler as well                  IS0358
+   if ( debug LT 10 )
+       debug = 0;                      IS0358 ends */
+
+  /*
+   *    Obtain output - Get messages mode
+   */
+
+   ret_buf->max_len   = MAX_TSS_API_ST;
+   ret_buf->use_len   = 0;
+   ret_buf->buffer[0] = NULL_CHAR;
+
+   /* SAS2IBMT
+   r15 = ctsscmd( &debug, tsscmd_mode, NULL, NULL,                   */
+   r15 = (*(ASM_RTN_TYP *)&ctsscmd)                       /* SAS2IBMT */
+                ( &debug, tsscmd_mode, NULL, NULL,
+                  cmd_handle, ret_buf, &tss_rc, &tss_reason);
+
+   ESA_DIAG_printf(comp, 10,
+             "mode=%s rc=%d/%d reason=%d  ret_buf->use_len=%d\n",
+              tsscmd_mode, r15,tss_rc, tss_reason, ret_buf->use_len);
+
+   rc = tsscmd_examine_rc(NULL, tss_rc, tss_reason, r15, dest, msgs );
+   if ( rc EQ ESA_FATAL ) {
+     OS_MVS_btrace();
+   }
+
+   ESA_DIAG_exit(comp, 6, func, rc);
+
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_free_output                            *
+ *                                                             *
+ * DESCRIPTION    : Free output buffers                        *
+ *                                                             *
+ * INPUT          : comp        - diag component               *
+ *                  cmd_handle  - command handle               *
+ *                  ret_buf     - return buffer                *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_free_output(ESA_DIAG_COMP_typ             comp,
+                        char                        * cmd_handle,
+                        CTSAMSG_DEST_TABLE_rec_ptr    dest,
+                        CTSAMSG_HANDLE_rec_ptr        msgs)
+ {
+
+  /*
+   *    Local Variables
+   */
+
+   static char func[]="TSS_free_output";
+
+   ESA_RC     rc = ESA_OK;
+   char       tsscmd_mode[TSS_CMD_MODE_LEN] = TSSCMD_FREE_BUFFER;
+   int        debug;
+   int        tss_rc;
+   int        tss_reason;
+   int        r15;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 6, func);
+
+   debug = ESA_DIAG_get_debug_level(comp); /* Debug level */
+   /* allow diag in assembler as well                  IS0358
+   if ( debug LT 10 )
+       debug = 0;                                      IS0358 ends*/
+
+  /*
+   *   Free buffers mode
+   */
+
+   /* SAS2IBMT
+   r15 = ctsscmd( &debug, tsscmd_mode, NULL, NULL,                   */
+   r15 = (*(ASM_RTN_TYP *)&ctsscmd)                       /* SAS2IBMT */
+                ( &debug, tsscmd_mode, NULL, NULL,
+                  cmd_handle, NULL, &tss_rc, &tss_reason);
+
+   rc  = tsscmd_examine_rc(NULL, tss_rc, tss_reason, r15, dest, msgs );
+
+   ESA_DIAG_exit(comp, 6, func, rc);
+
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_issue_cmd                              *
+ *                                                             *
+ * DESCRIPTION    : Issue TSS commande                         *
+ *                                                             *
+ * INPUT          : comp        - diag component               *
+ *                  cmd         - command                      *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_issue_cmd(ESA_DIAG_COMP_typ             comp,
+                      TSS_CMD_BUF_rec_typ         * cmd,
+                      char                        * onli_acid,
+                      OBJECT_TYPE_typ               onli_acid_type,
+                      char                          onli_evnt_action,
+                      ADMIN_PARAMS_rec_typ        * admin_params)
+ {
+
+  /*
+   *    Local Variables
+   */
+
+   static char func[]="TSS_issue_cmd";
+
+   CTSAMSG_DEST_TABLE_rec_ptr    dest;
+   CTSAMSG_HANDLE_rec_ptr        msgs;
+   ESA_RC                        rc_onli = ESA_OK;
+   ESA_RC                        rc = ESA_OK;
+   ESA_RC                        rc_cmd = ESA_OK,
+                                 rc_p = ESA_OK,
+                                 rc_f = ESA_OK,
+                                 rc_r = ESA_OK;
+   TSS_CMD_BUF_rec_typ           ret_buf;
+   char                          cmd_handle[TSS_CMD_HANDLE_LEN];
+   char                          proc_jobname[10];
+   char                          proc_jobid[10];
+   char                          proc_userid[10];
+   char                          proc_sysid[9];
+   void                        * proc_acee;
+   char                          evnt_usr[10];    /* user/oe     */
+   char                          evnt_grp[10];    /* group       */
+   char                          subsys_name[20]; /* subsys name */
+   char                          onli_evnt_type;
+   char                          event_action;            /* BS10052 */
+   char                          parm_get[81] = "";
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 4, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+  /*
+   * ONLINE Interceptot notify processing
+   */
+
+  /*
+   *    Get subsystem name
+   */
+
+   rc = admin_params->cs_func.rssprm_get_opt_ptr(ALL_RSS, /*ps0426*/
+                                             "CTSA_ID",   /*ps0426*/
+                                             sizeof(parm_get),
+                                             parm_get,    /*ps0426*/
+                                             OPT_TRUE,    /*ps0426*/
+                                             OPT_TRUE) ;  /*ps0426*/
+   /*
+   rc = admin_params->cs_func.rssprm_get_ptr(ALL_RSS,SUBSYS_PARAM_NAME,
+                                          sizeof(parm_get), parm_get);
+                                                              */
+   if (rc NE ESA_OK) {
+         ESA_DIAG_printf (comp, 2,
+                          "parameter get error keyword=%s rc=%d",
+                          SUBSYS_PARAM_NAME, rc );
+       rc = ESA_FATAL;
+       goto exit;
+   }
+
+   ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 2,
+                  "subsystem parameter=%s", parm_get );
+
+   strcpy(subsys_name, parm_get);
+   OS_MVS_whoami( proc_jobname, proc_jobid,
+                  proc_userid,  proc_sysid,
+                  &proc_acee );
+
+   evnt_usr[0] = NULL_CHAR;
+   evnt_grp[0] = NULL_CHAR;
+   event_action = onli_evnt_action;                      /* BS10052 */
+
+   if ( onli_acid_type EQ TYPE_GROUP ) {
+     strcpy( evnt_grp, onli_acid);
+     onli_evnt_type = TSS_EVNT_GROUP;
+   }
+   else  if ( onli_acid_type EQ TYPE_USER ) {
+     strcpy( evnt_usr, onli_acid);
+     onli_evnt_type = TSS_EVNT_USER;
+   }
+   else  if ( onli_acid_type EQ TYPE_CONNECTION) {        /* BS2429 */
+     strcpy( evnt_usr, onli_acid);                        /* BS2429 */
+     onli_evnt_type = TSS_EVNT_USER;                      /* BS2429 */
+     if (onli_evnt_action EQ TSS_EVNT_ACTION_DELETE)      /* BS10052 */
+       event_action = TSS_EVNT_ACTION_UPDATE;             /* BS10052 */
+   }                                                      /* BS2429 */
+   else  if ( onli_acid_type EQ TYPE_CONTAINER ) {
+     strcpy( evnt_usr, onli_acid);
+     onli_evnt_type = TSS_EVNT_OE;
+   }
+   else  if ( onli_acid_type EQ TYPE_IGNORE ) {
+     onli_evnt_type = TSS_EVNT_UNKNOWN;
+     strcpy( evnt_usr, onli_acid);
+   }
+
+   rc_onli = CTSCINO_notify_onli (
+                subsys_name,                 /* subsys name          */
+                admin_params->rss_name,      /* rss    name          */
+                admin_params->rss_type,      /* rss    type          */
+                proc_userid,                 /* originating userid   */
+                "",    /*  proc_jobname, */  /* originating jobname  */
+                TSS_CS_NOTIFY_TERM,          /* originating terminal */
+                TSS_CS_NOTIFY_PROG,          /* originating program  */
+                onli_evnt_type,              /* u/g/c/r/o            */
+  /* BS10052 */ event_action,                /* a/u/d/?/p/r          */
+                evnt_usr,                    /* user/oe              */
+                evnt_grp,                    /* group                */
+                dest, msgs);
+  /* BS10052    onli_evnt_action,             * a/u/d/?/p/r          */
+
+   if ( onli_acid_type EQ TYPE_CONNECTION) {              /* BS2429 */
+     onli_evnt_type = TSS_EVNT_CONNECTION;                /* BS2429 */
+
+     /* BS10052 - start */
+     if (onli_evnt_action EQ TSS_EVNT_ACTION_DELETE)
+     {
+       rc_onli = CTSCINO_notify_onli (
+                  subsys_name,               /* subsys name          */
+                  admin_params->rss_name,    /* rss    name          */
+                  admin_params->rss_type,    /* rss    type          */
+                  proc_userid,               /* originating userid   */
+                  "",    /*  proc_jobname,*/ /* originating jobname  */
+                  TSS_CS_NOTIFY_TERM,        /* originating terminal */
+                  TSS_CS_NOTIFY_PROG,        /* originating program  */
+                  onli_evnt_type,            /* u/g/c/r/o/           */
+                  event_action,              /* a/u/d/?/p/r          */
+                  evnt_usr,                  /* user/oe              */
+                  evnt_grp,                  /* group                */
+                  dest, msgs);
+       onli_evnt_type = 'M';
+     }
+     /* BS10052 - end  */
+
+     strcpy( evnt_grp, "*DUMMY*");                        /* BS2429 */
+     rc_onli = CTSCINO_notify_onli (                      /* BS2429 */
+                subsys_name,               /* subsys name          */
+                admin_params->rss_name,    /* rss    name          */
+                admin_params->rss_type,    /* rss    type          */
+                proc_userid,               /* originating userid   */
+                "",    /*  proc_jobname,*/ /* originating jobname  */
+                TSS_CS_NOTIFY_TERM,        /* originating terminal */
+                TSS_CS_NOTIFY_PROG,        /* originating program  */
+                onli_evnt_type,            /* u/g/c/r/o            */
+  /* BS10052 */ event_action,                /* a/u/d/?/p/r          */
+                evnt_usr,                  /* user/oe              */
+                evnt_grp,                  /* group                */
+                dest, msgs);                              /* BS2429 */
+  /* BS10052    onli_evnt_action,           * a/u/d/?/p/r          */
+   }                                                      /* BS2429 */
+
+   if ( TSS_change_password_detected(cmd->buffer) EQ ESA_OK )
+       rc_onli = CTSCINO_notify_onli (
+                    subsys_name,            /* subsys name          */
+                    admin_params->rss_name, /* rss    name          */
+                    admin_params->rss_type, /* rss    type          */
+                    proc_userid,            /* originating userid   */
+                    "",                     /* originating jobname  */
+                    TSS_CS_NOTIFY_TERM,     /* originating terminal */
+                    TSS_CS_NOTIFY_PROG,     /* originating program  */
+                    onli_evnt_type,         /* u/g/c/r/o            */
+                    TSS_EVNT_ACTION_CHG_PASSWORD,
+                    evnt_usr,               /* user/oe              */
+                    evnt_grp,               /* group                */
+                    dest, msgs);
+
+   rc_cmd = TSS_send_cmd(comp, TSS_CMD_DEFAULT_MODE,
+                         cmd, cmd_handle, TRUE, dest, msgs);
+   if ( rc_cmd NE ESA_OK )
+      goto exit;
+
+   rc_p = TSS_get_output(comp, cmd_handle, &ret_buf, dest, msgs);
+   if ( rc_p EQ ESA_FATAL)
+       goto exit;
+
+   while (rc_p NE ESA_EOF) {
+       CTSAMSG_print(TSS_OUTPUT_LINE, msgs, NULL, dest,
+                     HidePasswordText(ret_buf.buffer));
+       rc_p = TSS_get_output(comp, cmd_handle, &ret_buf, dest, msgs);
+       if ( rc_p EQ ESA_FATAL)
+           goto exit;
+   }
+
+
+   rc_p = ESA_OK;
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   rc_f = TSS_free_output(comp, cmd_handle, dest, msgs);
+
+   if ( ( rc_cmd NE ESA_OK ) OR
+        ( rc_p   NE ESA_OK ) OR
+        ( rc_f   NE ESA_OK ) OR
+        ( rc_r   NE ESA_OK )  )
+     rc = ESA_FATAL;
+
+   ESA_DIAG_exit(comp, 4, func, rc);
+
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_trap_cmd                               *
+ *                                                             *
+ * DESCRIPTION    : Issue TSS commands and save output         *
+ *                                                             *
+ * INPUT          : comp        - diag component               *
+ *                  cmd         - command                      *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_trap_cmd(ESA_DIAG_COMP_typ              comp,
+                     TSS_CMD_BUF_rec_typ          * cmd,
+                     TSS_TRAP_BUF_rec_typ        ** trap_buffer,
+                     TSS_OUTPUT_typ               * line_desc,
+                     CTSAMSG_DEST_TABLE_rec_ptr     dest,
+                     CTSAMSG_HANDLE_rec_ptr         msgs)
+ {
+
+  /*
+   *    Local Variables
+   */
+
+   static char func[]="TSS_trap_cmd";
+
+   TSS_LIST_HANDLE_rec_typ    handle;
+   GET_VAR_FUNC_ptr           get_func;
+   TSS_TRAP_BUF_rec_typ     * tmp = NULL;
+   ESA_RC                     rc  = ESA_OK;
+   ESA_RC                     rc1 = ESA_OK;
+   ESA_RC                     rc_cmd = ESA_OK,
+                              rc_p = ESA_OK,
+                              rc_f = ESA_OK;
+   int                        i_trap = 0;
+   TSS_CMD_BUF_rec_typ        ret_buf;
+   char                       cmd_handle[TSS_CMD_HANDLE_LEN];
+   char                       tmp_handle[TSS_CMD_HANDLE_LEN];
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 6, func);
+
+  /*
+   *  Check additional parameter (line description)
+   */
+
+   if (line_desc NE NULL)
+      get_func = (GET_VAR_FUNC_typ  *)line_desc->func;
+   else
+      get_func = NULL;
+
+  /*
+   *   Send cmd to TSS
+   */
+
+   rc_cmd = TSS_send_cmd(comp, TSS_CMD_DEFAULT_MODE,
+                         cmd, cmd_handle, FALSE, dest, msgs);
+   if ( rc_cmd NE ESA_OK )
+      goto exit;
+
+  /*
+   * Calculate number of output lines
+   */
+
+   memcpy(tmp_handle, cmd_handle, sizeof(cmd_handle) );
+   rc_p = TSS_get_output(comp, tmp_handle, &ret_buf, dest, msgs);
+   if ( rc_p EQ ESA_FATAL)
+       goto exit;
+
+   while (rc_p NE ESA_EOF) {
+        i_trap++;
+        rc_p = TSS_get_output(comp, tmp_handle, &ret_buf, dest, msgs);
+        if ( rc_p EQ ESA_FATAL)
+            goto exit;
+   }
+
+   rc_p = ESA_OK;
+
+   ESA_DIAG_printf(comp,6, "Detected %d output lines", i_trap );
+
+  /*
+   *  Create trap command handle
+   */
+
+   i_trap += 2;
+
+   if ( (*trap_buffer) EQ NULL) {
+     rc = TSS_alloc_trap_handle (comp, i_trap, &tmp, dest, msgs );
+     if ( rc NE ESA_OK )
+        goto exit;
+   }
+   else {
+      tmp = *trap_buffer;
+      rc = TSS_realloc_trap_buffer(comp, tmp, i_trap, dest, msgs);
+      if ( rc NE ESA_OK )
+        goto exit;
+   }
+
+   rc_p = TSS_get_output(comp, cmd_handle, &ret_buf, dest, msgs);
+   if ( rc_p EQ ESA_FATAL )
+       goto exit;
+
+   while (rc_p NE ESA_EOF) {
+      if ( rc_p EQ ESA_OK)  {
+        /*
+         *  Special function supplied
+         */
+
+         if (get_func NE NULL ) {
+
+             handle.start_line_ptr   = ret_buf.buffer;
+             handle.current_line_ptr = ret_buf.buffer;
+
+             ESA_DIAG_printf (comp, 10,
+                              "Obtained data=%s",ret_buf.buffer);
+
+             rc1 = TSS_identify_rec(comp, &handle, line_desc,
+                                    dest, msgs);
+             if ( rc1 NE ESA_SKIP ) {      /* Record found */
+               line_desc->line->datas[0].data[0] = NULL_CHAR;
+               rc = (get_func)(comp, &handle, line_desc->line->datas,
+                               dest, msgs);
+               if ( rc NE ESA_OK )
+                 goto exit;
+               else
+                 rc = TSS_save_output(comp, tmp,
+                                      line_desc->line->datas[0].data,
+                                      dest, msgs );
+             }
+       } /* external function supplied */
+       else
+         rc = TSS_save_output(comp, tmp, ret_buf.buffer,
+                              dest, msgs );
+       if ( rc NE ESA_OK )
+          goto exit;
+      } /* rc = ESA_OK after get_output */
+      else  if ( rc_p EQ ESA_FATAL)
+          goto exit;
+
+      rc_p = TSS_get_output(comp, cmd_handle, &ret_buf, dest, msgs);
+   }
+
+   if ( ESA_DIAG_get_debug_level(comp) GE 5 )  {
+      ESA_DIAG_printf (comp, 0 , "cmd trap data");
+      TSS_trap_buf_dump(comp, tmp);
+   }
+
+   rc_p = ESA_OK;
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   rc_f = TSS_free_output(comp, cmd_handle, dest, msgs);
+
+   if ( ( rc_cmd NE ESA_OK ) OR
+        ( rc_p   NE ESA_OK ) OR
+        ( rc_f   NE ESA_OK )  )
+     rc = ESA_FATAL;
+
+   *trap_buffer = tmp;
+
+   ESA_DIAG_exit(comp, 6, func, rc);
+
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_trap_vars                              *
+ *                                                             *
+ * DESCRIPTION    : Issue TSS commands and return requested var*
+ *                                                             *
+ * INPUT          : comp        - diag component               *
+ *                  cmd         - command                      *
+ *                  dest                                       *
+ *                  line_desc   - lines description table      *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_trap_vars(ESA_DIAG_COMP_typ              comp,
+                      TSS_CMD_MODE_typ               mode,
+                      TSS_CMD_BUF_rec_typ          * cmd,
+                      TSS_OUTPUT_typ                 line_desc[1],
+                      CTSAMSG_DEST_TABLE_rec_ptr     dest,
+                      CTSAMSG_HANDLE_rec_ptr         msgs)
+ {
+
+  /*
+   *    Local Variables
+   */
+
+   static char func[]="TSS_trap_vars";
+
+   TSS_LIST_HANDLE_rec_typ    handle;
+   GET_VAR_FUNC_ptr           get_func;
+   ESA_RC                     rc  = ESA_OK;
+   ESA_RC                     rc1 = ESA_OK;
+   ESA_RC                     rc_cmd = ESA_OK,
+                              rc_p = ESA_OK,
+                              rc_f = ESA_OK;
+   int                        j;
+   TSS_CMD_BUF_rec_typ        ret_buf;
+   char                       cmd_handle[TSS_CMD_HANDLE_LEN];
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 6, func);
+
+  /*
+   *   Send cmd to TSS
+   */
+
+   rc_cmd = TSS_send_cmd(comp,mode,cmd,cmd_handle,FALSE,dest,msgs);
+   if ( rc_cmd NE ESA_OK )
+      goto exit;
+
+   rc_p = TSS_get_output(comp, cmd_handle, &ret_buf, dest, msgs);
+
+   while (rc_p NE ESA_EOF) {
+      if ( rc_p EQ ESA_OK)  {
+        handle.start_line_ptr   = ret_buf.buffer;
+        handle.current_line_ptr = ret_buf.buffer;
+
+        ESA_DIAG_printf (comp, 10,"Obtained data=%s",ret_buf.buffer);
+
+       /*
+        *   Loop through TSS output lines  description
+        */
+
+        for (j=0; line_desc[j].line; j++ ) {
+           rc1 = TSS_identify_rec(comp, &handle, &line_desc[j],
+                                  dest, msgs);
+           if ( rc1 NE ESA_SKIP ) { /* Record found */
+             get_func = (GET_VAR_FUNC_typ  *)line_desc[j].func;
+             rc = (get_func)(comp, &handle, line_desc[j].line->datas,
+                             dest, msgs);
+             if ( rc NE ESA_OK )
+                goto exit;
+             else
+                break;
+           }
+        }    /* TSS output lines descriptions */
+      } /* rc = ESA_OK after get_output */
+      else  if ( rc_p EQ ESA_FATAL)
+         goto exit;
+
+      rc_p = TSS_get_output(comp, cmd_handle, &ret_buf, dest, msgs);
+   }
+
+   rc_p = ESA_OK;
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   rc_f = TSS_free_output(comp, cmd_handle, dest, msgs);
+
+   if ( ( rc_cmd NE ESA_OK ) OR
+        ( rc_p   NE ESA_OK ) OR
+        ( rc_f   NE ESA_OK )  )
+     rc = ESA_FATAL;
+
+   ESA_DIAG_exit(comp, 6, func, rc);
+
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_do_trap_buf                            *
+ *                                                             *
+ * DESCRIPTION    : List output processing                     *
+ *                                                             *
+ * INPUT          : get_info - trap buffer                     *
+ *                  acid_type- acid type                       *
+ *                  line_desc- list descriptions               *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_do_trap_buf(ESA_DIAG_COMP_typ            comp,
+                        TSS_TRAP_BUF_rec_typ       * get_info,
+                        TSS_OUTPUT_typ               line_desc[1],
+                        CTSAMSG_DEST_TABLE_rec_typ * dest,
+                        CTSAMSG_HANDLE_rec_typ     * msgs)
+ {
+
+  static char func[]="TSS_do_trap_buf";
+  TSS_LIST_HANDLE_rec_typ   handle;
+  GET_VAR_FUNC_ptr          get_func;
+  ESA_RC                    rc  = ESA_OK;
+  ESA_RC                    rc1 = ESA_OK;
+  int                       i;
+  int                       j;
+
+ /*
+  *    Initialize
+  */
+
+  ESA_DIAG_enter(comp, 6, func);
+
+ /*
+  *   Loop through TSS output lines
+  */
+
+  for (i=0; i LT get_info->used_entries; i++ ) {
+     if ( get_info->trap_data[i].used )  /* Skip this record */
+        continue;
+
+     handle.start_line_ptr   = get_info->trap_data[i].data;
+     handle.current_line_ptr = get_info->trap_data[i].data;
+
+     ESA_DIAG_printf (comp, 10, "i=%d data=%s",
+                      i ,get_info->trap_data[i].data);
+
+    /*
+     *   Loop through TSS output lines  description
+     */
+
+     for (j=0; line_desc[j].line; j++ ) {
+        rc1 = TSS_identify_rec(comp, &handle, &line_desc[j],
+                               dest, msgs);
+        if ( rc1 NE ESA_SKIP ) { /* Record found */
+          get_info->trap_data[i].used = 1; /* Record is busy */
+          get_func = (GET_VAR_FUNC_typ  *)line_desc[j].func;
+          rc = (get_func)(comp, &handle, line_desc[j].line->datas,
+                          dest, msgs);
+          if ( rc NE ESA_OK )
+             goto exit;
+          else
+             break;
+        }
+     }    /* TSS output lines descriptions */
+  }    /* TSS output trap buffer */
+
+ /*
+  *    Finish
+  */
+
+  exit:;
+
+   ESA_DIAG_exit(comp, 6, func, rc);
+
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_identify_rec                           *
+ *                                                             *
+ * DESCRIPTION    : Identify record according desciption       *
+ *                                                             *
+ * INPUT          : info     - list processing handle          *
+ *                  line_desc- line description record         *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_identify_rec(ESA_DIAG_COMP_typ            comp,
+                         TSS_LIST_HANDLE_rec_typ    * handle,
+                         TSS_OUTPUT_typ             * list_dsc,
+                         CTSAMSG_DEST_TABLE_rec_typ * dest,
+                         CTSAMSG_HANDLE_rec_typ     * msgs)
+ {
+
+  ESA_RC           rc = ESA_OK;
+  static char func[]="TSS_identify_rec";
+  /* BS10109 char             tmp[MAX_TSS_API_ST_TRAP];   */
+  char             tmp[MAX_TSS_API_ST];                 /* BS10109 */
+  char            *token;
+  char            *start_ptr;
+  int              i;
+
+ /*
+  *    Initialize
+  */
+
+  ESA_DIAG_enter(comp, 6, func);
+
+  strcpy(tmp, handle->start_line_ptr); /* save string */
+
+  start_ptr = handle->start_line_ptr;
+  token = strtok(handle->start_line_ptr , " ");
+  i = 0;
+
+  while (token AND list_dsc->line->keywords[i] ) {
+    ESA_DIAG_printf (comp, 10, "i=%d token=%s keyword=%s",
+                     i, token,list_dsc->line->keywords[i] );
+
+    if ( strcmp(token,list_dsc->line->keywords[i] ) NE 0 ) {
+       strcpy(start_ptr, tmp ); /* restore string */
+       rc = ESA_SKIP;
+       goto exit;
+    }
+    i++;
+    token = strtok(NULL, " ");
+  }
+
+ /*
+  *  Check condition end-of-loop
+  */
+
+  if (list_dsc->line->keywords[i] EQ NULL) {
+    handle->current_line_ptr = token;
+    ESA_DIAG_printf (comp, 10, "found token=%s", token );
+    rc = ESA_OK;
+  }
+  else {
+    strcpy(start_ptr, tmp ); /* restore string */
+    rc = ESA_SKIP;  /* end-of-tokens */
+  }
+
+ /*
+  *    Finish
+  */
+
+
+  exit:;
+
+   ESA_DIAG_exit(comp, 6, func, rc);
+
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_get_simple_var                         *
+ *                                                             *
+ * DESCRIPTION    : Get simple var from output line            *
+ *                                                             *
+ * INPUT          : info     - list processing handle          *
+ *                  line_desc- line description record         *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC  TSS_get_simple_var(ESA_DIAG_COMP_typ            comp,
+                            TSS_LIST_HANDLE_rec_typ    * handle,
+                            TSS_OUTP_typ               * vars,
+                            CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                            CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  ESA_RC           rc = ESA_OK;
+  static char func[]="TSS_get_simple_var";
+  char            *token;
+  int              i;
+
+ /*
+  *    Initialize
+  */
+
+  ESA_DIAG_enter(comp, 6, func);
+
+  /* Start record position after identifying */
+
+  token = handle->current_line_ptr;
+
+ /*
+  *    Vars loop
+  */
+
+  for (i=0; vars[i].data; i++ ) {
+     ESA_DIAG_printf (comp, 10,
+                      "var=%d/%s max_var_len=%d",
+                      strlen(token), token , vars[i].data_len );
+
+     rc=TSS_check_param_overflow(comp, NULL, NULL, NULL,
+                                 strlen(token), vars[i].data_len,
+                                 dest,msgs);
+     if ( rc NE ESA_OK )
+       goto exit;
+     else {
+        strcpy(vars[i].data, token);
+
+       /*
+        * Goto the next var.
+        * Vary dangerous, because we suppose that current ptr
+        * of string was saved in "C"-system, by
+        * previous calls to strtok
+        */
+
+        token = strtok(NULL, " ");
+
+        handle->current_line_ptr = token;
+     }
+  }     /* Vars loop */
+
+ /*
+  *    Finish
+  */
+
+  exit:;
+
+   ESA_DIAG_exit(comp, 6, func, rc);
+
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_extract_acid                           *
+ *                                                             *
+ * DESCRIPTION    : Extract acid from line                     *
+ *                  Very similar to get_simple_var, but        *
+ *                  this program free from vars loop, and      *
+ *                  sets acid with offset 1 ( for sort symbol) *
+ *                                                             *
+ * INPUT          : info     - list processing handle          *
+ *                  line_desc- line description record         *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC  TSS_extract_acid(ESA_DIAG_COMP_typ            comp,
+                          TSS_LIST_HANDLE_rec_typ    * handle,
+                          TSS_OUTP_typ               * vars,
+                          CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                          CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  ESA_RC           rc = ESA_OK;
+  static char func[]="TSS_extract_acid";
+  char            *token;
+  int              i = 0;
+
+ /*
+  *    Initialize
+  */
+
+  ESA_DIAG_enter(comp, 6, func);
+
+  /* Start record position after identifying */
+
+  token = handle->current_line_ptr;
+
+  ESA_DIAG_printf (comp, 10,
+                   "var=%d/%s max_var_len=%d",
+                   strlen(token), token , vars[i].data_len );
+
+  rc=TSS_check_param_overflow(comp, NULL, NULL, NULL,
+                              strlen(token), vars[i].data_len,
+                              dest,msgs);
+  if ( rc NE ESA_OK )
+   goto exit;
+  else {
+    strcpy(vars[i].data, " ");      /* Place for sort symbol */
+    strcat(vars[i].data, token);
+  }
+
+ /*
+  *    Finish
+  */
+
+  exit:;
+
+   ESA_DIAG_exit(comp, 6, func, rc);
+
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_get_acid_header                        *
+ *                                                             *
+ * DESCRIPTION    : Trap cmd and build acid related field      *
+ *                  dept, deiv , zone                          *
+ *                                                             *
+ * INPUT          : acid     - acid                            *
+ *                  admin_params                               *
+ *                  err                                        *
+ *                                                             *
+ * OUTPUT         : acid_info                                  *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_get_acid_header(ESA_DIAG_COMP_typ            comp,
+                            TSS_CMD_MODE_typ             mode,
+                            char                       * acid,
+                            TSS_ACID_HEADER_rec_typ    * acid_info,
+                            ADMIN_PARAMS_rec_typ       * admin_params,
+                            ERR_STRUCT_rec_typ         * err)
+ {
+
+  static char func[]="TSS_get_acid_header";
+  TSS_CMD_BUF_rec_typ          cmd = { 0, 0, "" };
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+  ESA_RC                       rc = ESA_OK;
+  int                          logout_done = 0;
+
+ /********************************************************************
+  *   ACCESSORID = DEPTCTSA  NAME       = CONTROL-SA DEPARTMENT      *
+  ********************************************************************/
+
+  static char            get_acid[TSS_USER_NAME_LEN + 1] = "";
+  static char           *accss_k[]={"ACCESSORID", "=", NULL};
+  static TSS_OUTP_typ    accss_d[] = {
+                     { sizeof(get_acid), get_acid },
+                     { 0,                NULL     }
+                               };
+  TSS_LIST_LINE(accss, LIST_ACCESSORID, CURRENT_LINE);
+
+ /********************************************************************
+  *   TYPE       = DEPT      SIZE       =      256  BYTES            *
+  ********************************************************************/
+
+  static char            get_acid_type[TSS_ACID_TYPE_LEN + 1] = "";
+  static char            get_acid_expl[TSS_ACID_TYPE_LEN + 1] = "";
+  static char           *type_k[]={"TYPE", "=", NULL };
+  static TSS_OUTP_typ    type_d[] = {
+                     { sizeof(get_acid_type), get_acid_type },
+                     { sizeof(get_acid_expl), get_acid_expl },
+                     { 0,                     NULL          }
+                               };
+  TSS_LIST_LINE(type, LIST_TYPE, CURRENT_LINE );
+
+ /********************************************************************
+  *   DEPT ACID  = DEPTCTSA  NAME       =      DEPARTMENT            *
+  ********************************************************************/
+
+  static char            dept_acid[TSS_ACID_TYPE_LEN + 1] = "";
+  static char           *dept_k[]={"DEPT", "ACID", "=", NULL };
+  static TSS_OUTP_typ    dept_d[] = {
+                     { sizeof(dept_acid),     dept_acid     },
+                     { 0,                     NULL          }
+                               };
+  TSS_LIST_LINE(dept, LIST_TYPE, CURRENT_LINE );
+
+ /********************************************************************
+  *   DIV  ACID  = DIVCTSA   NAME       =      DIVISION              *
+  ********************************************************************/
+
+  static char            div_acid[TSS_ACID_TYPE_LEN + 1] = "";
+  static char           *div_k[]={"DIV", "ACID", "=", NULL };
+  static TSS_OUTP_typ    div_d[] = {
+                     { sizeof(div_acid),     div_acid     },
+                     { 0,                    NULL          }
+                               };
+  TSS_LIST_LINE(div, LIST_TYPE, CURRENT_LINE );
+
+ /********************************************************************
+  *  ZONE  ACID  = ZONECTSA   NAME      =      ZONE                  *
+  ********************************************************************/
+
+  static char            zone_acid[TSS_ACID_TYPE_LEN + 1] = "";
+  static char           *zone_k[] = {"ZONE", "ACID", "=", NULL };
+  static TSS_OUTP_typ    zone_d[] = {
+                     { sizeof(zone_acid),    zone_acid     },
+                     { 0,                    NULL          }
+                               };
+  TSS_LIST_LINE(zone, LIST_TYPE, CURRENT_LINE );
+
+  static TSS_OUTPUT_typ  list_info[] = {
+        { &accss,    (void *)TSS_get_simple_var },         /* SAS2IBMN */
+        { &type,     (void *)TSS_get_simple_var },         /* SAS2IBMN */
+        { &dept,     (void *)TSS_get_simple_var },         /* SAS2IBMN */
+        { &div,      (void *)TSS_get_simple_var },         /* SAS2IBMN */
+        { &zone,     (void *)TSS_get_simple_var },         /* SAS2IBMN */
+        { NULL,      NULL                }
+                                        };
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(comp,6,func);
+
+  get_acid[0]      = NULL_CHAR;
+  get_acid_type[0] = NULL_CHAR;
+  get_acid_expl[0] = NULL_CHAR;
+  dept_acid[0]     = NULL_CHAR;
+  div_acid[0]      = NULL_CHAR;
+  zone_acid[0]     = NULL_CHAR;
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  ESA_DIAG_printf(comp,6, "acid=%s", acid);
+
+  rc = CTSCRSS_set_authority( &logout_done,
+                              SET_TO_STARTED_TASK_AUTH,
+                              admin_params, err );
+  if ( rc NE ESA_OK )
+      goto exit;
+
+ /*
+  *   Check acid existance
+  */
+
+  /* BS10085 Adding VERBOSE to LIST command
+  sprintf(cmd.buffer, "LIST(%s) DATA(BASIC) ", acid);                */
+  sprintf(cmd.buffer, "LIST(%s) DATA(BASIC,VERBOSE) ", acid);/*BS10085*/
+
+  cmd.max_len = strlen(cmd.buffer);
+  cmd.use_len = strlen(cmd.buffer);
+
+  rc = TSS_trap_vars(comp, mode, &cmd, list_info, dest, msgs );
+  if ( rc NE ESA_OK )
+   goto exit;
+
+  ESA_DIAG_printf(comp,6,
+              "Obtained: acid=%s type=%s/%s dept=%s div=%s zone=%s",
+              get_acid, get_acid_type, get_acid_expl, dept_acid,
+              div_acid, zone_acid);
+
+ /*
+  *  "SIZE" side effect field. SEE tss list output
+  */
+  if ( strcmp(get_acid_expl, "SIZE" ) NE 0 )  {
+     strcat(get_acid_type, " ");
+     strcat(get_acid_type, get_acid_expl);
+  }
+
+  TSS_type_tss2ess(comp, get_acid_type);
+
+ /*
+  *   Fill up the acid_info structure
+  */
+
+  strcpy(acid_info->acid,       get_acid);
+  strcpy(acid_info->type,       get_acid_type);
+  strcpy(acid_info->dept_acid,  dept_acid);
+  strcpy(acid_info->div_acid,   div_acid);
+  strcpy(acid_info->zone_acid,  zone_acid);
+
+ /*
+  *    Finish
+  */
+
+ exit :;
+
+  if (logout_done)
+    CTSCRSS_set_authority( &logout_done,
+                           RETURN_FROM_STARTED_TASK_AUTH,
+                           admin_params, err );
+
+  ESA_DIAG_exit(comp, 6, func, rc );
+  return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_check_param_overflow                   *
+ *                                                             *
+ * DESCRIPTION    : Check param overflow before put to cmd buff*
+ *                                                             *
+ * INPUT          : src           - source field               *
+ *                  kwd           - keyword                    *
+ *                  value         - param value                *
+ *                  i_len         - input length               *
+ *                  max_len       - max allowed length         *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK, ESA_FATAL - overflow          *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_check_param_overflow(ESA_DIAG_COMP_typ             comp,
+                                  char                       * src,
+                                  char                       * kwd,
+                                  char                       * value,
+                                  int                          i_len,
+                                  int                          max_len,
+                                  CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                                  CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   ESA_RC                rc = ESA_OK;
+   int                   len;
+   static char           func[]="TSS_check_param_overflow";
+
+  /*
+   * Calculate length
+   */
+
+   if (src AND kwd AND value)
+     len = strlen(src) + strlen(kwd) + strlen(value) + 2;
+   else if (kwd AND value)
+     len = strlen(kwd) + strlen(value) + 2;
+   else if (value)
+     len = strlen(value) + 2;
+   else if ( i_len NE TSS_LENGTH_UNDEFINED )
+     len = i_len;
+
+  /*
+   * Overflow checking
+   */
+
+   if ( len GT max_len ) {
+     if (kwd AND value)
+        ESA_DIAG_printf(comp,0,
+                        "TSS parameter overflow kwd=%d/%s value=%d/%s",
+                        strlen(kwd), kwd, strlen(value),value);
+
+     if (src AND kwd AND value)
+        sprintf(internal2_msg_buf,
+            "TSS parameter overflow.Src len=%d,key len=%d,param len=%d."
+            "Max allowed len=%d",
+            strlen(src), strlen(kwd), strlen(value), max_len);
+     else if (kwd AND value)
+        sprintf(internal2_msg_buf,
+            "TSS parameter overflow.key len=%d,param len=%d."
+            "Max allowed len=%d",
+            strlen(kwd), strlen(value), max_len);
+     else if (value)
+        sprintf(internal2_msg_buf,
+            "TSS parameter overflow.param len=%d."
+            "Max allowed len=%d",
+            strlen(value), max_len);
+     else if ( i_len NE TSS_LENGTH_UNDEFINED )
+        sprintf(internal2_msg_buf,
+            "TSS parameter overflow.param len=%d."
+            "Max allowed len=%d",
+            i_len, max_len);
+
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                      component, func, internal2_msg_buf,
+                      8, __LINE__);
+
+     if (kwd AND value) {
+        sprintf(internal2_msg_buf,
+                "TSS parameter overflow.kwd=%.20s param=%.100s",
+                kwd, value);
+
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                      component, func, internal2_msg_buf,
+                      8, __LINE__);
+     }
+
+     OS_MVS_btrace();
+     rc = ESA_FATAL;
+
+   }
+
+   return rc;
+ }
+

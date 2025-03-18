@@ -1,0 +1,328 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Add an ACE to a resource ACL (TSS)       *
+ *                                                             *
+ * File Name        : ctstiac.c                                *
+ *                                                             *
+ * Author           : Alexander Shvartsman                     *
+ *                                                             *
+ * Creation Date    : 19/01/97                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------- -------------------------------- *
+ * PS0252   Guy      13/04/98 Common code changes              *
+ * BS2385   AS       13/04/99 Issue a clear error message      *
+ *                            when ACE type container is added *
+ * IS10092  NuritY   10/06/13 Adapt to changes in cmd struct...*
+ *                            ...(IS10077)                     *
+ * WS10082  AvnerL   19/09/23 Update field length              *
+ **************************************************************/
+
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_API
+ #include ESA_API_CODES
+
+ #include MVS_ONLINE_INTERCEPTOR
+
+ #include API_ADDINFO
+
+ #include TSS
+
+ #define  INCLUDE_ACL_RTT_TABLE
+
+ #include TSS_XRES
+ #include TSS_CODES
+
+ static char *component = "CTSTIAC";       /* BS2385 */
+
+ static ESA_RC TSS_do_cmd_ace(ESA_DIAG_COMP_typ       comp,
+                              char                  * acid,
+                              OBJECT_TYPE_typ         acid_type,
+                              TSS_CMD_HANDLE_typ    * cmd_handle,
+                              ADMIN_PARAMS_rec_typ  * admin_params);
+
+ /**************************************************************
+ *                                                             *
+ * Procedure Name : CTSAddACE                                  *
+ * Description    : Connect user/ug to a resource              *
+ * Input          : ACE type, user, group, resource, addinfo,  *
+ *                  admin                                      *
+ * Output         : err                                        *
+ * Input/Output   :                                            *
+ * Return Value   : ESA_RC                                     *
+ * Side Effects   :                                            *
+ * Comments       : 1. addinfo contains the requested          *
+ *                     permissions.                            *
+ *                  2. Either 'user_params' or 'ug_params'     *
+ *                     is used,                                *
+ *                     as per 'ace_type' value.                *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC CTSAddACE (RES_PARAMS_rec_typ   * res_params,
+         /*        ADDINFO_rec_typ      * res_addinfo,    PS0252 */
+                   ACE_rec_typ          * new_ace,
+                   ADDINFO_rec_typ      * new_addinfo,
+                   ACE_POS_typ            ace_place,
+                   ACE_rec_typ          * rel_ace,
+                   ADDINFO_rec_typ      * rel_addinfo,
+                   ADMIN_PARAMS_rec_typ * admin_params,
+                   ERR_STRUCT_rec_typ   * err)
+
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                      rc = ESA_OK;
+   char                        func[]="CTSAddACE";
+   CTSAMSG_HANDLE_rec_ptr      msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr  dest;
+   /*WS10082 char             acid[MAX_TSS_PARAM_LEN] = "";       */
+   char           /*WS10082*/ acid[MAX_RSS_ACE_OE_NAME_LEN + 1]="";
+   ADDINFO_rec_ptr             ess_addinfo = NULL;
+   ADDINFO_rec_ptr             get_addinfo = NULL;
+   /* IS10092 TSS_CMD_SET_rec_typ      cmd = { 0, "", 0 };   */
+   TSS_CMD_SET_rec_typ         cmd = { 0, "", 0 ,0};    /* IS10092 */
+   TSS_CMD_HANDLE_typ        * cmd_handle  = NULL;
+   TSS_RTT_rec_typ           * rtt = acl_rtt;
+   OBJECT_TYPE_typ             acid_type;
+   ONE_FIELD_rec_ptr           cpair;
+   char internal2_msg_buf[200];     /* BS2385 */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_ADDACE, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+  /*
+   *   Print entering parameters
+   */
+
+   if ( ESA_DIAG_get_debug_level(ESA_COMP_ADDACE) GT 0 ) {
+   /* ESA_DIAG_printf(ESA_COMP_ADDACE, 0, "res_addinfo");
+      ADDINFO_dump(res_addinfo,1);                        PS0252 */
+      ESA_DIAG_printf(ESA_COMP_ADDACE, 0, "new_addinfo");
+      ADDINFO_dump(new_addinfo,1);
+      ESA_DIAG_printf(ESA_COMP_ADDACE, 0, "rel_addinfo");
+      ADDINFO_dump(rel_addinfo,1);
+   }
+
+  /*  BS2385
+   *  Check ace_type
+   */
+
+   if (new_ace->ace_type EQ ACE_TYPE_OE) {
+     strcpy(internal2_msg_buf ,
+     "Invalid ace_type=ACE_TYPE_OE specified. Tranaction cancelled");
+     CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                   component,func, internal2_msg_buf,
+                   16,__LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+   }
+
+  /*
+   *   Create command handle
+   */
+
+   rc = TSS_alloc_cmd_handle (ESA_COMP_ADDACE,
+                              MAX_TSS_CMD_ACL_ENTRIES,
+                              &cmd_handle, dest, msgs );
+   if ( rc NE ESA_OK )
+      goto exit;
+
+  /*
+   *   Build internal addinfo
+   */
+
+   rc = ADDINFO_alloc(func, new_addinfo->num_pairs,
+                      &ess_addinfo, dest, msgs);
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   rc = ADDINFO_alloc(func, new_addinfo->num_pairs,
+                      &get_addinfo, dest, msgs);
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   ADDINFO_copy ( ess_addinfo, new_addinfo );
+
+   cpair=ADDINFO_search("DAYS", TSS_ADDINFO_KWD_LEN,
+                         ess_addinfo->pair, ess_addinfo->num_pairs);
+   if (cpair NE NULL) {
+     if (strstr (cpair->value, "ALL") NE NULL)
+       ADDINFO_updval ("", TSS_ADDINFO_VAL_LEN, cpair);
+   }
+
+   cpair=ADDINFO_search("TIMES", TSS_ADDINFO_KWD_LEN,
+                         ess_addinfo->pair, ess_addinfo->num_pairs);
+   if (cpair NE NULL) {
+     if (strstr (cpair->value, "ANY") NE NULL)
+       ADDINFO_updval ("", TSS_ADDINFO_VAL_LEN, cpair);
+   }
+
+  /*
+   *   Create header
+   */
+
+   cmd.type = TSS_CMD_PERMIT;
+
+   sprintf(cmd.param, "%s(%s) ",
+           TSS_convert_restype(res_params->restype),
+           res_params->resource);
+
+   rc = TSS_put_cmd(ESA_COMP_ADDACE, cmd_handle, &cmd, dest, msgs);
+
+   ESA_DIAG_printf(ESA_COMP_ADDACE, 1, "cmd header=%s", cmd.param );
+
+   rc = TSS_do_addinfo (ESA_COMP_ADDACE, cmd_handle, rtt,
+                        ess_addinfo, get_addinfo, dest, msgs);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   TSS_determine_acid(new_ace, acid, &acid_type);
+
+   ESA_DIAG_printf(ESA_COMP_ADDACE, 1, "acid=%s", acid);
+
+   rc = TSS_do_cmd_ace( ESA_COMP_ADDACE, acid, acid_type,
+                        cmd_handle, admin_params);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+  /*
+   *   Finish
+   */
+
+   exit:;
+
+   if (cmd_handle)
+      TSS_free_cmd_handle( ESA_COMP_ADDACE, &cmd_handle, dest, msgs);
+
+   if (get_addinfo)
+      ADDINFO_free(&get_addinfo);
+
+   if (ess_addinfo)
+      ADDINFO_free(&ess_addinfo);
+
+   ESA_DIAG_exit(ESA_COMP_ADDACE, 1, func, rc);
+
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_do_cmd_ace                             *
+ *                                                             *
+ * DESCRIPTION    : Set TSS issue TSS commands (with appends)  *
+ *                                                             *
+ * INPUT          : acid        - object                       *
+ *                  acid_type   - object type                  *
+ *                  cmd_handle  - command handle               *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_OK - OK  , ESA_FATAL - err             *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_do_cmd_ace(ESA_DIAG_COMP_typ           comp,
+                              char                      * acid,
+                              OBJECT_TYPE_typ             acid_type,
+                              TSS_CMD_HANDLE_typ        * cmd_handle,
+                              ADMIN_PARAMS_rec_typ      * admin_params)
+ {
+
+   static char                func[]="TSS_do_cmd_ace";
+   ESA_RC                     rc = ESA_OK;
+   CTSAMSG_DEST_TABLE_rec_ptr dest;
+   CTSAMSG_HANDLE_rec_ptr     msgs;
+   TSS_CMD_BUF_rec_typ        cmd = { 0, 0, "" };
+   int                        i;
+
+  /*
+   *    Initialize
+   */
+
+   ESA_DIAG_enter(comp, 3, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   ESA_DIAG_printf(comp,3, "ACID=%s", acid );
+
+   if ( ESA_DIAG_get_debug_level(comp) GE 3 )  {
+       ESA_DIAG_printf (comp,0, "cmd before sort");
+       TSS_cmd_buf_dump(comp, cmd_handle, acid);
+   }
+
+  /*
+   *   Build full command.Concatenate properties.
+   */
+
+   sprintf(cmd.buffer, "%s(%s) ",
+           TSS_convert_cmd(cmd_handle->tss_cmds[0].type), acid);
+
+   for (i=0; i LT cmd_handle->used_entries; i++)  {
+      rc=TSS_check_param_overflow(comp, " ",
+                            cmd.buffer, cmd_handle->tss_cmds[i].param,
+                            TSS_LENGTH_UNDEFINED,MAX_TSS_API_ST,
+                            dest,msgs);
+      if ( rc NE ESA_OK )
+       goto exit;
+
+      strcat(cmd.buffer, cmd_handle->tss_cmds[i].param);
+      strcat(cmd.buffer, " ");
+   }
+
+   ESA_DIAG_printf(comp,3, "cmd=%s", cmd.buffer);
+
+   cmd.max_len = strlen(cmd.buffer);
+   cmd.use_len = strlen(cmd.buffer);
+   rc = TSS_issue_cmd(comp, &cmd, acid, acid_type,
+                      TSS_EVNT_ACTION_UPDATE, admin_params);
+
+  /*
+   *    Finish
+   */
+
+   exit:;
+
+   ESA_DIAG_exit(comp, 3, func, rc);
+
+   return rc;
+
+}     /* TSS_do_cmd_ace */
+

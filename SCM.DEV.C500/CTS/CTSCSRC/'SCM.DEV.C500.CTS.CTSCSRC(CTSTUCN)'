@@ -1,0 +1,267 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Update user to group connection (TSS)    *
+ *                                                             *
+ * File Name        : ctstucn.c                                *
+ *                                                             *
+ * Author           : Alexander Shvartsman                     *
+ *                                                             *
+ * Creation Date    : 19/01/97                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * BS2384   AS       15/04/99 If update connection fails,      *
+ *                            the connection ma be deleted     *
+ * BS2410   YB       08/12/99 TSS0353E appears although add    *
+ *                            connection successful            *
+ * BS2429   YB       13/09/00 notify connection update         *
+ * BS2678   AH       23/05/04 Memory leak during update        *
+ *                            connection                       *
+ **************************************************************/
+
+ /*
+  *   Standard include files
+  */
+
+ #include   <globs.h>
+ #include   STDIO
+ #include   STDLIB
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include   ESA_API
+ #include   ESA_DIAG
+ #include   ESA_CTSAMSG
+ #include   ESA_API_CODES
+ #include   API_ADDINFO
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_COMP
+
+ #include MVS_ONLINE_INTERCEPTOR
+
+ #include MVS_OS_MVS
+
+ /*
+  *   TSS include files
+  */
+
+ #include TSS
+ #include TSS_XCNN
+ #include TSS_CODES
+
+ static char component[] = "CTSTUCN";
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : updu2ug                                    *
+ *                                                             *
+ * DESCRIPTION    :                                            *
+ *                                                             *
+ * INPUT          :                                            *
+ *                                                             *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC CTSUpdUserToUG (U2UG_PARAMS_rec_typ  * u2ug_params,
+                        ADDINFO_rec_typ      * addinfo,
+                        ADMIN_PARAMS_rec_typ * admin_params,
+                        ERR_STRUCT_rec_typ   * err)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                     rc = ESA_OK;
+   static char                func[]="CTSUpdUserToUG";
+   CTSAMSG_HANDLE_rec_ptr     msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr dest;
+   TSS_CMD_BUF_rec_typ        del_cmd = { 0, 0, "" };
+   TSS_CMD_BUF_rec_typ        add_cmd = { 0, 0, "" };
+   TSS_TRAP_CNN_DATA_typ      pair_info;
+   TSS_TRAP_CNN_DATA_typ      pair_info_old;              /* BS2384 */
+   int                        connection_deleted = FALSE; /* BS2384 */
+   TSS_TRAP_CNN_BUF_rec_typ  *user_info = NULL;
+   TSS_TRAP_CNN_BUF_rec_typ  *ug_info   = NULL;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_UPDU2UG, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+  /*
+   *  Check user, group existance
+   */
+
+   rc = TSS_pre_set_cnn_proc(ESA_COMP_UPDU2UG, u2ug_params, &pair_info,
+                             &user_info, &ug_info, admin_params, err);
+   if ( rc NE ESA_OK )
+     goto exit;
+
+   ESA_DIAG_printf(ESA_COMP_UPDU2UG, 1,
+                   "User=%s Group=%s pos=%d relative=%s/%s",
+                    u2ug_params->user, u2ug_params->group,
+                    pair_info.pos,
+                    pair_info.relative_pos,
+                    pair_info.relative_profile);
+
+   if ( pair_info.pos EQ TSS_CNN_POS_UNDEFINED ) {
+      CTSAMSG_print(ERR_ALREADY_DISCONNECTED, msgs, NULL, dest,
+                    u2ug_params->user, u2ug_params->group);
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /* BS2384
+   * Keep information about connection that
+   * will be deleted by update connection process
+   */
+
+   memcpy( (char *)&pair_info_old,            /* BS2384 */
+           (char *)&pair_info,                /* BS2384 */
+           sizeof(TSS_TRAP_CNN_DATA_typ) );   /* BS2384 */
+
+   rc = TSS_merge_cnn_info(ESA_COMP_UPDU2UG, &pair_info, addinfo);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+  /*
+   *  Build cmd for Delete old connection
+   */
+
+   sprintf(del_cmd.buffer, "REMOVE(%s) PROFILE(%s) ",
+           u2ug_params->user, u2ug_params->group);
+
+   ESA_DIAG_printf(ESA_COMP_UPDU2UG, 1,
+                   "1.del_cmd=%s", del_cmd.buffer);
+
+   del_cmd.max_len = strlen(del_cmd.buffer);
+   del_cmd.use_len = strlen(del_cmd.buffer);
+
+  /*
+   *  Build cmd for Add new connection
+   */
+
+   sprintf(add_cmd.buffer, "ADD(%s) PROFILE(%s) ",
+           u2ug_params->user, u2ug_params->group);
+
+   ESA_DIAG_printf(ESA_COMP_UPDU2UG, 1,
+                   "1.add_cmd=%s", add_cmd.buffer);
+
+  /*
+   *  Create additional connection parameters
+   */
+
+   rc = TSS_aux_conn_proc(ESA_COMP_UPDU2UG, add_cmd.buffer,
+                          &pair_info, user_info, dest, msgs );
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   ESA_DIAG_printf(ESA_COMP_UPDU2UG, 1,
+                   "2.add_cmd=%s", add_cmd.buffer);
+
+   add_cmd.max_len = strlen(add_cmd.buffer);
+   add_cmd.use_len = strlen(add_cmd.buffer);
+
+  /*
+   *  Issue delete command
+   */
+
+   rc = TSS_issue_cmd(ESA_COMP_UPDU2UG, &del_cmd,
+                      u2ug_params->user, TYPE_CONNECTION, /* bs2429 */
+                      TSS_EVNT_ACTION_UPDATE, admin_params);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   connection_deleted = TRUE; /* BS2384 */
+
+  /*
+   *  Issue add command
+   */
+
+   rc = TSS_issue_cmd(ESA_COMP_UPDU2UG, &add_cmd,
+                      u2ug_params->user, TYPE_USER,
+                      TSS_EVNT_ACTION_UPDATE, admin_params);
+  /*
+   *   Finish
+   */
+
+   exit:;
+
+   /* BS2384
+    * If update connection, fails. Restore deleted connection
+    */
+
+   if ((rc NE ESA_OK) AND connection_deleted) {           /* BS2410 */
+     /*  Build cmd for Restore deleted connection */      /* BS2384 */
+                                                          /* BS2384 */
+     sprintf(add_cmd.buffer, "ADD(%s) PROFILE(%s) ",      /* BS2384 */
+             u2ug_params->user, u2ug_params->group);      /* BS2384 */
+                                                          /* BS2384 */
+     ESA_DIAG_printf(ESA_COMP_UPDU2UG, 1,                 /* BS2384 */
+                     "1.add_cmd=%s", add_cmd.buffer);     /* BS2384 */
+                                                          /* BS2384 */
+     /*  Create additional connection parameters */       /* BS2384 */
+                                                          /* BS2384 */
+     rc = TSS_aux_conn_proc(ESA_COMP_UPDU2UG,             /* BS2384 */
+                            add_cmd.buffer,               /* BS2384 */
+                            &pair_info_old, user_info,    /* BS2384 */
+                            dest, msgs );                 /* BS2384 */
+     if ( rc EQ ESA_OK ) {                                /* BS2384 */
+        ESA_DIAG_printf(ESA_COMP_UPDU2UG, 1,              /* BS2384 */
+                        "2.add_cmd=%s", add_cmd.buffer);  /* BS2384 */
+                                                          /* BS2384 */
+        add_cmd.max_len = strlen(add_cmd.buffer);         /* BS2384 */
+        add_cmd.use_len = strlen(add_cmd.buffer);         /* BS2384 */
+                                                          /* BS2384 */
+        TSS_issue_cmd(ESA_COMP_UPDU2UG, &add_cmd,         /* BS2384 */
+                      u2ug_params->user, TYPE_USER,       /* BS2384 */
+                      TSS_EVNT_ACTION_UPDATE,             /* BS2384 */
+                      admin_params);                      /* BS2384 */
+     }    /* TSS_aux_conn_proc - OK */                    /* BS2384 */
+   }      /* If connection deleted  */                    /* BS2384 */
+
+  /* BS2678
+   * Free traped user connections buffer
+   */
+   if ( user_info ) {
+      TSS_free_cnn_trap_handle( ESA_COMP_UPDU2UG,
+         &user_info, dest, msgs);
+   }
+
+  /*
+   * Free traped user group connections buffer
+   */
+   if ( ug_info ) {
+      TSS_free_cnn_trap_handle( ESA_COMP_UPDU2UG,
+         &ug_info, dest, msgs);
+   } /* BS2678 end */
+
+   ESA_DIAG_exit(ESA_COMP_UPDU2UG, 1, func , rc);
+
+   return rc;
+
+ }

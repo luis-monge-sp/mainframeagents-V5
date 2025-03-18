@@ -1,0 +1,448 @@
+/**************************************************************
+*                                                             *
+* Title            : Update user password (TSS)               *
+*                                                             *
+* File Name        : ctstups.c                                *
+*                                                             *
+* Author           : Alex Shvartsman                          *
+*                                                             *
+* Creation Date    : 08/06/96                                 *
+*                                                             *
+* Description      :                                          *
+*                                                             *
+* Assumptions and                                             *
+*   Considerations :                                          *
+*                                                             *
+**************************************************************/
+
+/**************************************************************
+* Mod.Id   Who      When     Description                      *
+* -------- -------- -------  -------------------------------- *
+* ws2458   Yonatan  13/02/02 Support VERIFY_PWD keyword       *
+* BS2562   AmirH    20/10/02 Verify password check            *
+*                            (no handling of revoked/expired) *
+* BS2609   BellaP   28/05/03 Verify password by login is      *
+*                            default for TSS                  *
+* IS10066  NuritY   14/02/12 Verify password succeeds even    *
+*                            when the user is revoked /       *
+*                            expired.                         *
+* IS10093  NuritY   11/06/13 Login enduser if self password...*
+*                            ...(WS10037)                     *
+* SAS2IBMT SeligT   31/10/16 SAS/C to IBM C Conversion Project*
+* IS10174  NuritY   25/12/17 Take VERIFY_PASSWORD_BY_LOGIN    *
+*                            from common_params.              *
+* WS10074  NuritY   29/10/18 use LOGIN_MODE_FIRST_USER for    *
+*                            login enduser.                   *
+* WS10074  KailasP  18/12/18 Instead of setting def_group to  *
+*                            blank pass empty string.         *
+* IS10184  NuritY   02/09/21 Improve scripts performance      *
+* WS10082  MauriC   14/11/22 Recompile for new ADDINFO macros *
+**************************************************************/
+
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_API
+ #include ESA_API_CODES
+
+ #include MVS_ONLINE_INTERCEPTOR
+
+ #include API_ADDINFO
+
+ #include TSS
+
+ /* ws2458 */
+ #include MVS_OS_DYNAM
+ #include TSS_CODES
+ /* IS10174
+ #define VERIFY_PASSWORD_BY_LOGIN "VERIFY_PASSWORD_BY_LOGIN"     */
+ #define RACF_FUNCTION_OK_RC      0
+ #define RACF_FUNCTION_FAILED_RC  8
+ #define RACF_PASSWORD_EXPIRED_RC 12
+ #define RACF_USER_REVOKED_RC     28
+ /* ws2458 */
+
+ static char component[]="UpdPass";                    /*IS10093*/
+
+/***************************************************************
+* Procedure Name : updpass                                     *
+* Description    : Update password and its parameters          *
+* Input          : user, password, addinfo, admin              *
+* Output         : err                                         *
+* Input/Output   :                                             *
+* Return Value   : ESA_RC                                      *
+* Side Effects   :                                             *
+* Comments       :                                             *
+***************************************************************/
+
+ESA_RC CTSUpdPassword (USER_PARAMS_rec_typ  * user_params,
+                       ADDINFO_rec_typ      * addinfo,
+                       ADMIN_PARAMS_rec_typ * admin_params,
+                       ERR_STRUCT_rec_typ   * err)
+{
+
+  static char       func[]="CTSUpdPassword";
+
+  /*
+   *   Variables
+   */
+
+  ESA_RC            rc;          /*drop = ESA_OK setting IS10093 */
+  CTSAMSG_HANDLE_rec_ptr     msgs;
+  CTSAMSG_DEST_TABLE_rec_ptr dest;
+  ADDINFO_rec_ptr            ess_addinfo = NULL;
+  TSS_CMD_HANDLE_typ        *cmd_handle  = NULL;
+  void                      *login_handle = NULL;       /*IS10093*/
+  ESA_RC                    rc_login   = ESA_ERR;       /*IS10093*/
+  ESA_RC                    rc_login_f = ESA_ERR;       /*IS10093*/
+
+  /*** For TSS_chk_acid ***/
+
+  char                       real_acid_type[TSS_ACID_TYPE_LEN+1]="";
+  OBJECT_TYPE_typ            real_obj_type = TYPE_IGNORE;
+
+  /*ws2458*/
+  int         create_racf_rc, create_racf_out, create_racf_reason;
+  int         delete_racf_rc, delete_racf_out, delete_racf_reason;
+  int         verify_password_rc,dbg_lvl; /*prm_rc IS10093*/
+  /* IS10093 char      * how_to_verify =" "; */
+  /* IS10184 char        how_to_verify[2];           *IS10093*   */
+  char          how_to_verify = ' ';               /*IS10184*/
+  ONE_FIELD_rec_ptr cpair;
+  /*ws2458*/
+ TSS_PARAMS_rec_typ *params_ptr=admin_params->apiinit_handle;/*IS10093*/
+  COMMON_PARAMS_rec_typ    * cmnp_ptr = NULL;             /* IS10184 */
+  char                       errmsg[170] = "";            /* IS10184 */
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(ESA_COMP_UPDPASS, 1, func);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+ /*
+  * Initialize global parameters
+  */
+
+  rc = TSS_global_init (ESA_COMP_UPDPASS, admin_params, err);
+  if ( rc NE ESA_OK )
+     goto exit;
+
+  if ( ESA_DIAG_get_debug_level(ESA_COMP_UPDPASS) GE 1 )
+    ADDINFO_dump(addinfo,1);
+
+  /* ws2458 start
+   *
+   *  Check if VERIFY_PWD was requested
+   *  If it was, call the verify password routine and exit,
+   * Otherwise continue as normal.
+   *
+   */
+
+  cpair = ADDINFO_search("VERIFY_PWD",
+                         TSS_ADDINFO_KWD_LEN,
+                         addinfo->pair,
+                         addinfo->num_pairs);
+
+  if (cpair NE NULL)
+    {
+     ESA_DIAG_printf(ESA_COMP_UPDPASS, 2,
+                     "VERIFY_PWD = %s", cpair->value);
+     if (strcmp(cpair->value,KWD_FLAG_ON) EQ 0)
+        {
+          /* IS10093 use the value set in CTSAPIInit
+          prm_rc = admin_params->cs_func.rssprm_get_opt_ptr
+                          (admin_params->rss_name,
+                          VERIFY_PASSWORD_BY_LOGIN,
+                          sizeof(how_to_verify),
+                          how_to_verify,
+                          OPT_TRUE,
+                          OPT_FALSE);
+          if (prm_rc NE ESA_OK)
+  * bs2609  how_to_verify = KWD_FLAG_OFF; verify using login by dflt*
+
+            how_to_verify = KWD_FLAG_ON;   * verify using login by
+                                          default bs2609 */
+              /*IS10093 start*/
+          /* IS10184 - replace with a call to GET_P_CMNPRMS
+          params_ptr=admin_params->apiinit_handle;
+          /@ IS10174 - start @/
+          /@ strcpy(how_to_verify,
+                 params_ptr->rssparm_VERIFY_PASS_LOGIN);   @/
+          strcpy(how_to_verify,
+                 params_ptr->common_params->rssparm_VERIFY_PASS_LOGIN);
+          /@ IS10174 - end   @/
+          end of replaced code  */
+       GET_P_CMNPRMS(admin_params, cmnp_ptr, rc, errmsg)  /* IS10184 */
+       if (rc NE ESA_OK)       /* no common_params - err     IS10184 */
+       {                                                  /* IS10184 */
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,   /* IS10184 */
+                       component, func, errmsg,           /* IS10184 */
+                       16, __LINE__);                     /* IS10184 */
+         goto exit;                                       /* IS10184 */
+       };                                                 /* IS10184 */
+
+       how_to_verify =                                    /* IS10184 */
+                 cmnp_ptr->rssparm_VERIFY_PASS_LOGIN[0];  /* IS10184 */
+          ESA_DIAG_printf (ESA_COMP_UPDPASS,2,
+                      "VERIFY_PASSWORD_BY_LOGIN = <%c> ", /* IS10184 */
+                      how_to_verify);
+                     /* IS10184 "VERIFY_PASSWORD_BY_LOGIN = <%s> ",  */
+              /*IS10093 end  */
+          rc=ESA_FATAL;
+          dbg_lvl =
+             (int)ESA_DIAG_get_debug_level(ESA_COMP_UPDPASS);
+          if ( dbg_lvl GT 0 )
+             dbg_lvl = 1;
+
+          /* SAS2IBMT
+          verify_password_rc =  OS_DYNAM_call("CTSAVPS ",1,          */
+          verify_password_rc = (*(ASM_RTN_TYP *)&OS_DYNAM_call)
+                                       ("CTSAVPS ",1,
+                                       user_params->user,
+                                       user_params->passwd,
+                          /*IS10093    how_to_verify, */
+                                       &how_to_verify, /*IS10093*/
+                                       admin_params->rss_type,
+                                       &dbg_lvl,
+                                       &create_racf_out,
+                                       &create_racf_rc,
+                                       &create_racf_reason,
+                                       &delete_racf_out,
+                                       &delete_racf_rc,
+                                       &delete_racf_reason);
+
+          ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT,2,
+                       "CTSAVPS create: FRC=%d, RC=%d  rc=%d, rs=%d",
+                       verify_password_rc,create_racf_out,
+                       create_racf_rc,create_racf_reason);
+
+          if (verify_password_rc EQ RACF_FUNCTION_OK_RC)    /* BS2562 */
+                  rc = ESA_OK;
+
+          CTSAMSG_print(TSS_VERIFY_PWD, msgs, NULL, dest,
+                     user_params->user,rc);
+          goto exit_verify_password;
+        }
+     }
+  /* ws2458 end */
+ /*
+  *  Check user existance
+  */
+
+  rc = TSS_chk_acid(ESA_COMP_UPDPASS, user_params->user,
+                    TSS_USER, TYPE_USER,
+                    OBJ_EXIST, TRUE, real_acid_type, &real_obj_type,
+                    admin_params, err);
+  if (rc NE ESA_OK)
+     goto exit;
+
+ /*
+  *   Create command handle
+  */
+
+  rc = TSS_alloc_cmd_handle (ESA_COMP_UPDPASS,
+                             MAX_TSS_CMD_USER_ENTRIES,
+                             &cmd_handle, dest, msgs );
+  if ( rc NE ESA_OK )
+     goto exit;
+
+ /*
+  *   Build internal addinfo
+  */
+
+  rc = ADDINFO_alloc(func, addinfo->num_pairs,
+                     &ess_addinfo, dest, msgs);
+  if (rc NE ESA_OK)
+  {
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+  ADDINFO_copy( ess_addinfo, addinfo );
+
+ /************************ IS10093 start (part 1) *****************
+  When enduser changes his own password (usually when call arrives from
+  PassPort or Password Manager) - switch control to enduser's ACEE.
+  This is specifically important for TSS, as TSS verifies its password
+  policy is kept based on ACID type. When ACID which issues the REPLACE
+  PASSWORD command is non-Administrative, the password policy is
+  verified. However, when REPLACE PASSWORD is issued by an
+  Administrative ACID (as Managed System Administrator is) the password
+  policy is not verified by TSS.
+  Customer expectation is that when end-user changes his own password
+  the password policy will be verified by TSS.
+  To implement this new feature of switch to enduser's control, we use
+  a new RSSPARM parameter called SWITCH_TO_ENDUSER.
+  This will allow existing customers, who do not want or need this
+  switch control to enduser, to stay with current flow, so REPLACE
+  PASSWORD command will be issued by Managed System Administrator as
+  done for all other Set commands.                                 ***/
+
+  if (params_ptr->rssparm_SWITCH_TO_ENDUSER[0] EQ 'Y')
+  {
+   ESA_DIAG_printf(ESA_COMP_UPDPASS,2,
+      "SWITCH_TO_ENDUSER = Y");
+   if (user_params->passwd_life EQ PASS_LIFE_PERMANENT )
+   {
+    ESA_DIAG_printf(ESA_COMP_UPDPASS,2,
+       "PASS_LIFE_PERMANENT ==> switch control to end-user");
+  /*strcpy(user_params->def_group,"        ");           WS10074 */
+    rc_login_f = CTSRSSLogin (admin_params->rss_name,
+                 user_params->user,
+                 "",                                     /* WS10074 */
+                 "",
+                 LOGIN_MODE_FIRST_USER,                  /* WS10074 */
+                 &login_handle,
+                 admin_params, err);
+    /* WS10074   user_params->def_group,  */
+    /* WS10074   LOGIN_MODE_FIRST,   */
+
+    if ( rc_login_f NE ESA_OK ) {
+      CTSAMSG_print(ERR_TL_FUNC_CALL,msgs, NULL, dest, component,
+       /* WS10074 */ __LINE__, "CTSRSSLogin(LOGIN_MODE_FIRST_USER)");
+       /*           __LINE__, "CTSRSSLogin(LOGIN_MODE_FIRST)");  */
+      /* WS10074
+      ESA_DIAG_printf(ESA_COMP_UPDPASS,2,"LOGIN_MODE_FIRST failed"); */
+      ESA_DIAG_printf(ESA_COMP_UPDPASS,2,                /* WS10074 */
+                     "LOGIN_MODE_FIRST_USER failed");    /* WS10074 */
+      rc = ESA_FATAL;
+      goto exit;
+    }
+
+    ESA_DIAG_printf(ESA_COMP_UPDPASS,2,
+                   "LOGIN_MODE_FIRST with <%s> done successfully",
+                   user_params->user);
+
+    rc_login =   CTSRSSLogin (admin_params->rss_name,
+                 user_params->user,
+                 "",                                     /* WS10074 */
+                 "",
+                 LOGIN_MODE,
+                 &login_handle,
+                 admin_params, err);
+   /* WS10074    user_params->def_group,           */
+
+    if ( rc_login NE ESA_OK ) {
+      CTSAMSG_print(ERR_TL_FUNC_CALL,msgs, NULL, dest, component,
+                    __LINE__, "CTSRSSLogin(LOGIN_MODE)");
+      ESA_DIAG_printf(ESA_COMP_UPDPASS,2,"LOGIN_MODE failed");
+      rc = ESA_FATAL;
+      goto exit;
+    }
+    ESA_DIAG_printf(ESA_COMP_UPDPASS,2,
+                   "LOGIN_MODE with <%s> done successfully",
+                   user_params->user);
+    }
+   }
+  /*** end of IS10093 part 1 ***/
+
+  rc = TSS_do_password(ESA_COMP_UPDPASS, cmd_handle, user_params,
+                       ess_addinfo, dest, msgs );
+  if ( rc NE ESA_OK )
+     goto exit;
+
+  rc = TSS_do_cmd( ESA_COMP_UPDPASS, (char *)user_params->user,
+                   TYPE_USER,  TSS_EVNT_ACTION_UPDATE,
+                   cmd_handle, admin_params);
+                   /*          TSS_EVNT_ACTION_CHG_PASSWORD   */
+  if ( rc NE ESA_OK )
+     goto exit;
+
+ /*
+  *   Finish
+  */
+
+ exit:;
+
+  /*** IS10093 - part 2 - return to admin control if needed ***/
+  if (params_ptr->rssparm_SWITCH_TO_ENDUSER[0] EQ 'Y' AND
+      user_params->passwd_life EQ PASS_LIFE_PERMANENT )
+  {
+   /*
+    *   Back to administrator authority
+    */
+   if ( rc_login EQ ESA_OK )
+   {
+      ESA_DIAG_printf(ESA_COMP_UPDPASS,2,
+                      "Before logout rss_name=%s userid=%s group=%s",
+                       admin_params->rss_name,
+                       user_params->user, user_params->def_group);
+      rc_login = CTSRSSLogout(admin_params->rss_name,
+                 user_params->user,
+                 "",                                    /* WS10074 */
+                 LOGOUT_MODE,
+                 &login_handle,
+                 admin_params, err);
+    /* WS10074   user_params->def_group,           */
+      if ( rc_login NE ESA_OK ) {
+         CTSAMSG_print(ERR_TL_FUNC_CALL,msgs, NULL, dest, component,
+                       __LINE__, "CTSRSSLogout(LOGOUT_MODE)");
+         ESA_DIAG_printf(ESA_COMP_UPDPASS,2,"LOGOUT_MODE failed");
+      }
+      else
+        ESA_DIAG_printf(ESA_COMP_UPDPASS,2,
+                   "LOGOUT_MODE with <%s> done successfully",
+                   user_params->user);
+   }
+   if ( rc_login_f EQ ESA_OK ) {
+      ESA_DIAG_printf(ESA_COMP_UPDPASS,2,
+                      "Logout last to be done.");
+      rc_login_f = CTSRSSLogout(admin_params->rss_name,
+                 user_params->user,
+                 "",                                    /* WS10074 */
+                 LOGOUT_MODE_LAST,
+                 &login_handle,
+                 admin_params, err);
+    /* WS10074   user_params->def_group,       */
+                                                           /* ps0295 */
+   if ( rc_login_f NE ESA_OK ) {
+      CTSAMSG_print(ERR_TL_FUNC_CALL,msgs, NULL, dest, component,
+                    __LINE__, "CTSRSSLogin(LOGOUT_MODE_LAST)");
+      ESA_DIAG_printf(ESA_COMP_UPDPASS,2,"LOGOUT_MODE_LAST failed");
+   }
+   else
+      ESA_DIAG_printf(ESA_COMP_UPDPASS,2,
+              "LOGOUT_MODE_LAST with <%s> done successfully",
+               user_params->user);
+  }
+  /* it's possible next login 2 be done before logout_mode_last above
+    CTSRSSLogin (admin_params->rss_name,
+                 admin_params->admin_uname,
+                 admin_params->admin_gname,
+                 "",
+                 LOGIN_MODE,
+                 &(admin_params->login_handle),
+                 admin_params, err);    */
+ }
+  /*** end of IS10093 part 2 ***/
+
+ if (cmd_handle)
+   TSS_free_cmd_handle( ESA_COMP_UPDPASS,
+                        &cmd_handle, dest, msgs);
+
+ if (ess_addinfo)
+   ADDINFO_free(&ess_addinfo);
+
+ exit_verify_password:
+
+ ESA_DIAG_exit(ESA_COMP_UPDPASS, 1, func, rc );
+
+ return rc;
+
+}

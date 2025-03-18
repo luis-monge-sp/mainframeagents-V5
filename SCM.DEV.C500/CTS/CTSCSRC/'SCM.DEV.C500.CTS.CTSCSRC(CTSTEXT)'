@@ -1,0 +1,5746 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Service TSS extractor functions          *
+ *                                                             *
+ * File Name        : ctstext                                  *
+ *                                                             *
+ * Author           : Alexander Shvartsman                     *
+ *                                                             *
+ * Creation Date    : 16/06/96                                 *
+ *                                                             *
+ * Description      : TSS  service functions                   *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------- -------------------------------- *
+ * BS2318   GS+AS    27/11/97 Added TSS_extract_2011           *
+ * WS2322   AS       23/02/98 Added Netview segment support    *
+ * PS0286   AS       01/07/98 Changed TSS_extract_1100 (LTIME) *
+ * PS0287   AS       01/07/98 Fix bug in ADMIN field extracts  *
+ * PS0294   AS       24/07/98 Skip AUDIT acid                  *
+ * PS0312   Alex     16/09/98 GetAll By Containers support     *
+ * PS0376   AS       04/05/99 Test Download by prefix in case  *
+ *                            when container is a reserved     *
+ *                            word                             *
+ * ps0380   AS       05/05/99 Download fails, when acid deleted*
+ *                            during the download transaction  *
+ * ps0388   AS       28/09/99 TSS 5.1 Support                  *
+ * WS2359   AlexS    16/11/99 New ADMIN.MISC3 filed            *
+ * WS2360   AlexS    16/11/99 New FACILITY subfileds           *
+ * WS2362   AlexS    13/12/99 LAT_MOD field support            *
+ * PS0459   Yoni     19/03/01 LAST_MOD in TSS date format      *
+ * BS2460   AlexS    23/03/01 TSS 5.1: FIX OUTPUT FORMAT FOR   *
+ *                            FIELDS PTHRESH, PCMINPWD, OPPRTY *
+ *                            PCIDLE, PCDSDAYS                 *
+ * BS2461            28/03/01 OPCLASS FIELD FOR                *
+ *                            CICS AND NETVIEW SEGMENTS        *
+ * BS2518   RamiK    25/03/02 correct download cancel\restart  *
+ *                            fix and return use for TSSCACHE  *
+ * bs2583   Yonatan  19/01/03 Support recid 4404 (OMVSPGM)     *
+ * WS2506   AmirH    13/04/03 Suppres error message issued for *
+ *                            user defined segment             *
+ * BS2471   AmirH    25/04/03 Support NETVIEW domains comma    *
+ *                            list (NETVDMNS)                  *
+ * BS2602   BellaP   18/05/03 Support comma list for fields    *
+ *                            from OPERPARM tab (MCSAUTH,      *
+ *                            MCSLEVL, MCSMFRM, MCSMON)        *
+ * BS2667            26/03/04 Fix NETVOPCL retrieval           *
+ * BS2671   AmirH    26/04/04 Memory leak in CS address space  *
+ *                            due to TSS_trap_cmd allocations  *
+ * IS0358   YoniMa   17/08/06 Memory leak.(BS2698)             *
+ * IS0361   YoniMa   20/08/06 TSS upgrade for v3.2.03,include: *
+ *                            IS0347 - Support external CFILE  *
+ *                            BS2713 - Support long FDT fileds *
+ * WS10009  MeirS    18/10/07 Support RU_LOCKED & RU_SUSPENDED.*
+ * BS10014  ShmuelK  25/11/08 Correctly interpret NEWPW record *
+ *                            9675 across CA-TSS versions      *
+ * IS10026  AvnerL   18/01/09 Drop support in TSS earlier 5.1. *
+ * IS10027  AvnerL   25/01/09 format memory size as heX in diag*
+ * IS10089  NuritY   03/06/13 add KERBEROS support. (WS10032)  *
+ * IS10091  NuritY   06/06/13 ParentContainer for accounts and *
+ *                            Groups (WS10036)                 *
+ * WS10050  AvnerL   18/08/15 Support MISC4 (for AIG)          *
+ * SAS2IBMT SeligT   30/06/16 SAS/C to IBM C Conversion Project*
+ * SAS2IBMN NuritY   15/06/17 SAS/C to IBM C Conversion Project*
+ *                            Replcae system() with a local    *
+ *                            attach routine because in IBM it *
+ *                            uses LINK while in SAS/C it uses *
+ *                            ATTACH. The ATTACH is needed to  *
+ *                            get all task stotage cleanup up  *
+ *                            to prevent storage accumulation  *
+ *                            issues caused by TSSCFILE not    *
+ *                            freeing all its stotage.         *
+ * IS10147A SeligT   10/07/17 Add support for password phrase  *
+ * BS10080  AvnerL   08/02/18 UpperCase R0600-TSSCACHE-compile *
+ * IS10174  NuritY   15/01/18 Dynamic EXECOUT support.         *
+ * IS10181  SeligT   03/06/19 Display Message When ADDINFO     *
+ *                            Value Is Too Large               *
+ * WS10082  AvnerL   18/09/23 ADDINFO_VAL_LEN to 16K if needed *
+ ***************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDIO
+ #include   STDLIB
+ #include   STRING
+ /* SAS2IBMT #include  LCIO                                          */
+ #include   TIME             /* PS0312 */
+ #include   ERRNO                                         /* SAS2IBMT */
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_CTSAMSG
+ #include ESA_API
+ #include ESA_API_CODES
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_COMP
+ #include MVS_OS_MVS
+ #include API_ADDINFO
+ #include API_AUTH
+
+ /*
+  *   TSS include files
+  */
+
+ #include TSS
+ #include TSS_XCNN
+ #include TSS_CODES
+
+ static char component[] = "CTSTEXT";
+
+ static ESA_RC TSS_clear_tsscfile_output(ESA_DIAG_COMP_typ       comp,
+                                    CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                                    CTSAMSG_HANDLE_rec_ptr       msgs);
+/*
+ *   Global static vars
+ */
+
+ static char internal2_msg_buf[200] = "";
+ static char pending_acid[TSS_USER_NAME_LEN + 1] = "";
+ static char admin_qualif[TSS_USER_NAME_LEN + 1] = "";
+ static int  key_ind_lst_fld = 0; /* See TSS_sort_list */
+ /*WS10082 static char rec_4011_fdt[MAX_TSS_PARAM_LEN] = "" ;      */
+ static char rec_4011_fdt[MAX_TSS_REC_LEN+1] = "" ;         /*WS10082*/
+
+
+ /*
+  *  Extract functions
+  */
+
+ static ESA_RC TSS_select_subf(ESA_DIAG_COMP_typ            comp,
+                               char                       * keyword,
+                               TSS_SUBF_typ                 subf_t[1],
+                               int                        * found,
+                               CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                               CTSAMSG_HANDLE_rec_ptr       msgs);
+
+ static ESA_RC TSS_init_list(ESA_DIAG_COMP_typ     comp,
+                             int                          key_ind,
+                             char                       * keyword,
+                             char                       * val,
+                             TSS_SUBF_typ                 subf_t[1],
+                             TSSCFILE_HANDLE_typ        * h_desc,
+                             TSSCFILE_REC_typ           * r_desc,
+                             TSSCFILE_DESCR_typ         * d_desc,
+                             char                       * key_val,
+                             CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                             CTSAMSG_HANDLE_rec_ptr       msgs);
+
+ static ESA_RC TSS_fill_list(ESA_DIAG_COMP_typ            comp,
+                             int                          key_ind,
+                             int                          f_ind,
+                             char                       * main_k,
+                             char                       * fval,
+                             TSSCFILE_HANDLE_typ        * h_desc,
+                             TSSCFILE_REC_typ           * r_desc,
+                             TSSCFILE_DESCR_typ         * d_desc,
+                             char                       * key_val,
+                             int                          aux_ind,
+                             char                       * aux_key_val,
+                             CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                             CTSAMSG_HANDLE_rec_ptr       msgs);
+
+ static ESA_RC TSS_init_and_fill_list(ESA_DIAG_COMP_typ   comp,
+                             int                          key_ind,
+                             int                          f_ind,
+                             char                       * main_k,
+                             char                       * fval,
+                             TSS_SUBF_typ                 subf_t[1],
+                             TSSCFILE_HANDLE_typ        * h_desc,
+                             TSSCFILE_REC_typ           * r_desc,
+                             TSSCFILE_DESCR_typ         * d_desc,
+                             char                       * key_val,
+                             CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                             CTSAMSG_HANDLE_rec_ptr       msgs);
+
+ static ESA_RC TSS_cmd_proc (ESA_DIAG_COMP_typ            comp,
+                             char                       * facility,
+                             char                       * main_cmd,
+                             char                       * record,
+                             TSSCFILE_HANDLE_typ        * h_desc,
+                             TSSCFILE_REC_typ           * r_desc,
+                             TSSCFILE_DESCR_typ         * d_desc,
+                             char                       * key_val,
+                             ADDINFO_rec_ptr              addinfo,
+                             ADDINFO_rec_ptr              laddinfo,
+                             CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                             CTSAMSG_HANDLE_rec_ptr       msgs);
+
+ static ESA_RC TSS_convert_facility_date(ESA_DIAG_COMP_typ   comp,
+                         char                              * tssdate,
+                         CTSAMSG_DEST_TABLE_rec_ptr          dest,
+                         CTSAMSG_HANDLE_rec_ptr              msgs);
+
+extern  int ctsaatc();                                /* SAS2IBMN */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_clear_subfields                        *
+ *                                                             *
+ * DESCRIPTION    : Clear subfields                            *
+ *                                                             *
+ * INPUT          : lst_handle                                 *
+ *                  subf_t    - subfields table                *
+ *                  k         - index of list data             *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ static void TSS_clear_subfields(TSS_LST_FIELD_typ  *lst_handle,
+                                 TSS_SUBF_typ        subf_t[1],
+                                 int                 k)
+ {
+
+    int    j;
+
+   /*
+    *  Clear subfields for current entry
+    *  index of current entry = k
+    */
+
+    lst_handle->lst_data[k].fill_done = 0;
+    for (j=0; j LT MAX_TSS_SUBFIELD; j++) {
+        lst_handle->lst_data[k].field[j][0] = NULL_CHAR;
+        lst_handle->lst_data[k].exists[j]   = TSS_VAL_NOT_EXISTS;
+        lst_handle->lst_data[k].type[j]     = RTT_IGN;
+    }
+
+   /*
+    *  Set initial subfields names values
+    */
+
+    lst_handle->subf_cnt = 0;
+    for (j=0; subf_t[j].subf_name; j++)  {
+       lst_handle->subf_cnt++;
+      /*
+       *  May be some defaults ?
+       *  strcpy(lst_handle->lst_data[k].field[j],
+       *              subf_t[j].subf_name);
+       */
+
+       lst_handle->lst_data[k].type[j] = subf_t[j].rtt_typ;
+
+       if (subf_t[j].rtt_typ EQ RTT_FLG)
+         strcpy(lst_handle->lst_data[k].field[j],KWD_FLAG_OFF);
+    }
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_set_subfield_value                     *
+ *                                                             *
+ * DESCRIPTION    : set subfield value                         *
+ *                                                             *
+ * INPUT          : lst_handle                                 *
+ *                  i         - index of list data             *
+ *                  j         - index of subfield              *
+ *                  kwd       - keyword                        *
+ *                  val       - value                          *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : none                                       *
+ *                                                             *
+ **************************************************************/
+
+ static void TSS_set_subfield_value(ESA_DIAG_COMP_typ   comp,
+                                    TSS_LST_FIELD_typ  *lst_handle,
+                                    int                 i,
+                                    int                 j,
+                                    char               *kwd,
+                                    char               *val)
+ {
+
+  /*
+   * Set field value
+   */
+
+   lst_handle->lst_data[i].fill_done = 1;
+
+   ESA_DIAG_printf(comp, 5, "1.Set(%d-%d) %s=%s", i, j, kwd, val );
+
+   if (lst_handle->lst_data[i].exists[j] EQ TSS_VAL_NOT_EXISTS)
+     lst_handle->lst_data[i].field[j][0] = NULL_CHAR;
+
+   if (lst_handle->lst_data[i].field[j][0] EQ NULL_CHAR)
+     strcpy(lst_handle->lst_data[i].field[j], val );
+   else {
+     strcat(lst_handle->lst_data[i].field[j], "," );
+     strcat(lst_handle->lst_data[i].field[j], val );
+   }
+
+   ESA_DIAG_printf(comp, 5, "2.Set(%d-%d) %s=%s", i, j, kwd, val );
+
+   lst_handle->lst_data[i].exists[j] = TSS_VAL_EXISTS;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_check_rec_dep                          *
+ *                                                             *
+ * DESCRIPTION    : Check rec dependencies                     *
+ *                                                             *
+ * INPUT          : prev_id   - previous rec id                *
+ *                  dep_id    - dep ids                        *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_check_rec_dep(ESA_DIAG_COMP_typ            comp,
+                          char                       * rec_id,
+                          char                       * prev_id,
+                          char                       * dep_id,
+                          CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                          CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  ESA_RC      rc = ESA_OK;
+  static char func[]="TSS_check_rec_dep";
+  char        value[TSS_ADDINFO_VAL_LEN + 1];
+  char       *token;
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(comp,5,func);
+
+  strcpy(value, dep_id);
+  token = strtok(value, "," );
+
+  while (token)  {
+
+    ESA_DIAG_printf(comp,5, "token=%s pending_id=%s", token, prev_id );
+
+    if (strcmp(prev_id, token) EQ 0 )
+         goto exit;
+
+    token = strtok( NULL, "," );
+  }
+
+  rc = ESA_ERR;
+  sprintf(internal2_msg_buf,
+        "'%s'.Invalid sequence.Recid=%s is not after recid=%s.Found %s",
+        pending_acid, rec_id, dep_id, prev_id);
+  CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                component, func, internal2_msg_buf,
+                4, __LINE__);
+ /*
+  *    Finish
+  */
+
+ exit :;
+
+  ESA_DIAG_exit(comp, 5, func, rc );
+  return rc;
+
+ }
+
+ /*
+  * Prototype :see prototype of extract function
+  */
+
+ ESA_RC TSS_strip_zero(ESA_DIAG_COMP_typ         comp,
+                       char                       * fdata,
+                       TSSCFILE_HANDLE_typ        * h_desc,
+                       TSSCFILE_REC_typ           * r_desc,
+                       TSSCFILE_DESCR_typ         * d_desc,
+                       char                       * key_val,
+                       ADDINFO_rec_ptr              addinfo,
+                       ADDINFO_rec_ptr              laddinfo,
+                       CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                       CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_strip_zero";
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   if ( strlen(fdata) EQ 0 )
+    goto exit;
+
+   TSS_strip_val(fdata, '0', TSS_STRIP_LEFT);
+   if ( strlen(fdata) EQ 0 )
+      strcpy(fdata, "0");
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_strip_fzero(ESA_DIAG_COMP_typ           comp,
+                       char                       * fdata,
+                       TSSCFILE_HANDLE_typ        * h_desc,
+                       TSSCFILE_REC_typ           * r_desc,
+                       TSSCFILE_DESCR_typ         * d_desc,
+                       char                       * key_val,
+                       ADDINFO_rec_ptr              addinfo,
+                       ADDINFO_rec_ptr              laddinfo,
+                       CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                       CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_strip_fzero";
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   if ( strlen(fdata) EQ 0 )
+      goto exit;
+
+   TSS_strip_val(fdata, '0', TSS_STRIP_LEFT);
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_get_acids_list                         *
+ *                                                             *
+ * DESCRIPTION    : Get list of acids of requested type        *
+ *                                                             *
+ *!!!!!!!!!!!!!! Important Note !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!*
+ *!                                                           !*
+ *! The list parameter, passed by caller, should be NULL or   !*
+ *! a pointer to a trap handler (TSS_TRAP_BUF_rec_typ).       !*
+ *! If list is NULL, TSS_trap_cmd will allocate a new handler !*
+ *! (using TSS_alloc_trap_handle()), otherwise,               !*
+ *! TSS_trap_cmd will reallocate the trap area pointed by the !*
+ *! passed handler (using TSS_realloc_trap_buffer() ).        !*
+ *!                                                           !*
+ *!                                                    BS2671 !*
+ *!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!*
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  acid_type - acids type                     *
+ *                  parent_oe - container                      *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : list      - list of acids                  *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_get_acids_list(ESA_DIAG_COMP_typ       comp,
+                           char                 *  acid_type,
+                           TSS_TRAP_BUF_rec_typ ** list,
+                           TSS_GET_TYPES_rec_typ   get_types[1],
+                           OE_typ                  oe,
+                           ADMIN_PARAMS_rec_typ  * admin_params,
+                           ERR_STRUCT_rec_typ    * err)
+ {
+
+  static char func[]="TSS_get_acids_list";
+  TSS_ACID_HEADER_rec_typ      acid_info;
+  TSS_CMD_BUF_rec_typ          cmd = { 0, 0, "" };
+  TSS_TRAP_BUF_rec_typ       * get_info = NULL;
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+  char                         parent_oe_type[TSS_ACID_TYPE_LEN] = "";
+  char                         root_name[MAX_TSS_PARAM_LEN + 1];
+  ESA_RC                       rc = ESA_OK;
+  int                          logout_done = 0;
+  int                          i;
+  int                          j;
+
+  /*
+   *  PS0132. Time managament vars
+   */
+
+  char         get_all_vrbs[MAX_TSS_PARAM_LEN + 1]= "";
+  time_t       before,  after;
+  double       difft, ss;
+  int          hh, mm;
+  int          new_entries;
+  char         elapsed_m[100];
+  char         elapsed_t[400];
+
+ /********************************************************************
+  *   ACCESSORID = CTSUSR1   NAME       = TEST USER #1               *
+  *   ACCESSORID = CTSUSR2   NAME       = TEST USER #2               *
+  *   ACCESSORID = CTSUSR3   NAME       = TEST USER #3               *
+  ********************************************************************/
+
+  static char            get_acid[TSS_USER_NAME_LEN + 1];
+  static char           *accss_k[]={"ACCESSORID", "=", NULL};
+  static TSS_OUTP_typ    accss_d[] = {
+                     { sizeof(get_acid), get_acid },
+                     { 0,                NULL     }
+                               };
+  TSS_LIST_LINE(accss, LIST_ACCESSORID, CURRENT_LINE);
+
+  static TSS_OUTPUT_typ  line_desc[] = {
+        { &accss,    (void *) TSS_extract_acid    },  /* SAS2IBMT */
+        { NULL,      NULL                }
+                                        };
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(comp,3,func);
+
+  get_info = *list;            /* Get handler passed by caller BS2671 */
+
+  rc= admin_params->cs_func.rssprm_get_opt_ptr(admin_params->rss_name,
+                    TSS_GET_ALL_VERBOSE,
+                    sizeof(get_all_vrbs) - 1,
+                    get_all_vrbs, OPT_TRUE, OPT_TRUE);
+  if ( rc NE ESA_OK)
+    strcpy(get_all_vrbs, KWD_FLAG_OFF);
+
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  TSS_use_root_object(comp,root_name,dest,msgs);
+  ESA_DIAG_printf(comp,3, "acid type=%s list handler=%X",   /* BS2671 */
+     acid_type, get_info);
+
+  rc = CTSCRSS_set_authority( &logout_done,
+                              SET_TO_STARTED_TASK_AUTH,
+                              admin_params, err );
+  if ( rc NE ESA_OK )
+      goto exit;
+
+ /*
+  *  If obtained container - check it
+  */
+
+  if ( strlen(oe) GT 0 ) {
+    if ( strcmp(oe, root_name ) NE 0 )  {
+
+     /*  Get parent acid parameters */
+
+     rc = TSS_get_acid_header(comp, TSS_CMD_DEFAULT_MODE,
+                              oe, &acid_info,
+                              admin_params, err);
+     if ( rc NE ESA_OK )
+        goto exit;
+
+     ESA_DIAG_printf(comp, 3, "ACID=%s",      acid_info.acid);
+     ESA_DIAG_printf(comp, 3, "ACID_TYPE=%s", acid_info.type);
+
+     ESA_DIAG_printf(comp, 3, "parent acid=%s/%s",
+                     oe, acid_info.acid);
+
+     if ( strcmp(oe, acid_info.acid) NE 0 ) {
+        CTSAMSG_print(TSS_ERR_NO_ACID, msgs, NULL,
+                      dest, acid_type, oe);
+        rc = ESA_ERR;
+        goto exit;
+     }
+     strcpy (parent_oe_type, acid_info.type);
+    }    /* oe type none ROOT */
+  }     /* strlen(oe) GT 0 */
+
+ /*
+  *   Obtain acid list
+  */
+
+  for (i=0; get_types[i].get_type; i++ ) {
+
+     time(&before);     /* PS0132 */
+
+     sprintf(cmd.buffer, "LIST(ACIDS) DATA(NAME) TYPE(%s) ",
+             get_types[i].get_type );
+
+     sprintf( elapsed_m, "LIST:ACIDS TYPE(%s) ",   /* PS0312 */
+             get_types[i].get_type );              /* PS0312 */
+
+     /* Check whether append container */
+
+     ESA_DIAG_printf(comp,3, "oe=%d/%s oe_type=%d/%s",
+                     strlen(oe), oe,
+                     strlen(parent_oe_type), parent_oe_type);
+
+     if ( ( strlen(oe) GT 0 )             AND
+          ( strlen(parent_oe_type) GT 0 )   )  {
+          strcat(cmd.buffer, parent_oe_type );
+          strcat(cmd.buffer, "("  );
+          strcat(cmd.buffer, oe   );
+          strcat(cmd.buffer, ") " );
+
+          strcat(elapsed_m , parent_oe_type);      /* PS0312 */
+          strcat(elapsed_m , "("  );               /* PS0312 */
+          strcat(elapsed_m , oe   );               /* PS0312 */
+          strcat(elapsed_m , ") " );               /* PS0312 */
+     }    /* Append container */
+
+     cmd.max_len = strlen(cmd.buffer);
+     cmd.use_len = strlen(cmd.buffer);
+
+     rc = TSS_trap_cmd(comp, &cmd, &get_info,
+                       &line_desc[0], dest, msgs );
+     if ( rc NE ESA_OK )
+          goto exit;
+
+     if ( get_info EQ NULL ) {
+       CTSAMSG_print(TSS_CMD_RESULT_ERR, msgs, NULL, dest, cmd.buffer);
+       OS_MVS_btrace();
+       rc = ESA_FATAL;
+       goto exit;
+     }
+
+    /*
+     *   Put sort symbol
+     */
+
+     new_entries = 0;     /* PS0312 */
+     for (j=0; j LT get_info->used_entries; j++)  {
+       /* Check only new entries */
+       if (get_info->trap_data[j].data[0] EQ ' ') {
+         new_entries++;   /* PS0312 */
+         get_info->trap_data[j].data[0] = get_types[i].sort_symb;
+         /* TSS special records */                    /* ps0294 */
+         if ( (strcmp(&get_info->trap_data[j].data[1],/* ps0294 */
+                    "AUDIT") EQ 0)  OR                /* ps0294 */
+          /*
+           *  (strcmp(&get_info->trap_data[j].data[1],(* ps0376 *)
+           *      "CTSDP01") EQ 0)  OR                (* ps0376 *)
+           */
+              (strcmp(&get_info->trap_data[j].data[1],/* ps0294 */
+                    "APPCLU") EQ 0)  OR               /* ps0294 */
+              (strcmp(&get_info->trap_data[j].data[1],/* ps0294 */
+                    "RDT")    EQ 0)  OR               /* ps0294 */
+              (strcmp(&get_info->trap_data[j].data[1],/* ps0294 */
+                    "NDT")    EQ 0)  OR               /* ps0294 */
+              (strcmp(&get_info->trap_data[j].data[1],/* ps0294 */
+                    "FDT")    EQ 0)  OR               /* ps0294 */
+              (strcmp(&get_info->trap_data[j].data[1],/* ps0294 */
+                    "STC")    EQ 0)  OR               /* ps0294 */
+              (strcmp(&get_info->trap_data[j].data[1],/* ps0294 */
+                    "DLF")    EQ 0)  OR               /* ps0294 */
+              (strcmp(&get_info->trap_data[j].data[1],/* ps0294 */
+                    "ALL")    EQ 0)   ) {             /* ps0294 */
+            get_info->trap_data[j].used = TRUE;       /* ps0294 */
+            sprintf(internal2_msg_buf,                /* ps0294 */
+               "Processing for record %s bypassed - ACID ignored",
+                &get_info->trap_data[j].data[1]);     /* ps0294 */
+            CTSAMSG_print(ERR_INTERNAL2,              /* ps0294 */
+                          msgs, NULL, dest,           /* ps0294 */
+                          component, func,            /* ps0294 */
+                          internal2_msg_buf,          /* ps0294 */
+                          4, __LINE__);               /* ps0294 */
+         }    /* Special TSS records */               /* ps0294 */
+       }      /* New entries         */
+     }        /* Entire list         */
+
+     if ( strcmp(get_all_vrbs, KWD_FLAG_ON) EQ 0) { /* PS0312 */
+       time(&after);                                    /* PS0312 */
+       difft = difftime(after, before);                 /* PS0312 */
+       hh = (int)(difft/3600);                          /* PS0312 */
+       mm = (int)((difft - (hh * 3600))/60);            /* PS0312 */
+       ss = difft - (hh * 3600) - (mm * 60);            /* PS0312 */
+       sprintf(elapsed_t,                               /* PS0312 */
+               "%-45s(%6d):Time=%02d.%02d.%07.4f",   /* PS0312 */
+               elapsed_m,  new_entries,                 /* PS0312 */
+               hh, mm, ss );                            /* PS0312 */
+       CTSAMSG_print(ERR_3_STRINGS,                     /* PS0312 */
+                     msgs, NULL, dest,                  /* PS0312 */
+                     elapsed_t, "", "");                /* PS0312 */
+     }                                                  /* PS0312 */
+  }     /* get_types loop */
+
+  TSS_trap_buf_sort(comp, get_info);
+
+  if ( ESA_DIAG_get_debug_level(comp) GE 5 )  {
+      ESA_DIAG_printf (comp, 0 , "ACIDS LIST");
+      TSS_trap_buf_dump(comp, get_info);
+  }
+
+ /*
+  *    Finish
+  */
+
+ exit :;
+
+  if (logout_done)
+    CTSCRSS_set_authority( &logout_done,
+                           RETURN_FROM_STARTED_TASK_AUTH,
+                           admin_params, err );
+
+  *list = get_info;
+
+  ESA_DIAG_exit(comp, 3, func, rc );
+  return rc;
+
+ }
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_cfile_activate                         *
+*                                                             *
+* DESCRIPTION    : Activate tsscfile utility                  *
+*                                                             *
+* INPUT          : dest             -  destinations table     *
+*                  msgs             -  messages buffer        *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+**************************************************************/
+
+ESA_RC TSS_cfile_activate(ESA_DIAG_COMP_typ       comp,
+                          CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                          CTSAMSG_HANDLE_rec_ptr       msgs)
+{
+
+  static char func[] = "TSS_cfile_activate";
+  ESA_RC rc = ESA_OK;
+  int    sys_rc = 0;
+  int    debug_level = 0;                                /* SAS2IBMN */
+  int    att_rc = 0;                                     /* SAS2IBMN */
+  int    task_rs = 0;                                    /* SAS2IBMN */
+  char   task_abend = ' ';                               /* SAS2IBMN */
+  char   parm_type = 'P';   /* parm type is P(rogram)       SAS2IBMN */
+  char   s0 = 'N';          /* szero = no                   SAS2IBMN */
+
+ /*
+  *   Initialization
+  */
+
+  ESA_DIAG_enter(comp, 3, func );
+
+  rc = TSS_clear_tsscfile_output(comp, dest, msgs );
+  if ( rc NE ESA_OK )
+    goto exit;
+
+ /*
+  *   Activate TSSCFILE
+  */
+
+  /* SAS2IBMT sys_rc = system("PGM:TSSCFILE");       /* PRINTDATA"); */
+  /* SAS2IBMN - start */
+  /*
+  sys_rc = system("PGM=TSSCFILE");   * PRINTDATA");          SAS2IBMT *
+  */
+  debug_level = ESA_DIAG_get_debug_level(comp);
+  if (debug_level GT 1)
+    debug_level = 1;
+  att_rc = (*(ASM_RTN_TYP *)&ctsaatc)("TSSCFILE", &parm_type, NULL,
+                                      &s0, debug_level, &sys_rc,
+                                      &task_rs, &task_abend);
+  /* ESA_DIAG_printf(comp, 3, "TSSCFILE rc = %d",sys_rc);    */
+  ESA_DIAG_printf(comp, 3, "ATTACH:  rc = %d",sys_rc);
+  ESA_DIAG_printf(comp, 3, "TSSCFILE: rc = %d (%8X) / %d (%8X) / %c",
+                 sys_rc, sys_rc, task_rs, task_rs, task_abend);
+
+  switch (att_rc)
+  {
+    case 0:
+
+      if (sys_rc LT 998)
+      /* SAS2IBMN - end   */
+         sys_rc = 0;  /* When we had prepared info
+                      to list acid that does not
+                      exists, TSSCFILE returns rc=8 */
+
+
+      if (sys_rc EQ 0)
+        rc = ESA_OK ;
+      else
+        rc = ESA_FATAL;
+    /* SAS2IBMN - start   */
+    break;
+    case 4:
+    case 8:
+    case 12:
+    case 16:
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                     component, func,
+                     "CTSAATCH failed with an error return code",
+                     att_rc, __LINE__);
+       rc = ESA_FATAL;
+    break;
+    case 20:
+       sprintf(internal2_msg_buf,
+               "TSSCFILE abended:  abend code %c%.8X-%.8X",
+               task_abend, sys_rc, task_rs);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                     component, func, internal2_msg_buf,
+                     12, __LINE__);
+       rc = ESA_FATAL;
+    break;
+    default:
+       sprintf(internal2_msg_buf,
+               "CTSAATC unknown rc: %d (%c / %.8X / %.8X)",
+               att_rc, task_abend, sys_rc, task_rs);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                     component, func, internal2_msg_buf,
+                     12, __LINE__);
+       rc = ESA_FATAL;
+    break;
+  }
+  /* SAS2IBMN - end */
+
+ /*
+  *   Finish
+  */
+
+  exit: ;
+
+  ESA_DIAG_exit(comp, 3, func, rc);
+
+  return rc;
+
+ }
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_clear_tsscfile_output                  *
+*                                                             *
+* DESCRIPTION    : Clear tsscfile output file                 *
+*                                                             *
+* INPUT          : dest             -  destinations table     *
+*                  msgs             -  messages buffer        *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+**************************************************************/
+
+static ESA_RC TSS_clear_tsscfile_output(ESA_DIAG_COMP_typ       comp,
+                                   CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                                   CTSAMSG_HANDLE_rec_ptr       msgs)
+{
+
+  static char func[] = "TSS_clear_tsscfile_output";
+  char        file_name[TSS_MAX_FILENAME_LEN + 10];
+  char        ddn_with[MAX_FILENAME_LEN];                 /* SAS2IBMT */
+
+  ESA_RC      rc = ESA_OK ;
+  FILE       *file_out = NULL;
+
+ /*
+  *   Initialization
+  */
+
+  ESA_DIAG_enter(comp, 5, func );
+
+ /*
+  *   Check ddname existance
+  */
+  /* IS10174
+  rc = OS_MVS_ddinfo(TSSCFILE_OUT_DD, file_name, TRUE, dest, msgs); */
+  rc = OS_MVS_ddinfo(TSSCFILE_OUT_DD, file_name,         /* IS10174 */
+                     TRUE, dest, msgs, 0);               /* IS10174 */
+  if ( rc NE ESA_OK ) {
+     rc = ESA_OK;
+     goto exit;
+  }
+
+ /*
+  *   Open output file
+  */
+
+  strcpy(ddn_with,"DD:");                                 /* SAS2IBMT */
+  strcat(ddn_with, TSSCFILE_OUT_DD);                      /* SAS2IBMT */
+
+  /* SAS2IBMT
+  file_out = fopen(TSSCFILE_OUT_DD, FILE_OPEN_WRITE_TEXT);           */
+  file_out = fopen(ddn_with, FILE_OPEN_WRITE_TEXT);       /* SAS2IBMT */
+  if (file_out EQ NULL) {
+      CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                    "fopen", func, TSSCFILE_OUT_DD, strerror(errno));
+      OS_MVS_btrace();
+      rc = ESA_FATAL;
+      goto exit;
+  }
+
+ /*
+  *   write empty line
+  */
+
+  fputs( " ",  file_out);
+  if (ferror(file_out)) {
+     CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                   "fputs", func, TSSCFILE_OUT_DD, strerror(errno));
+     OS_MVS_btrace();
+     rc = ESA_FATAL;
+     goto exit;
+  }
+
+ /*
+  *   Finish
+  */
+
+  exit: ;
+
+  if (file_out NE NULL)
+     fclose(file_out);
+
+  ESA_DIAG_exit(comp, 5, func, rc);
+
+  return rc;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_init_get_handle                        *
+ *                                                             *
+ * DESCRIPTION    : Check and create get handle                *
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  handle    - entered handle                 *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : get_handle- get handle                     *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_init_get_handle (ESA_DIAG_COMP_typ            comp,
+                             TSSCFILE_ERR_BEH_typ         err_action,
+                             TSS_GET_HANDLE_typ        ** get_handle,
+                             void                      ** handle,
+                             ADDINFO_rec_ptr              addinfo,
+                             ADMIN_PARAMS_rec_typ       * admin_params,
+                             ERR_STRUCT_rec_typ         * err)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                       rc   = ESA_OK ;
+   CTSAMSG_HANDLE_rec_typ     * msgs;
+   CTSAMSG_DEST_TABLE_rec_typ * dest;
+   int                          size = 0;
+   int                          i;
+   static char func[]="TSS_init_get_handle";
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(comp, 3, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+  /*
+   *   First time, obtain handle
+   */
+
+   size = sizeof(TSS_GET_HANDLE_typ);
+   if ( *handle EQ NULL ) {
+      *handle = malloc(size);
+      if ( *handle EQ NULL ) {
+         CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                       "Get Handle", size);
+         OS_MVS_btrace();
+         rc = ESA_FATAL ;
+         goto exit ;
+      }
+      ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,                 /*IS0358*/
+      "malloc (%6X) bytes at address (%x) (%d,%s)",         /*IS10027*/
+       size, *handle,   __LINE__, __FILE__ );
+
+      *get_handle = (TSS_GET_HANDLE_typ *)(*handle);
+
+     /*
+      *   Create Local addinfo
+      */
+
+      rc = ADDINFO_alloc(func,  TSS_MAX_LOCAL_ADI_ENTRIES,
+                         &( (*get_handle)->laddinfo), dest, msgs);
+      if (rc NE ESA_OK) {
+          ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,   /*IS0358*/
+           "Free address (%x) (%d,%s)",
+           *handle, __LINE__, __FILE__ );
+          free( *handle ) ;
+          *handle=NULL;
+          rc = ESA_FATAL ;
+          goto exit;
+      }
+
+     /*
+      *   Create work addinfo
+      */
+
+      rc = ADDINFO_alloc(func,  addinfo->num_pairs,
+                         &( (*get_handle)->waddinfo), dest, msgs);
+      if (rc NE ESA_OK) {
+          if ( (*get_handle)->laddinfo NE NULL)
+               ADDINFO_free(  &( (*get_handle)->laddinfo) );
+          (*get_handle)->laddinfo = NULL;
+          ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,   /*IS0358*/
+           "Free address (%x) (%d,%s)",
+           *handle, __LINE__, __FILE__ );
+          free( *handle ) ;
+          *handle=NULL;
+          rc = ESA_FATAL ;
+          goto exit;
+      }
+
+     /*
+      *  Create addinfo with empty keywords
+      */
+
+      ADDINFO_copy( (*get_handle)->waddinfo, addinfo );
+
+     /*
+      *   Initialize entry structure variables
+      */
+
+      (*get_handle)->list_ind      = 0;
+      (*get_handle)->found_err     = 0;
+      (*get_handle)->err_action    = err_action;
+      (*get_handle)->acids_list    = NULL;
+      (*get_handle)->cnn_data      = NULL;
+      (*get_handle)->oe_acids_list = NULL;      /* PS0312 */
+      (*get_handle)->oe_list_ind   = 0;         /* PS0312 */
+      (*get_handle)->r0600         = NULL;      /* ps0359 */
+
+      (*get_handle)->this_is_a_restart             = 0; /* BS2518 */
+      (*get_handle)->this_is_a_first_restart_entry = 0; /* BS2518 */
+
+      (*get_handle)->r4404.data_len = 0;        /* bs2583 */
+      (*get_handle)->r4404.data     = NULL;     /* bs2583 */
+
+      ESA_DIAG_printf(comp, 5, "r4404 data len = %d",
+           (*get_handle)->r4404.data_len);
+
+      /*
+       *   Initialize LIST'S buffer
+       */
+
+       for (i=0; i LT MAX_TSS_LIST_FIELDS; i++ ) {
+         (*get_handle)->list_buffer.lst_f[i].kwd[0] = NULL_CHAR;
+         (*get_handle)->list_buffer.lst_f[i].vall   = NULL;
+       }
+
+      /*
+       * Initialize global parameters
+       */
+
+       rc = TSS_global_init (comp, admin_params, err);
+   }
+
+  /*
+   *   NO first time, move handle address to entry address
+   */
+
+   else
+      *get_handle = (TSS_GET_HANDLE_typ *)(*handle);
+
+  /*
+   *   Finish
+   */
+
+   exit :;
+
+   ESA_DIAG_exit(comp, 3, func, rc);
+
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_free_get_handle                        *
+ *                                                             *
+ * DESCRIPTION    : Free get handle                            *
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  handle    - entered handle                 *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                 e                     *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_free_get_handle (ESA_DIAG_COMP_typ            comp,
+                             void                      ** handle,
+                             CTSAMSG_DEST_TABLE_rec_typ * dest,
+                             CTSAMSG_HANDLE_rec_typ     * msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   static char func[]="TSS_free_get_handle";
+   ESA_RC                      rc = ESA_OK ;
+   int                         i;
+   ADDINFO_rec_ptr             addinfo;
+   TSS_GET_HANDLE_typ        * get_handle = NULL;
+   TSS_TRAP_BUF_rec_typ      * users_list = NULL;
+   TSS_TRAP_CNN_BUF_rec_typ  * cnn_data = NULL;
+   TSSCFILE_HANDLE_typ       * h_desc;
+   TSS_LST_FIELD_typ         * lst_handle;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(comp, 3, func);
+
+   get_handle = (TSS_GET_HANDLE_typ *)(*handle);
+   if ( get_handle EQ NULL )
+      goto exit;
+
+   if ( get_handle->acids_list NE NULL ) {
+     users_list =  get_handle->acids_list;
+     TSS_free_trap_handle(comp, &users_list, dest, msgs);
+   }
+
+   if ( get_handle->oe_acids_list NE NULL ) {             /* PS0312 */
+     users_list =  get_handle->oe_acids_list;             /* PS0312 */
+     TSS_free_trap_handle(comp, &users_list, dest, msgs); /* PS0312 */
+   }                                                      /* PS0312 */
+
+   addinfo = get_handle->laddinfo;
+   if ( addinfo NE NULL)
+        ADDINFO_free(&addinfo);
+
+   addinfo = get_handle->waddinfo;
+   if ( addinfo NE NULL)
+        ADDINFO_free(&addinfo);
+
+   if (get_handle->r0600 NE NULL)          /* WS2359 */
+     fclose(get_handle->r0600);            /* WS2359 */
+
+   h_desc = &(get_handle->list_buffer);
+   for (i=0; i LT MAX_TSS_LIST_FIELDS; i++ ) {
+      if (h_desc->lst_f[i].vall NE NULL ) {
+          lst_handle = h_desc->lst_f[i].vall;
+
+          ESA_DIAG_printf(comp, 4,
+                          "***free(1) handle i=%d %X-%X (%d,%s)",
+                          i, lst_handle, lst_handle->lst_data,
+                          __LINE__, __FILE__ );
+
+          TSS_free_lst_handle( comp, &lst_handle, dest, msgs);
+      }
+   }
+
+  /*
+   *  Free connection data
+   */
+
+   if ( get_handle->cnn_data ){
+      cnn_data = (TSS_TRAP_CNN_BUF_rec_typ *)get_handle->cnn_data;
+      TSS_free_cnn_trap_handle(comp, &cnn_data, dest, msgs);
+      get_handle->cnn_data = NULL;
+   }
+
+   ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,                 /*IS0358*/
+      "Free address (%x) (%d,%s)",
+       *handle, __LINE__, __FILE__ );
+
+   free( (*handle) );
+   *handle = NULL;                                       /*IS0358*/
+
+  /*
+   *   Finish
+   */
+
+   exit :;
+
+   ESA_DIAG_exit(comp, 3, func, rc);
+
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_select_acids_list_from                 *
+ *                                                             *
+ * DESCRIPTION    : acids list processing (selected nessecc )  *
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  acids_list- acids list                     *
+ *                  acid_type - acid type                      *
+ *                  acid_from - acids from                     *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_select_acids_list_from(ESA_DIAG_COMP_typ        comp,
+                               TSS_TRAP_BUF_rec_typ       * acids_list,
+                               char                       * acid_type,
+                               char                       * acid_from,
+                               CTSAMSG_DEST_TABLE_rec_typ * dest,
+                               CTSAMSG_HANDLE_rec_typ     * msgs)
+ {
+
+  ESA_RC      rc = ESA_OK;
+  static char func[]="TSS_select_acids_list_from";
+  int    i;
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(comp,3,func);
+
+
+  ESA_DIAG_printf(comp, 3,
+                  "trap handle: alloc entries=%d used=%d",
+                   acids_list->allocated_entries,
+                   acids_list->used_entries);
+
+  ESA_DIAG_printf(comp, 3, "acid from=%s", acid_from );
+
+  for (i=0; i LT acids_list->used_entries; i++) {
+    if (acids_list->trap_data[i].used)
+      continue;
+
+    ESA_DIAG_printf(comp, 3, "%s", acids_list->trap_data[i].data);
+
+   /*
+    *  Requested acid found
+    *  Attention ! The first symbol - sort symbol !
+    */
+
+  /* Not Added by ps0380
+   * changed checking of result from function strcmp
+   * instead of EQ 0, now is GE 0 ( in case, when acid from which
+   * we must start process, does not exist )
+   *
+   * Meanwhile delayed. Requires more changes .
+   * TSS_trap_buf_dump: 0TSSP390
+   * TSS_trap_buf_dump: 1CTSZ01
+   * TSS_trap_buf_dump: 1CTSZ02
+   * TSS_trap_buf_dump: 1CTSZ03
+   * TSS_trap_buf_dump: 1CTSZ1
+   * TSS_trap_buf_dump: 1CTS67N
+   * TSS_trap_buf_dump: 1CTS67Z
+   * TSS_trap_buf_dump: 1CTS67Z1
+   *
+   * In some cases: GetUser, GetConnnections (by Containers)
+   * we need to compare from position (0)
+   *
+   *if (strcmp( &acids_list->trap_data[i].data[1], acid_from ) GE 0 )
+   */
+
+    if (strcmp( &acids_list->trap_data[i].data[1], acid_from ) EQ 0 )
+       goto exit;
+
+    acids_list->trap_data[i].used = 1;
+  }
+
+  CTSAMSG_print(TSS_ERR_NO_ACID, msgs, NULL, dest,
+                acid_type, acid_from );
+
+  rc = ESA_ERR;
+
+ /*
+  *    Finish
+  */
+
+ exit :;
+
+  ESA_DIAG_exit(comp, 3, func, rc );
+  return rc;
+
+ }
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_output_to_addinfo                      *
+*                                                             *
+* DESCRIPTION    : Separate information reutrned from TSSCFILE*
+*                  and insert it to addinfo                   *
+*                                                             *
+* INPUT          : acid_type       - acid type                *
+*                  addinfo         - addinfo area             *
+*                  laddinfo        - local addinfo            *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+/**************************************************************/
+
+ESA_RC TSS_output_to_addinfo(ESA_DIAG_COMP_typ          comp,
+ /*IS10026 use 5.1's recs    TSSCFILE_REC_typ         * tsscf_recs[1],
+                /*IS10026*/  TSSCFILE_REC_typ         *tsscf_recs_51[1],
+                             TSS_GET_HANDLE_typ       * get_handle,
+                             FILE                     * file_out,
+                             int                      * rec_cnt,
+                             char                     * acid_type,
+                             ADDINFO_rec_ptr            addinfo,
+                             ADDINFO_rec_ptr            laddinfo,
+                             CTSAMSG_DEST_TABLE_rec_ptr dest,
+                             CTSAMSG_HANDLE_rec_ptr     msgs)
+{
+
+/*
+ *      Variables
+ */
+
+ ESA_RC                 rc       = ESA_OK;
+ ESA_RC                 rc_check = ESA_OK;
+ static                 char func[]="TSS_output_to_addinfo";
+ int                    i;
+ int                    read_tsscfile_file = 1;
+ char                   record_id_1[5]               = "";
+ char                   record_id_2[3]               = "";
+ char                   record_id_1_prev[5]          = "";
+ char                   record[MAX_TSSCFILE_REC_LEN] = "";
+ char                   key[MAX_TSS_PARAM_LEN]       = "";
+ TSS_LST_FIELD_typ     *lst_handle;
+ TSSCFILE_DATA_EXT_typ *pfunc;
+ TSSCFILE_DATA_PUT_typ *pfunc_p;
+ TSSCFILE_REC_typ      *rec_desc;
+ ONE_FIELD_rec_ptr      pair;
+ /*WS10082 char         c_acid[MAX_TSS_PARAM_LEN];                 */
+ char                   c_acid[TSS_USER_NAME_LEN+1];      /*WS10082*/
+
+/*
+ *      Initialize
+ */
+
+ ESA_DIAG_enter(comp, 3,func);
+
+ pending_acid[0] = NULL_CHAR;
+
+/*
+ *   read TSSCFILE
+ */
+/* SAS2IBMT afread(record, 1, sizeof(record), file_out);             */
+  fread(record, 1, sizeof(record), file_out);             /* SAS2IBMT */
+ while ( read_tsscfile_file )  {
+
+   /*   Handle EOF */
+
+    if ( feof(file_out) NE 0) {
+       rc = ESA_EOF;
+       goto exit;
+    }
+
+   /*   Handle errors */
+
+    if (ferror(file_out)) {
+       CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                     "fgets", func, TSSCFILE_OUT_DD, strerror(errno));
+       OS_MVS_btrace();
+       rc = ESA_FATAL;
+       goto exit;
+    }
+
+    (*rec_cnt)++;
+
+    /* Clear reserved garbage part of TSSCFILE record */
+
+    memset(record, ' ', TSSCFILE_RESERVED_LEN);
+    ESA_DIAG_printf(comp, 3, "%d.%s",
+                    *rec_cnt, &record[TSSCFILE_RESERVED_LEN] );
+
+   /*   Get RECORD ID  */
+
+    TSS_get_rec_id( comp, record, record_id_1, record_id_2 );
+    /*BS10014
+    rec_desc = TSS_select_rec_desc( comp, record_id_1, tsscf_recs); */
+ /*IS10026rec_desc=TSS_select_rec_desc( comp, record_id_1, tsscf_recs,*/
+    rec_desc = TSS_select_rec_desc( comp, record_id_1, tsscf_recs_51,
+                                    dest, msgs);            /*IS10026*/
+    if ( rec_desc EQ NULL ) {
+       c_acid[0] = NULL_CHAR;
+       pair = ADDINFO_search( "ACID", TSS_ADDINFO_KWD_LEN,
+                              laddinfo->pair, laddinfo->num_pairs );
+       if ( pair NE NULL )
+          strcpy(c_acid, pair->value);
+
+       sprintf(internal2_msg_buf,
+               "'%s'.Unable to locate description of recid=%s",
+               c_acid, record_id_1);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                     component, func, internal2_msg_buf,
+                     4, __LINE__);
+       /* OS_MVS_btrace(); */
+
+    }
+
+    else {
+
+    /*
+     *   Record descriptor's router
+     */
+
+     if ( rec_desc->action EQ CFILE_BREAK ) {
+        TSS_extract_proc(comp, record,
+                         &(get_handle->list_buffer),
+                         rec_desc, rec_desc->vars,
+                         key, addinfo, laddinfo, dest, msgs);
+        break;
+     }
+     else if ( rec_desc->action NE CFILE_SKIP )  {
+     /* Start of ps0395 */
+           if ( rec_desc->action EQ CFILE_ACCEPT_0600 ) {
+                pfunc_p = (TSSCFILE_DATA_PUT_typ *)rec_desc->pfunc;
+                rc = (pfunc_p)(comp, get_handle,
+                             record, &(get_handle->list_buffer),
+                             rec_desc, rec_desc->vars, key, addinfo,
+                             laddinfo, dest, msgs);
+
+                if ( rc EQ ESA_WARN ) {
+                  get_handle->found_err = 1;
+                  rc = ESA_OK;
+                }
+
+                if ( rc EQ ESA_SKIP )
+                   rc = ESA_OK;
+
+                if ( rc NE ESA_OK )
+                  goto exit;
+           }
+     /* End of ps0395 */
+     /* Start of bs2583 */
+           if ( rec_desc->action EQ CFILE_ACCEPT_4404 ) {
+                pfunc_p = (TSSCFILE_DATA_PUT_typ *)rec_desc->pfunc;
+                rc = (pfunc_p)(comp, get_handle,
+                             record, &(get_handle->list_buffer),
+                             rec_desc, rec_desc->vars, key, addinfo,
+                             laddinfo, dest, msgs);
+
+                if ( rc EQ ESA_WARN ) {
+                  get_handle->found_err = 1;
+                  rc = ESA_OK;
+                }
+
+                if ( rc EQ ESA_SKIP )
+                   rc = ESA_OK;
+
+                if ( rc NE ESA_OK )
+                  goto exit;
+           }
+     /* End of bs2583 */
+           if ( rec_desc->action EQ CFILE_ACCEPT ) {
+
+          /* Check record dependencies */
+
+          ESA_DIAG_printf(comp, 5, "1.Rec_id=%s Dep by %s Pending=%s",
+                          record_id_1, rec_desc->id1_dep,
+                          record_id_1_prev);
+
+          /* Rec dependence should be checked */
+
+          rc_check = ESA_OK;
+          if ( strlen(rec_desc->id1_dep) GT 0 )
+             rc_check = TSS_check_rec_dep( comp, record_id_1,
+                                           record_id_1_prev,
+                                           rec_desc->id1_dep,
+                                           dest, msgs );
+          else
+             strcpy(record_id_1_prev, record_id_1);
+
+          ESA_DIAG_printf(comp, 5,
+                      "2.rc_check=%s Rec_id=%s Dep by %s Pending=%s",
+                       ESA_rc2str(rc_check),
+                       record_id_1, rec_desc->id1_dep,
+                       record_id_1_prev);
+
+          if ( rc_check EQ ESA_OK ) {
+
+            /*  Rec processing function found */
+
+            if ( rec_desc->pfunc NE NULL ) {
+                pfunc = (TSSCFILE_DATA_EXT_typ *)rec_desc->pfunc;
+                rc = (pfunc)(comp, record, &(get_handle->list_buffer),
+                             rec_desc, rec_desc->vars, key, addinfo,
+                             laddinfo, dest, msgs);
+
+                if ( rc EQ ESA_WARN ) {
+                  get_handle->found_err = 1;
+                  rc = ESA_OK;
+                }
+
+                if ( rc EQ ESA_SKIP )
+                   rc = ESA_OK;
+
+                if ( rc NE ESA_OK )
+                  goto exit;
+            }    /* External supplied function */
+            else {
+                rc = TSS_extract_proc(comp, record,
+                                      &(get_handle->list_buffer),
+                                      rec_desc, rec_desc->vars,
+                                      key, addinfo, laddinfo,
+                                      dest, msgs);
+
+                if ( rc EQ ESA_WARN ) {
+                  get_handle->found_err = 1;
+                  rc = ESA_OK;
+                }
+
+                if ( rc EQ ESA_SKIP )
+                   rc = ESA_OK;
+
+                if ( rc NE ESA_OK )
+                  goto exit;
+            }    /* Internal extract function */
+
+           /*
+            *   Save pending acid
+            */
+
+            if ( strcmp(rec_desc->id1,"0100") EQ 0 ) {
+              pending_acid[0] = NULL_CHAR;
+              pair = ADDINFO_search( "ACID", TSS_ADDINFO_KWD_LEN,
+                                  laddinfo->pair, laddinfo->num_pairs );
+              if ( pair NE NULL )
+                strcpy(pending_acid, pair->value);
+
+              ESA_DIAG_printf(comp, 3, "Pending ACID=%s", pending_acid);
+            }
+
+          } /* rc_check EQ ESA_OK */
+      }    /* rec_desc->action = CFILE_ACCEPT  */
+      else if ( rec_desc->action EQ CFILE_MSG_OK )
+         CTSAMSG_print(TSS_OUTPUT_LINE, msgs, NULL, dest,
+                       &record[TSSCFILE_RESERVED_LEN] );
+      else if ( rec_desc->action EQ CFILE_MSG_WRN) {
+         CTSAMSG_print(TSS_OUTPUT_LINE, msgs, NULL, dest,
+                       &record[TSSCFILE_RESERVED_LEN] );
+         rc = ESA_WARN;
+         break;
+      }
+      else if ( rec_desc->action EQ CFILE_MSG_ERR) {
+         CTSAMSG_print(TSS_OUTPUT_LINE, msgs, NULL, dest,
+                       &record[TSSCFILE_RESERVED_LEN] );
+         rc = ESA_ERR;
+         break;
+      }
+      else if ( rec_desc->action EQ CFILE_MSG_FATAL) {
+         CTSAMSG_print(TSS_OUTPUT_LINE, msgs, NULL, dest,
+                       &record[TSSCFILE_RESERVED_LEN] );
+         rc = ESA_FATAL;
+         break;
+      }
+     }    /* rec action NE CFILE_SKIP */
+    }     /* Found line description */
+
+    /*  Get next record */
+/* SAS2IBMT afread(record, 1, sizeof(record), file_out);             */
+     fread(record, 1, sizeof(record), file_out);          /* SAS2IBMT */
+ }
+
+/*
+ *  Finish
+ */
+
+ exit : ;
+
+ if ( ESA_DIAG_get_debug_level(comp) GE 4 ) {
+    ADDINFO_dump(laddinfo,0);
+    for (i=0; i LT MAX_TSS_LIST_FIELDS; i++ ) {
+      if (get_handle->list_buffer.lst_f[i].vall NE NULL ) {
+        ESA_DIAG_printf (comp,0, "Field=%s",
+                         get_handle->list_buffer.lst_f[i].kwd);
+        lst_handle = get_handle->list_buffer.lst_f[i].vall;
+        TSS_lst_buf_dump(comp, lst_handle);
+      }
+    }
+ }
+
+ pending_acid[0] = NULL_CHAR;
+ ESA_DIAG_exit(comp, 3, func, rc);
+
+ return rc ;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_reset_list_buf                         *
+*                                                             *
+* DESCRIPTION    : Reset list buffer                          *
+*                                                             *
+* INPUT          : list_b          - list buf ptr             *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : none                                       *
+*                                                             *
+/**************************************************************/
+
+void TSS_reset_list_buf(ESA_DIAG_COMP_typ         comp,
+                        TSSCFILE_HANDLE_typ     * h_desc)
+{
+
+ static char         func[]="TSS_reset_list_buf";
+ int                 i;
+ TSS_LST_FIELD_typ  *lst_handle;
+
+/*
+ *  Initialize
+ */
+
+ ESA_DIAG_enter(comp, 5, func );
+
+ for (i=0; i LT MAX_TSS_LIST_FIELDS; i++ ) {
+    if (h_desc->lst_f[i].vall NE NULL ) {
+      h_desc->lst_f[i].kwd[0] = NULL_CHAR;
+      lst_handle = h_desc->lst_f[i].vall;
+      lst_handle->used_entries = 0;
+      lst_handle->subf_cnt     = 0;
+    }
+ }
+
+ ESA_DIAG_exit(comp, 5, func, ESA_OK);
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_translate_admin_key                    *
+*                                                             *
+* DESCRIPTION    : Create admin.XXX key                       *
+*                                                             *
+* INPUT          : subfield (subf0)                           *
+*                                                             *
+* OUTPUT         : keyword                                    *
+*                  subf_index (m)                             *
+* RETURN VALUE   : none                                       *
+*                                                             *
+/**************************************************************/
+
+ static void TSS_translate_admin_key(ESA_DIAG_COMP_typ    comp,
+                                     char               * keyword,
+                                     int                * m,
+                                     char               * subf0)
+{
+
+ static char  func[]="TSS_translate_admin_key";
+ int    i;
+ struct  admin_tr_table {
+        char   *subf;
+        char   *kpart;
+   } ;
+
+ static struct admin_tr_table  adm_tbl[] = {
+       { "ACID"        ,    ".ACID"     }  ,
+       { "LISTDATA"    ,    ".DATA"     }  ,
+       { "MISC1"       ,    ".MISC1"    }  ,
+       { "MISC2"       ,    ".MISC2"    }  ,
+       { "MISC3"       ,    ".MISC3"    }  ,   /* WS2359 */
+       { "MISC4"       ,    ".MISC4"    }  ,   /* WS10050 */
+       { "MISC8"       ,    ".MISC8"    }  ,
+       { "MISC9"       ,    ".MISC9"    }  ,
+       { "RESOURCE"    ,    ".RESOURCE" }  ,
+       { "SCOPE"       ,    ".SCOPE"    }  ,
+       { NULL          ,    NULL        }  };
+
+/*
+ *  Initialize
+ */
+
+ ESA_DIAG_enter(comp, 5, func );
+
+ ESA_DIAG_printf(comp, 5,
+                 "Entered keyword=%s subf0=%s", keyword, subf0);
+
+ for (i=0; adm_tbl[i].subf; i++) {
+   if (strcmp(subf0, adm_tbl[i].subf) EQ 0 ) {
+     strcat( keyword, adm_tbl[i].kpart);
+     *m = 1;
+     goto exit;
+   }
+ }
+
+ strcat( keyword, ".RESCLASS" );
+ *m = 0;
+
+ exit :;
+
+ ESA_DIAG_printf(comp, 5,
+                 "Exiting keyword=%s m=%d", keyword, *m);
+
+ ESA_DIAG_exit(comp, 5, func, ESA_OK);
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_put_list_info                          *
+*                                                             *
+* DESCRIPTION    : Create list info fields                    *
+*                                                             *
+* INPUT          : h_desc          - list buf ptr             *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : none                                       *
+*                                                             *
+/**************************************************************/
+
+ void TSS_put_list_info(ESA_DIAG_COMP_typ            comp,
+                        TSSCFILE_HANDLE_typ        * h_desc,
+                        ADDINFO_rec_ptr              addinfo,
+                        CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                        CTSAMSG_HANDLE_rec_ptr       msgs)
+{
+
+ static char         func[]="TSS_put_list_info";
+ int                 i, j, k;
+ int                 m;
+ int                 len;
+ TSS_LST_FIELD_typ  *lst_handle;
+ char                sep_subf[3];  /* Subfield separator   */
+ /*WS10082 char      value[TSS_ADDINFO_VAL_LEN + 1];          */
+ char                value[ADDINFO_16K_VAL_LEN + 1]; /*WS10082*/
+ char                keyword[TSS_ADDINFO_KWD_LEN + 1];
+
+/*
+ *  Initialize
+ */
+
+ ESA_DIAG_enter(comp, 5, func );
+
+ BUILD_STRING_SEPARATOR(sep_subf , ADDINFO_LIST_SUBFIELD)
+
+ for (i=0; i LT MAX_TSS_LIST_FIELDS; i++ ) {
+
+    ESA_DIAG_printf(comp, 10, "%d.List fields: vall=%X kwd(0)=%c",
+                    i, h_desc->lst_f[i].vall,
+                       h_desc->lst_f[i].kwd[0]);
+
+    if ( (h_desc->lst_f[i].vall   NE NULL     ) AND
+         (h_desc->lst_f[i].kwd[0] NE NULL_CHAR)   ) {
+      lst_handle = h_desc->lst_f[i].vall;
+
+      ESA_DIAG_printf(comp, 5, "Located %s Used entries=%d subf=%d",
+                      h_desc->lst_f[i].kwd,
+                      lst_handle->used_entries,
+                      lst_handle->subf_cnt);
+
+      if (lst_handle->used_entries EQ 0)
+        continue;
+
+     /*
+      *  Entries loop
+      */
+
+      for (k=0; k LT lst_handle->used_entries; k++) {
+         value[0] = NULL_CHAR;
+         strcpy(keyword, h_desc->lst_f[i].kwd);
+         m=0;
+
+        /*
+         *  For "ADMIN" fields the first subfield can be
+         *  part of keyword ( RESOURCE, MISC1, MISC2, ... )
+         *  so, for building list we must start loop from 1
+         *  but in case that first subfield does not belong
+         *  to keyword ADMIN.RESCLASS the loop should be
+         *  started from 0.
+         */
+
+         if (strcmp(keyword, "ADMIN") EQ 0 )
+             TSS_translate_admin_key(comp, keyword, &m,
+                                     lst_handle->lst_data[k].field[0]);
+
+         for (j=m; j LT lst_handle->subf_cnt; j++) {
+            ESA_DIAG_printf(comp,5, "%3d %3d %s",
+                            k, j, lst_handle->lst_data[k].field[j]);
+            strcat(value, lst_handle->lst_data[k].field[j]);
+            strcat(value, sep_subf);
+         }
+
+        /*
+         *  Remove last subfield separator
+         */
+
+         len = strlen(value);
+         if (len GT 0)
+           value[len-1] = NULL_CHAR;
+
+         ESA_DIAG_printf(comp,5, "%d. %s=%s", i, keyword,value);
+
+         if ( strlen(value) GT 0 )
+            TSS_put_to_addinfo(comp, keyword, value,
+                               addinfo, 0, dest, msgs );
+      } /* Entries loop */
+    } /* List not empty */
+ }    /* Lists fields loop */
+
+ ESA_DIAG_exit(comp, 5, func, ESA_OK);
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_get_record_id                          *
+*                                                             *
+* DESCRIPTION    : Get record id1, record id2                 *
+*                                                             *
+* INPUT          : record          - record                   *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : id1             - rec id1                  *
+*                  id2             - rec id2                  *
+*                                                             *
+* RETURN VALUE   : none                                       *
+*                                                             *
+/**************************************************************/
+
+void TSS_get_rec_id(ESA_DIAG_COMP_typ         comp,
+                    char                    * record,
+                    char                    * id1,
+                    char                    * id2)
+{
+
+    memcpy(id1, record + TSSCFILE_REC_ID1_POS, TSSCFILE_REC_ID1_LEN);
+    id1[TSSCFILE_REC_ID1_LEN] = NULL_CHAR;
+    memcpy(id2, record + TSSCFILE_REC_ID2_POS, TSSCFILE_REC_ID2_LEN);
+    id2[TSSCFILE_REC_ID2_LEN] = NULL_CHAR;
+
+    ESA_DIAG_printf(comp, 5, "recid_1=%s recid_2=%s", id1, id2 );
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_select_rec_desc                        *
+*                                                             *
+* DESCRIPTION    : Search record description                  *
+*                                                             *
+* INPUT          : id1       - id1                            *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : NULL - not found, ptr to rec description   *
+*                                                             *
+* BS10014        : added 2 in parameters dest and msgs        *
+*                  required to call another service routine   *
+/**************************************************************/
+
+ TSSCFILE_REC_typ * TSS_select_rec_desc(ESA_DIAG_COMP_typ comp,
+                             char               * id1,
+ /*IS10026 use 5.1's recs    TSSCFILE_REC_typ   * tsscf_recs[1],*/
+                 /*IS10026*/ TSSCFILE_REC_typ   * tsscf_recs_51[1],
+                        CTSAMSG_DEST_TABLE_rec_ptr  dest, /*BS10014*/
+                        CTSAMSG_HANDLE_rec_typ    * msgs) /*BS10014*/
+ {
+
+    int                i;
+    /*WS10082 char     t_rel[MAX_TSS_PARAM_LEN + 1];       *BS10014*/
+    char               t_rel[9];                          /*WS10082*/
+
+    TSSCFILE_REC_typ * r_desc = NULL;
+    ESA_DIAG_printf(comp,8,"Entering TSS_select_rec_desc id1=%s",id1);
+
+ /*IS10026   for (i=0; r_desc = tsscf_recs[i]; i++ ) *
+       if ( strcmp(tsscf_recs[i]->id1, id1 ) EQ 0 )                */
+    for (i=0; r_desc = tsscf_recs_51[i]; i++ )            /*IS10026*/
+     {
+      ESA_DIAG_printf(comp,8,"tsscf_recs_51[i]->id1=<%s> id1=<%s>",
+                      tsscf_recs_51[i]->id1, id1 );
+       if ( strcmp(tsscf_recs_51[i]->id1, id1 ) EQ 0 )    /*IS10026*/
+          break;
+     }
+    ESA_DIAG_printf(comp,8,"i(ndex)=%d Rec Selected=%s",
+                    i, r_desc->id1);
+
+ /*<BS10014 */
+    if (strcmp(id1,"9675") EQ 0)
+    {
+        t_rel[0] = NULL_CHAR;
+        TSS_get_global_parameter(comp, TSS_GLOBAL_RELEASE, t_rel,
+                                 dest, msgs);
+        ESA_DIAG_printf(comp,8,"TSS RELEASE is %s", t_rel);
+        /* default is  tsscf_recs[i] for 12.0 and above */
+        if (strcmp(t_rel,"9.0") EQ 0)
+ /*IS10026 {i=i+1; r_desc = tsscf_recs[i];}                       */
+           {i=i+1; r_desc = tsscf_recs_51[i];}
+        if (strcmp(t_rel,"8.0") EQ 0)
+ /*IS10026 {i=i+2; r_desc = tsscf_recs[i];}                       */
+           {i=i+2; r_desc = tsscf_recs_51[i];}
+        /* TSS releases previous to 8.0 are not supported*/
+        ESA_DIAG_printf(comp,8,"i(ndex) for 9675=%d Rec Selected=%s",
+                    i, r_desc->id1);
+    }
+ /* BS10014>*/
+
+    return r_desc;
+
+ }
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_put_to_addinfo                         *
+*                                                             *
+* DESCRIPTION    : Put data to addinfo                        *
+*                                                             *
+* INPUT          : comp        - diag component               *
+*                  keyword     - keyword                      *
+*                  value       - value                        *
+*                  addinfo     - addinfo ptr                  *
+*                  allow_ins   - allowed insert(only for local*
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : none                                       *
+*                                                             *
+/**************************************************************/
+
+ESA_RC TSS_put_to_addinfo(ESA_DIAG_COMP_typ            comp,
+                          char                       * keyword,
+                          char                       * value,
+                          ADDINFO_rec_ptr              addinfo,
+                          int                          allow_ins,
+                          CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                          CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc        = ESA_OK ;
+   ESA_RC                  addval_rc = ESA_OK ;
+   static  char            func[]="TSS_put_to_addinfo";
+   ONE_FIELD_rec_ptr       pair;
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   pair = ADDINFO_search( keyword, TSS_ADDINFO_KWD_LEN,
+                          addinfo->pair, addinfo->num_pairs );
+   if (pair NE NULL) {
+
+      /* IS10181 Change the test. Instead of checking for
+                 allow_ins or not, check if this is a TYPE_1A
+                 ADDINFO entry or not.
+      if (allow_ins )  /* Local addinfo */
+      if (pair->add_typ EQ TYPE_1A)                      /* IS10181 */
+        addval_rc = ADDINFO_updval(value, TSS_ADDINFO_VAL_LEN, pair);
+      else             /* Regular addinfo */
+        addval_rc = ADDINFO_addval(value, TSS_ADDINFO_VAL_LEN,
+                                 ADDINFO_LIST_ENTRY, pair, dest, msgs );
+
+      if (addval_rc NE ESA_OK ) {
+          sprintf(internal2_msg_buf,
+ "'%s'. ADDINFO_updval has detected an error, while processing kwd=%s",
+                  pending_acid, keyword);
+
+       /*
+        * CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+        *               component, func, internal2_msg_buf,
+        *               4, __LINE__);
+        */
+
+        /*
+         *CTSAMSG_print(...._ADDINFO_VAL_OVRFLW, msgs, NULL,
+         *              dest, keyword, value);
+         */
+
+         ESA_DIAG_printf(comp, 1,  "%s",
+                         internal2_msg_buf);
+         /* * * * * * * IS10181 Start * * * * * * */
+         /* WS10082N if (addval_rc EQ ESA_EOF)  */
+         if ( (addval_rc EQ ESA_EOF)  OR                  /* WS10082N */
+                (addval_rc EQ ESA_ERR) )                  /* WS10082N */
+            CTSAMSG_print(MSG_KWD_VALUE_TRUNCATED, msgs, NULL,
+                          dest, pair->keyword, value);
+         /* * * * * * * IS10181 End * * * * * * */
+      }
+   } /* keyword found */
+   else if (allow_ins )   /* Local addinfo */
+       ADDINFO_insert(TYPE_1A, keyword, value, addinfo,
+                      TSS_ADDINFO_KWD_LEN, TSS_ADDINFO_VAL_LEN, UNIQUE);
+
+   else
+       ESA_DIAG_printf(comp, 1, "%s=%s Ignored", keyword, value);
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_select_subf                            *
+*                                                             *
+* DESCRIPTION    : Search subfield name                       *
+*                                                             *
+* INPUT          : comp        - diag component               *
+*                  keyword     - keyword                      *
+*                  subf_t      - subfield table               *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : found       - field index in the table     *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+/**************************************************************/
+
+ static ESA_RC TSS_select_subf(ESA_DIAG_COMP_typ            comp,
+                               char                       * keyword,
+                               TSS_SUBF_typ                 subf_t[1],
+                               int                        * found,
+                               CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                               CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   static char func[]="TSS_select_subf";
+   ESA_RC      rc = ESA_OK;
+   int         i;
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+  /*
+   *  Search subfield name
+   */
+
+   for (i=0; subf_t[i].subf_name; i++) {
+      if (strcmp(keyword, subf_t[i].subf_name) EQ 0 ) {
+         *found = i;
+         ESA_DIAG_printf(comp, 5, "found=%s index=%d", keyword, i);
+         goto exit;
+      }
+   }
+
+   CTSAMSG_print(ERR_ADI_KEYWORD_NOSUPP, msgs, NULL, dest,
+                 keyword);
+   OS_MVS_btrace();
+
+   rc = ESA_ERR;
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+/*********************************************************
+ *                                                       *
+ *            Extract functions                          *
+ *                                                       *
+ *********************************************************/
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_init_list                              *
+*                                                             *
+* DESCRIPTION    : Create entry for entire list field         *
+*                                                             *
+* INPUT          : comp        - diag component               *
+*                  keyword     - keyword                      *
+*                  key_ind     - index of key                 *
+*                  val         - value                        *
+*                  subf_t      - subfield table               *
+*                  h_desc      - het handle                   *
+*                  r_desc      - record description           *
+*                  d_desc      - data description             *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : key_val     - key value                    *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+/**************************************************************/
+
+ static ESA_RC TSS_init_list(ESA_DIAG_COMP_typ     comp,
+                             int                          key_ind,
+                             char                       * keyword,
+                             char                       * val,
+                             TSS_SUBF_typ                 subf_t[1],
+                             TSSCFILE_HANDLE_typ        * h_desc,
+                             TSSCFILE_REC_typ           * r_desc,
+                             TSSCFILE_DESCR_typ         * d_desc,
+                             char                       * key_val,
+                             CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                             CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   static char func[]="TSS_init_list";
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC              rc = ESA_OK ;
+   int                 i, k;
+   int                 j;                        /* PS0287 */
+   int                 m;                        /* PS0287 */
+   int                 j_subfc;                  /* PS0287 */
+   int                 force_creating = FALSE;   /* PS0287 */
+   int                 found;
+   TSS_LST_FIELD_typ  *lst_handle;
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   ESA_DIAG_printf(comp,5, "Keyword %s=%s index=%d",
+                   keyword, val, key_ind);
+
+  /* PS0287
+   * Calculate number of subfields in the new being added
+   * list's entry
+   */
+   j_subfc = 0;                                            /* PS0287 */
+   for (j=0; subf_t[j].subf_name; j++)  {                  /* PS0287 */
+      j_subfc++;                                           /* PS0287 */
+   }                                                       /* PS0287 */
+
+  /*
+   *  Locate key. If not found, Open it.
+   *  keyword = list field name ( FACILITY, COMMAND, LTIME, ... )
+   *  val     = list field val  ( BATCH, TSO, ... )
+   */
+
+   for (i=0; i LT MAX_TSS_LIST_FIELDS; i++ ) {
+      if (strcmp(h_desc->lst_f[i].kwd, keyword) EQ 0) {
+
+          lst_handle = h_desc->lst_f[i].vall;
+          ESA_DIAG_printf(comp, 5, "1.Find %s.", keyword);
+
+         /* PS0287
+          * The 'key' of list field found.(Example: ADMIN)
+          * Now try to locate qualifier   (Example: MISC1)
+          */
+
+         /* PS0287
+          * ------
+          * In the loop below loop's index 'i' has been changed to 'm'
+          */
+
+          found = 0;
+          for (m=0; m LT lst_handle->used_entries; m++) {
+             if (strcmp(lst_handle->lst_data[m].field[key_ind], val )
+                                                         EQ 0 ) {
+                found = 1;
+                break;
+             }
+          }
+
+         /*
+          * Key not found. Create new entry
+          * Because can be duplicated entries
+          * In case list did not filled up yet -> the same entry
+          */
+
+          ESA_DIAG_printf(comp, 5, "1.1.%s found=%d", keyword, found);
+
+          if ( ( found ) AND
+/* PS0287 ---- ( lst_handle->lst_data[i].fill_done ) ) {       */
+               ( lst_handle->lst_data[m].fill_done ) ) {
+              ESA_DIAG_printf(comp, 5,
+                 "1.2.%s Found=%d fill_done=%d. Goto create new entry",
+/* PS0287 ----    keyword, found, lst_handle->lst_data[i].fill_done);*/
+                  keyword, found, lst_handle->lst_data[m].fill_done);
+
+              found = 0;               /* Open new entry */
+              force_creating = TRUE;   /* PS0287 */
+          }
+
+         /* PS0287
+          * ------
+          * Before creating new entry into located list data
+          * check if this entry has the same number of subfields
+          * ----------------------------------------------------
+          */
+
+          if ( (NOT found)        AND                    /* PS0287 */
+               (NOT force_creating) ) {                  /* PS0287 */
+            ESA_DIAG_printf(comp, 5,                     /* PS0287 */
+               "2.0:%s Not found.Checking before creating new entry",
+               val);                                     /* PS0287 */
+            ESA_DIAG_printf(comp, 5,                     /* PS0287 */
+               "Located list with %d subf count, The new one with %d",
+               lst_handle->subf_cnt, j_subfc);           /* PS0287 */
+                                                         /* PS0287 */
+            if (lst_handle->subf_cnt NE j_subfc)         /* PS0287 */
+              continue;  /* Goto the next entry */       /* PS0287 */
+            else                                         /* PS0287 */
+              i = m;                                     /* PS0287 */
+          }                                              /* PS0287 */
+
+          if ( NOT found) {
+            ESA_DIAG_printf(comp, 5,
+                            "2.%s Not found.Create new entry", val);
+            rc = TSS_realloc_lst_buffer(comp, lst_handle, dest, msgs);
+            if (rc NE ESA_OK)
+               goto exit;
+
+            ESA_DIAG_printf(comp, 4,
+                            "***reallocated handle i=%d %X-%X (%d,%s)",
+                            i, lst_handle, lst_handle->lst_data,
+                            __LINE__, __FILE__ );
+
+            k = lst_handle->used_entries;  /* keep prev entry cntr */
+            lst_handle->used_entries++;    /* incr entries counter */
+
+            ESA_DIAG_printf(comp,5, "entry=%d value=%x",
+                            lst_handle->used_entries, val);
+
+            /*  Clear subfields for current entry . Index = k  */
+
+            TSS_clear_subfields( lst_handle, subf_t, k );
+
+            /*  Save Key name */
+
+            strcpy(lst_handle->lst_data[k].field[key_ind], val);
+            lst_handle->lst_data[k].exists[0] = TSS_VAL_EXISTS;
+          }    /* Key NOT found */
+          strcpy(key_val, val ); /* Keep keyword */
+          goto exit;
+      } /* Key Found */
+   }     /* list fields loop */
+
+  /*
+   *  Any Key not found. Open the first.
+   */
+
+   for (i=0; i LT MAX_TSS_LIST_FIELDS; i++ ) {
+      if ( (strlen(h_desc->lst_f[i].kwd) EQ 0) OR
+           (h_desc->lst_f[i].vall EQ NULL    )  ) {
+          strcpy(h_desc->lst_f[i].kwd, keyword);
+          ESA_DIAG_printf(comp, 5, "3.Open new %s=%s", keyword, val );
+
+         /*
+          *  Allocate list's field handle
+          */
+
+          if (h_desc->lst_f[i].vall EQ NULL ) {
+            rc = TSS_alloc_lst_handle (comp, MAX_TSS_LST_ENTRIES,
+                                       &lst_handle, dest, msgs );
+            if ( rc NE ESA_OK )
+               goto exit;
+            h_desc->lst_f[i].vall = lst_handle;
+            ESA_DIAG_printf(comp, 4,
+                            "***allocated handle i=%d %X-%X (%d,%s)",
+                            i, lst_handle, lst_handle->lst_data,
+                            __LINE__, __FILE__ );
+          }
+          else
+            lst_handle = h_desc->lst_f[i].vall;
+
+          lst_handle->used_entries = 0;
+          k = lst_handle->used_entries;  /* keep prev entry cntr */
+          lst_handle->used_entries++;    /* incr entries counter */
+
+          ESA_DIAG_printf(comp,5, "entry=%d %s=%s",
+                          lst_handle->used_entries, keyword, val);
+
+          /*  Clear subfields for current entry. Index = k */
+
+          TSS_clear_subfields( lst_handle, subf_t, k );
+
+          /*  Save key name */
+
+          strcpy(lst_handle->lst_data[k].field[key_ind], val);
+          strcpy(key_val, val ); /* Keep keyword */
+          goto exit;
+      }
+   }
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_fill_list                              *
+*                                                             *
+* DESCRIPTION    : Fill list vars                             *
+*                                                             *
+* INPUT          : comp        - diag component               *
+*                  keyword     - keyword                      *
+*                  key_ind     - keyword index                *
+*                  f_ind       - field   index                *
+*                  val         - value                        *
+*                  subf_t      - subfield table               *
+*                  h_desc      - het handle                   *
+*                  r_desc      - record description           *
+*                  d_desc      - data description             *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+/**************************************************************/
+
+ static ESA_RC TSS_fill_list(ESA_DIAG_COMP_typ            comp,
+                             int                          key_ind,
+                             int                          f_ind,
+                             char                       * main_k,
+                             char                       * fval,
+                             TSSCFILE_HANDLE_typ        * h_desc,
+                             TSSCFILE_REC_typ           * r_desc,
+                             TSSCFILE_DESCR_typ         * d_desc,
+                             char                       * key_val,
+                             int                          aux_ind,
+                             char                       * aux_key_val,
+                             CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                             CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_fill_list";
+   int                     found;
+   int                     i, j;
+   TSS_LST_FIELD_typ      *lst_handle;
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   ESA_DIAG_printf(comp,5, "Key %s=%s Index=%d. Current field %s=%s",
+                   main_k, key_val, key_ind,
+                   d_desc->addinfo_k,  fval);
+  /*
+   *  Search Key
+   */
+
+   for (i=0; i LT MAX_TSS_LIST_FIELDS; i++ ) {
+
+      /*  main_k found */
+
+      if (strcmp(h_desc->lst_f[i].kwd, main_k) EQ 0)  {
+          lst_handle = h_desc->lst_f[i].vall;
+          found = 0;
+
+         /*
+          * for (i=0; i LT lst_handle->used_entries; i++) -> WRONG !
+          * The right way : search key from the end of the list
+          */
+
+          for (i = lst_handle->used_entries-1; i GE 0; i--) {
+             if (strcmp(lst_handle->lst_data[i].field[key_ind],
+                                             key_val ) EQ 0 ) {
+               if ( strlen(aux_key_val) GT 0 ) {
+                 if (strcmp(lst_handle->lst_data[i].field[aux_ind],
+                                        aux_key_val ) NE 0 )
+                    continue;
+               }
+
+               found = 1;
+               break;
+
+             }    /* Key found */
+          }
+
+         /*
+          *   Key not found. Internal error ?
+          *   When was obtained aux_key_val
+          *   Try to find "ALL" instead obtained aux_key_val
+          */
+
+          if ( (NOT found )               AND
+               (strlen(aux_key_val) GT 0 )  ) {
+
+           for (i = lst_handle->used_entries-1; i GE 0; i--) {
+              if (strcmp(lst_handle->lst_data[i].field[key_ind],
+                                              key_val ) EQ 0 ) {
+                if ( (strcmp(lst_handle->lst_data[i].field[aux_ind],
+                                       "ALL") EQ 0 )  OR
+                     (strcmp(lst_handle->lst_data[i].field[aux_ind],
+                                       "*ALL*") EQ 0 )  ) {
+                  found = 1;
+                  break;
+                }
+              }    /* Key found */
+           }
+          }
+
+          if ( NOT found ) {
+              sprintf(internal2_msg_buf,
+                      "'%s'.Keyword %d %s/%s=%s not found",
+                       pending_acid, key_ind, main_k,
+                       aux_key_val, key_val );
+              CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                            component, func, internal2_msg_buf,
+                            4, __LINE__);
+              OS_MVS_btrace();
+              rc = ESA_FATAL;
+              goto exit;
+          }
+
+          /* Set field value  */
+
+          j = f_ind;
+          TSS_set_subfield_value(comp, lst_handle, i, j,
+                                 d_desc->addinfo_k, fval );
+          goto exit;
+      } /* Key found */
+   }     /* List fields loop */
+
+   sprintf(internal2_msg_buf,
+           "'%s'.Keyword %d %s=%s not found",
+           pending_acid, key_ind, main_k, key_val );
+   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                 component, func, internal2_msg_buf,
+                 4, __LINE__);
+   rc = ESA_FATAL;
+   OS_MVS_btrace();
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_init_and_fill_list                     *
+*                                                             *
+* DESCRIPTION    : Init list and fill subfield value          *
+*                                                             *
+* INPUT          : comp        - diag component               *
+*                  keyword     - keyword                      *
+*                  key_ind     - keyword index                *
+*                  f_ind       - field   index                *
+*                  val         - value                        *
+*                  subf_t      - subfield table               *
+*                  h_desc      - het handle                   *
+*                  r_desc      - record description           *
+*                  d_desc      - data description             *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+/**************************************************************/
+
+ static ESA_RC TSS_init_and_fill_list(ESA_DIAG_COMP_typ   comp,
+                             int                          key_ind,
+                             int                          f_ind,
+                             char                       * main_k,
+                             char                       * fval,
+                             TSS_SUBF_typ                 subf_t[1],
+                             TSSCFILE_HANDLE_typ        * h_desc,
+                             TSSCFILE_REC_typ           * r_desc,
+                             TSSCFILE_DESCR_typ         * d_desc,
+                             char                       * key_val,
+                             CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                             CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_init_and_fill_list";
+   int                     found;
+   int                     i, j;
+   int                     k;
+   TSS_LST_FIELD_typ      *lst_handle;
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   ESA_DIAG_printf(comp,5, "Key %s=%s Index=%d. Current field %s=%s",
+                   main_k, key_val, key_ind,
+                   d_desc->addinfo_k,  fval);
+  /*
+   *  Search Key
+   */
+
+   for (i=0; i LT MAX_TSS_LIST_FIELDS; i++ ) {
+
+      /*  main_k found */
+
+      ESA_DIAG_printf(comp, 4,                              /* PS0287 */
+                "i=%d. Saved kwd=%s Looking for kwd=%s",i,  /* PS0287 */
+                 h_desc->lst_f[i].kwd, main_k) ;            /* PS0287 */
+
+      if (strcmp(h_desc->lst_f[i].kwd, main_k) EQ 0)  {
+          lst_handle = h_desc->lst_f[i].vall;
+          found = 0;
+
+         /*
+          * for (i=0; i LT lst_handle->used_entries; i++) {
+          * From now 13/03/97 try to search key from
+          * the end of the list
+          */
+
+
+          ESA_DIAG_printf(comp, 4,                        /* PS0287 */
+                "i=%d. Used_entries=%d",  i,              /* PS0287 */
+                 lst_handle->used_entries);               /* PS0287 */
+
+         /* PS0287
+          * In a loop below index 'i' changed to 'k'
+          */
+          for (k = lst_handle->used_entries-1; k GE 0; k--) {
+             ESA_DIAG_printf(comp, 5,                      /* PS0287 */
+                "k=%d.Ind=%d. Qualifier=%s Looking for %s",/* PS0287 */
+                k,  key_ind,                               /* PS0287 */
+                lst_handle->lst_data[k].field[key_ind],    /* PS0287 */
+                key_val);                                  /* PS0287 */
+
+             if (strcmp(lst_handle->lst_data[k].field[key_ind],
+                                             key_val ) EQ 0 ) {
+                found = 1;
+                break;
+             }
+          }
+
+          if ( NOT found )         /* PS0287 */
+             continue;             /* PS0287 */
+          else                     /* PS0287 */
+             i = k;                /* PS0287 */
+
+  /* Removed by PS0287
+   *      if ( NOT found ) {
+   *          sprintf(internal2_msg_buf,
+   *                  "'%s'.Keyword %d %s=%s not found",
+   *                  pending_acid, key_ind, main_k, key_val );
+   *          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+   *                        component, func, internal2_msg_buf,
+   *                        4, __LINE__);
+   *          rc = ESA_FATAL;
+   *          OS_MVS_btrace();
+   *          goto exit;
+   *      }
+   */
+
+          /*  Open new entry */
+
+          j = f_ind;
+          if (lst_handle->lst_data[i].exists[j] EQ TSS_VAL_EXISTS) {
+
+            ESA_DIAG_printf(comp, 5,
+                            "Create new entry: %s=%s, %d=%s",
+                             main_k, key_val, f_ind, fval);
+
+            rc = TSS_realloc_lst_buffer(comp, lst_handle, dest, msgs);
+            if (rc NE ESA_OK)
+               goto exit;
+
+            ESA_DIAG_printf(comp, 4,
+                            "***reallocated handle i=%d %X-%X (%d,%s)",
+                            i, lst_handle, lst_handle->lst_data,
+                            __LINE__, __FILE__ );
+
+            k = lst_handle->used_entries;  /* keep prev entry cntr */
+            lst_handle->used_entries++;    /* incr entries counter */
+
+            ESA_DIAG_printf(comp,5, "entry=%d value=%s/%s/%s",
+                            lst_handle->used_entries,
+                            main_k, key_val, f_ind, fval);
+
+            /*  Clear subfields for current entry . Index k  */
+
+            TSS_clear_subfields( lst_handle, subf_t, k );
+
+            /*  Save Key name */
+
+            strcpy(lst_handle->lst_data[k].field[key_ind], key_val);
+            lst_handle->lst_data[k].exists[0] = TSS_VAL_EXISTS;
+            i = k; /* New entry index */
+          }
+
+          TSS_set_subfield_value(comp, lst_handle, i, j,
+                                 d_desc->addinfo_k, fval );
+          goto exit;
+      } /* Key found */
+   }     /* List fields loop */
+
+   sprintf(internal2_msg_buf,
+           "'%s'.Keyword %d %s=%s not found",
+           pending_acid, key_ind, main_k, key_val );
+   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                 component, func, internal2_msg_buf,
+                 4, __LINE__);
+   rc = ESA_FATAL;
+   OS_MVS_btrace();
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_list_proc                              *
+*                                                             *
+* DESCRIPTION    : The main list proc router                  *
+*                                                             *
+* INPUT          : comp        - diag component               *
+*                  keyword     - keyword                      *
+*                  val         - value                        *
+*                  subf_t      - subfield table               *
+*                  h_desc      - het handle                   *
+*                  r_desc      - record description           *
+*                  d_desc      - data description             *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+/**************************************************************/
+
+ ESA_RC TSS_list_proc(ESA_DIAG_COMP_typ            comp,
+                      TSS_SUBF_typ                 subf_t[1],
+                      char                       * val,
+                      TSSCFILE_HANDLE_typ        * h_desc,
+                      TSSCFILE_REC_typ           * r_desc,
+                      TSSCFILE_DESCR_typ         * d_desc,
+                      char                       * key_val,
+                      ADDINFO_rec_ptr              addinfo,
+                      ADDINFO_rec_ptr              laddinfo,
+                      CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                      CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   static char func[]="TSS_list_proc";
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC              rc = ESA_OK ;
+   int                 found;
+   int                 f_ind;
+   char               *wrk;
+   char                main_k [MAX_TSS_PARAM_LEN];
+   char                main_t [MAX_TSS_PARAM_LEN];
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   if (strlen(val) EQ 0 )   /* Empty field */
+       goto exit;
+
+   ESA_DIAG_printf(comp, 5, "Keyword=%s", d_desc->addinfo_k);
+
+  /*
+   * Select key keyword
+   */
+
+   rc = TSS_select_subf(comp, d_desc->addinfo_k,
+                        subf_t, &found, dest, msgs);
+   if ( rc NE ESA_OK ) {      /* Field not found */
+      rc = ESA_OK;
+      goto exit;
+   }
+
+  /*
+   *   Separate obtained keyword
+   */
+
+   strcpy(main_k, d_desc->addinfo_k);
+   strcpy(main_t, d_desc->addinfo_k);
+   wrk = strrchr( main_k, '.' );
+   if ( wrk )  {
+      strcpy(main_t, wrk+1);    /* Main key Tailor */
+      *wrk = NULL_CHAR;
+   }
+
+  /*
+   *   Subfields processing
+   *   1. Main keyword
+   */
+
+   if ( subf_t[found].rtt_typ EQ RTT_GET_SUB_KEY ) {
+       strcpy(main_k, d_desc->addinfo_k);  /* Restore main key */
+       rc = TSS_init_list(comp,found,main_k,val, subf_t,
+                          h_desc, r_desc, d_desc, key_val, dest, msgs);
+       if ( rc NE ESA_OK )
+          goto exit;
+   }
+
+  /*
+   *   Subfields processing
+   *   2. Sub Main keyword
+   */
+
+   else if ( subf_t[found].rtt_typ EQ RTT_GET_SUB_KEY_S ) {
+
+      /*
+       * see : func[]="TSS_admin_lst";
+       *
+       * static TSS_SUBF_typ  admin_subfld_table[] = {
+       *       { "ADMIN"        , RTT_GET_SUB_KEY  ,  0, 0},
+       *       { "ADMIN.AUTH"   , RTT_GET_SUB_KEY_S,  0, 0},
+       *       { "ADMIN.ACCESS" , RTT_KEY          ,  0, 0},
+       *       { NULL           , RTT_KEY          ,  0, 0}  };
+       *
+       * see : func[]="TSS_admin_simple_lst";
+       *
+       * static TSS_SUBF_typ  admin_subfld_table[] = {
+       *       { "ADMIN"        , RTT_GET_SUB_KEY  ,  0, 0},
+       *       { "ADMIN.AUTH"   , RTT_GET_SUB_KEY_S,  0, 0},
+       *       { NULL           , RTT_KEY          ,  0, 0}  };
+       *
+       */
+
+       f_ind = found;  /* place of current field */
+
+      /*
+       * Select main keyword
+       */
+
+       rc = TSS_select_subf(comp, main_k,
+                            subf_t, &found, dest, msgs);
+       if ( rc NE ESA_OK ) {      /* Field not found */
+          rc = ESA_OK;
+          goto exit;
+       }
+
+      /*
+       *   Main subfield type processing
+       */
+
+       if (subf_t[f_ind].rtt_typ EQ RTT_FLG)
+          rc = TSS_convert_flag (comp,
+                                 val, h_desc, r_desc, d_desc, key_val,
+                                 addinfo, laddinfo, dest, msgs);
+       else if (subf_t[f_ind].rtt_typ EQ RTT_KEYT)
+          rc = TSS_convert_date (comp,
+                                 val, h_desc, r_desc, d_desc, key_val,
+                                 addinfo, laddinfo, dest, msgs);
+       else if (subf_t[f_ind].rtt_typ EQ RTT_KEYT_FACILITY)
+          rc = TSS_convert_facility_date (comp, val, dest, msgs);
+       if ( rc NE ESA_OK )
+           goto exit;
+
+       rc = TSS_init_and_fill_list(comp, found, f_ind,
+                                   main_k, val, subf_t, h_desc, r_desc,
+                                   d_desc, key_val, dest, msgs);
+       if ( rc NE ESA_OK )
+           goto exit;
+   }
+
+  /*
+   *   Subfields processing
+   *   3. Others subfields
+   */
+
+   else {
+
+       f_ind = found;  /* place of current field */
+
+      /*
+       * Select main keyword
+       */
+
+       rc = TSS_select_subf(comp, main_k,
+                            subf_t, &found, dest, msgs);
+       if ( rc NE ESA_OK ) {      /* Field not found */
+          rc = ESA_OK;
+          goto exit;
+       }
+
+      /*
+       *   Current subfield type processing
+       */
+
+       if (subf_t[f_ind].rtt_typ EQ RTT_FLG)
+          rc = TSS_convert_flag (comp,
+                                 val, h_desc, r_desc, d_desc, key_val,
+                                 addinfo, laddinfo, dest, msgs);
+       else if (subf_t[f_ind].rtt_typ EQ RTT_KEYT)
+          rc = TSS_convert_date (comp,
+                                 val, h_desc, r_desc, d_desc, key_val,
+                                 addinfo, laddinfo, dest, msgs);
+       else if (subf_t[f_ind].rtt_typ EQ RTT_KEYT_FACILITY)
+          rc = TSS_convert_facility_date (comp, val, dest, msgs);
+
+       if ( rc NE ESA_OK )
+           goto exit;
+
+       rc = TSS_fill_list(comp, found, f_ind,
+                          main_k, val, h_desc, r_desc,
+                          d_desc, key_val, 0, "", dest, msgs);
+       if ( rc NE ESA_OK )
+           goto exit;
+   }
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+ /*IS10026 drop TSS_facility_lst, as earlier than 5.1 is not supported
+ ESA_RC TSS_facility_lst(ESA_DIAG_COMP_typ            comp,
+                         char                       * val,
+                         TSSCFILE_HANDLE_typ        * h_desc,
+                         TSSCFILE_REC_typ           * r_desc,
+                         TSSCFILE_DESCR_typ         * d_desc,
+                         char                       * key_val,
+                         ADDINFO_rec_ptr              addinfo,
+                         ADDINFO_rec_ptr              laddinfo,
+                         CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                         CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   static char func[]="TSS_facility_lst";
+
+  /*
+   *   Variables
+   *
+
+   ESA_RC              rc = ESA_OK ;
+   static TSS_SUBF_typ  facility_subfld_table[] = {
+     { "FACILITY"            , RTT_GET_SUB_KEY   ,  0, 0},
+     { "FACILITY.ACTION"     , RTT_KEY           ,  0, 0},
+     { "FACILITY.EXPIRES"    , RTT_KEYT_FACILITY ,  0, 0},
+     { "FACILITY.DAYS"       , RTT_KEY           ,  0, 0},
+     { "FACILITY.TIMES"      , RTT_KEY           ,  0, 0},
+  /*
+   * { "FACILITY.AUDIT"      , RTT_FLG           ,  0, 0},
+   * { "FACILITY.NOTIFY"     , RTT_FLG           ,  0, 0},
+   * { "FACILITY.DENY"       , RTT_FLG           ,  0, 0},
+   * { "FACILITY.MODE"       , RTT_KEY           ,  0, 0},
+   *
+     { NULL                  , RTT_KEY           ,  0, 0}  };
+
+  /*
+   *  Initialize
+   *
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   rc = TSS_list_proc(comp, facility_subfld_table, val, h_desc, r_desc,
+                      d_desc, key_val, addinfo, laddinfo, dest, msgs);
+   if ( rc NE ESA_OK )
+     goto exit;
+   else
+     rc = ESA_SKIP;
+
+  /*
+   *  Finish
+   *
+
+   exit :;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+ ************* end of IS10026*/
+ /* WS2359 */
+ ESA_RC TSS_fac51_lst(ESA_DIAG_COMP_typ            comp,
+                      char                       * val,
+                      TSSCFILE_HANDLE_typ        * h_desc,
+                      TSSCFILE_REC_typ           * r_desc,
+                      TSSCFILE_DESCR_typ         * d_desc,
+                      char                       * key_val,
+                      ADDINFO_rec_ptr              addinfo,
+                      ADDINFO_rec_ptr              laddinfo,
+                      CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                      CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   static char func[]="TSS_fac51_lst";
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC              rc = ESA_OK ;
+   static TSS_SUBF_typ  facility_subfld_table[] = {
+     { "FACILITY_51"          , RTT_GET_SUB_KEY   ,  0, 0},
+     { "FACILITY_51.ACTION"   , RTT_KEY           ,  0, 0},
+     { "FACILITY_51.EXPIRES"  , RTT_KEYT_FACILITY ,  0, 0},
+     { "FACILITY_51.DAYS"     , RTT_KEY           ,  0, 0},
+     { "FACILITY_51.TIMES"    , RTT_KEY           ,  0, 0},
+     { "FACILITY_51.SYSID"    , RTT_KEY           ,  0, 0},
+     { "FACILITY_51.CALENDAR" , RTT_KEY           ,  0, 0}, /*IS10091*/
+     { "FACILITY_51.TIMEREC"  , RTT_KEY           ,  0, 0},
+     { NULL                   , RTT_KEY           ,  0, 0}  };
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   rc = TSS_list_proc(comp, facility_subfld_table, val, h_desc, r_desc,
+                      d_desc, key_val, addinfo, laddinfo, dest, msgs);
+   if ( rc NE ESA_OK )
+     goto exit;
+   else
+     rc = ESA_SKIP;
+
+  /*
+   *  Finish
+   */
+
+   exit :;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_admin_lst(ESA_DIAG_COMP_typ            comp,
+                      char                       * val,
+                      TSSCFILE_HANDLE_typ        * h_desc,
+                      TSSCFILE_REC_typ           * r_desc,
+                      TSSCFILE_DESCR_typ         * d_desc,
+                      char                       * key_val,
+                      ADDINFO_rec_ptr              addinfo,
+                      ADDINFO_rec_ptr              laddinfo,
+                      CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                      CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   static char func[]="TSS_admin_lst";
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC               rc = ESA_OK ;
+   static TSS_SUBF_typ  admin_subfld_table[] = {
+     { "ADMIN"        , RTT_GET_SUB_KEY  ,  0, 0},
+     { "ADMIN.AUTH"   , RTT_GET_SUB_KEY_S,  0, 0},
+     { "ADMIN.ACCESS" , RTT_KEY          ,  0, 0},
+     { NULL           , RTT_KEY          ,  0, 0}  };
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   strcpy( admin_qualif, "ADMIN" );
+   rc = TSS_list_proc(comp, admin_subfld_table, val, h_desc, r_desc,
+                      d_desc, key_val, addinfo, laddinfo, dest, msgs);
+   if ( rc NE ESA_OK )
+     goto exit;
+   else
+     rc = ESA_SKIP;
+
+  /*
+   *  Finish
+   */
+
+   exit :;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_admin_simple_lst(ESA_DIAG_COMP_typ     comp,
+                      char                       * val,
+                      TSSCFILE_HANDLE_typ        * h_desc,
+                      TSSCFILE_REC_typ           * r_desc,
+                      TSSCFILE_DESCR_typ         * d_desc,
+                      char                       * key_val,
+                      ADDINFO_rec_ptr              addinfo,
+                      ADDINFO_rec_ptr              laddinfo,
+                      CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                      CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   static char func[]="TSS_admin_simple_lst";
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC               rc = ESA_OK ;
+   static TSS_SUBF_typ  admin_subfld_table[] = {
+     { "ADMIN"        , RTT_GET_SUB_KEY  ,  0, 0},
+     { "ADMIN.AUTH"   , RTT_GET_SUB_KEY_S,  0, 0},
+     { NULL           , RTT_KEY          ,  0, 0}  };
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   strcpy( admin_qualif, "ADMIN" );
+   rc = TSS_list_proc(comp, admin_subfld_table, val, h_desc, r_desc,
+                      d_desc, key_val, addinfo, laddinfo, dest, msgs);
+   if ( rc NE ESA_OK )
+     goto exit;
+   else
+     rc = ESA_SKIP;
+
+  /*
+   *  Finish
+   */
+
+   exit :;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_xadmin_lst(ESA_DIAG_COMP_typ           comp,
+                      char                       * val,
+                      TSSCFILE_HANDLE_typ        * h_desc,
+                      TSSCFILE_REC_typ           * r_desc,
+                      TSSCFILE_DESCR_typ         * d_desc,
+                      char                       * key_val,
+                      ADDINFO_rec_ptr              addinfo,
+                      ADDINFO_rec_ptr              laddinfo,
+                      CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                      CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   static char func[]="TSS_xdmin_lst";
+   static int  not_use = 1;
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC               rc = ESA_OK ;
+   static TSS_SUBF_typ  xadmin_subfld_table[] = {
+     { "XADMIN"           , RTT_GET_SUB_KEY  ,  0, 0},
+     { "XADMIN.RES_OWNER" , RTT_KEY          ,  0, 0},
+     { "XADMIN.RES_NAME"  , RTT_KEY          ,  0, 0},
+     { "XADMIN.ACCESS"    , RTT_KEY          ,  0, 0},
+     { NULL               , RTT_KEY          ,  0, 0}  };
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   strcpy( admin_qualif, "XADMIN" );
+
+   if (not_use) {
+     rc = ESA_SKIP;
+     goto exit;
+   }
+
+   rc = TSS_list_proc(comp, xadmin_subfld_table, val, h_desc, r_desc,
+                      d_desc, key_val, addinfo, laddinfo, dest, msgs);
+   if ( rc NE ESA_OK )
+     goto exit;
+   else
+     rc = ESA_SKIP;
+
+  /*
+   *  Finish
+   */
+
+   exit :;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_extract_proc(ESA_DIAG_COMP_typ            comp,
+                         char                       * record,
+                         TSSCFILE_HANDLE_typ        * h_desc,
+                         TSSCFILE_REC_typ           * r_desc,
+                         TSSCFILE_DESCR_typ         * d_desc,
+                         char                       * key_val,
+                         ADDINFO_rec_ptr              addinfo,
+                         ADDINFO_rec_ptr              laddinfo,
+                         CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                         CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_extract_proc";
+   int                     i;
+   TSSCFILE_DESCR_typ    * data = &d_desc[0];
+   TSSCFILE_DATA_EXT_typ * cfunc;
+   char                    val[MAX_TSS_PARAM_LEN];
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+  /*
+   *  Extract data
+   */
+
+   for (i=0; data = &d_desc[i], data->addinfo_k; i++) {
+
+      memcpy(val, record + data->pos - 1, data->len);
+      val[data->len] = NULL_CHAR;
+      TSS_strip_val(val, ' ', TSS_STRIP_BOTH);
+
+      ESA_DIAG_printf(comp, 5,
+                      "%d.%s data pos=%d data len=%d value=(%d)%s",
+                      i, data->addinfo_k, data->pos, data->len,
+                      strlen(val), val );
+     /*
+      * Special conversion ?
+      */
+
+      if ( data->cfunc NE NULL ) {
+        cfunc = (TSSCFILE_DATA_EXT_typ *)data->cfunc;
+        rc = (cfunc)(comp, val, h_desc, r_desc, data, key_val,
+                     addinfo, laddinfo, dest, msgs);
+        if ( rc EQ ESA_SKIP ) {
+            rc = ESA_OK;
+            continue;
+        }
+        if ( rc NE ESA_OK )
+          goto exit;
+      }
+
+     /*
+      * Put to addinfo
+      */
+
+      if ( strlen(val) GT 0 ) {
+/* IS10091 if ( data->dest EQ ADI_LOCAL ) {                         */
+        if ( data->dest EQ ADI_LOCAL   OR                /* IS10091 */
+             data->dest EQ ADI_REGLR   OR                /* IS10091 */
+             data->dest EQ ADI_LOCAL_AND_REGLR)          /* IS10091 */
+        {                                                /* IS10091 */
+          if ( data->dest EQ ADI_LOCAL   OR              /* IS10091 */
+               data->dest EQ ADI_LOCAL_AND_REGLR)        /* IS10091 */
+          {
+            ESA_DIAG_printf(comp, 5, "Local: %s=%s",
+                            data->addinfo_k, val);
+            TSS_put_to_addinfo(comp, data->addinfo_k, val,
+                               laddinfo, 1, dest, msgs );
+          }
+/* IS10091 else if ( data->dest EQ ADI_REGLR ) {                    */
+          if ( data->dest EQ ADI_REGLR   OR              /* IS10091 */
+               data->dest EQ ADI_LOCAL_AND_REGLR)        /* IS10091 */
+          {                                              /* IS10091 */
+            ESA_DIAG_printf(comp, 5, "Reglr: %s=%s",
+                            data->addinfo_k, val);
+            TSS_put_to_addinfo(comp, data->addinfo_k, val,
+                               addinfo, 0, dest, msgs );
+          }
+        }
+        else {
+          sprintf(internal2_msg_buf,
+        "'%s'.Unable to determine destination of %k=%s.Destination=%d",
+          pending_acid,
+          data->addinfo_k, val, data->dest );
+
+          ESA_DIAG_printf(comp, 5, "DEST_ERR:%s", internal2_msg_buf);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                          component, func, internal2_msg_buf,
+                          4, __LINE__);
+          rc = ESA_FATAL;
+          OS_MVS_btrace();
+          goto exit;
+        }
+      }
+   }      /* vars loop */
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_extract_2101(ESA_DIAG_COMP_typ            comp,
+                         char                       * record,
+                         TSSCFILE_HANDLE_typ        * h_desc,
+                         TSSCFILE_REC_typ           * r_desc,
+                         TSSCFILE_DESCR_typ         * d_desc,
+                         char                       * key_val,
+                         ADDINFO_rec_ptr              addinfo,
+                         ADDINFO_rec_ptr              laddinfo,
+                         CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                         CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_extract_2101";
+   ONE_FIELD_rec_ptr       pair;
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   pair = ADDINFO_search(CFILE_REC_2100, TSS_ADDINFO_KWD_LEN,
+                         laddinfo->pair,
+                         laddinfo->num_pairs );
+   if (pair EQ NULL) {
+     sprintf(internal2_msg_buf,
+       "'%s'.Record id %s not found.Parameter %s can not be extracted",
+       pending_acid, "2100", "COMMAND");
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                   component, func, internal2_msg_buf,
+                   8, __LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+   }
+
+   ESA_DIAG_printf(comp, 5, "Obtained rec 2100 value=%s",
+                   pair->value);
+
+   rc = TSS_cmd_proc(comp, pair->value, "COMMAND",
+                     record, h_desc, r_desc, d_desc, key_val,
+                     addinfo, laddinfo, dest, msgs);
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_extract_2102(ESA_DIAG_COMP_typ            comp,
+                         char                       * record,
+                         TSSCFILE_HANDLE_typ        * h_desc,
+                         TSSCFILE_REC_typ           * r_desc,
+                         TSSCFILE_DESCR_typ         * d_desc,
+                         char                       * key_val,
+                         ADDINFO_rec_ptr              addinfo,
+                         ADDINFO_rec_ptr              laddinfo,
+                         CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                         CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_extract_2102";
+   ONE_FIELD_rec_ptr       pair;
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   pair = ADDINFO_search(CFILE_REC_2100, TSS_ADDINFO_KWD_LEN,
+                         laddinfo->pair,
+                         laddinfo->num_pairs );
+   if (pair EQ NULL) {
+     sprintf(internal2_msg_buf,
+       "'%s'.Record id %s not found.Parameter %s can not be extracted",
+       pending_acid, "2100", "XCOMMAND");
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                   component, func, internal2_msg_buf,
+                   8, __LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+   }
+
+   ESA_DIAG_printf(comp, 5, "Obtained rec 2100 value=%s",
+                   pair->value);
+
+   rc = TSS_cmd_proc(comp, pair->value, "XCOMMAND",
+                     record, h_desc, r_desc, d_desc, key_val,
+                     addinfo, laddinfo, dest, msgs);
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_extract_2301 (ESA_DIAG_COMP_typ        comp,
+                          char                       * record,
+                          TSSCFILE_HANDLE_typ        * h_desc,
+                          TSSCFILE_REC_typ           * r_desc,
+                          TSSCFILE_DESCR_typ         * d_desc,
+                          char                       * key_val,
+                          ADDINFO_rec_ptr              addinfo,
+                          ADDINFO_rec_ptr              laddinfo,
+                          CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                          CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_extract_2301";
+   int                     i;
+   TSSCFILE_DESCR_typ    * data = &d_desc[0];
+   char                    main_cmd[21] = "SITRAN";     /*WS10082*/
+   char                    str_trn[21];                 /*WS10082*/
+   char                    str_fac[21];                 /*WS10082*/
+   char                    val[21];                     /*WS10082*/
+   char                    trn[21];                     /*WS10082*/
+   char                    fac[21];                     /*WS10082*/
+   char                    value[42];                   /*WS10082*/
+   /*WS10082 char          main_cmd[MAX_TSS_PARAM_LEN] = "SITRAN";
+   char                    str_trn[MAX_TSS_PARAM_LEN];
+   char                    str_fac[MAX_TSS_PARAM_LEN];
+   char                    val[MAX_TSS_PARAM_LEN];
+   char                    trn[MAX_TSS_PARAM_LEN];
+   char                    fac[MAX_TSS_PARAM_LEN];
+   char                    value[TSS_ADDINFO_VAL_LEN + 1];       */
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   strcpy(str_trn, main_cmd);
+   strcat(str_trn, ".TRN");
+   strcpy(str_fac, main_cmd);
+   strcat(str_fac, ".FACILITY" );
+
+  /*
+   *  Extract data
+   */
+
+   for (i=0; data = &d_desc[i], data->addinfo_k; i++) {
+
+      memcpy(val, record + data->pos - 1, data->len);
+      val[data->len] = NULL_CHAR;
+      TSS_strip_val(val, ' ', TSS_STRIP_BOTH);
+
+      ESA_DIAG_printf(comp, 5,
+                      "%d.%s data pos=%d data len=%d value=(%d)%s",
+                      i, data->addinfo_k, data->pos, data->len,
+                      strlen(val), val );
+
+      if ( strcmp(data->addinfo_k, str_trn) EQ 0 ) {
+         strcpy(trn, val);
+         fac[0] = NULL_CHAR;
+         continue;
+      }
+      else  if ( strcmp(data->addinfo_k, str_fac) EQ 0 ) {
+         strcpy(fac, val);
+         if ( strlen(fac) GT 0 ) {
+          /*
+           * if ( strcmp(fac, "*ALL*") EQ 0 )
+           *    fac[0] = NULL_CHAR;
+           */
+
+           sprintf( value, "%s%c%s", trn,
+                                     ADDINFO_LIST_SUBFIELD,
+                                     fac);
+          /*
+           * Put to addinfo
+           */
+
+           ESA_DIAG_printf(comp, 5, "Reglr: %s=%s", main_cmd, value );
+           TSS_put_to_addinfo(comp, main_cmd, value, addinfo,
+                              0, dest, msgs );
+         }
+         trn[0] = NULL_CHAR;
+         fac[0] = NULL_CHAR;
+      }
+      else {
+         sprintf(internal2_msg_buf, "'%s'.Unsupported keyword=%s",
+                 pending_acid, data->addinfo_k);
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                       component, func, internal2_msg_buf,
+                       0, __LINE__);
+      }
+   }      /* vars loop */
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_extract_2700 (ESA_DIAG_COMP_typ            comp,
+                          char                       * record,
+                          TSSCFILE_HANDLE_typ        * h_desc,
+                          TSSCFILE_REC_typ           * r_desc,
+                          TSSCFILE_DESCR_typ         * d_desc,
+                          char                       * key_val,
+                          ADDINFO_rec_ptr              addinfo,
+                          ADDINFO_rec_ptr              laddinfo,
+                          CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                          CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_extract_2700";
+   int                     i;
+   TSSCFILE_DESCR_typ    * data = &d_desc[0];
+   char                    main_cmd[101] = "USER";          /*WS10082*/
+   char                    str_cls[101];                    /*WS10082*/
+   char                    str_res[101];                    /*WS10082*/
+   char                    val[101];                        /*WS10082*/
+   char                    cls[101];                        /*WS10082*/
+   char                    res[101];                        /*WS10082*/
+   char                    value[202];                      /*WS10082*/
+   /*WS10082 char          main_cmd[MAX_TSS_PARAM_LEN] = "USER";
+   char                    str_cls[MAX_TSS_PARAM_LEN];
+   char                    str_res[MAX_TSS_PARAM_LEN];
+   char                    val[MAX_TSS_PARAM_LEN];
+   char                    cls[MAX_TSS_PARAM_LEN];
+   char                    res[MAX_TSS_PARAM_LEN];
+   char                    value[TSS_ADDINFO_VAL_LEN + 1];          */
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   strcpy(str_cls, main_cmd);
+   strcat(str_cls, ".CLASS");
+   strcpy(str_res, main_cmd);
+   strcat(str_res, ".RESOURCE" );
+
+  /*
+   *  Extract data
+   */
+
+   for (i=0; data = &d_desc[i], data->addinfo_k; i++) {
+
+      memcpy(val, record + data->pos - 1, data->len);
+      val[data->len] = NULL_CHAR;
+      TSS_strip_val(val, ' ', TSS_STRIP_BOTH);
+
+      ESA_DIAG_printf(comp, 5,
+                      "%d.%s data pos=%d data len=%d value=(%d)%s",
+                      i, data->addinfo_k, data->pos, data->len,
+                      strlen(val), val );
+
+      if ( strcmp(data->addinfo_k, str_res) EQ 0 ) {
+         strcpy(res, val);
+         cls[0] = NULL_CHAR;
+         continue;
+      }
+      else  if ( strcmp(data->addinfo_k, str_cls) EQ 0 ) {
+         strcpy(cls, val);
+         if ( strlen(res) GT 0 ) {
+           sprintf( value, "%s%c%s", cls,
+                                     ADDINFO_LIST_SUBFIELD,
+                                     res);
+          /*
+           * Put to addinfo
+           */
+
+           ESA_DIAG_printf(comp, 5, "Reglr: %s=%s", main_cmd, value );
+           TSS_put_to_addinfo(comp, main_cmd, value, addinfo,
+                              0, dest, msgs );
+         }
+         res[0] = NULL_CHAR;
+         cls[0] = NULL_CHAR;
+      }
+      else {
+         sprintf(internal2_msg_buf, "'%s'.Unsupported keyword=%s",
+                 pending_acid, data->addinfo_k);
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                       component, func, internal2_msg_buf,
+                       0, __LINE__);
+      }
+   }      /* vars loop */
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_extract_1100 (ESA_DIAG_COMP_typ            comp,
+                          char                       * record,
+                          TSSCFILE_HANDLE_typ        * h_desc,
+                          TSSCFILE_REC_typ           * r_desc,
+                          TSSCFILE_DESCR_typ         * d_desc,
+                          char                       * key_val,
+                          ADDINFO_rec_ptr              addinfo,
+                          ADDINFO_rec_ptr              laddinfo,
+                          CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                          CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_extract_1100";
+   int                     i;
+   TSSCFILE_DESCR_typ    * data = &d_desc[0];
+   char                    main_cmd[31] = "LTIME";        /*WS10082*/
+   char                    str_time[31];                  /*WS10082*/
+   char                    str_fac[31];                   /*WS10082*/
+   char                    val[31];                       /*WS10082*/
+   char                    vtime[31];                     /*WS10082*/
+   char                    fac[31];                       /*WS10082*/
+   char                    value[62];                     /*WS10082*/
+   /*WS10082 char          main_cmd[MAX_TSS_PARAM_LEN] = "LTIME";
+   char                    str_time[MAX_TSS_PARAM_LEN];
+   char                    str_fac[MAX_TSS_PARAM_LEN];
+   char                    val[MAX_TSS_PARAM_LEN];
+   char                    vtime[MAX_TSS_PARAM_LEN];
+   char                    fac[MAX_TSS_PARAM_LEN];
+   char                    value[TSS_ADDINFO_VAL_LEN + 1];         */
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   strcpy(str_time, main_cmd);
+   strcat(str_time, ".TIME");
+   strcpy(str_fac,  main_cmd);
+   strcat(str_fac, ".FACILITY" );
+
+  /*
+   *  Extract data
+   */
+
+   for (i=0; data = &d_desc[i], data->addinfo_k; i++) {
+
+      memcpy(val, record + data->pos - 1, data->len);
+      val[data->len] = NULL_CHAR;
+      TSS_strip_val(val, ' ', TSS_STRIP_BOTH);
+
+      ESA_DIAG_printf(comp, 5,
+                      "%d.%s data pos=%d data len=%d value=(%d)%s",
+                      i, data->addinfo_k, data->pos, data->len,
+                      strlen(val), val );
+
+      if ( strcmp(data->addinfo_k, str_time) EQ 0 ) {
+         strcpy(vtime, val);
+
+         TSS_strip_val(vtime, '0', TSS_STRIP_LEFT);
+         if ( strlen(vtime) EQ 0 )
+           strcpy(vtime, "0");
+
+         if ( memcmp(vtime, "NEV", 3 ) EQ 0 )             /* PS0286 */
+            strcpy(vtime, "0" );                          /* PS0286 */
+
+         fac[0] = NULL_CHAR;
+         continue;
+      }
+      else  if ( strcmp(data->addinfo_k, str_fac) EQ 0 ) {
+         strcpy(fac, val);
+         if (strlen(fac) GT 0 ) {
+          /*
+           * if ( strcmp(fac, "*ALL*") EQ 0 )
+           *   fac[0] = NULL_CHAR;
+           */
+
+           sprintf( value, "%s%c%s", vtime,
+                                     ADDINFO_LIST_SUBFIELD,
+                                     fac);
+
+           ESA_DIAG_printf(comp, 5, "Reglr: %s=%s", main_cmd, value);
+
+          /*
+           * Put to addinfo
+           */
+
+           ESA_DIAG_printf(comp, 5, "Reglr: %s=%s", main_cmd, value );
+           TSS_put_to_addinfo(comp, main_cmd, value, addinfo,
+                           0, dest, msgs );
+         }
+         vtime[0] = NULL_CHAR;
+         fac[0]   = NULL_CHAR;
+      }
+      else {
+         sprintf(internal2_msg_buf, "'%s'.Unsupported keyword=%s",
+                 pending_acid, data->addinfo_k);
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                       component, func, internal2_msg_buf,
+                       0, __LINE__);
+      }
+   }      /* vars loop */
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ static ESA_RC TSS_cmd_proc (ESA_DIAG_COMP_typ            comp,
+                             char                       * facility,
+                             char                       * main_cmd,
+                             char                       * record,
+                             TSSCFILE_HANDLE_typ        * h_desc,
+                             TSSCFILE_REC_typ           * r_desc,
+                             TSSCFILE_DESCR_typ         * d_desc,
+                             char                       * key_val,
+                             ADDINFO_rec_ptr              addinfo,
+                             ADDINFO_rec_ptr              laddinfo,
+                             CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                             CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_cmd_proc";
+   int                     i;
+   TSSCFILE_DESCR_typ * data = &d_desc[0];
+   char                 str_name[MAX_TSS_PARAM_LEN];
+   char                 str_flag[MAX_TSS_PARAM_LEN];
+   char                 val[MAX_TSS_PARAM_LEN];
+   char                 name[MAX_TSS_PARAM_LEN] = "";
+   char                 flag[MAX_TSS_PARAM_LEN] = "";
+   /*WS10082 char       value[TSS_ADDINFO_VAL_LEN + 1] = "";          */
+   char                 value[ADDINFO_16K_VAL_LEN + 1] = ""; /*WS10082*/
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   ESA_DIAG_printf(comp, 5, "facility=%s main_cmd=%s",
+                   facility, main_cmd );
+
+   strcpy(str_name, main_cmd);
+   strcat(str_name, ".NAME");
+   strcpy(str_flag, main_cmd);
+   strcat(str_flag, ".FLAG");
+
+  /*
+   *  Extract data
+   */
+
+   for (i=0; data = &d_desc[i], data->addinfo_k; i++) {
+
+      memcpy(val, record + data->pos - 1, data->len);
+      val[data->len] = NULL_CHAR;
+      TSS_strip_val(val, ' ', TSS_STRIP_BOTH);
+
+      ESA_DIAG_printf(comp, 5,
+                      "%d.%s data pos=%d data len=%d value=(%d)%s",
+                      i, data->addinfo_k, data->pos, data->len,
+                      strlen(val), val );
+
+      if ( strcmp(data->addinfo_k, str_name) EQ 0 ) {
+         strcpy(name, val);
+         flag[0] = NULL_CHAR;
+         continue;
+      }
+      else  if ( strcmp(data->addinfo_k, str_flag) EQ 0 ) {
+         strcpy(flag, val);
+         if ( strlen(name) EQ 0 ) {
+           flag[0] = NULL_CHAR;
+           continue;
+         }
+
+         if ( strlen(flag) EQ 0 )
+            sprintf( value, "%s%c%s", facility,
+                                      ADDINFO_LIST_SUBFIELD,
+                                      name);
+         else
+            sprintf( value, "%s%c%s(%s)", facility,
+                                          ADDINFO_LIST_SUBFIELD,
+                                          name, flag );
+        /*
+         * Put to addinfo
+         */
+
+         ESA_DIAG_printf(comp, 5, "Reglr: %s=%s", main_cmd, value );
+         TSS_put_to_addinfo(comp, main_cmd, value, addinfo,
+                            0, dest, msgs );
+         name[0] = NULL_CHAR;
+         flag[0] = NULL_CHAR;
+      }
+      else {
+         sprintf(internal2_msg_buf, "'%s'.Unsupported keyword=%s",
+                 pending_acid, data->addinfo_k);
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                       component, func, internal2_msg_buf,
+                       0, __LINE__);
+      }
+   }      /* vars loop */
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_convert_date(ESA_DIAG_COMP_typ         comp,
+                         char                       * tssdate,
+                         TSSCFILE_HANDLE_typ        * h_desc,
+                         TSSCFILE_REC_typ           * r_desc,
+                         TSSCFILE_DESCR_typ         * d_desc,
+                         char                       * key_val,
+                         ADDINFO_rec_ptr              addinfo,
+                         ADDINFO_rec_ptr              laddinfo,
+                         CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                         CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_convert_date";
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   rc = TSS_ConvertDateTSS2ESS(comp, tssdate, dest, msgs );
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ static ESA_RC TSS_convert_facility_date(ESA_DIAG_COMP_typ   comp,
+                         char                              * tssdate,
+                         CTSAMSG_DEST_TABLE_rec_ptr          dest,
+                         CTSAMSG_HANDLE_rec_ptr              msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_convert_facility_date";
+   char                    ess_date[21];                  /*WS10082*/
+   /*WS10082 char          ess_date[MAX_TSS_PARAM_LEN];
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   rc = TSS_ConvertDateTSS2ESS(comp, tssdate, dest, msgs );
+
+  /*
+   *   Build "STRING" in form "DATE"
+   */
+
+   memcpy(ess_date, tssdate, 4 );              /* YYYY  */
+   ess_date[4] = '/';
+   memcpy( &ess_date[5], tssdate+4, 2 );       /* MM    */
+   ess_date[7] = '/';
+   strcpy( &ess_date[8], tssdate+6 );          /* DD    */
+
+   strcpy(tssdate, ess_date);
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_convert_flag(ESA_DIAG_COMP_typ         comp,
+                         char                       * fdata,
+                         TSSCFILE_HANDLE_typ        * h_desc,
+                         TSSCFILE_REC_typ           * r_desc,
+                         TSSCFILE_DESCR_typ         * d_desc,
+                         char                       * key_val,
+                         ADDINFO_rec_ptr              addinfo,
+                         ADDINFO_rec_ptr              laddinfo,
+                         CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                         CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_convert_flag";
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   if ( strlen(fdata) EQ 0 )
+      strcpy(fdata, KWD_FLAG_OFF);
+   else
+      strcpy(fdata, KWD_FLAG_ON);
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ /* WS10009      start                                            */
+ /* WS10009 like convert_flag if keyword equal to value in record */
+ ESA_RC TSS_cnvflag_onequal(ESA_DIAG_COMP_typ         comp,
+                         char                       * fdata,
+                         TSSCFILE_HANDLE_typ        * h_desc,
+                         TSSCFILE_REC_typ           * r_desc,
+                         TSSCFILE_DESCR_typ         * d_desc,
+                         char                       * key_val,
+                         ADDINFO_rec_ptr              addinfo,
+                         ADDINFO_rec_ptr              laddinfo,
+                         CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                         CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_cnvflag_onequal";
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+     if (strlen(fdata) GT 0 AND
+         strcmp(d_desc->addinfo_k,fdata) EQ 0)
+        strcpy(fdata, KWD_FLAG_ON);
+     else
+        strcpy(fdata, KWD_FLAG_OFF);
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+ /* WS10009      end                                              */
+
+ ESA_RC TSS_convert_type(ESA_DIAG_COMP_typ         comp,
+                         char                       * tdata,
+                         TSSCFILE_HANDLE_typ        * h_desc,
+                         TSSCFILE_REC_typ           * r_desc,
+                         TSSCFILE_DESCR_typ         * d_desc,
+                         char                       * key_val,
+                         ADDINFO_rec_ptr              addinfo,
+                         ADDINFO_rec_ptr              laddinfo,
+                         CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                         CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_convert_type";
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   ESA_DIAG_printf(comp, 5, "1.Before convert type=%s", tdata);
+
+   TSS_type_tss2ess(comp, tdata);
+
+   ESA_DIAG_printf(comp, 5, "2.After  convert type=%s", tdata);
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_convert_segm(ESA_DIAG_COMP_typ            comp,
+                         char                       * sdata,
+                         TSSCFILE_HANDLE_typ        * h_desc,
+                         TSSCFILE_REC_typ           * r_desc,
+                         TSSCFILE_DESCR_typ         * d_desc,
+                         char                       * key_val,
+                         ADDINFO_rec_ptr              addinfo,
+                         ADDINFO_rec_ptr              laddinfo,
+                         CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                         CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                   rc = ESA_OK ;
+   static  char             func[]="TSS_convert_segm";
+   int                      i;
+   int                      found;
+   char                    *addinfo_k;
+   TSS_SGM_rec_typ         *tss_segments;
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   tss_segments = TSS_get_global_segments();
+
+   found = 0;
+
+   for (i=0; tss_segments[i].artificial_field; i++) {
+     if (strcmp(tss_segments[i].tss_field, sdata ) EQ 0 ) {
+        found = 1;
+        addinfo_k = tss_segments[i].artificial_field;
+        break;
+     }
+   }
+
+   if ( NOT found ) {
+       ESA_DIAG_printf(comp, 2,
+          "Unable to convert segment: %s", sdata); /* WS2506 */
+
+/*WS2506  sprintf(internal2_msg_buf,
+             "'%s'.Unable to convert segment field %s",
+             pending_acid, sdata );
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                   component, func, internal2_msg_buf,
+                   8, __LINE__); */
+
+    /*
+     * rc = ESA_FATAL;
+     * OS_MVS_btrace();
+     */
+     goto exit;
+   }
+
+  /*
+   * Put to addinfo
+   */
+
+   if ( d_desc->dest EQ ADI_LOCAL ) {
+       ESA_DIAG_printf(comp, 5, "Local: %s=%s",addinfo_k, "N");
+       TSS_put_to_addinfo(comp, addinfo_k, KWD_FLAG_OFF, laddinfo,
+                          1, dest, msgs );
+       rc = ESA_SKIP;
+   }
+   else if ( d_desc->dest EQ ADI_REGLR ) {
+       ESA_DIAG_printf(comp, 5, "Reglr: %s=%s",addinfo_k, "N");
+       TSS_put_to_addinfo(comp, addinfo_k, KWD_FLAG_OFF, addinfo,
+                          0, dest, msgs );
+       rc = ESA_SKIP;
+   }
+   else {
+       sprintf(internal2_msg_buf,
+        "'%s'.Unable to determine destination of %k=%s. Destination=%d",
+        pending_acid , addinfo_k, KWD_FLAG_OFF, d_desc->dest );
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                     component, func, internal2_msg_buf,
+                     8, __LINE__);
+       rc = ESA_FATAL;
+       OS_MVS_btrace();
+       goto exit;
+   }
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_extract_var_val(ESA_DIAG_COMP_typ            comp,
+                            char                       * vdata,
+                            TSSCFILE_HANDLE_typ        * h_desc,
+                            TSSCFILE_REC_typ           * r_desc,
+                            TSSCFILE_DESCR_typ         * d_desc,
+                            char                       * key_val,
+                            ADDINFO_rec_ptr              addinfo,
+                            ADDINFO_rec_ptr              laddinfo,
+                            CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                            CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_extract_var_val";
+   int                     vallen;
+   ONE_FIELD_rec_ptr       pair;
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   pair = ADDINFO_search(CFILE_DATA_VALLEN, TSS_ADDINFO_KWD_LEN,
+                         laddinfo->pair,
+                         laddinfo->num_pairs );
+   if ( pair EQ NULL ) {
+       sprintf(internal2_msg_buf,
+               "'%s'.Unable to determine val len for %k=%s",
+               pending_acid, d_desc->addinfo_k, vdata);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                     component, func, internal2_msg_buf,
+                     4, __LINE__);
+       goto exit;
+   }
+
+   vallen = atoi(pair->value);
+   ESA_DIAG_printf(comp, 5, "Vallen %d Obtained=%d",
+                   vallen + 1, strlen(vdata) );
+
+   if ( strlen(vdata) GT (vallen + 1) )
+      *(vdata + vallen) = NULL_CHAR;
+
+   ADDINFO_updval( "", TSS_ADDINFO_VAL_LEN, pair );
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_extract_2011 (ESA_DIAG_COMP_typ        comp,
+                          char                       * record,
+                          TSSCFILE_HANDLE_typ        * h_desc,
+                          TSSCFILE_REC_typ           * r_desc,
+                          TSSCFILE_DESCR_typ         * d_desc,
+                          char                       * key_val,
+                          ADDINFO_rec_ptr              addinfo,
+                          ADDINFO_rec_ptr              laddinfo,
+                          CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                          CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_extract_2011";
+   int                     len;
+   int                     found;
+   int                     f_ind;
+   int                     i=0;
+   TSSCFILE_DESCR_typ    * data = &d_desc[0];
+   TSSCFILE_DESCR_typ      dummy_data;
+   TSSCFILE_DATA_EXT_typ * cfunc;
+   char                    val[MAX_TSS_PARAM_LEN];
+   char                    p_kwd[TSS_ADDINFO_KWD_LEN + 1] = "";
+   char                    f_kwd[TSS_ADDINFO_KWD_LEN + 1] = "";
+   /*WS10082 char          raccess[TSS_ADDINFO_VAL_LEN + 1] = "";   */
+   char             raccess[ADDINFO_16K_VAL_LEN + 1] = ""; /*WS10082*/
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+  /*
+   *  Extract data
+   */
+
+   /* This record belongs to "ADMIN"/"XADMIN" group records */
+
+   ESA_DIAG_printf(comp, 5, "admin_qualif=%s", admin_qualif);
+
+  /*
+   *  While XADMIN record action is SKIP(see CTSTTSF, rec.3400)
+   *  The action related to this must be skipped as well
+   */
+
+   if ( strcmp(admin_qualif, "XADMIN") EQ 0 ) {
+       rc = ESA_SKIP;
+       goto exit;
+   }
+
+   strcpy(p_kwd, admin_qualif);
+
+   found = 0;    /* "ADMIN"/"XADMIN" key index */
+
+   data = &d_desc[0];
+   memcpy( (char *)&dummy_data,
+           (char *)data, sizeof(TSSCFILE_DESCR_typ) );
+
+   strcpy(f_kwd, p_kwd);
+   strcat(f_kwd, "." );
+   strcat(f_kwd, data->addinfo_k);   /* ACCESS */
+   dummy_data.addinfo_k = f_kwd;
+
+   ESA_DIAG_printf(comp, 5, "Main keyword=%s Current keyword=%s",
+                   p_kwd, f_kwd);
+
+  /*
+   *  Extract data
+   */
+
+   for (i=0; data = &d_desc[i], data->addinfo_k; i++) {
+
+      memcpy(val, record + data->pos - 1, data->len);
+      val[data->len] = NULL_CHAR;
+      TSS_strip_val(val, ' ' ,TSS_STRIP_BOTH);
+
+      ESA_DIAG_printf(comp, 5,
+                      "%d.%s data pos=%d data len=%d value=(%d)%s",
+                      i, data->addinfo_k, data->pos, data->len,
+                      strlen(val), val );
+      if (strlen(val) EQ 0)
+         continue;
+
+     /*
+      * Special conversion ?
+      */
+
+      if ( data->cfunc NE NULL ) {
+        cfunc = (TSSCFILE_DATA_EXT_typ *)data->cfunc;
+        rc = (cfunc)(comp, val, h_desc, r_desc, data, key_val,
+                     addinfo, laddinfo, dest, msgs);
+        if ( rc EQ ESA_SKIP ) {
+            rc = ESA_OK;
+            continue;
+        }
+        if ( rc NE ESA_OK )
+          goto exit;
+      }
+
+      /*** Save data ***/
+
+      strcat(raccess, val);
+      strcat(raccess, ",");
+
+   }      /* Vars loop */
+
+   /* Remove last comma */
+
+   len = strlen(raccess);
+   if (len GT 0)
+      raccess[len - 1] = NULL_CHAR;
+
+   ESA_DIAG_printf(comp, 5, "Res access=%s", raccess);
+
+   if ( strcmp(admin_qualif, "ADMIN") EQ 0 ) {
+      f_ind = 2;
+      rc = TSS_fill_list(comp, found, f_ind,
+                         p_kwd, raccess, h_desc, r_desc,
+                         &dummy_data, key_val,
+                         f_ind - 1, "XAUTH", dest, msgs);
+   }
+   else {
+      f_ind = 3;
+      rc = TSS_fill_list(comp, found, f_ind,
+                         p_kwd, raccess, h_desc, r_desc,
+                         &dummy_data, key_val,
+                         0, "", dest, msgs);
+   }
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ ESA_RC TSS_extract_2921 (ESA_DIAG_COMP_typ        comp,
+                          char                       * record,
+                          TSSCFILE_HANDLE_typ        * h_desc,
+                          TSSCFILE_REC_typ           * r_desc,
+                          TSSCFILE_DESCR_typ         * d_desc,
+                          char                       * key_val,
+                          ADDINFO_rec_ptr              addinfo,
+                          ADDINFO_rec_ptr              laddinfo,
+                          CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                          CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_extract_2921";
+   int                     len;
+   int                     found;
+   int                     f_ind;
+   int                     i=0;
+   TSSCFILE_DESCR_typ    * data = &d_desc[0];
+   TSSCFILE_DESCR_typ      dummy_data;
+   char                  * token;
+   char                    val[MAX_TSS_PARAM_LEN];
+   char                    p_kwd[TSS_ADDINFO_KWD_LEN + 1] = "";
+   char                    f_kwd[TSS_ADDINFO_KWD_LEN + 1] = "";
+   /*WS10082 char          raccess[TSS_ADDINFO_VAL_LEN + 1] = "";  */
+   char             raccess[ADDINFO_16K_VAL_LEN + 1] = "";/*WS10082*/
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+  /*
+   *  Extract data
+   */
+
+   /* This record belongs to "ADMIN"/"XADMIN" group records */
+
+   ESA_DIAG_printf(comp, 5, "admin_qualif=%s", admin_qualif);
+
+  /*
+   *  While XADMIN record action is SKIP(see CTSTTSF, rec.3400)
+   *  The action related to this must be skipped as well
+   */
+
+   if ( strcmp(admin_qualif, "XADMIN") EQ 0 ) {
+       rc = ESA_SKIP;
+       goto exit;
+   }
+
+   strcpy(p_kwd, admin_qualif);
+
+   found = 0;    /* "ADMIN"/"XADMIN" key index */
+
+   data = &d_desc[0];
+   memcpy( (char *)&dummy_data,
+           (char *)data, sizeof(TSSCFILE_DESCR_typ) );
+
+   strcpy(f_kwd, p_kwd);
+   strcat(f_kwd, "." );
+   strcat(f_kwd, data->addinfo_k);   /* ACCESS */
+   dummy_data.addinfo_k = f_kwd;
+
+   ESA_DIAG_printf(comp, 5, "Main keyword=%s Current keyword=%s",
+                   p_kwd, f_kwd);
+
+   token = strtok(record, " \n");
+   if ( NOT token )
+      goto exit;
+
+   token = strtok(NULL, " \n");    /* Skip RECID  */
+   if ( NOT token )
+      goto exit;
+
+   token = strtok(NULL, " \n");    /* Skip ACID   */
+   while (token) {
+
+      strcpy(val, token );
+      i++;
+      ESA_DIAG_printf(comp, 5, "%d.%s data value=(%d)%s",
+                      i, data->addinfo_k, strlen(val), val );
+
+      strcat(raccess, val);
+      strcat(raccess, ",");
+      token = strtok(NULL, " \n");
+   }
+
+   /* Remove last comma */
+
+   len = strlen(raccess);
+   if (len GT 0)
+      raccess[len - 1] = NULL_CHAR;
+
+   ESA_DIAG_printf(comp, 5, "Res access=%s", raccess);
+
+   if ( strcmp(admin_qualif, "ADMIN") EQ 0 ) {
+      f_ind = 2;
+      rc = TSS_fill_list(comp, found, f_ind,
+                         p_kwd, raccess, h_desc, r_desc,
+                         &dummy_data, key_val,
+                         f_ind - 1, "XAUTH", dest, msgs);
+   }
+   else {
+      f_ind = 3;
+      rc = TSS_fill_list(comp, found, f_ind,
+                         p_kwd, raccess, h_desc, r_desc,
+                         &dummy_data, key_val,
+                         0, "", dest, msgs);
+   }
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+ /*WS10082 this routine is not used since TSS51
+ ESA_RC TSS_extract_4011 (ESA_DIAG_COMP_typ            comp,
+                          char                       * record,
+                          TSSCFILE_HANDLE_typ        * h_desc,
+                          TSSCFILE_REC_typ           * r_desc,
+                          TSSCFILE_DESCR_typ         * d_desc,
+                          char                       * key_val,
+                          ADDINFO_rec_ptr              addinfo,
+                          ADDINFO_rec_ptr              laddinfo,
+                          CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                          CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+   *
+   *   Variables
+   *
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_extract_4011";
+   char                  * token;
+   char                  * wrk;
+   char                    acid[TSSCFILE_ACID_LEN+1];
+   char                    val[TSS_ADDINFO_VAL_LEN + 1] = "";
+   char                    kwd[TSS_ADDINFO_KWD_LEN + 1] = "";
+   ONE_FIELD_rec_ptr       pair;
+   int                     i;                               * WS2322 *
+   struct kwd_t {                                           * WS2322 *
+       char     *kwd_in;        * kwd from 4011 record *    * WS2322 *
+       char     *kwd_out;       * addinfo kwd          *    * WS2322 *
+   } ;                                                      * WS2322 *
+                                                            * WS2322 *
+   static struct kwd_t  kwd_table[] = {                     * WS2322 *
+                   { "CONSNAME"  ,   "NETVCONS" },          * WS2322 *
+                   { "INIT CMD"  ,   "NETVIC"   },          * WS2322 *
+                   { "CONTROL"   ,   "NETVCTL"  },          * WS2322 *
+                   { "MSGRECVR"  ,   "NETVMSGR" },          * WS2322 *
+                   { "OPCLASS"   ,   "NETVOPCL" },          * WS2322 *
+                   { "DOMAINS"   ,   "NETVDMNS" },          * WS2322 *
+                   { "NGMFADMN"  ,   "NETVNGMF" },          * WS2322 *
+                   { "KERBNAME"  ,   "KERBNAME" },          * IS10089 *
+                   { "ENCTYPE"   ,   "ENCTYPE"  },          * IS10089 *
+                   { "MAXTKTLF"  ,   "MAXTKTLF" },          * IS10089 *
+                   { "MINTKTLF"  ,   "MINTKTLF" },          * IS10089 *
+                   { NULL        ,   NULL       }  };       * WS2322 *
+
+   *
+   *  Initialize
+   *
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   *
+   *  Check. For error messages
+   *
+
+   pair = ADDINFO_search( CFILE_REC_0001, TSS_ADDINFO_KWD_LEN,
+                          laddinfo->pair, laddinfo->num_pairs );
+   if ( pair NE NULL ) {
+     if ( pair->vallen GT 0 ) {
+        memcpy(acid, record + TSSCFILE_ACID_POS, TSSCFILE_ACID_LEN);
+        acid[TSSCFILE_ACID_LEN] = NULL_CHAR;
+        TSS_strip_val(acid, ' '   , TSS_STRIP_BOTH);
+        TSS_strip_val(acid, '\0'  , TSS_STRIP_BOTH);
+        ESA_DIAG_printf(comp, 5, "acid=%d/%s", strlen(acid), acid);
+
+        *
+        *  Try to locate acid in rec 0001
+        *  If not found - this record error message
+        *
+
+        wrk = NULL;
+        if ( strlen(acid) GT 0 )
+           wrk = strstr(pair->value, acid);
+        if ( NOT wrk ) {
+
+            * Remove new line character *
+
+           wrk = strchr(record + TSSCFILE_INFO_POS , '\n');
+           if ( wrk )
+             *wrk = NULL_CHAR;
+
+            * Remove trailing blanks from the end of a line *
+
+           TSS_strip_val( (record + TSSCFILE_INFO_POS),
+                          ' ', TSS_STRIP_RIGHT );
+
+           CTSAMSG_print(TSS_OUTPUT_LINE, msgs, NULL, dest,
+                         pair->value);
+           CTSAMSG_print(TSS_OUTPUT_LINE, msgs, NULL, dest,
+                         record + TSSCFILE_INFO_POS);
+           ADDINFO_updval("", TSS_ADDINFO_VAL_LEN, pair);
+           rc = ESA_WARN;
+           goto exit;
+        }     * acid not found *
+     }  * Record 0001 has the value *
+     else {        * continue errors records *
+
+        * Remove new line character *
+
+       wrk = strchr(record + TSSCFILE_INFO_POS , '\n');
+       if ( wrk )
+         *wrk = NULL_CHAR;
+
+        * Remove trailing blanks from the end of a line *
+
+       TSS_strip_val( (record + TSSCFILE_INFO_POS),
+                       ' ', TSS_STRIP_RIGHT );
+
+       CTSAMSG_print(TSS_OUTPUT_LINE, msgs, NULL, dest,
+                     record + TSSCFILE_INFO_POS);
+       rc = ESA_WARN;
+       goto exit;
+     }             * continue errors records *
+   }      * Record 0001 *
+
+   *
+   *  Extract data
+   *
+
+   token = strtok(record, " \n");   * Skip service bytes *
+   if ( NOT token )
+      goto exit;
+
+   token = strtok(NULL, " \n");     * Skip RECID         *
+   if ( NOT token )
+      goto exit;
+
+    * Removed by WS2322
+    * token = strtok(NULL, " \n"); /. Skip ACID          ./
+    * if ( NOT token )
+    *   goto exit;
+    *
+
+    * Added by WS2322  *
+    token = strtok(NULL, "=");      * Skip ACID          *
+    if ( NOT token )
+      goto exit;
+
+   strcpy(kwd, token );             * Obtained keyword   *
+   TSS_strip_val(kwd, ' ', TSS_STRIP_BOTH);     * WS2322 *
+   ESA_DIAG_printf(comp, 5, "1.keyword=%s", kwd);
+
+    *   WS2322
+    *   Convert keyword
+    *
+
+   for (i=0; kwd_table[i].kwd_in; i++ ) {                * WS2322 *
+      if (strcmp(kwd, kwd_table[i].kwd_in) EQ 0) {       * WS2322 *
+         strcpy(kwd, kwd_table[i].kwd_out);              * WS2322 *
+         break;                                          * WS2322 *
+      }                                                  * WS2322 *
+   }                                                     * WS2322 *
+
+   ESA_DIAG_printf(comp, 5, "2.keyword=%s", kwd);
+
+    * Removed by WS2322
+    * token = strtok(NULL, " \n"); /. Skip keyword ./
+    * if ( NOT token )
+    *   goto exit;
+    *
+
+    * Removed by WS2322
+    * token = strtok(NULL, " \n"); /. Skip = ./
+    * if ( NOT token )
+    *   goto exit;
+    *
+
+    * Added by WS2322  *
+    token = strtok(NULL, "\n");     * Set end of string *
+    if ( NOT token )
+      goto exit;
+
+   strcpy(val, token );             * Obtained value *
+   TSS_strip_val(val, ' ', TSS_STRIP_BOTH);      * WS2322 *
+   ESA_DIAG_printf(comp, 5, "(%d)%s=(%d)%s",
+                   strlen(kwd), kwd,  strlen(val), val);
+
+   ESA_DIAG_printf(comp, 5, "Reglr: %s=%s", kwd, val);
+   TSS_strip_val(val, '0', TSS_STRIP_LEFT);
+   ESA_DIAG_printf(comp, 5, "Reglr: %s=%s", kwd, val);
+
+   *  WS2322
+   *  Special NETVDMNS field processing
+   *
+
+   if ( strcmp(kwd, "NETVDMNS") EQ 0)                       * WS2322 *
+      ADDINFO_convert_list_sep( val,                        * WS2322 *
+                ',', ',',                                   * WS2322 *
+                ADDINFO_LIST_ENTRY, ADDINFO_LIST_ENTRY);    * WS2322 *
+
+   TSS_put_to_addinfo(comp, kwd, val, addinfo, 0, dest, msgs );
+   rc = ESA_SKIP;
+
+   *
+   *  Finish
+   *
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }      end of dropping the routine by WS10082 */
+
+ ESA_RC TSS_extract_3000(ESA_DIAG_COMP_typ            comp,
+                         char                       * record,
+                         TSSCFILE_HANDLE_typ        * h_desc,
+                         TSSCFILE_REC_typ           * r_desc,
+                         TSSCFILE_DESCR_typ         * d_desc,
+                         char                       * key_val,
+                         ADDINFO_rec_ptr              addinfo,
+                         ADDINFO_rec_ptr              laddinfo,
+                         CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                         CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_extract_3000";
+   int                     i;
+   TSSCFILE_DESCR_typ    * data = &d_desc[0];
+   TSSCFILE_DATA_EXT_typ * cfunc;
+   int                     ix = 5;
+   char                    val[5][MAX_TSS_PARAM_LEN];
+                            /* 0   "PASSWORD"           */
+                            /* 1   "PASSWORD.EXP_DATE"  */
+                            /* 2   "INTERVAL"           */
+                            /* 3   "PASSWORD.FACILITY"  */
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   for(i=0; i LT ix; i++)
+      val[i][0] = NULL_CHAR;
+
+  /*
+   *  Extract data
+   */
+
+   for (i=0; data = &d_desc[i], data->addinfo_k; i++) {
+
+      memcpy(val[i], record + data->pos - 1, data->len);
+      val[i][data->len] = NULL_CHAR;
+      TSS_strip_val(val[i], ' ' ,TSS_STRIP_BOTH);
+
+      ESA_DIAG_printf(comp, 5,
+                      "%d.%s data pos=%d data len=%d value=(%d)%s",
+                      i, data->addinfo_k, data->pos, data->len,
+                      strlen(val[i]), val[i] );
+     /*
+      * Special conversion ?
+      */
+
+      if ( data->cfunc NE NULL ) {
+        cfunc = (TSSCFILE_DATA_EXT_typ *)data->cfunc;
+        rc = (cfunc)(comp, val[i], h_desc, r_desc, data, key_val,
+                     addinfo, laddinfo, dest, msgs);
+        if ( rc EQ ESA_SKIP ) {
+            rc = ESA_OK;
+            continue;
+        }
+        if ( rc NE ESA_OK )
+          goto exit;
+      }
+   }      /* Vars loop */
+
+   if ( strlen(val[3]) GT 0 ) {      /* 3   "PASSWORD.FACILITY"  */
+      rc = ESA_SKIP;
+      goto exit;
+   }
+
+  /*
+   * Put to addinfo
+   */
+
+   data = &d_desc[0];
+   for (i=0; data = &d_desc[i], data->addinfo_k; i++) {
+      if ( strlen(val[i]) GT 0 ) {
+        if ( data->dest EQ ADI_LOCAL ) {
+          ESA_DIAG_printf(comp, 5, "Local: %s=%s",
+                          data->addinfo_k, val[i]);
+          TSS_put_to_addinfo(comp, data->addinfo_k, val[i], laddinfo,
+                             1, dest, msgs );
+        }
+        else if ( data->dest EQ ADI_REGLR ) {
+          ESA_DIAG_printf(comp, 5, "Reglr: %s=%s",
+                          data->addinfo_k, val[i]);
+          TSS_put_to_addinfo(comp, data->addinfo_k, val[i], addinfo,
+                             0, dest, msgs );
+        }
+        else {
+            sprintf(internal2_msg_buf,
+        "'%s'.Unable to determine destination of %k=%s.Destination=%d",
+              pending_acid, data->addinfo_k, val[i], data->dest );
+            ESA_DIAG_printf(comp, 5, "DEST_ERR:%s", internal2_msg_buf);
+            CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                          component, func, internal2_msg_buf,
+                          4, __LINE__);
+            rc = ESA_FATAL;
+            OS_MVS_btrace();
+            goto exit;
+        }
+      }    /* val has value */
+   }      /* vars loop */
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ /********** The following routine added for IS10147A **********/
+ ESA_RC TSS_extract_3001(ESA_DIAG_COMP_typ            comp,
+                         char                       * record,
+                         TSSCFILE_HANDLE_typ        * h_desc,
+                         TSSCFILE_REC_typ           * r_desc,
+                         TSSCFILE_DESCR_typ         * d_desc,
+                         char                       * key_val,
+                         ADDINFO_rec_ptr              addinfo,
+                         ADDINFO_rec_ptr              laddinfo,
+                         CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                         CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_extract_3001";
+   int                     i;
+   TSSCFILE_DESCR_typ    * data = &d_desc[0];
+   TSSCFILE_DATA_EXT_typ * cfunc;
+   int                     ix = 3;
+   char                    userid[9];
+   char                    val[3][MAX_TSS_PARAM_LEN];
+                            /* 0   "INFO.PHRASE_EXP_DATE" */
+                            /* 1   "PHRASE_INTERVAL"      */
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   for(i=0; i LT ix; i++)
+      val[i][0] = NULL_CHAR;
+
+  /*
+   *  Extract data
+   */
+
+   for (i=0; data = &d_desc[i], data->addinfo_k; i++) {
+
+      memcpy(val[i], record + data->pos - 1, data->len);
+      val[i][data->len] = NULL_CHAR;
+      TSS_strip_val(val[i], ' ' ,TSS_STRIP_BOTH);
+
+      ESA_DIAG_printf(comp, 5,
+                      "%d.%s data pos=%d data len=%d value=(%d)%s",
+                      i, data->addinfo_k, data->pos, data->len,
+                      strlen(val[i]), val[i] );
+     /*
+      * Special conversion ?
+      */
+
+      if ( data->cfunc NE NULL ) {
+        cfunc = (TSSCFILE_DATA_EXT_typ *)data->cfunc;
+        rc = (cfunc)(comp, val[i], h_desc, r_desc, data, key_val,
+                     addinfo, laddinfo, dest, msgs);
+        ESA_DIAG_printf(comp, 5, "cfunc rc=%d  %s=%s",
+                        rc, data->addinfo_k, val[i]);
+        if ( rc EQ ESA_SKIP ) {
+            rc = ESA_OK;
+            continue;
+        }
+        if ( rc NE ESA_OK ) {
+            memcpy(userid, &record[14], 8);
+            userid[8] = NULL_CHAR;
+            CTSAMSG_print(TSS_CONV_ERR_IGN, msgs, NULL, dest,
+                          data->addinfo_k, userid);
+            rc = ESA_OK;
+            goto exit;
+        }
+      }
+   }      /* Vars loop */
+
+  /*
+   * Put to addinfo
+   */
+
+   data = &d_desc[0];
+   for (i=0; data = &d_desc[i], data->addinfo_k; i++) {
+      if ( strlen(val[i]) GT 0 ) {
+        if ( data->dest EQ ADI_LOCAL ) {
+          ESA_DIAG_printf(comp, 5, "Local: %s=%s",
+                          data->addinfo_k, val[i]);
+          TSS_put_to_addinfo(comp, data->addinfo_k, val[i], laddinfo,
+                             1, dest, msgs );
+        }
+        else if ( data->dest EQ ADI_REGLR ) {
+          ESA_DIAG_printf(comp, 5, "Reglr: %s=%s",
+                          data->addinfo_k, val[i]);
+          TSS_put_to_addinfo(comp, data->addinfo_k, val[i], addinfo,
+                             0, dest, msgs );
+        }
+        else {
+            sprintf(internal2_msg_buf,
+        "'%s'.Unable to determine destination of %k=%s.Destination=%d",
+              pending_acid, data->addinfo_k, val[i], data->dest );
+            ESA_DIAG_printf(comp, 5, "DEST_ERR:%s", internal2_msg_buf);
+            CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                          component, func, internal2_msg_buf,
+                          4, __LINE__);
+            rc = ESA_FATAL;
+            OS_MVS_btrace();
+            goto exit;
+        }
+      }    /* val has value */
+   }      /* vars loop */
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ /* PS0388 */
+
+ /***************** BS2713 start *******************************/
+ ESA_RC TSS_extract_4012_51(ESA_DIAG_COMP_typ            comp,
+                         char                       * record,
+                         TSSCFILE_HANDLE_typ        * h_desc,
+                         TSSCFILE_REC_typ           * r_desc,
+                         TSSCFILE_DESCR_typ         * d_desc,
+                         char                       * key_val,
+                         ADDINFO_rec_ptr              addinfo,
+                         ADDINFO_rec_ptr              laddinfo,
+                         CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                         CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_extract_4012_51";
+   TSSCFILE_DESCR_typ    * data = &d_desc[0];
+   char                    val[MAX_TSS_PARAM_LEN];
+   ONE_FIELD_rec_ptr       pair;
+   char                    n16[ADDINFO_16K_VAL_LEN+1];  /*WS10082*/
+   int                     n16_len = 0;                 /*WS10082*/
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+      /* get record 4012 value */
+      memcpy(val, record + data->pos - 1, data->len);
+      val[data->len] = NULL_CHAR;
+      TSS_strip_val(val, ' ', TSS_STRIP_BOTH);
+
+      /* find rec 4011 keyword */
+      pair = ADDINFO_search( rec_4011_fdt, TSS_ADDINFO_KWD_LEN,
+                             addinfo->pair, addinfo->num_pairs );
+      /* keyword not found */
+      if (pair EQ NULL)
+      {
+       ESA_DIAG_printf(comp, 5, "keyword not found (%s)", rec_4011_fdt);
+       goto exit ;
+      }
+
+      ESA_DIAG_printf(comp, 5, "%s=%s", rec_4011_fdt, val);
+
+      /* concatenate value of rec 4012 to 4011 */
+      if (val NE NULL)
+      {
+         /*** WS10082 ***
+          - copy from pair->value to new
+          - cat to new
+          - updval with new                                       */
+         strcpy(n16,pair->value);                        /*WS10082*/
+         /*WS10082 strcat(pair->value,val);                       */
+         strcat(n16,val);                                /*WS10082*/
+         n16_len = strlen(n16);                          /*WS10082*/
+         /*WS10082 pair->vallen = strlen(pair->value);            */
+         rc = ADDINFO_updval(n16, n16_len, pair);        /*WS10082*/
+      }
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+ /***************** BS2713 end *********************************/
+ ESA_RC TSS_extract_4011_51(ESA_DIAG_COMP_typ            comp,
+                         char                       * record,
+                         TSSCFILE_HANDLE_typ        * h_desc,
+                         TSSCFILE_REC_typ           * r_desc,
+                         TSSCFILE_DESCR_typ         * d_desc,
+                         char                       * key_val,
+                         ADDINFO_rec_ptr              addinfo,
+                         ADDINFO_rec_ptr              laddinfo,
+                         CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                         CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_extract_4011_51";
+   int                     i;
+   TSSCFILE_DESCR_typ    * data = &d_desc[0];
+   TSSCFILE_DATA_EXT_typ * cfunc;
+   /*WS10082 char          fdt[MAX_TSS_PARAM_LEN];
+   char                    kwd[MAX_TSS_PARAM_LEN];
+   char                    val[MAX_TSS_PARAM_LEN];                */
+   char                    fdt[MAX_TSS_REC_LEN+1];       /*WS10082*/
+   char                    kwd[MAX_TSS_REC_LEN+1];       /*WS10082*/
+   char                    val[MAX_TSS_REC_LEN+1];       /*WS10082*/
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+  /*
+   *  Extract data
+   */
+
+   for (i=0; data = &d_desc[i], data->addinfo_k; i++) {
+
+      memcpy(val, record + data->pos - 1, data->len);
+      val[data->len] = NULL_CHAR;
+      TSS_strip_val(val, ' ', TSS_STRIP_BOTH);
+
+      ESA_DIAG_printf(comp, 5,
+                      "%d.%s data pos=%d data len=%d value=(%d)%s",
+                      i, data->addinfo_k, data->pos, data->len,
+                      strlen(val), val );
+     /*
+      * Special conversion ?
+      */
+
+      if ( data->cfunc NE NULL ) {
+        cfunc = (TSSCFILE_DATA_EXT_typ *)data->cfunc;
+        rc = (cfunc)(comp, val, h_desc, r_desc, data, key_val,
+                     addinfo, laddinfo, dest, msgs);
+        if ( rc EQ ESA_SKIP ) {
+            rc = ESA_OK;
+            continue;
+        }
+        if ( rc NE ESA_OK )
+          goto exit;
+      }
+
+      /* Save the data */
+
+      switch(i) {
+       case 0:  /* FDT Name  */
+                strcpy(fdt, val);
+                /* saving the fdt name . use in rec 4012 */
+                strcpy(rec_4011_fdt,fdt) ; /* BS2713 */
+                break;
+       case 1:  /* FDT Field */
+                strcpy(kwd, val);
+                break;
+       case 2:  /* FDT Value */
+                break;
+       default :break;
+      }
+   }      /* vars loop */
+
+  /*
+   * Put to addinfo
+   */
+
+   data = &d_desc[2];  /* Ptr to Value */
+   if ( (strlen(val) GT 0 ) AND (strlen(fdt) GT 0) ) {
+
+     /*
+      * Special processing for the following fields :
+      * PCLGTYPE
+      * PCOPTS
+      * PCMINPWD  -  BS2460
+      * OPPRTY    -  BS2460
+      * PCIDLE    -  BS2460
+      * PCDSDAYS  -  BS2460
+      */
+
+     if (strcmp(fdt, "PCLGTYPE") EQ 0) {
+       TSS_strip_val(val, '0', TSS_STRIP_LEFT);
+     }
+     else if (strcmp(fdt, "PCOPTS") EQ 0) {
+       ADDINFO_convert_list_sep( val,
+                ',',               ',' ,
+                ADDINFO_LIST_ENTRY, ADDINFO_LIST_ENTRY);
+     }
+     else if ((strcmp(fdt, "PCMINPWD") EQ 0)  OR       /* BS2460 */
+              (strcmp(fdt, "OPPRTY")   EQ 0)  OR       /* BS2460 */
+              (strcmp(fdt, "PCIDLE")   EQ 0)  OR       /* BS2460 */
+              (strcmp(fdt, "PCDSDAYS") EQ 0)   ) { /* BS2460 */
+       /* Exactly what's TSS_strip_zero doing */       /* BS2460 */
+       TSS_strip_val(val, '0', TSS_STRIP_LEFT);        /* BS2460 */
+       if ( strlen(val) EQ 0 )                         /* BS2460 */
+          strcpy(val, "0");                            /* BS2460 */
+     }                                                 /* BS2460 */
+
+     /*
+      * Convert OPCLASS field to NETVOPCL
+      * BS2461
+      */
+
+     /* BS2485 start
+     else if (strcmp(fdt, "OPCLASS") EQ 0) {              BS2461
+        strcpy(fdt, "NETVOPCL");                          BS2461
+         *Exactly what's TSS_strip_zero doing *           BS2461
+       TSS_strip_val(val, '0', TSS_STRIP_LEFT);           BS2461
+       if ( strlen(val) EQ 0 )                            BS2461
+          strcpy(val, "0");                               BS2461
+     }
+     */
+     else if (strcmp(fdt, "OPCLASS") EQ 0) {
+       strcpy(fdt, "NETVOPCL");
+       ADDINFO_convert_list_sep( val,
+                ',',               ',' ,
+                ADDINFO_LIST_ENTRY, ADDINFO_LIST_ENTRY);
+     }
+     /* BS2485 end */
+
+     /* BS2667
+      * The TSSCFILE changed in v5.2 so we need to search NETVOPCL
+      */
+     else if (strcmp(fdt, "NETVOPCL") EQ 0) {
+       ADDINFO_convert_list_sep( val,
+                ',',               ',' ,
+                ADDINFO_LIST_ENTRY, ADDINFO_LIST_ENTRY);
+     } /* BS2667 end */
+
+     /* BS2471 Support comma list for NETVIEW domains */
+     else if (strcmp(fdt, "NETVDMNS") EQ 0) {
+       ADDINFO_convert_list_sep( val,
+                ',', ',' ,
+                ADDINFO_LIST_ENTRY, ADDINFO_LIST_ENTRY);
+     }
+     /* BS2471 end */
+
+     if ( data->dest EQ ADI_LOCAL ) {
+       ESA_DIAG_printf(comp, 5, "Local: %s=%s",fdt, val);
+       TSS_put_to_addinfo(comp, fdt, val, laddinfo,
+                          1, dest, msgs );
+     }
+     else if ( data->dest EQ ADI_REGLR ) {
+       ESA_DIAG_printf(comp, 5, "Reglr: %s=%s", fdt, val);
+       TSS_put_to_addinfo(comp, fdt, val, addinfo,
+                          0, dest, msgs );
+     }
+     else {
+       sprintf(internal2_msg_buf,
+     "'%s'.Unable to determine destination of %k=%s.Destination=%d",
+       pending_acid,
+       fdt, val, data->dest );
+
+       ESA_DIAG_printf(comp, 5, "DEST_ERR:%s", internal2_msg_buf);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                       component, func, internal2_msg_buf,
+                       4, __LINE__);
+       rc = ESA_FATAL;
+       OS_MVS_btrace();
+       goto exit;
+     }
+   }
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+ /* bs2602 - begin */
+ ESA_RC TSS_convert_list_sep(ESA_DIAG_COMP_typ        comp,
+                         char                       * record,
+                         TSSCFILE_HANDLE_typ        * h_desc,
+                         TSSCFILE_REC_typ           * r_desc,
+                         TSSCFILE_DESCR_typ         * d_desc,
+                         char                       * key_val,
+                         ADDINFO_rec_ptr              addinfo,
+                         ADDINFO_rec_ptr              laddinfo,
+                         CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                         CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_convert_list_sep";
+   TSSCFILE_DESCR_typ    * data = &d_desc[0];
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+      ESA_DIAG_printf(comp, 5,
+              "data for mcs: len=%d value=(%d)%s ",
+                                 data->len,
+                      strlen(record ), record );
+
+   rc =  ADDINFO_convert_list_sep( record,
+             ',', ',',
+             ADDINFO_LIST_ENTRY, ADDINFO_LIST_ENTRY);
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+ } /*bs2602 */
+
+ /* ps0395 */
+ ESA_RC TSS_put_0600(ESA_DIAG_COMP_typ            comp,
+                     TSS_GET_HANDLE_typ         * get_handle,
+                     char                       * record,
+                     TSSCFILE_HANDLE_typ        * h_desc,
+                     TSSCFILE_REC_typ           * r_desc,
+                     TSSCFILE_DESCR_typ         * d_desc,
+                     char                       * key_val,
+                     ADDINFO_rec_ptr              addinfo,
+                     ADDINFO_rec_ptr              laddinfo,
+                     CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                     CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_put_0600";
+   int                     i;
+   char                    acid[10] = "";
+   char                    prf[10]  = "";
+   char                    expd[10] = "";
+   char                    rec0600[100];
+   TSSCFILE_DESCR_typ    * data = &d_desc[0];
+   TSSCFILE_DATA_EXT_typ * cfunc;
+   char                    val[MAX_TSS_PARAM_LEN];
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+  /*
+   *  Extract data
+   */
+
+   for (i=0; data = &d_desc[i], data->addinfo_k; i++) {
+
+      memcpy(val, record + data->pos - 1, data->len);
+      val[data->len] = NULL_CHAR;
+
+      ESA_DIAG_printf(comp, 5,
+                      "%d.%s data pos=%d data len=%d value=(%d)%s",
+                      i, data->addinfo_k, data->pos, data->len,
+                      strlen(val), val );
+     /*
+      * Special conversion ?
+      */
+
+      if ( data->cfunc NE NULL ) {       /* Expiration data ? */
+        TSS_strip_val(val, ' ', TSS_STRIP_BOTH);
+        cfunc = (TSSCFILE_DATA_EXT_typ *)data->cfunc;
+        rc = (cfunc)(comp, val, h_desc, r_desc, data, key_val,
+                     addinfo, laddinfo, dest, msgs);
+        if ( rc EQ ESA_SKIP ) {
+            rc = ESA_OK;
+            continue;
+        }
+        if ( rc NE ESA_OK )
+          goto exit;
+      }
+
+     /*
+      * Put to addinfo
+      */
+
+      if ( strlen(val) GT 0 ) {
+        if ( data->dest EQ ADI_LOCAL ) {
+          ESA_DIAG_printf(comp, 5, "Local: %s=%s",data->addinfo_k, val);
+          strcpy(acid, val);
+          TSS_strip_val(acid, ' ', TSS_STRIP_BOTH);
+        }
+        else if ( data->dest EQ ADI_REGLR ) {
+          ESA_DIAG_printf(comp, 5, "Reglr: %s=%s",data->addinfo_k, val);
+          memcpy(prf, val,8);
+          prf[8] = '\0';
+          TSS_strip_val(prf, ' ', TSS_STRIP_BOTH);
+          memcpy(expd, &val[8], 8);
+          expd[8] = '\0';
+          TSS_strip_val(expd, ' ', TSS_STRIP_BOTH);
+
+          TSS_strip_val(val, ' ', TSS_STRIP_BOTH);
+          TSS_put_to_addinfo(comp, data->addinfo_k, val, addinfo,
+                               0, dest, msgs );
+        }
+        else {
+          sprintf(internal2_msg_buf,
+        "'%s'.Unable to determine destination of %k=%s.Destination=%d",
+          pending_acid,
+          data->addinfo_k, val, data->dest );
+
+          ESA_DIAG_printf(comp, 5, "DEST_ERR:%s", internal2_msg_buf);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                          component, func, internal2_msg_buf,
+                          4, __LINE__);
+          rc = ESA_FATAL;
+          OS_MVS_btrace();
+          goto exit;
+        }
+      }
+   }      /* vars loop */
+
+   /* Put record 0600 information */
+
+   if (get_handle->r0600 NE NULL) {
+      if ( (strlen(acid) GT 0) AND
+           (strlen(prf)  GT 0)   ) {
+        /*
+         * fprintf(get_handle->r0600,
+         *        "%s,%s,%s\n", acid, prf, expd);
+         */
+
+         sprintf(rec0600, "%s,%s,%s", acid, prf, expd);
+         for (i=0; i LT strlen(rec0600); i++) {
+           rec0600[i] = ~rec0600[i];
+         }
+         fprintf(get_handle->r0600, "%s\n", rec0600);
+         if ( ferror(get_handle->r0600) ) {
+            ESA_DIAG_printf(comp, 5,
+                         "TSS_put_0600: acid=|%s| prf=|%s| expd=|%s|",
+                         acid, prf, expd);               /* SAS2IBMT */
+            ESA_DIAG_printf(comp, 5,
+             "TSS_put_0600: rec0600=%02X%02X%02X%02X%02X%02X%02X%02X",
+             rec0600[0],rec0600[1],rec0600[2],rec0600[3],
+             rec0600[4],rec0600[5],rec0600[6],rec0600[7]);
+            ESA_DIAG_printf(comp, 5,
+             "                      %02X%02X%02X%02X%02X%02X%02X%02X",
+             rec0600[8],rec0600[9],rec0600[10],rec0600[11],
+             rec0600[12],rec0600[13],rec0600[14],rec0600[15]);
+            ESA_DIAG_printf(comp, 5,
+             "                      %02X%02X%02X%02X%02X%02X%02X%02X",
+             rec0600[16],rec0600[17],rec0600[18],rec0600[19],
+             rec0600[20],rec0600[21],rec0600[22],rec0600[23]);
+            ESA_DIAG_printf(comp, 5,
+             "                      %02X%02X%02X%02X%02X%02X%02X%02X",
+             rec0600[24],rec0600[25],rec0600[26],rec0600[27],
+             rec0600[28],rec0600[29],rec0600[30],rec0600[31]);
+            ESA_DIAG_printf(comp, 5,
+             "                      %02X%02X%02X%02X%02X%02X%02X%02X",
+             rec0600[32],rec0600[33],rec0600[34],rec0600[35],
+             rec0600[36],rec0600[37],rec0600[38],rec0600[39]);
+            ESA_DIAG_printf(comp, 5,
+             "                      %02X%02X%02X%02X%02X%02X%02X%02X",
+             rec0600[40],rec0600[41],rec0600[42],rec0600[43],
+             rec0600[44],rec0600[45],rec0600[46],rec0600[47]);
+            CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                          "fputs", R0600_DD, strerror(errno) );
+            rc = ESA_FATAL;
+            fclose(get_handle->r0600);
+            get_handle->r0600 = NULL;
+         }
+         else {
+            ESA_DIAG_printf(comp, 5,
+             "TSS_put_0600: rec0600=%02X%02X%02X%02X%02X%02X%02X%02X",
+             rec0600[0],rec0600[1],rec0600[2],rec0600[3],
+             rec0600[4],rec0600[5],rec0600[6],rec0600[7]);
+            ESA_DIAG_printf(comp, 5,
+             "                      %02X%02X%02X%02X%02X%02X%02X%02X",
+             rec0600[8],rec0600[9],rec0600[10],rec0600[11],
+             rec0600[12],rec0600[13],rec0600[14],rec0600[15]);
+            ESA_DIAG_printf(comp, 5,
+             "                      %02X%02X%02X%02X%02X%02X%02X%02X",
+             rec0600[16],rec0600[17],rec0600[18],rec0600[19],
+             rec0600[20],rec0600[21],rec0600[22],rec0600[23]);
+            ESA_DIAG_printf(comp, 5,
+             "                      %02X%02X%02X%02X%02X%02X%02X%02X",
+             rec0600[24],rec0600[25],rec0600[26],rec0600[27],
+             rec0600[28],rec0600[29],rec0600[30],rec0600[31]);
+            ESA_DIAG_printf(comp, 5,
+             "                      %02X%02X%02X%02X%02X%02X%02X%02X",
+             rec0600[32],rec0600[33],rec0600[34],rec0600[35],
+             rec0600[36],rec0600[37],rec0600[38],rec0600[39]);
+            ESA_DIAG_printf(comp, 5,
+             "                      %02X%02X%02X%02X%02X%02X%02X%02X",
+             rec0600[40],rec0600[41],rec0600[42],rec0600[43],
+             rec0600[44],rec0600[45],rec0600[46],rec0600[47]);
+         }
+      }
+   }
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+ /* ws2362 */
+ ESA_RC TSS_last_mod(ESA_DIAG_COMP_typ            comp,
+                     char                       * tss_last_mod,
+                     TSSCFILE_HANDLE_typ        * h_desc,
+                     TSSCFILE_REC_typ           * r_desc,
+                     TSSCFILE_DESCR_typ         * d_desc,
+                     char                       * key_val,
+                     ADDINFO_rec_ptr              addinfo,
+                     ADDINFO_rec_ptr              laddinfo,
+                     CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                     CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc     = ESA_OK ;
+   ESA_RC                  rc_cnv = ESA_OK ;
+   char                    last_mod_date[10];
+   char                    last_mod_time[10];
+   /*WS10082 char          last_mod[MAX_TSS_PARAM_LEN + 1];         */
+   char                    last_mod[21];                   /*WS10082*/
+   static  char            func[]="TSS_last_mod";
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   /* Extract Date */
+
+   memcpy(last_mod_date, tss_last_mod, 8);
+   last_mod_date[8] = NULL_CHAR;
+   rc_cnv = TSS_ConvertDateTSS2ESS(comp, last_mod_date, dest, msgs );
+
+   /* Extract Time */
+
+   memcpy(last_mod_time, tss_last_mod+8, 5);
+   last_mod_time[5]  = NULL_CHAR;
+
+   /* Build Combined field */
+
+   /* if (rc_cnv EQ ESA_OK) { */
+   if (rc_cnv NE ESA_OK) { /* PS0459 */
+     memcpy(last_mod,     &last_mod_date[6], 2);  /* DD   */
+     last_mod[2] = '/';
+     memcpy(&last_mod[3], &last_mod_date[4], 2);  /* MM   */
+     last_mod[5] = '/';
+     memcpy(&last_mod[6], last_mod_date,     4);  /* YYYY */
+     last_mod[10] = NULL_CHAR;
+   }
+   else {      /* Take as is from TSS */
+     memcpy(last_mod, tss_last_mod, 8);
+     last_mod[8] = NULL_CHAR;
+   }
+
+   strcat(last_mod, " ");
+   strcat(last_mod, last_mod_time);
+
+   /* Return field back */
+
+   strcpy(tss_last_mod, last_mod);
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+
+/*********************************** start of bs2583 *************/
+ /* bs2583 */
+ ESA_RC TSS_put_4404(ESA_DIAG_COMP_typ            comp,
+                     TSS_GET_HANDLE_typ         * get_handle,
+                     char                       * record,
+                     TSSCFILE_HANDLE_typ        * h_desc,
+                     TSSCFILE_REC_typ           * r_desc,
+                     TSSCFILE_DESCR_typ         * d_desc,
+                     char                       * key_val,
+                     ADDINFO_rec_ptr              addinfo,
+                     ADDINFO_rec_ptr              laddinfo,
+                     CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                     CTSAMSG_HANDLE_rec_ptr       msgs)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                  rc = ESA_OK ;
+   static  char            func[]="TSS_put_4404";
+   int                     i;
+   TSSCFILE_DESCR_typ    * data = &d_desc[0];
+   TSSCFILE_DATA_EXT_typ * cfunc;
+   char                    val[MAX_TSS_PARAM_LEN];
+   char                    segment[67];
+   int                     cont;
+   char                  * addinfo_k = NULL;
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(comp, 5, func );
+
+   if (get_handle->r4404.data == NULL) {
+
+      ESA_DIAG_printf(comp, 5,
+                      "allocating r4404 data buffer");
+      get_handle->r4404.data = (char *) malloc(MAX_R4404_SIZE);
+      if ( get_handle->r4404.data EQ NULL ) {
+         CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                       "Get R4404 Buffer", MAX_R4404_SIZE);
+         OS_MVS_btrace();
+         rc = ESA_FATAL ;
+         goto exit ;
+      }
+      ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,                 /*IS0358*/
+       "malloc (%6X) bytes at address (%x) (%d,%s)",        /*IS10027*/
+       MAX_R4404_SIZE,
+       get_handle->r4404.data, __LINE__, __FILE__ );
+      ESA_DIAG_printf(comp, 5,
+                      "zero r4404 data buffer");
+      memset((char *) get_handle->r4404.data,'\x0', MAX_R4404_SIZE);
+   }
+
+  /*
+   *  Extract data
+   */
+
+   cont = 0;   /* init the continue flag */
+
+   for (i=0; data = &d_desc[i], data->addinfo_k; i++) {
+
+      memcpy(val, record + data->pos - 1, data->len);
+      val[data->len] = NULL_CHAR;
+
+      ESA_DIAG_printf(comp, 5,
+                      "%d.%s data pos=%d data len=%d value=(%d)%s",
+                      i, data->addinfo_k, data->pos, data->len,
+                      strlen(val), val );
+     /*
+      * Special conversion ?
+      */
+
+      if ( data->cfunc NE NULL ) {       /* Expiration data ? */
+        TSS_strip_val(val, ' ', TSS_STRIP_BOTH);
+        cfunc = (TSSCFILE_DATA_EXT_typ *)data->cfunc;
+        rc = (cfunc)(comp, val, h_desc, r_desc, data, key_val,
+                     addinfo, laddinfo, dest, msgs);
+        if ( rc EQ ESA_SKIP ) {
+            rc = ESA_OK;
+            continue;
+        }
+        if ( rc NE ESA_OK )
+          goto exit;
+      }
+
+     /*
+      * Put to addinfo
+      */
+
+      if ( strlen(val) GT 0 ) {
+        if ( data->dest EQ ADI_LOCAL ) {
+          ESA_DIAG_printf(comp, 5, "Local: %s=%s",data->addinfo_k, val);
+          if (val[0] == 'C')
+            cont = 1;
+        }
+        else if ( data->dest EQ ADI_REGLR ) {
+          ESA_DIAG_printf(comp, 5, "Reglr: %s=%s",data->addinfo_k, val);
+          memcpy(segment,val,66);
+          segment[66] = '\0';
+          TSS_strip_val(segment, ' ', TSS_STRIP_BOTH);
+          if (!cont)
+             addinfo_k = data->addinfo_k;
+        }
+        else {
+          sprintf(internal2_msg_buf,
+        "'%s'.Unable to determine destination of %k=%s.Destination=%d",
+          pending_acid,
+          data->addinfo_k, val, data->dest );
+
+          ESA_DIAG_printf(comp, 5, "DEST_ERR:%s", internal2_msg_buf);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                          component, func, internal2_msg_buf,
+                          4, __LINE__);
+          rc = ESA_FATAL;
+          OS_MVS_btrace();
+          goto exit;
+        }
+      }
+   }      /* vars loop */
+
+   /* Put the segment in the cumulative buffer */
+
+   ESA_DIAG_printf(comp, 5, "data len = %d, segment = %s, len = %d",
+        get_handle->r4404.data_len,segment,strlen(segment));
+
+   strcpy(get_handle->r4404.data+get_handle->r4404.data_len,segment);
+   get_handle->r4404.data_len += strlen(segment);
+
+   /* if last segment, put to addinfo buffer and reset */
+   /* cumulative buffer                                */
+
+   ESA_DIAG_printf(comp, 5, "cont = %d", cont);
+   if (!cont) {
+      TSS_put_to_addinfo(comp, addinfo_k,
+       get_handle->r4404.data, addinfo, 0, dest, msgs );
+      get_handle->r4404.data_len = 0;
+      ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,   /*IS0358*/
+           "Free address (%x) (%d,%s)",
+           get_handle->r4404.data, __LINE__, __FILE__ );
+      free(get_handle->r4404.data);
+      get_handle->r4404.data  = NULL;
+    }
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_exit(comp, 5, func, rc);
+
+   return rc ;
+
+ }
+/*************************************************************/
+/* IS0347 start */
+ESA_RC TSS_open_output_file(ESA_DIAG_COMP_typ  comp,
+                            ADMIN_PARAMS_rec_typ * admin_params,
+                            FILE ** out_file)
+{
+     static char func[]="TSS_open_output_file";
+
+     /* define end */
+     ESA_RC     rc = ESA_OK;
+     ESA_RC     rc_parm = ESA_OK;
+     char       parm_get[4] = " ";
+     char       file_name[20] = " ";
+     char       ddn_with[MAX_FILENAME_LEN];               /* SAS2IBMT */
+     CTSAMSG_HANDLE_rec_typ     * msgs;
+     CTSAMSG_DEST_TABLE_rec_typ * dest;
+
+     ESA_DIAG_enter(comp, 3, func);
+     /* init */
+     msgs = admin_params->ctsamsg_handle;
+     dest = admin_params->ctsamsg_dest;
+
+     /* get parm */
+     rc_parm=admin_params->cs_func.rssprm_get_opt_ptr(admin_params->rss_name,
+                                             CFILE_DEBUG,
+                                             sizeof(parm_get),
+                                             parm_get,
+                                             OPT_TRUE,
+                                             OPT_TRUE) ;
+
+     ESA_DIAG_printf(comp, 10,
+            "Get CFILE_DEBUG parameter rc = %d ", rc_parm);
+
+     ESA_DIAG_printf(comp, 7,
+            "Value parameter CFILE_DEBUG = %c", parm_get[0]);
+
+     /* check if CFILE_DEBUD activate */
+     if ((rc_parm EQ ESA_OK) && (parm_get[0] EQ CFILE_DEBUG_ON))
+         strcpy(file_name,TSSCFILE_DEBUG_DD);
+     else
+         strcpy(file_name,TSSCFILE_OUT_DD);
+
+     ESA_DIAG_printf(comp, 10,
+            "File open - '%s' ", file_name);
+
+     strcpy(ddn_with,"DD:");                              /* SAS2IBMT */
+     strcat(ddn_with, file_name);                         /* SAS2IBMT */
+
+     /* SAS2IBMT *out_file = afopen(file_name, FILE_OPEN_READ_BINARY,
+                  NULL_STRING, NULL_STRING);                         */
+     /* SAS2IBMT
+     *out_file = fopen(file_name, FILE_OPEN_READ_BINARY_REC);        */
+     *out_file = fopen(ddn_with, FILE_OPEN_READ_BINARY_REC);
+                                                          /* SAS2IBMT */
+     if (*out_file EQ NULL)
+     {
+         CTSAMSG_print(ERR_FILE, msgs, NULL, dest,
+                "fopen", comp, file_name, strerror(errno));
+         rc = ESA_FATAL;
+         return rc;
+     }
+     ESA_DIAG_exit(comp, 3, func, rc);
+     return rc;
+}
+/* IS0347 end */

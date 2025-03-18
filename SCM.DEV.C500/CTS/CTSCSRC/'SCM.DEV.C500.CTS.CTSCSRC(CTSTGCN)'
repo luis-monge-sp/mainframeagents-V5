@@ -1,0 +1,3292 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : get user to group connections (TSS)      *
+ *                                                             *
+ * File Name        : ctstgcn.c                                *
+ *                                                             *
+ * Author           : Alexander Shvartsman                     *
+ *                                                             *
+ * Creation Date    : 19/01/97                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * PS0312   Alex     16/09/98 GetAll By Containers support     *
+ * PS0318   Alex     09/10/98 Self learning extracts           *
+ * BS2382   AS       13/04/99 Connections may be returned with *
+ *                            POS = -1                         *
+ * PS0380   AS       05/05/99 Download fails, when acid deleted*
+ *                            during the download transaction  *
+ * PS0395   As       17/11/99 Cache  Connections               *
+ * PS0495   RK       27/12/01 correct download cancel\restart  *
+ *                            and skip use of TSSCACHE for     *
+ *                            download restart                 *
+ * BS2518   RK       25/03/02 correct download cancel\restart  *
+ *                            fix and return use for TSSCACHE  *
+ * IS0358   YoniMa   17/08/06 memory leak.(BS2698)             *
+ * IS10015  MS       20/11/07 Storage Violation                *
+ * IS10027  ShmuelK  25/01/09 memory diag is 5 & size in heX.  *
+ * IS10032  AvnerL   17/08/09 Fix IS10015 so print limited diag*
+ * SAS2IBMT SeligT   30/06/16 SAS/C to IBM C Conversion Project*
+ * BS10080  AvnerL   08/02/18 UpperCase R0600-TSSCACHE-compile *
+ * IS10171  SeligT   15/04/18 Do not retrieve unneeded data.   *
+ *                            This was copied from change      *
+ *                            WS10066 from V3 and was tagged   *
+ *                            WS10066 here.                    *
+ * IS10174  NuritY   15/01/18 Dynamic EXECOUT support.         *
+ * WS10082  MauriC   14/11/22 Recompile for new ADDINFO macros *
+ **************************************************************/
+
+ /*
+  *   Standard include files
+  */
+
+ #include   <globs.h>
+ #include   STDIO
+ #include   STDLIB
+ #include   STRING
+ #include   TIME
+ #include   ERRNO                                         /* SAS2IBMT */
+
+ /*
+  *   ESA include files
+  */
+
+ #include   ESA_API
+ #include   ESA_DIAG
+ #include   ESA_CTSAMSG
+ #include   ESA_API_CODES
+ #include   API_ADDINFO
+
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_COMP
+ #include MVS_OS_MVS
+
+ /*
+  *   TSS include files
+  */
+
+ #include TSS
+ #include TSS_XCNN
+ #include TSS_CODES
+
+ static char component[] = "CTSTGCN";
+
+ static ESA_RC TSS_do_users_list(ESA_DIAG_COMP_typ  comp,
+                            char                  * acid_type,
+                            TSS_TRAP_BUF_rec_typ  * acids_list,
+                            TSS_GET_HANDLE_typ    * get_handle,
+                            short                   max_conns,
+                            short                 * actual_num,
+                            HAVE_MORE_typ         * have_more,
+                            U2UG_PARAMS_rec_typ     u2ug_params[1],
+                            ADDINFO_rec_ptr         addinfo[1],
+                            OBJ_EXISTS_typ          objs_exist[1],
+                            ADMIN_PARAMS_rec_typ  * admin_params,
+                            ERR_STRUCT_rec_typ    * err);
+
+ static ESA_RC TSS_do_ug_list(ESA_DIAG_COMP_typ     comp,
+                            char                  * acid_type,
+                            TSS_TRAP_BUF_rec_typ  * acids_list,
+                            TSS_GET_HANDLE_typ    * get_handle,
+                            short                   max_conns,
+                            short                 * actual_num,
+                            HAVE_MORE_typ         * have_more,
+                            U2UG_PARAMS_rec_typ     u2ug_params[1],
+                            ADDINFO_rec_ptr         addinfo[1],
+                            OBJ_EXISTS_typ          objs_exist[1],
+                            ADMIN_PARAMS_rec_typ  * admin_params,
+                            ERR_STRUCT_rec_typ    * err);
+
+ static ESA_RC TSS_do_pairs_list(ESA_DIAG_COMP_typ  comp,
+                        TSS_TRAP_CNN_BUF_rec_typ  * pairs_list,
+                        TSS_GET_HANDLE_typ        * get_handle,
+                        short                       max_conns,
+                        short                     * actual_num,
+                        HAVE_MORE_typ             * have_more,
+                        U2UG_PARAMS_rec_typ         u2ug_params[1],
+                        ADDINFO_rec_ptr             addinfo[1],
+                        OBJ_EXISTS_typ              objs_exist[1],
+                        ADMIN_PARAMS_rec_typ      * admin_params,
+                        ERR_STRUCT_rec_typ        * err);
+
+ static ESA_RC  TSS_put_connect_info(ESA_DIAG_COMP_typ   comp,
+                             int                         k,
+                             TSS_TRAP_CNN_DATA_typ     * cnn_data,
+                             U2UG_PARAMS_rec_typ         u2ug_params[1],
+                             ADDINFO_rec_ptr             addinfo[1],
+                             OBJ_EXISTS_typ              objs_exist[1],
+                             CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                             CTSAMSG_HANDLE_rec_ptr      msgs);
+
+static ESA_RC TSS_set_ug_acids_list(ESA_DIAG_COMP_typ   comp,
+                   TSS_TRAP_BUF_rec_typ              ** ug_list,
+                   UG_typ                               ugs_in[1],
+                   short                                num_ugs_in,
+                   ADMIN_PARAMS_rec_typ               * admin_params,
+                   ERR_STRUCT_rec_typ                 * err);
+
+static ESA_RC TSS_set_user_acids_list(ESA_DIAG_COMP_typ comp,
+                   TSS_TRAP_BUF_rec_typ              ** user_list,
+                   USER_typ                             users_in[1],
+                   short                                num_users_in,
+                   ADMIN_PARAMS_rec_typ               * admin_params,
+                   ERR_STRUCT_rec_typ                 * err);
+
+static ESA_RC TSS_set_pair_acids_list(ESA_DIAG_COMP_typ comp,
+                   TSS_TRAP_CNN_BUF_rec_typ          ** pair_list,
+                   USER_typ                             users_in[1],
+                   short                                num_users_in,
+                   UG_typ                               ugs_in[1],
+                   short                                num_ugs_in,
+                   ADMIN_PARAMS_rec_typ               * admin_params,
+                   ERR_STRUCT_rec_typ                 * err);
+
+  /*
+   *  PS0132. Time managament vars
+   */
+
+   static  char         get_all_vrbs[MAX_TSS_PARAM_LEN + 1]= "";
+   static  time_t       before,  after;
+   static  double       difft, ss;
+   static  int          hh, mm;
+   static  int          new_entries;
+   static  char         elapsed_m[100];
+   static  char         elapsed_t[400];
+
+  /*
+   *  ps0318. Self-learning extracts
+   */
+
+typedef  struct _extract_table_entry_t {
+   char        acid[12];
+   char       *list;
+                 /*
+                  * For Download By Group :
+                  * list = prf1#prf2#prf3#....
+                  * For Download By User  :
+                  * list = usr1#exp_date1#usr2#exp_date2#....
+                  */
+} TSS_EXTRACT_TABLE_ENTRY_typ, *TSS_EXTRACT_TABLE_ENTRY_ptr;
+
+typedef  struct _extract_table_t {
+  int                            allow_to_realloc;
+  int                            allocated;
+  int                            used;
+  TSS_EXTRACT_TABLE_ENTRY_typ   *entries;
+} TSS_EXTRACT_TABLE_typ, *TSS_EXTRACT_TABLE_ptr;
+
+#define MAX_INITIAL_EXTRACT_TABLE   1000
+static TSS_EXTRACT_TABLE_typ  extract_table;
+static char                   sepc[3 ];
+static ESA_RC TSS_EXtractTableInit(CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                                   CTSAMSG_HANDLE_rec_ptr       msgs);
+static ESA_RC TSS_EXtractTableTerm(CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                                   CTSAMSG_HANDLE_rec_ptr       msgs);
+static ESA_RC TSS_EXtractTableRealloc(CTSAMSG_DEST_TABLE_rec_ptr dest,
+                                      CTSAMSG_HANDLE_rec_ptr     msgs);
+static ESA_RC TSS_ExtractTable_UGet(char                     *u_acid,
+                                   TSS_TRAP_CNN_BUF_rec_typ **user_data,
+                                   CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                                   CTSAMSG_HANDLE_rec_ptr       msgs);
+static ESA_RC TSS_ExtractTable_GGet(char                     *g_acid,
+                                   TSS_TRAP_CNN_BUF_rec_typ **ug_data,
+                                   CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                                   CTSAMSG_HANDLE_rec_ptr       msgs);
+static ESA_RC TSS_ExtractTable_UPut(char                     *u_acid,
+                                   TSS_TRAP_CNN_BUF_rec_typ **user_data,
+                                   CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                                   CTSAMSG_HANDLE_rec_ptr       msgs);
+
+static ESA_RC TSS_ExtractTable_GPut(char                     *g_acid,
+                                   TSS_TRAP_CNN_BUF_rec_typ **ug_data,
+                                   CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                                   CTSAMSG_HANDLE_rec_ptr       msgs);
+
+
+/* ps0395 */
+static ESA_RC R0600_build_cnn_data(TSS_GET_HANDLE_typ    * get_handle,
+                           TSS_TRAP_CNN_DATA_typ  * cnn_data_in,
+                           TSS_TRAP_CNN_DATA_typ  * cnn_data_out);
+
+static ESA_RC R0600_split_record(char                * r0600_record,
+                          TSS_TRAP_CNN_DATA_typ      * cnn_data_out,
+                          CTSAMSG_HANDLE_rec_typ     * msgs,
+                          CTSAMSG_DEST_TABLE_rec_typ * dest);
+
+static ESA_RC TSS_do_r0600_list(ESA_DIAG_COMP_typ  comp,
+                            TSS_GET_HANDLE_typ    * get_handle,
+                            short                   max_conns,
+                            short                 * actual_num,
+                            HAVE_MORE_typ         * have_more,
+                            U2UG_PARAMS_rec_typ     u2ug_params[1],
+                            ADDINFO_rec_ptr         addinfo[1],
+                            OBJ_EXISTS_typ          objs_exist[1],
+                            ADMIN_PARAMS_rec_typ  * admin_params,
+                            ERR_STRUCT_rec_typ    * err);
+   /* commented by BS2518   int                   * this_is_a_restart)*/
+
+ static ESA_RC R0600_seek_record(TSS_GET_HANDLE_typ   * get_handle,
+                           char                       * user,
+                           char                       * group,
+                           CTSAMSG_HANDLE_rec_typ     * msgs,
+                           CTSAMSG_DEST_TABLE_rec_typ * dest);
+
+ /****************************************************
+ * Procedure Name: gtug2uc
+ * Description   : Get user-group to user connections
+ * Input         : mode         - ALL_UGS    - get connections of all
+ *                                             ugs (all users of all
+ *                                             groups)
+ *                                ALL_USERS  - get connections of all
+ *                                             users (same as ALL_UGS
+ *                                             from different angle)
+ *                                MANY_UGS   - get connections of
+ *                                             supplied ugs
+ *                                MANY_USERS - NOT IMPLEMENTED yet
+ *                                MANY_PAIRS - get connections for
+ *                                             supplied pairs.
+ *                 max_conns    - # of elements in ugs,
+ *                                users, objs_exist & addinfo
+ *                                arrays
+ *                 admin_params -
+ *                 num_ugs_in   - # of input ugs
+ *                 num_users_in - # of input users
+ *                 ugs_in - array of num_ugs_in.
+ *                                Caller fills with ugs requested
+ *                                (if not GET_ALL);
+ *                 users_params_in - array of num_users_in.
+ *                                Caller fills with users requested.
+ * Output        : actual_num   - # of connections returned
+ *                 have_more    - HAVE_MORE if more conns, else NO_MORE
+ *                 objs_exist   - array of max_conns:
+ *                                OBJ_EXIST if connection exists, else
+ *                                OBJ_NOT_EXIST.
+ *                 addinfo      - array of max_conns:
+ *                                add.info per connection
+ *                 err          - error indication, message, etc.
+ * Input/Output  : handle       - NULL on first call, filled by callee,
+ *                                used by callee to keep track.
+ *                                Freed by caller.
+ * Return Value  : ESA_RC
+ * Side Effects  : Function may allocate memory, return pointer in
+ *                 *handle; Caller MUST free when done.
+ * Comments      : 1. Data is returned as quartets - ug, user, obj_exist,
+ *                    add.info.
+ *
+ ****************************************************/
+
+ ESA_RC CTSGetConns (GET_CONN_MODE          mode,
+                     short                  max_conns,
+                     short                * actual_num,
+                     HAVE_MORE_typ        * have_more,
+                     void                ** handle,
+                     short                  num_ugs_in,
+                     short                  num_users_in,
+                     UG_typ                 ugs_in[1],
+                     USER_typ               users_in[1],
+                     U2UG_PARAMS_rec_typ    u2ug_params[1],
+                     ADDINFO_rec_ptr        addinfo[1],
+                     OBJ_EXISTS_typ         objs_exist[1],
+                     ADMIN_PARAMS_rec_typ * admin_params,
+                     ERR_STRUCT_rec_typ   * err)
+
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                       rc = ESA_OK;
+   CTSAMSG_HANDLE_rec_ptr       msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr   dest;
+   OE_typ                       dummy_oe = "";
+   TSS_GET_HANDLE_typ         * get_handle = NULL;
+   TSS_TRAP_BUF_rec_typ       * users_list = NULL;
+   TSS_TRAP_BUF_rec_typ       * oes_list   = NULL;         /* PS0312 */
+   TSS_ACID_HEADER_rec_typ      acid_info;                 /* PS0312 */
+   char                         val[MAX_TSS_PARAM_LEN + 1];/* PS0312 */
+   int                          run_get_acids_list = FALSE;/* PS0312 */
+   int                          get_next_container = FALSE;/* PS0312 */
+   char                         get_types_ind;             /* PS0312 */
+   int                          i_tmp;                     /* PS0312 */
+   int                          download_from = FALSE;     /* PS0312 */
+   OE_typ                       tmp_oe = "";               /* PS0312 */
+ /* commented by BS2518 */
+ /*static int                   this_is_a_restart = FALSE; /* ps0495 */
+   char                         tmp_oe_tp[MAX_TSS_PARAM_LEN + 1];
+   char                         get_all_mode[MAX_TSS_PARAM_LEN + 1]= "";
+   char                         get_all_rule[MAX_TSS_PARAM_LEN + 1]= "";
+   char                         root_name[MAX_TSS_PARAM_LEN + 1];
+   TSS_TRAP_BUF_rec_typ       * ug_list    = NULL;
+   TSS_TRAP_CNN_BUF_rec_typ   * pair_list  = NULL;
+   int                          i_dump;
+   static TSS_GET_TYPES_rec_typ user_get_types[] = {
+                       {  TSS_USER,   '0'     } ,
+                       {  TSS_DCA,    '0'     } ,
+                       {  TSS_VCA,    '0'     } ,
+                       {  TSS_ZCA,    '0'     } ,
+                       {  TSS_SCA,    '0'     } ,
+                       {  TSS_LSCA,   '0'     } ,
+                       {  NULL ,      '0'     }   };
+
+
+   /* PS0312 */
+
+   static TSS_GET_TYPES_rec_typ group_get_types[] = {
+                       {  TSS_PROFILE,   '0'     } ,
+                       {  TSS_GROUP,     '0'     } ,
+                       {  NULL ,         '0'     }   };
+
+   static TSS_GET_TYPES_rec_typ    oe_get_types_u[] = {
+                       /*                   '0' - Reserved for Root */
+                       {  TSS_ZONE,         '1'   } ,
+                       {  TSS_DIVISION,     '2'   } ,
+                       {  TSS_DEPARTMENT,   '3'   } ,
+                       {  NULL ,            '0'   } };
+
+   static TSS_GET_TYPES_rec_typ    oe_get_types_g[] = {
+                       /*                   '0' - Reserved for Root */
+                       {  TSS_DEPARTMENT,   '3'   } ,
+                       {  NULL ,            '0'   } };
+
+   static TSS_GET_TYPES_rec_typ  get_types_for_root   []  = {
+                       {  TSS_SCA,    '0'     } ,
+                       {  TSS_LSCA,   '0'     } ,
+                       {  NULL ,      '0'     }   };
+   static TSS_GET_TYPES_rec_typ  get_types_for_zone   []  = {
+                       {  TSS_ZCA,    '0'     } ,
+                       {  NULL ,      '0'     }   };
+   static TSS_GET_TYPES_rec_typ  get_types_for_div    []  = {
+                       {  TSS_VCA,    '0'     } ,
+                       {  NULL ,      '0'     }   };
+   static TSS_GET_TYPES_rec_typ  get_types_for_dept   []  = {
+                       {  TSS_USER,   '0'     } ,
+                       {  TSS_DCA,    '0'     } ,
+                       {  NULL ,      '0'     }   };
+
+   static char                func[]="CTSGetConns";
+
+  /*
+   *     Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GTUG2UC, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   users_list  = NULL;
+   ug_list     = NULL;
+   *have_more  = NO_MORE ;
+   *actual_num = 0;
+
+   strcpy(get_all_vrbs, "");      /* PS0312 */
+
+   ESA_DIAG_printf(ESA_COMP_GTUG2UC,1,
+                   "mode=%d handle=%X max_conns=%d",
+                    mode, *handle , max_conns);
+
+  /*
+   *    Check if handle was passed, if no create it
+   */
+
+   if ( mode NE GET_FREE_HANDLE_CONNS ) {
+
+      if ( (*handle) EQ NULL) {                /* ps0318 */
+         TSS_EXtractTableInit(dest, msgs);     /* ps0318 */
+         sepc[0] = ADDINFO_LIST_ENTRY;         /* ps0318 */
+         sepc[1] = NULL_CHAR;                  /* ps0318 */
+      }                                        /* ps0318 */
+
+      rc = TSS_init_get_handle( ESA_COMP_GTUG2UC, TSS_IGNORE_ERR,
+                                &get_handle, handle ,
+                                addinfo[0], admin_params, err );
+      if ( rc NE ESA_OK )
+         goto exit ;
+   }
+
+  /*
+   *  Executing according to mode
+   */
+
+   switch (mode) {
+
+      case GET_FREE_HANDLE_CONNS :
+         *have_more=NO_MORE;
+         goto exit;
+
+      case GET_ALL_CONNS:
+
+       /* Start of PS0495 */
+       if ( ( num_users_in EQ 1 )            AND
+            ( NOT get_handle->acids_list ) ) {
+          if (get_handle->this_is_a_restart) {
+             if (get_handle->this_is_a_first_restart_entry) {
+                get_handle->this_is_a_first_restart_entry = FALSE;
+             }
+             ESA_DIAG_printf(ESA_COMP_GTUG2UC,3,
+                          "this is a restart - subsequent entry");
+          }
+          else {
+             get_handle->this_is_a_restart = TRUE;
+             get_handle->this_is_a_first_restart_entry = TRUE;
+             ESA_DIAG_printf(ESA_COMP_GTUG2UC,3,
+                          "this is a restart - first entry");
+          }
+       } /* end of PS0495 */
+
+       /* Start of PS0312 */
+
+       /*  Get Verbose parameter */
+
+       rc= admin_params->
+             cs_func.rssprm_get_opt_ptr(admin_params->rss_name,
+                    TSS_GET_ALL_VERBOSE,
+                    sizeof(get_all_vrbs) - 1,
+                    get_all_vrbs, OPT_TRUE, OPT_TRUE);
+       if ( rc NE ESA_OK)
+         strcpy(get_all_vrbs, KWD_FLAG_OFF);
+
+       /*  Get GetALL Connection rule */
+
+       rc= admin_params->
+             cs_func.rssprm_get_opt_ptr(admin_params->rss_name,
+                    TSS_GET_ALL_CONN_RULE,
+                    sizeof(get_all_rule) - 1,
+                    get_all_rule, OPT_TRUE, OPT_TRUE);
+
+       if (rc NE ESA_OK)     /* Parameter not found */
+         strcpy(get_all_rule, TSS_GET_ALL_CONN_RULE_G); /* By Group */
+
+/* start_over_because_of_restart : ;  /* ps0495 / commented by bs2518*/
+
+    /* if ( this_is_a_restart ) } /* PS0495 / commented by bs2518*/
+    /*    strcpy(get_all_mode, "");               commented by bs2518*/
+    /*                                            commented by bs2518*/
+    /* else                                       commented by bs2518*/
+       /* Start of PS0395         */
+       /* Check DD card existance */
+       rc = OS_MVS_ddinfo (R0600_DD_NAME,
+                           get_all_mode, FALSE,          /* IS10174 */
+                           dest, msgs, 0);               /* IS10174 */
+               /* IS10174  get_all_mode, FALSE, dest, msgs);   */
+       if ( rc NE ESA_OK) /* DD not found */
+         strcpy(get_all_mode, "");
+       else
+         strcpy(get_all_mode, TSS_STANDARD_MODE2);
+
+       ESA_DIAG_printf(ESA_COMP_GTUG2UC,3,
+                      "get_all_mode=%s", get_all_mode);
+          /* End   of PS0395 */
+    /* } /* PS0495    /                           commented by bs2518*/
+
+       /* Get GetAll mode */
+
+       if (strlen(get_all_mode) EQ 0) {            /* PS0395 */
+          rc= admin_params->
+                    cs_func.rssprm_get_opt_ptr(admin_params->rss_name,
+                    TSS_GET_ALL_CONN_MODE,
+                    sizeof(get_all_mode) - 1,
+                    get_all_mode, OPT_TRUE, OPT_TRUE);
+       }
+       else                                         /* PS0395 */
+         rc = ESA_OK;                               /* PS0395 */
+
+       if ( rc NE ESA_OK) {       /* If parameter not found.Standard*/
+       /* End of PS0312 */
+         if ( NOT get_handle->acids_list ) {
+
+            /* Get All Connections by USER */                /*PS0312*/
+
+            if (strcmp(get_all_rule,                         /*PS0312*/
+                       TSS_GET_ALL_CONN_RULE_U) EQ 0) {      /*PS0312*/
+               rc=TSS_get_acids_list(ESA_COMP_GTUG2UC, TSS_USER,
+                                     &users_list, user_get_types,
+                                     dummy_oe, admin_params, err );
+               get_handle->acids_list = users_list;
+               if ( rc NE ESA_OK )
+                  goto exit;
+            }                                                /*PS0312*/
+            else {       /* By GROUP */                      /*PS0312*/
+               rc=TSS_get_acids_list(ESA_COMP_GTUG2UC,       /*PS0312*/
+                                     TSS_GROUP,              /*PS0312*/
+                                     &ug_list,               /*PS0312*/
+                                     group_get_types,        /*PS0312*/
+                                     dummy_oe,               /*PS0312*/
+                                     admin_params, err );    /*PS0312*/
+               get_handle->acids_list = ug_list;             /*PS0312*/
+               if ( rc NE ESA_OK )                           /*PS0312*/
+                 goto exit;                                  /*PS0312*/
+            }                                                /*PS0312*/
+
+            /*  Restart Download  */
+
+            if ( num_users_in EQ 1 ) {
+               ESA_DIAG_printf(ESA_COMP_GTUG2UC,1,
+                        "Restart aggregation from=User=%s Group=%s",
+                        users_in[0], ugs_in[0]);
+
+               CTSAMSG_print(ERR_3_STRINGS,                 /* PS0312 */
+                             msgs, NULL, dest,              /* PS0312 */
+                             "Restart Aggregation From",  /* PS0312 */
+                              users_in[0], ugs_in[0]);      /* PS0312 */
+
+               if (strcmp(get_all_rule,                     /*PS0312*/
+                          TSS_GET_ALL_CONN_RULE_U) EQ 0) {  /*PS0312*/
+
+                 /* Select from User */
+
+                 rc=TSS_select_acids_list_from(ESA_COMP_GTUG2UC,
+                                               users_list, TSS_USER,
+                                               users_in[0],
+                                               dest, msgs );
+               }
+               else { /* Select from Group */               /*PS0312*/
+                 rc=TSS_select_acids_list_from(ESA_COMP_GTUG2UC,
+                                               ug_list,     /*PS0312*/
+                                               TSS_GROUP,   /*PS0312*/
+                                               ugs_in[0],   /*PS0312*/
+                                               dest, msgs); /*PS0312*/
+               }
+               if ( rc NE ESA_OK )
+                  goto exit;
+            }
+
+         }       /* Get Connection. First invoke */
+         else {                                             /*PS0312*/
+            if (strcmp(get_all_rule,                        /*PS0312*/
+                       TSS_GET_ALL_CONN_RULE_U) EQ 0)       /*PS0312*/
+              users_list = get_handle->acids_list;
+            else                                            /*PS0312*/
+              ug_list    = get_handle->acids_list;          /*PS0312*/
+         }                                                  /*PS0312*/
+
+         if (strcmp(get_all_rule,                           /*PS0312*/
+                    TSS_GET_ALL_CONN_RULE_U) EQ 0) {        /*PS0312*/
+            rc=TSS_do_users_list(ESA_COMP_GTUG2UC,
+                              TSS_USER, users_list,
+                              get_handle, max_conns,   actual_num,
+                              have_more,  u2ug_params, addinfo,
+                              objs_exist, admin_params, err);
+         }
+         else {/* According Group */                        /*PS0312*/
+            rc=TSS_do_ug_list(ESA_COMP_GTUG2UC,
+                           TSS_GROUP, ug_list,
+                           get_handle, max_conns,   actual_num,
+                           have_more,  u2ug_params, addinfo,
+                           objs_exist, admin_params, err);
+         }
+       }    /* Standard mode */        /* PS0312 */
+
+       /* Start of PS0312 */
+
+       /* Start Of ps0395 , using cache file created by GetUser */
+       else if (strcmp(get_all_mode, TSS_STANDARD_MODE2) EQ 0) {
+         if (get_handle->r0600 EQ NULL) {
+           strcpy(get_handle->r0600_cnn_data.user_acid, "");
+           strcpy(get_handle->r0600_cnn_data.relative_profile, "");
+           strcpy(get_handle->r0600_cnn_data.relative_pos, "");
+           strcpy(get_handle->r0600_cnn_data.ug_acid, "");
+           strcpy(get_handle->r0600_cnn_data.expires, "");
+           get_handle->r0600_cnn_data.pos = 0;
+/*SAS2IBMT get_handle->r0600 = fopen(R0600_DD, "r");                 */
+           get_handle->r0600 = fopen(R0600_DD, "rb");    /* SAS2IBMT */
+           if ( !get_handle->r0600 ) {
+               CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                             "fopen", R0600_DD, strerror(errno) );
+               rc = ESA_FATAL;
+               goto exit;
+           }
+         }
+
+         /*  Restart Download. Seek Record */
+
+         if ( get_handle->this_is_a_first_restart_entry ) {
+            ESA_DIAG_printf(ESA_COMP_GTUG2UC,1,
+                         "Restart aggregation from=User=%s Group=%s",
+                         users_in[0], ugs_in[0]);
+            /* PS0495 commented, bs2518 returned */
+            rc = R0600_seek_record(get_handle,
+                              users_in[0], ugs_in[0], msgs, dest);
+            if (rc NE ESA_OK)
+              goto exit;
+
+            CTSAMSG_print(ERR_3_STRINGS,
+                          msgs, NULL, dest,
+                          "Restart Download From",
+                          users_in[0], ugs_in[0]);
+         }
+     /*  if ( NOT this_is_a_restart )   PS0495 commented by bs2518*/
+         rc=TSS_do_r0600_list(ESA_COMP_GTUG2UC,
+                              get_handle, max_conns,   actual_num,
+                              have_more,  u2ug_params, addinfo,
+                              objs_exist, admin_params, err);
+         /* commented by BS2518 &this_is_a_restart);  */
+            /* ps0495                                                */
+            /* function TSS_do_r0600_list checks the first record of */
+            /* TSSCACHE. if it finds the restart marker it raises the*/
+            /* restart flag and returns.                             */
+     /*     if (this_is_a_restart)                 commented by bs2518*/
+     /*        ESA_DIAG_printf(ESA_COMP_GTUG2UC,3, commented by bs2518*/
+     /*          "identified restart");            commented by bs2518*/
+     /*        goto start_over_because_of_restart; commented by bs2518*/
+     /*     }                                      commented by bs2518*/
+     /*    /* PS0495 /                             commented by bs2518*/
+         goto exit;
+       }
+       /* End   Of ps0395 , using cache file created by GetUser */
+       /* None Standard mode, by Containers */
+       else {
+         rc = ESA_OK;   /* Reset return code after rssprm_get_opt */
+         if ( NOT get_handle->oe_acids_list ) {
+
+          /* Get Containers List */
+
+          if (strcmp(get_all_rule, TSS_GET_ALL_CONN_RULE_U) EQ 0) {
+            rc=TSS_get_acids_list(ESA_COMP_GTUG2UC, TSS_CONTAINER,
+                                  &oes_list, oe_get_types_u,
+                                  dummy_oe, admin_params, err );
+            get_handle->oe_acids_list = oes_list;
+            if ( rc NE ESA_OK )
+               goto exit;
+
+            /*  Add Root Container */
+
+            TSS_use_root_object(ESA_COMP_GTUG2UC, root_name,dest,msgs);
+            sprintf(val, "%c%s", '0', root_name);
+            rc = TSS_save_output(ESA_COMP_GTUG2UC,
+                                 oes_list, val, dest, msgs );
+            if ( rc NE ESA_OK )
+             goto exit;
+
+            TSS_trap_buf_sort(ESA_COMP_GTUG2UC, oes_list);
+          }           /* According User  */
+          else {      /* According Group */
+            rc=TSS_get_acids_list(ESA_COMP_GTUG2UC, TSS_CONTAINER,
+                                  &oes_list, oe_get_types_g,
+                                  dummy_oe, admin_params, err );
+            get_handle->oe_acids_list = oes_list;
+            if ( rc NE ESA_OK )
+               goto exit;
+
+          }           /* According Group */
+
+          /*  Restart Download. Select Container  */
+
+          if ( num_users_in EQ 1 ) {
+
+               ESA_DIAG_printf(ESA_COMP_GTUG2UC,1,
+                            "Restart aggregation from=User=%s Group=%s",
+                            users_in[0], ugs_in[0]);
+
+               if (strcmp(get_all_rule, TSS_GET_ALL_CONN_RULE_U) EQ 0)
+                 TSS_get_acid_header(ESA_COMP_GTUG2UC,
+                                     TSS_CMD_WEAK_QUIET_MODE,
+                                     users_in[0],
+                                     &acid_info,
+                                     admin_params, err);
+               else
+                 TSS_get_acid_header(ESA_COMP_GTUG2UC,
+                                     TSS_CMD_WEAK_QUIET_MODE,
+                                     ugs_in[0],
+                                     &acid_info,
+                                     admin_params, err);
+
+               ESA_DIAG_printf(ESA_COMP_GTUG2UC, 3,
+                               "ACID=%s",      acid_info.acid);
+               ESA_DIAG_printf(ESA_COMP_GTUG2UC, 3,
+                               "ACID_TYPE=%s", acid_info.type);
+               ESA_DIAG_printf(ESA_COMP_GTUG2UC, 3,
+                               "DEPT_ACID=%s", acid_info.dept_acid);
+               ESA_DIAG_printf(ESA_COMP_GTUG2UC, 3,
+                                "DIV_ACID=%s",  acid_info.div_acid);
+               ESA_DIAG_printf(ESA_COMP_GTUG2UC, 3,
+                                "ZONE_ACID=%s", acid_info.zone_acid);
+
+               strcpy(tmp_oe,    "");
+               strcpy(tmp_oe_tp, "");
+               download_from = TRUE;
+               if (strcmp(acid_info.type, TSS_ZCA) EQ 0) {
+                   strcpy(tmp_oe, acid_info.zone_acid);
+                   strcpy(tmp_oe_tp, TSS_ZONE);
+               }
+               else if (strcmp(acid_info.type, TSS_VCA) EQ 0) {
+                   strcpy(tmp_oe, acid_info.div_acid);
+                   strcpy(tmp_oe_tp, TSS_DIVISION);
+               }
+               else if (strcmp(acid_info.type, TSS_DCA) EQ 0) {
+                   strcpy(tmp_oe, acid_info.dept_acid);
+                   strcpy(tmp_oe_tp, TSS_DEPARTMENT);
+               }
+               else if (strcmp(acid_info.type, TSS_USER) EQ 0) {
+                   strcpy(tmp_oe, acid_info.dept_acid);
+                   strcpy(tmp_oe_tp, TSS_DEPARTMENT);
+               }
+               else if (strcmp(acid_info.type, TSS_PROFILE) EQ 0) {
+                   strcpy(tmp_oe, acid_info.dept_acid);
+                   strcpy(tmp_oe_tp, TSS_DEPARTMENT);
+               }
+               else if (strcmp(acid_info.type, TSS_GROUP) EQ 0) {
+                   strcpy(tmp_oe, acid_info.dept_acid);
+                   strcpy(tmp_oe_tp, TSS_DEPARTMENT);
+               }
+               else { /* From the top - Root */
+                   TSS_use_root_object(ESA_COMP_GTUG2UC,
+                                       root_name,dest,msgs);
+                   strcpy(tmp_oe, root_name);
+                   strcpy(tmp_oe_tp, TSS_ROOT_TYPE);
+               }
+
+               ESA_DIAG_printf(ESA_COMP_GTUG2UC, 3,
+                  "Restart Aggregation from Container=%d/%s",
+                  strlen(tmp_oe), tmp_oe);
+
+               CTSAMSG_print(ERR_3_STRINGS,
+                          msgs, NULL, dest,
+                          "Restart Aggregation From Container",
+                           tmp_oe_tp, tmp_oe);
+
+               CTSAMSG_print(ERR_3_STRINGS,
+                          msgs, NULL, dest,
+                          "Restart Aggregation From",
+                           users_in[0], ugs_in[0]);
+
+               if (strlen(tmp_oe) GT 0) {
+                   rc=TSS_select_acids_list_from(ESA_COMP_GTUG2UC,
+                                                 oes_list,
+                                                 TSS_CONTAINER,
+                                                 tmp_oe,
+                                                 dest, msgs );
+                   if ( rc NE ESA_OK )
+                     goto exit;
+               }
+          }    /* Restart Download */
+         }            /* Get OE   ALL. First invoke */
+         else {       /* Continue processing        */
+            oes_list   = get_handle->oe_acids_list;
+            if (strcmp(get_all_rule, TSS_GET_ALL_CONN_RULE_U) EQ 0)
+              users_list = get_handle->acids_list;
+            else
+              ug_list    = get_handle->acids_list;
+         }            /* Continue processing        */
+
+         Get_All_Again :;
+
+         ESA_DIAG_printf(ESA_COMP_GTUG2UC, 3,
+              "Get_ALL: oes_list=%X users_list=%X ug_list=%X",
+               oes_list, users_list, ug_list );
+
+         /* First Invoking */
+
+         run_get_acids_list = FALSE;
+         if (strcmp(get_all_rule, TSS_GET_ALL_CONN_RULE_U) EQ 0) {
+            if ( NOT users_list )
+              run_get_acids_list = TRUE;
+         }
+         else {       /* By Group */
+            if ( NOT ug_list )
+              run_get_acids_list = TRUE;
+         }
+
+         /* Continue Processing */
+
+         if ( NOT run_get_acids_list ) {
+
+           /* If No more Users/Groups, get next Container */
+
+           if (users_list)
+              ESA_DIAG_printf(ESA_COMP_GTUG2UC, 3,
+                "get_handle->list_ind=%d users_list->used_entries=%d",
+                 get_handle->list_ind,   users_list->used_entries);
+           else if (ug_list)
+              ESA_DIAG_printf(ESA_COMP_GTUG2UC, 3,
+                "get_handle->list_ind=%d ug_list->used_entries=%d",
+                 get_handle->list_ind,   ug_list->used_entries);
+
+           get_next_container = FALSE;
+           if (users_list) {         /* Users */
+             if (get_handle->list_ind GE users_list->used_entries)
+               get_next_container = TRUE;
+           }
+           else if (ug_list) {       /* Groups */
+             if (get_handle->list_ind GE ug_list->used_entries)
+               get_next_container = TRUE;
+           }
+
+           if (get_next_container) {
+            get_handle->oe_list_ind++;
+
+            /* If No more Containers and No more Users/Grps, all done */
+
+            if (get_handle->oe_list_ind GE oes_list->used_entries) {
+                *have_more  = NO_MORE;
+                goto exit;
+            }
+            run_get_acids_list = TRUE;
+           } /* Get New Container Entry */
+         }     /* Continue Processing     */
+
+         /* Ensure that current Container information is really */
+         /* need to be procceeded. For continue download some   */
+         /* Containers may be skipped by this step              */
+
+         if (download_from AND run_get_acids_list) {
+           for (i_tmp = get_handle->oe_list_ind;
+                (i_tmp LT oes_list->used_entries) AND
+                (oes_list->trap_data[i_tmp].used)     ;
+                i_tmp++) ;
+         }
+         else
+           i_tmp = get_handle->oe_list_ind;
+
+         ESA_DIAG_printf(ESA_COMP_GTUG2UC, 3,
+                         "1.run_get_acids_list=%d oe_list_ind=%d/%c/%s",
+                         run_get_acids_list,
+                         get_handle->oe_list_ind,
+                         oes_list->trap_data[i_tmp].data[0],
+                         &(oes_list->trap_data[i_tmp].data[1]) );
+
+         get_handle->oe_list_ind = i_tmp;
+
+         /* If No more Containers and No more Users/Grps, all done */
+         if (get_handle->oe_list_ind GE oes_list->used_entries) {
+             *have_more  = NO_MORE;
+             goto exit;
+         }
+
+         oes_list->trap_data[i_tmp].used = TRUE;
+         if (run_get_acids_list) {
+
+           get_handle->oe_list_ind--;
+
+           do {         /* Perform this loop, while will be obtained */
+                        /* At least one user/grp for get processing  */
+
+            get_handle->oe_list_ind++;
+            i_tmp = get_handle->oe_list_ind;
+
+            /* If No more Containers and No more Users/Grps, all done */
+            if (get_handle->oe_list_ind GE oes_list->used_entries) {
+                *have_more  = NO_MORE;
+                goto exit;
+            }
+
+            /* Free/Reset Old user's/Groups's list , if exists */
+
+            if ( get_handle->acids_list NE NULL ) {
+               users_list =  get_handle->acids_list;
+              /*
+               * TSS_free_trap_handle(ESA_COMP_GTUG2UC,
+               *                      &users_list, dest, msgs);
+               * get_handle->acids_list = NULL;
+               */
+               get_handle->list_ind     = 0;
+               users_list->used_entries = 0;
+            }
+
+            get_types_ind  =  oes_list->trap_data [i_tmp].data[0];
+            strcpy(tmp_oe, &(oes_list->trap_data [i_tmp].data[1]) );
+
+            ESA_DIAG_printf(ESA_COMP_GTUG2UC, 3,
+                        "2.run_get_acids_list=%d oe_list_ind=%d/%c/%s",
+                         run_get_acids_list,
+                         get_handle->oe_list_ind,
+                         oes_list->trap_data[i_tmp].data[0],
+                         &(oes_list->trap_data[i_tmp].data[1]) );
+
+            /* Get Users's list */
+
+            if (strcmp(get_all_rule,TSS_GET_ALL_CONN_RULE_U) EQ 0) {
+
+             switch (get_types_ind) {
+              case '0' :    /* Root */
+                rc=TSS_get_acids_list(ESA_COMP_GTUG2UC, TSS_USER,
+                               &users_list,
+                               get_types_for_root,
+                               tmp_oe, admin_params, err );
+                break;
+              case '1' :    /* Zone */
+                rc=TSS_get_acids_list(ESA_COMP_GTUG2UC, TSS_USER,
+                               &users_list,
+                               get_types_for_zone,
+                               tmp_oe, admin_params, err );
+                break;
+              case '2' :    /* Division */
+                rc=TSS_get_acids_list(ESA_COMP_GTUG2UC, TSS_USER,
+                               &users_list,
+                               get_types_for_div,
+                               tmp_oe, admin_params, err );
+                break;
+              case '3' :    /* Department */
+                rc=TSS_get_acids_list(ESA_COMP_GTUG2UC, TSS_USER,
+                               &users_list,
+                               get_types_for_dept,
+                               tmp_oe, admin_params, err );
+                break;
+              default :
+                CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                              component, func, "Invalid get_types_ind",
+                              get_types_ind,__LINE__) ;
+                rc = ESA_FATAL;
+             } /* switch (get_types_ind) */
+
+             get_handle->acids_list = users_list;
+
+             if (rc NE ESA_OK)
+                goto exit;
+
+             ESA_DIAG_printf(ESA_COMP_GTUG2UC, 3,
+                             "users_list->used_entries=%d",
+                              users_list->used_entries);
+            }            /* Get User's list */
+            else {       /* Get Group's list */
+               rc=TSS_get_acids_list(ESA_COMP_GTUG2UC, TSS_GROUP,
+                                     &ug_list, group_get_types,
+                                     tmp_oe, admin_params, err );
+               get_handle->acids_list = ug_list;
+               if ( rc NE ESA_OK )
+                 goto exit;
+
+               ESA_DIAG_printf(ESA_COMP_GTUG2UC, 3,
+                               "ug_list->used_entries=%d",
+                                ug_list->used_entries);
+            }     /* Get Group's List */
+           } while (NOT get_handle->acids_list->used_entries);
+
+           /*  For Continue Download , select User/Group from */
+
+           if (download_from) {
+             if (strcmp(get_all_rule, TSS_GET_ALL_CONN_RULE_U) EQ 0)
+               rc=TSS_select_acids_list_from(ESA_COMP_GTUG2UC,
+                                          users_list,
+                                          TSS_USER,
+                                          users_in[0],
+                                          dest, msgs );
+             else   /* Select from Group */
+               rc=TSS_select_acids_list_from(ESA_COMP_GTUG2UC, ug_list,
+                                             TSS_GROUP, ugs_in[0],
+                                             dest, msgs);
+             download_from = FALSE; /* Reset parameter */
+             if ( rc NE ESA_OK )
+                goto exit;
+           }
+         }           /* Get new user's/group's list */
+         else  { /* Use already existing user/group list */
+            if (strcmp(get_all_rule, TSS_GET_ALL_CONN_RULE_U) EQ 0)
+              users_list = get_handle->acids_list;
+            else
+              ug_list    = get_handle->acids_list;
+         }            /* Continue processing        */
+
+         if (strcmp(get_all_rule, TSS_GET_ALL_CONN_RULE_U) EQ 0) {
+           rc=TSS_do_users_list(ESA_COMP_GTUG2UC,
+                                TSS_USER, users_list,
+                                get_handle, max_conns,   actual_num,
+                                have_more,  u2ug_params, addinfo,
+                                objs_exist, admin_params, err);
+           if ( (*have_more) EQ NO_MORE )
+             get_handle->list_ind = users_list->used_entries;
+
+           if ( (*actual_num EQ 0) ) {
+             get_handle->list_ind = users_list->used_entries;
+             goto Get_All_Again;
+           }
+         }
+         else { /* According Group */
+            rc=TSS_do_ug_list(ESA_COMP_GTUG2UC,
+                           TSS_GROUP, ug_list,
+                           get_handle, max_conns,   actual_num,
+                           have_more,  u2ug_params, addinfo,
+                           objs_exist, admin_params, err);
+           if ( (*have_more) EQ NO_MORE )
+             get_handle->list_ind = ug_list->used_entries;
+
+           if ( (*actual_num EQ 0) ) {
+             get_handle->list_ind = ug_list->used_entries;
+             goto Get_All_Again;
+           }
+         }
+         *have_more = HAVE_MORE;
+       }     /* None Standard Download */
+       /* end of PS0312 */
+
+         break ;
+
+      case GET_GROUPS_CONNS:
+
+         if ( NOT get_handle->acids_list ) {
+           rc=TSS_set_ug_acids_list(ESA_COMP_GTUG2UC, &ug_list,
+                                    ugs_in, num_ugs_in,
+                                    admin_params, err );
+           get_handle->acids_list = ug_list;
+           if ( rc NE ESA_OK )
+              goto exit;
+         }
+         else
+           ug_list = get_handle->acids_list;
+
+         rc=TSS_do_ug_list(ESA_COMP_GTUG2UC,
+                           TSS_GROUP, ug_list,
+                           get_handle, max_conns,   actual_num,
+                           have_more,  u2ug_params, addinfo,
+                           objs_exist, admin_params, err);
+
+         break ;
+
+      case GET_USERS_CONNS :
+
+         if ( NOT get_handle->acids_list ) {
+           rc=TSS_set_user_acids_list(ESA_COMP_GTUG2UC, &users_list,
+                                       users_in, num_users_in,
+                                       admin_params, err );
+           get_handle->acids_list = users_list;
+           if ( rc NE ESA_OK )
+              goto exit;
+         }
+         else
+           users_list = get_handle->acids_list;
+
+         rc=TSS_do_users_list(ESA_COMP_GTUG2UC,
+                              TSS_USER, users_list,
+                              get_handle, max_conns,   actual_num,
+                              have_more,  u2ug_params, addinfo,
+                              objs_exist, admin_params, err);
+
+         break ;
+
+      case GET_MANY_CONNS :
+           rc=TSS_set_pair_acids_list(ESA_COMP_GTUG2UC, &pair_list,
+                                      users_in, num_users_in,
+                                      ugs_in,   num_ugs_in,
+                                      admin_params, err );
+           get_handle->cnn_data = pair_list;
+           if ( rc NE ESA_OK )
+              goto exit;
+
+           rc=TSS_do_pairs_list(ESA_COMP_GTUG2UC, pair_list,
+                                get_handle, max_conns,   actual_num,
+                                have_more,  u2ug_params, addinfo,
+                                objs_exist, admin_params, err);
+
+           break ;
+
+      default       : rc = ESA_FATAL;
+                      CTSAMSG_print(ERR_INTERNAL2,msgs,NULL,dest,
+                         component, func,"Invalid mode",mode,__LINE__);
+                      goto exit;
+                      break ;
+   }
+
+   ESA_DIAG_printf(ESA_COMP_GTUG2UC,1,
+                   "**** max_conns=%d actual num=%d",
+                   max_conns, *actual_num);
+
+   if ( ESA_DIAG_get_debug_level(ESA_COMP_GTUG2UC) GE 1 ) {
+      for (i_dump=0; i_dump LT *actual_num; i_dump++) {
+        ESA_DIAG_printf(ESA_COMP_GTUG2UC,0,
+                        "User=%s Group=%s exist=%d connect_data=%d",
+                        u2ug_params[i_dump].user,
+                        u2ug_params[i_dump].group,
+                        objs_exist[i_dump],
+                        u2ug_params[i_dump].u2ug_admin_data);
+        if ( ( objs_exist[i_dump] EQ OBJ_EXIST ) AND
+             ( ESA_DIAG_get_debug_level(ESA_COMP_GTUG2UC) GE 2 ) )
+             ADDINFO_dump(addinfo[i_dump],0);
+      }
+   }
+
+  /*
+   *  Finish
+   */
+
+   exit : ;
+
+   ESA_DIAG_printf(ESA_COMP_GTUG2UC, 1,
+                   "Finished with rc %d actual num=%d have_more=%d",
+                   rc, *actual_num, *have_more);
+
+  /*
+   *  Cleanup
+   */
+
+   if ( (rc NE ESA_OK) OR (*have_more EQ NO_MORE) ) {
+      if ( *handle NE NULL ) {
+         TSS_free_get_handle(ESA_COMP_GTUG2UC , handle, dest, msgs);
+         *handle    = NULL;
+         get_handle = NULL;
+      }
+      TSS_EXtractTableTerm(dest, msgs);   /* ps0318 */
+      *have_more = NO_MORE ;
+      /* commented by BS2518 this_is_a_restart = FALSE;  /* ps0495 */
+   }
+
+   ESA_DIAG_exit(ESA_COMP_GTUG2UC, 1, func, rc );
+   return rc ;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_do_users_list                          *
+ *                                                             *
+ * DESCRIPTION    : acids list processing (get info)           *
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  acid_type - acid type                      *
+ *                  acids_list- acids list                     *
+ *                  get_handle- get handle                     *
+ *                  max_conns - max conns                      *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : actual_num - actual num                    *
+ *                  have_more  - have more flag                *
+ *                  u2ug_params- conn params                   *
+ *                  addinfo    - addinfo                       *
+ *                  obj_exist  - obj exist                     *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_do_users_list(ESA_DIAG_COMP_typ  comp,
+                            char                  * acid_type,
+                            TSS_TRAP_BUF_rec_typ  * acids_list,
+                            TSS_GET_HANDLE_typ    * get_handle,
+                            short                   max_conns,
+                            short                 * actual_num,
+                            HAVE_MORE_typ         * have_more,
+                            U2UG_PARAMS_rec_typ     u2ug_params[1],
+                            ADDINFO_rec_ptr         addinfo[1],
+                            OBJ_EXISTS_typ          objs_exist[1],
+                            ADMIN_PARAMS_rec_typ  * admin_params,
+                            ERR_STRUCT_rec_typ    * err)
+{
+
+ static char func[]="TSS_do_users_list";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                       rc   = ESA_OK ;
+ ESA_RC                       rc_put;     /* BS2383 */
+
+ /* 2 lines below added by ps0380 */
+ TSS_CMD_MODE_typ        cmd_get_usr_mode =  TSS_CMD_DEFAULT_MODE;
+ TSS_CMD_MODE_typ        cmd_get_ug_mode  =  TSS_CMD_WEAK_QUIET_MODE;
+
+ CTSAMSG_HANDLE_rec_typ     * msgs;
+ CTSAMSG_DEST_TABLE_rec_typ * dest;
+ TSS_TRAP_CNN_BUF_rec_typ   * ug_data = NULL;
+ TSS_TRAP_CNN_DATA_typ      * located_data;
+ TSS_TRAP_CNN_BUF_rec_typ   *
+          cnn_data = (TSS_TRAP_CNN_BUF_rec_typ *)get_handle->cnn_data;
+ int                          i, j;
+ int                          k;
+ int                          m;
+ int                          i_from;
+ int                          ui_only;  /* do not get group  WS10066 */
+
+ /*
+  *  Initialize
+  */
+
+  ESA_DIAG_enter(comp, 3, func );
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  *have_more = HAVE_MORE;
+
+ /*
+  *  Check if neseccary continue put previous connections data
+  */
+
+  ESA_DIAG_printf(comp,3,"Obtained connection data ptr=%x",cnn_data);
+
+  if ( cnn_data ) {
+
+    ESA_DIAG_printf(comp, 3,
+                    "continue processing from ind=%d",
+                     cnn_data->list_ind);
+
+    ESA_DIAG_printf(comp, 3,
+                    "1.cnn_data->list_ind=%d cnn_data->used_entries=%d",
+                     cnn_data->list_ind,   cnn_data->used_entries);
+
+    for (j = cnn_data->list_ind;
+                  (j LT cnn_data->used_entries ) AND
+                  ( (*actual_num) LT max_conns ); j++ )  {
+
+       k = (*actual_num);
+      /* Del By BS2382
+       * TSS_put_connect_info(comp, k, &(cnn_data->c_data[j]),
+       *                 u2ug_params, addinfo, objs_exist, dest, msgs);
+       */
+
+       rc_put = TSS_put_connect_info(comp, k,                /*BS2382*/
+                                     &(cnn_data->c_data[j]), /*BS2382*/
+                                     u2ug_params, addinfo,   /*BS2382*/
+                                     objs_exist, dest, msgs);/*BS2382*/
+       if (rc_put EQ ESA_OK) {                               /*BS2382*/
+         (*actual_num)++;
+         ESA_DIAG_printf(comp, 3,
+                         "j=%d actual_num=%d",
+                          j, *actual_num);
+       }                                                     /*BS2382*/
+    }
+
+    cnn_data->list_ind = j;
+
+    ESA_DIAG_printf(comp, 3, "max_conns=%d actual_num=%d",
+                    max_conns, *actual_num);
+
+    ESA_DIAG_printf(comp, 3,
+                    "2.cnn_data->list_ind=%d cnn_data->used_entries=%d",
+                     cnn_data->list_ind,   cnn_data->used_entries);
+
+   /*
+    *  Check reason end-of-loop
+    */
+
+    if ( *actual_num GE max_conns) {
+        *have_more = HAVE_MORE ;
+        goto exit;
+    }
+    cnn_data->used_entries = 0;
+  }
+
+  /* WS10066 - start */
+  if ( ADDINFO_search( "EXPIRES", TSS_ADDINFO_KWD_LEN,
+                      addinfo[0]->pair, addinfo[0]->num_pairs ) EQ NULL)
+    ui_only = TRUE;
+  else
+    ui_only = FALSE;
+  /* WS10066 - end  */
+
+  i_from = get_handle->list_ind;
+  ESA_DIAG_printf(comp, 3, "processing list from ind=%d", i_from);
+
+  i=i_from;
+  while (i LT acids_list->used_entries) {
+
+     if (acids_list->trap_data[i].used) {
+        i++;
+        continue;
+     }
+
+    /*
+     *  Attention ! The first symbol - sort symbol !
+     */
+
+     time(&before);                                /* PS0132 */
+     sprintf( elapsed_m, "LIST:CONN ACID(%s)  ",   /* PS0312 */
+             &acids_list->trap_data[i].data[1]);   /* PS0312 */
+
+     rc=TSS_get_user_connections(comp,
+                                 cmd_get_usr_mode,   /* ps0380 */
+                                 &acids_list->trap_data[i].data[1],
+                                 &cnn_data, admin_params, err );
+     get_handle->cnn_data = cnn_data;
+     if ( rc NE ESA_OK )
+         goto exit;
+
+     if (cnn_data EQ NULL) {
+       OS_MVS_btrace();
+       rc = ESA_FATAL;
+       goto exit;
+     }
+
+     cnn_data->list_ind   = 0;
+
+     if (NOT ui_only)                                   /* WS10066 */
+     {                                                  /* WS10066 */
+
+      /*
+       *  Get Group connection info
+       */
+
+       for (m=0; m LT cnn_data->used_entries; m++) {
+         ESA_DIAG_printf (comp, 10, "Get ug info %d.%s",
+                          m, cnn_data->c_data[m].ug_acid);
+
+         /* ps0318 */
+         rc=TSS_ExtractTable_GGet( cnn_data->c_data[m].ug_acid,
+                                   &ug_data, dest, msgs);
+         if (rc NE ESA_OK) {        /* Not Found */
+           rc=TSS_get_ug_connections(comp,
+                            cmd_get_ug_mode,     /* ps0380 */
+                            cnn_data->c_data[m].ug_acid, &ug_data,
+                            admin_params, err );
+           if ( rc NE ESA_OK )
+              goto exit;
+
+           if (ug_data EQ NULL) {
+              OS_MVS_btrace();
+              rc = ESA_FATAL;
+              goto exit;
+           }
+
+           /* ps0318 */
+           TSS_ExtractTable_GPut( cnn_data->c_data[m].ug_acid,
+                                  &ug_data, dest, msgs);
+         }
+
+         located_data = TSS_locate_user_cnn_info(comp, ug_data,
+                                      cnn_data->c_data[m].user_acid,
+                                      dest, msgs);
+         if (located_data)
+           strcpy(cnn_data->c_data[m].expires, located_data->expires);
+
+         ug_data->used_entries = 0;
+
+       }
+     }                                                  /* WS10066 */
+
+     new_entries = cnn_data->used_entries;              /* PS0312 */
+     if ( strcmp(get_all_vrbs, KWD_FLAG_ON) EQ 0) { /* PS0312 */
+       time(&after);                                    /* PS0312 */
+       difft = difftime(after, before);                 /* PS0312 */
+       hh = (int)(difft/3600);                          /* PS0312 */
+       mm = (int)((difft - (hh * 3600))/60);            /* PS0312 */
+       ss = difft - (hh * 3600) - (mm * 60);            /* PS0312 */
+       sprintf(elapsed_t,                               /* PS0312 */
+               "%-45s(%6d):Time=%02d.%02d.%07.4f",   /* PS0312 */
+               elapsed_m, new_entries,                  /* PS0312 */
+               hh, mm, ss );                            /* PS0312 */
+       CTSAMSG_print(ERR_3_STRINGS,                     /* PS0312 */
+                     msgs, NULL, dest,                  /* PS0312 */
+                     elapsed_t, "", "");                /* PS0312 */
+     }                                                  /* PS0312 */
+
+     if ( ESA_DIAG_get_debug_level(comp) GE 5 )  {
+        ESA_DIAG_printf (comp, 0 , "Connection info");
+        TSS_cnn_trap_buf_dump(comp, cnn_data);
+     }
+
+     ESA_DIAG_printf(comp, 3,
+                    "1.cnn_data->list_ind=%d cnn_data->used_entries=%d",
+                     cnn_data->list_ind,   cnn_data->used_entries);
+
+     for (j = cnn_data->list_ind;
+                  (j LT cnn_data->used_entries ) AND
+                  ( (*actual_num) LT max_conns ); j++ )  {
+
+       k = (*actual_num);
+      /* Del By BS2382
+       * TSS_put_connect_info(comp, k, &(cnn_data->c_data[j]),
+       *                 u2ug_params, addinfo, objs_exist, dest, msgs);
+       */
+
+       rc_put = TSS_put_connect_info(comp, k,                /*BS2383*/
+                                     &(cnn_data->c_data[j]), /*BS2383*/
+                                     u2ug_params, addinfo,   /*BS2383*/
+                                     objs_exist, dest, msgs);/*BS2383*/
+       if (rc_put EQ ESA_OK) {                               /*BS2383*/
+           (*actual_num)++;
+           ESA_DIAG_printf(comp, 3,
+                           "j=%d actual_num=%d",
+                           j, *actual_num);
+       }                                                     /*BS2382*/
+     }
+
+     cnn_data->list_ind = j;
+
+     ESA_DIAG_printf(comp, 3, "max_conns=%d actual_num=%d",
+                    max_conns, *actual_num);
+
+     ESA_DIAG_printf(comp, 3,
+                    "2.cnn_data->list_ind=%d cnn_data->used_entries=%d",
+                     cnn_data->list_ind,   cnn_data->used_entries);
+
+    /*
+     *  Check reason end-of-loop
+     */
+
+     if ( *actual_num GE max_conns) {
+         get_handle->list_ind = i + 1;
+         *have_more = HAVE_MORE ;
+         goto exit;
+     }
+     cnn_data->used_entries = 0;
+     i++;
+  }
+
+  *have_more = NO_MORE;
+  rc = ESA_OK;
+
+ /*
+  *  Finish
+  */
+
+ exit : ;
+
+ /*
+  *  Free temporary connection data
+  */
+
+  if ( ug_data )
+     TSS_free_cnn_trap_handle(comp, &ug_data, dest, msgs);
+
+  ESA_DIAG_exit(comp, 3, func, rc);
+
+  return rc ;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_do_ug_list                             *
+ *                                                             *
+ * DESCRIPTION    : acids list processing (get info)           *
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  acid_type - acid type                      *
+ *                  acids_list- acids list                     *
+ *                  get_handle- get handle                     *
+ *                  max_conns - max conns                      *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : actual_num - actual num                    *
+ *                  have_more  - have more flag                *
+ *                  u2ug_params- conn params                   *
+ *                  addinfo    - addinfo                       *
+ *                  obj_exist  - obj exist                     *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_do_ug_list(ESA_DIAG_COMP_typ     comp,
+                            char                  * acid_type,
+                            TSS_TRAP_BUF_rec_typ  * acids_list,
+                            TSS_GET_HANDLE_typ    * get_handle,
+                            short                   max_conns,
+                            short                 * actual_num,
+                            HAVE_MORE_typ         * have_more,
+                            U2UG_PARAMS_rec_typ     u2ug_params[1],
+                            ADDINFO_rec_ptr         addinfo[1],
+                            OBJ_EXISTS_typ          objs_exist[1],
+                            ADMIN_PARAMS_rec_typ  * admin_params,
+                            ERR_STRUCT_rec_typ    * err)
+{
+
+ static char func[]="TSS_do_ug_list";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                       rc   = ESA_OK ;
+ ESA_RC                       rc_put;
+
+ /* 2 lines below added by ps0380 */
+ TSS_CMD_MODE_typ        cmd_get_usr_mode =  TSS_CMD_WEAK_QUIET_MODE;
+ TSS_CMD_MODE_typ        cmd_get_ug_mode  =  TSS_CMD_DEFAULT_MODE;
+
+ CTSAMSG_HANDLE_rec_typ     * msgs;
+ CTSAMSG_DEST_TABLE_rec_typ * dest;
+ TSS_TRAP_CNN_BUF_rec_typ   * user_data = NULL;
+ TSS_TRAP_CNN_DATA_typ      * located_data;
+ TSS_TRAP_CNN_BUF_rec_typ *
+          cnn_data = (TSS_TRAP_CNN_BUF_rec_typ *)get_handle->cnn_data;
+ int                          i, j;
+ int                          k;
+ int                          m;
+ int                          i_from;
+ int                          gi_only;  /* do not get user   WS10066 */
+
+ /*
+  *  Initialize
+  */
+
+  ESA_DIAG_enter(comp, 3, func );
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  *have_more = HAVE_MORE;
+
+ /*
+  *  Check if neseccary continue put previous connections data
+  */
+
+
+  ESA_DIAG_printf(comp,3,"Obtained connection data ptr=%x",cnn_data);
+
+  if ( cnn_data ) {
+
+    ESA_DIAG_printf(comp, 3,
+                    "continue processing from ind=%d",
+                     cnn_data->list_ind);
+
+    ESA_DIAG_printf(comp, 3,
+                    "1.cnn_data->list_ind=%d cnn_data->used_entries=%d",
+                     cnn_data->list_ind,   cnn_data->used_entries);
+
+    for (j = cnn_data->list_ind;
+                  (j LT cnn_data->used_entries ) AND
+                  ( (*actual_num) LT max_conns ); j++ )  {
+       k = (*actual_num);
+      /* Del By BS2382
+       * TSS_put_connect_info(comp, k, &(cnn_data->c_data[j]),
+       *                 u2ug_params, addinfo, objs_exist, dest, msgs);
+       */
+
+       rc_put = TSS_put_connect_info(comp, k,                /*BS2382*/
+                                     &(cnn_data->c_data[j]), /*BS2382*/
+                                     u2ug_params, addinfo,   /*BS2382*/
+                                     objs_exist, dest, msgs);/*BS2382*/
+       if (rc_put EQ ESA_OK) {                               /*BS2382*/
+        (*actual_num)++;
+        ESA_DIAG_printf(comp, 3,
+                      "j=%d actual_num=%d acid=%s",
+                      j, *actual_num,&(cnn_data->c_data[j]));
+       }                                                     /*BS2382*/
+    }
+
+    cnn_data->list_ind = j;
+
+    ESA_DIAG_printf(comp, 3, "max_conns=%d actual_num=%d",
+                    max_conns, *actual_num);
+
+    ESA_DIAG_printf(comp, 3,
+                    "2.cnn_data->list_ind=%d cnn_data->used_entries=%d",
+                     cnn_data->list_ind,   cnn_data->used_entries);
+
+   /*
+    *  Check reason end-of-loop
+    */
+
+    if ( *actual_num GE max_conns) {
+        *have_more = HAVE_MORE ;
+        goto exit;
+    }
+    cnn_data->used_entries = 0;
+  }
+
+  i_from = get_handle->list_ind;
+  ESA_DIAG_printf(comp, 3, "processing list from ind=%d", i_from);
+
+  /* WS10066 - start */
+  if (( ADDINFO_search( "RELATIVE_POS", TSS_ADDINFO_KWD_LEN,
+                addinfo[0]->pair, addinfo[0]->num_pairs ) EQ NULL)
+       AND
+      ( ADDINFO_search( "RELATIVE_PROFILE", TSS_ADDINFO_KWD_LEN,
+                addinfo[0]->pair, addinfo[0]->num_pairs ) EQ NULL)
+       AND
+     ( ADDINFO_search( "POS", TSS_ADDINFO_KWD_LEN,
+                addinfo[0]->pair, addinfo[0]->num_pairs ) EQ NULL) )
+    gi_only = TRUE;
+  else
+    gi_only = FALSE;
+  /* WS10066 - end  */
+
+  i=i_from;
+  while (i LT acids_list->used_entries) {
+
+     if (acids_list->trap_data[i].used) {
+        i++;
+        continue;
+     }
+
+    /*
+     *  Attention ! The first symbol - sort symbol !
+     */
+
+     time(&before);                                /* PS0132 */
+     sprintf( elapsed_m, "LIST:CONN ACID(%s)  ",   /* PS0312 */
+             &acids_list->trap_data[i].data[1]);   /* PS0312 */
+
+     rc=TSS_get_ug_connections(comp,
+                               cmd_get_ug_mode,    /* ps0380 */
+                               &acids_list->trap_data[i].data[1],
+                               &cnn_data, admin_params, err );
+     get_handle->cnn_data = cnn_data;
+     if ( rc NE ESA_OK )
+         goto exit;
+
+     if (cnn_data EQ NULL) {
+       OS_MVS_btrace();
+       rc = ESA_FATAL;
+       goto exit;
+     }
+
+     cnn_data->list_ind   = 0;
+
+     if (NOT gi_only)                                   /* WS10066 */
+     {                                                  /* WS10066 */
+      /*
+       *  Get User connection info
+       */
+
+       for (m=0; m LT cnn_data->used_entries; m++) {
+         ESA_DIAG_printf (comp, 10, "Get user info %d.%s",
+                          i, cnn_data->c_data[m].user_acid);
+
+         /* ps0318 */
+         rc=TSS_ExtractTable_UGet( cnn_data->c_data[m].user_acid,
+                                   &user_data, dest, msgs);
+         if (rc NE ESA_OK) {        /* Not Found */
+            rc=TSS_get_user_connections(comp,
+                                  cmd_get_usr_mode,  /* ps0380 */
+                                  cnn_data->c_data[m].user_acid,
+                                  &user_data, admin_params, err );
+            if ( rc NE ESA_OK )
+               goto exit;
+
+            if (user_data EQ NULL) {
+               OS_MVS_btrace();
+               rc = ESA_FATAL;
+               goto exit;
+            }
+
+            /* ps0318 */
+            TSS_ExtractTable_UPut( cnn_data->c_data[m].user_acid,
+                                   &user_data, dest, msgs);
+         }
+
+         located_data = TSS_locate_ug_cnn_info(comp, user_data,
+                                      cnn_data->c_data[m].ug_acid,
+                                      dest, msgs);
+         if (located_data) {
+           cnn_data->c_data[m].pos = located_data->pos;
+           strcpy( cnn_data->c_data[m].relative_pos,
+                   located_data->relative_pos);
+           strcpy( cnn_data->c_data[m].relative_profile,
+                   located_data->relative_profile);
+         }
+
+         user_data->used_entries = 0;
+
+       }
+     }                                                  /* WS10066 */
+
+     new_entries = cnn_data->used_entries;              /* PS0312 */
+     if ( strcmp(get_all_vrbs, KWD_FLAG_ON) EQ 0) { /* PS0312 */
+       time(&after);                                    /* PS0312 */
+       difft = difftime(after, before);                 /* PS0312 */
+       hh = (int)(difft/3600);                          /* PS0312 */
+       mm = (int)((difft - (hh * 3600))/60);            /* PS0312 */
+       ss = difft - (hh * 3600) - (mm * 60);            /* PS0312 */
+       sprintf(elapsed_t,                               /* PS0312 */
+               "%-45s(%6d):Time=%02d.%02d.%07.4f",      /* PS0312 */
+               elapsed_m, new_entries,                  /* PS0312 */
+               hh, mm, ss );                            /* PS0312 */
+       CTSAMSG_print(ERR_3_STRINGS,                     /* PS0312 */
+                     msgs, NULL, dest,                  /* PS0312 */
+                     elapsed_t, "", "");                /* PS0312 */
+     }                                                  /* PS0312 */
+
+     if ( ESA_DIAG_get_debug_level(comp) GE 5 )  {
+        ESA_DIAG_printf (comp, 0 , "Connection info");
+        TSS_cnn_trap_buf_dump(comp, cnn_data);
+     }
+
+     ESA_DIAG_printf(comp, 3,
+                    "1.cnn_data->list_ind=%d cnn_data->used_entries=%d",
+                     cnn_data->list_ind,   cnn_data->used_entries);
+
+     for (j = cnn_data->list_ind;
+                  (j LT cnn_data->used_entries ) AND
+                  ( (*actual_num) LT max_conns ); j++ )  {
+
+       k = (*actual_num);
+      /* Del By BS2382
+       * TSS_put_connect_info(comp, k, &(cnn_data->c_data[j]),
+       *                 u2ug_params, addinfo, objs_exist, dest, msgs);
+       */
+
+       rc_put = TSS_put_connect_info(comp, k,                /*BS2382*/
+                                     &(cnn_data->c_data[j]), /*BS2382*/
+                                     u2ug_params, addinfo,   /*BS2382*/
+                                     objs_exist, dest, msgs);/*BS2382*/
+       if (rc_put EQ ESA_OK) {                               /*BS2382*/
+        (*actual_num)++;
+        ESA_DIAG_printf(comp, 3,
+                      "j=%d actual_num=%d acid=%s",
+                      j, *actual_num,&(cnn_data->c_data[j]));
+       }                                                     /*BS2382*/
+     }
+
+     cnn_data->list_ind = j;
+
+     ESA_DIAG_printf(comp, 3, "max_conns=%d actual_num=%d",
+                    max_conns, *actual_num);
+
+     ESA_DIAG_printf(comp, 3,
+                    "2.cnn_data->list_ind=%d cnn_data->used_entries=%d",
+                     cnn_data->list_ind,   cnn_data->used_entries);
+
+    /*
+     *  Check reason end-of-loop
+     */
+
+     if ( *actual_num GE max_conns) {
+         get_handle->list_ind = i + 1;
+         *have_more = HAVE_MORE ;
+         goto exit;
+     }
+     cnn_data->used_entries = 0;
+     i++;
+  }
+
+  *have_more = NO_MORE;
+  rc = ESA_OK;
+
+ /*
+  *  Finish
+  */
+
+ exit : ;
+
+ /*
+  *  Free temporary connection data
+  */
+
+  if ( user_data )
+     TSS_free_cnn_trap_handle(comp, &user_data, dest, msgs);
+
+  ESA_DIAG_exit(comp, 3, func, rc);
+
+  return rc ;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_do_pairs_list                          *
+ *                                                             *
+ * DESCRIPTION    : acids list processing (get info)           *
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  pairs_list- pairs list                     *
+ *                  get_handle- get handle                     *
+ *                  max_conns - max conns                      *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : actual_num - actual num                    *
+ *                  have_more  - have more flag                *
+ *                  u2ug_params- conn params                   *
+ *                  addinfo    - addinfo                       *
+ *                  obj_exist  - obj exist                     *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_do_pairs_list(ESA_DIAG_COMP_typ  comp,
+                        TSS_TRAP_CNN_BUF_rec_typ  * pairs_list,
+                        TSS_GET_HANDLE_typ        * get_handle,
+                        short                       max_conns,
+                        short                     * actual_num,
+                        HAVE_MORE_typ             * have_more,
+                        U2UG_PARAMS_rec_typ         u2ug_params[1],
+                        ADDINFO_rec_ptr             addinfo[1],
+                        OBJ_EXISTS_typ              objs_exist[1],
+                        ADMIN_PARAMS_rec_typ      * admin_params,
+                        ERR_STRUCT_rec_typ        * err)
+{
+
+ static char func[]="TSS_do_pairs_list";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                       rc   = ESA_OK ;
+
+ /* 2 lines below added by ps0380 */
+ TSS_CMD_MODE_typ        cmd_get_usr_mode =  TSS_CMD_DEFAULT_MODE;
+ TSS_CMD_MODE_typ        cmd_get_ug_mode  =  TSS_CMD_DEFAULT_MODE;
+
+ CTSAMSG_HANDLE_rec_typ     * msgs;
+ CTSAMSG_DEST_TABLE_rec_typ * dest;
+ TSS_TRAP_CNN_BUF_rec_typ   * user_data = NULL;
+ TSS_TRAP_CNN_BUF_rec_typ   * ug_data   = NULL;
+ TSS_TRAP_CNN_DATA_typ      * located_data;
+ int                          user_located;
+ int                          group_located;
+ int                          i;
+ int                          k;
+
+ /*
+  *  Initialize
+  */
+
+  ESA_DIAG_enter(comp, 3, func );
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  ESA_DIAG_printf(comp, 3, "processing list from ind=%d", 0);
+
+  for (i=0; i LT pairs_list->used_entries; i++) {
+
+     ESA_DIAG_printf(comp, 3, "%d. User=%s Group=%s pos=%d",
+                     i, pairs_list->c_data[i].user_acid,
+                        pairs_list->c_data[i].ug_acid,
+                        pairs_list->c_data[i].pos);
+
+     if (pairs_list->c_data[i].pos EQ TSS_CNN_PAIR_NOT_VALID) {
+        k = (*actual_num);
+        objs_exist[k] = OBJ_NOT_EXIST ;
+        strcpy(u2ug_params[k].user,  pairs_list->c_data[i].user_acid);
+        strcpy(u2ug_params[k].group, pairs_list->c_data[i].ug_acid);
+
+        u2ug_params[k].def_group[0]    = NULL_CHAR;
+        u2ug_params[k].u2ug_admin_data = U2UG_ADM_NONE;
+        u2ug_params[k].u2ug_attr_data  = U2UG_ATTR_REGULAR;
+
+        (*actual_num)++;
+        continue;
+     }
+
+     /*  Get User connection info  */
+
+     rc=TSS_get_user_connections(comp,
+                                 cmd_get_usr_mode,  /* ps0380 */
+                                 pairs_list->c_data[i].user_acid,
+                                 &user_data, admin_params, err );
+     if ( rc NE ESA_OK )
+        goto exit;
+
+     if ( user_data EQ NULL ) {
+        OS_MVS_btrace();
+        rc = ESA_FATAL;
+        goto exit;
+     }
+
+     /*  Get Group connection info */
+
+     rc=TSS_get_ug_connections(comp,
+                               cmd_get_ug_mode,    /* ps0380 */
+                               pairs_list->c_data[i].ug_acid,
+                               &ug_data, admin_params, err );
+     if ( rc NE ESA_OK )
+        goto exit;
+
+     if ( ug_data EQ NULL ) {
+        OS_MVS_btrace();
+        rc = ESA_FATAL;
+        goto exit;
+     }
+
+    /*
+     *   Extract UG info
+     */
+
+     located_data = TSS_locate_user_cnn_info(comp, ug_data,
+                                    pairs_list->c_data[i].user_acid,
+                                    dest, msgs);
+     if (located_data) {
+       user_located  = TRUE;
+       strcpy(pairs_list->c_data[i].expires, located_data->expires);
+     }
+     else
+       user_located  = FALSE;
+
+     ug_data->used_entries = 0;
+
+    /*
+     *   Extract USER info
+     */
+
+     located_data = TSS_locate_ug_cnn_info(comp, user_data,
+                                    pairs_list->c_data[i].ug_acid,
+                                    dest, msgs);
+     if (located_data) {
+       group_located = TRUE;
+       pairs_list->c_data[i].pos = located_data->pos;
+       strcpy( pairs_list->c_data[i].relative_pos,
+               located_data->relative_pos);
+       strcpy( pairs_list->c_data[i].relative_profile,
+               located_data->relative_profile);
+     }
+     else
+       group_located = FALSE;
+
+     user_data->used_entries = 0;
+
+    /*
+     * Check whether connection information was obtained
+     */
+
+     if ( NOT (user_located) OR NOT(group_located) ) {
+        k = (*actual_num);
+        objs_exist[k] = OBJ_NOT_EXIST ;
+        strcpy(u2ug_params[k].user,  pairs_list->c_data[i].user_acid);
+        strcpy(u2ug_params[k].group, pairs_list->c_data[i].ug_acid);
+
+        u2ug_params[k].def_group[0]    = NULL_CHAR;
+        u2ug_params[k].u2ug_admin_data = U2UG_ADM_NONE;
+        u2ug_params[k].u2ug_attr_data  = U2UG_ATTR_REGULAR;
+
+        (*actual_num)++;
+        continue;
+     }
+
+    /*
+     * With connection info everything O.K., put it
+     */
+
+     k = (*actual_num);
+     TSS_put_connect_info(comp, k, &(pairs_list->c_data[i]),
+                          u2ug_params, addinfo, objs_exist, dest, msgs);
+     (*actual_num)++;
+  }
+
+  *have_more = NO_MORE;
+  rc = ESA_OK;
+
+ /*
+  *  Finish
+  */
+
+ exit : ;
+
+ /*
+  *  Free temporary connection data
+  */
+
+  if ( user_data )
+     TSS_free_cnn_trap_handle(comp, &user_data, dest, msgs);
+  if ( ug_data )
+     TSS_free_cnn_trap_handle(comp, &ug_data, dest, msgs);
+
+  ESA_DIAG_exit(comp, 3, func, rc);
+
+  return rc ;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * Subroutine name : put_connect_info                          *
+ *                                                             *
+ * DESCRIPTION     : Put connect information to addinfo        *
+ *                                                             *
+ * INPUT           : cnn_data   - connection trap area         *
+ *                   k          - current index                *
+ *                   u2ug_params- connection param             *
+ *                   addinfo    - addinfo area                 *
+ *                   obj_exist  - obj exist area               *
+ *                                                             *
+ * OUTPUT          : none                                      *
+ *                                                             *
+ * RETURN VALUE    : none                                      *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC  TSS_put_connect_info(ESA_DIAG_COMP_typ   comp,
+                             int                         k,
+                             TSS_TRAP_CNN_DATA_typ     * cnn_data,
+                             U2UG_PARAMS_rec_typ         u2ug_params[1],
+                             ADDINFO_rec_ptr             addinfo[1],
+                             OBJ_EXISTS_typ              objs_exist[1],
+                             CTSAMSG_DEST_TABLE_rec_ptr  dest,
+                             CTSAMSG_HANDLE_rec_ptr      msgs)
+ {
+
+ /*
+  *   Variables
+  */
+
+  static char func[] = "TSS_put_connect_info";
+  char   err_buf[200];               /* BS2382 */
+  ESA_RC rc          = ESA_OK;       /* BS2382 */
+  char   pos[MAX_TSS_PARAM_LEN];
+
+ /*
+  *   Initialization
+  */
+
+  ESA_DIAG_enter(ESA_COMP_GTUG2UC, 3, func );
+
+  ESA_DIAG_printf(comp, 5,
+                  "%d.input=%x u2ug_params=%x objs_exist=%x addinfo=%x",
+                  k, cnn_data,
+                  &u2ug_params[k], &objs_exist[k], addinfo[k] );
+
+  /* The following check was added because we found error     IS10171
+     messages in the batch utility when executing the         IS10171
+     following command:                                       IS10171
+     :LISTCONN                                                IS10171
+     FILTER.GROUP=(TSSADMIN,OMVSGRP,AMIR4)                    IS10171
+     These error messages appeared for each acid in each      IS10171
+     group requested in the batch command:                    IS10171
+     CTS3632I User=SECAK Group=TSSADMIN Connection Rejected.  IS10171
+              Undefined Position                              IS10171
+     CTS3632I User=SECAL Group=TSSADMIN Connection Rejected.  IS10171
+              Undefined Position                              IS10171*/
+  if (ADDINFO_search( "POS", TSS_ADDINFO_KWD_LEN,           /*IS10171*/
+       addinfo[0]->pair, addinfo[0]->num_pairs ) NE NULL) { /*IS10171*/
+     /* Lines below added by BS2382 */
+     if (cnn_data->pos EQ TSS_CNN_POS_UNDEFINED) {
+       sprintf(err_buf,
+               "User=%s Group=%s Connection Rejected. Undefined Position",
+                cnn_data->user_acid,
+                cnn_data->ug_acid);
+       ESA_DIAG_printf(comp, 5, "%s", err_buf);
+       CTSAMSG_print(TSS_CONN_REJECTED,
+                     msgs, NULL, dest,
+                     cnn_data->user_acid,
+                     cnn_data->ug_acid);
+       rc = ESA_ERR;
+       goto exit;
+     }
+  /* Lines above added by BS2382 */
+  }                                                         /*IS10171*/
+
+  objs_exist[k] = OBJ_EXIST ;
+  strcpy(u2ug_params[k].user,  cnn_data->user_acid);
+  strcpy(u2ug_params[k].group, cnn_data->ug_acid);
+
+  u2ug_params[k].def_group[0]    = NULL_CHAR;
+  u2ug_params[k].u2ug_admin_data = U2UG_ADM_NONE;
+  u2ug_params[k].u2ug_attr_data  = U2UG_ATTR_REGULAR;
+
+  ESA_DIAG_printf(comp, 5, "cnn_data->expires=%s",
+                  cnn_data->expires);
+
+  TSS_put_to_addinfo(comp, TSS_CNN_EXPIRES,
+                     cnn_data->expires,
+                     addinfo[k], 0, dest, msgs );
+
+  ESA_DIAG_printf(comp, 5, "cnn_data->relative_pos=%s",
+                  cnn_data->relative_pos);
+
+  TSS_put_to_addinfo(comp, TSS_CNN_RELATIVE_POS,
+                     cnn_data->relative_pos,
+                     addinfo[k], 0, dest, msgs );
+
+  ESA_DIAG_printf(comp, 5, "cnn_data->relative_profile=%s",
+                  cnn_data->relative_profile);
+
+  TSS_put_to_addinfo(comp, TSS_CNN_RELATIVE_PROFILE,
+                     cnn_data->relative_profile,
+                     addinfo[k], 0, dest, msgs );
+
+  ESA_DIAG_printf(comp, 5, "cnn_data->pos=%d", cnn_data->pos);
+
+  sprintf(pos, "%d", cnn_data->pos);
+  TSS_put_to_addinfo(comp, TSS_CNN_POS,  pos,
+                     addinfo[k], 0, dest, msgs );
+ /*
+  *    Finish
+  */
+
+  exit : ;
+
+  /* BS2382 ESA_DIAG_exit(ESA_COMP_GTUG2UC, 3, func, ESA_OK) ; */
+
+  ESA_DIAG_exit(ESA_COMP_GTUG2UC, 3, func, rc);  /* BS2382 */
+
+  /* BS2383  return ESA_OK;  */
+
+  return rc;      /*  BS2382 */
+
+ }
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_set_ug_acids_list                      *
+*                                                             *
+* DESCRIPTION    : Create acids list from obtained ug id      *
+*                                                             *
+* INPUT          : ugs_in          - ugs list                 *
+*                  num_ugs_in      - number of entered ugs    *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : ug_list                                    *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+/**************************************************************/
+
+static ESA_RC TSS_set_ug_acids_list(ESA_DIAG_COMP_typ   comp,
+                   TSS_TRAP_BUF_rec_typ              ** ug_list,
+                   UG_typ                               ugs_in[1],
+                   short                                num_ugs_in,
+                   ADMIN_PARAMS_rec_typ               * admin_params,
+                   ERR_STRUCT_rec_typ                 * err)
+{
+
+ static char func[]="TSS_set_ug_acids_list";
+ CTSAMSG_DEST_TABLE_rec_typ      * dest;
+ CTSAMSG_HANDLE_rec_typ          * msgs;
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                      rc = ESA_OK ;
+ TSS_TRAP_BUF_rec_typ      * tmp;
+ int                         i;
+ int                         buf_size = num_ugs_in + 2;
+ char                        acid[MAX_TSS_PARAM_LEN];
+
+   /*** For TSS_chk_acid ***/
+
+ char                        real_acid_type[TSS_ACID_TYPE_LEN+1]="";
+ OBJECT_TYPE_typ             real_obj_type = TYPE_IGNORE;
+
+
+/*
+ *  Initialize
+ */
+
+ ESA_DIAG_enter(comp, 3, func );
+
+ msgs = admin_params->ctsamsg_handle;
+ dest = admin_params->ctsamsg_dest;
+
+/*
+ *  Create buffer
+ */
+
+ rc = TSS_alloc_trap_handle (comp, buf_size, &tmp, dest, msgs );
+ if ( rc NE ESA_OK )
+   goto exit;
+
+ for (i=0; i LT num_ugs_in; i++ ) {
+
+   /*  Check ug existance */
+
+   rc = TSS_chk_acid(comp, ugs_in[i],
+                     TSS_GROUP, TYPE_GROUP,
+                     OBJ_EXIST, TRUE, real_acid_type, &real_obj_type,
+                     admin_params, err);
+
+   ESA_DIAG_printf(ESA_COMP_GTUG2UC,1,
+                   "Group %d.%s rc=%s", i, ugs_in[i], ESA_rc2str(rc) );
+
+   if (rc EQ ESA_OK) {
+     ESA_DIAG_printf(comp, 3, "Saved:%d.%s", i, ugs_in[i]);
+     strcpy(acid, "0");   /* Sort symbol */
+     strcat(acid, ugs_in[i]);
+     rc = TSS_save_output(comp,tmp, acid, dest, msgs);
+     if ( rc NE ESA_OK )
+       goto exit;
+   }
+ }
+
+ *ug_list = tmp;
+
+/*
+ *  Finish
+ */
+
+ exit : ;
+
+ ESA_DIAG_exit(comp, 3, func, rc);
+
+ return rc ;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_set_user_acids_list                    *
+*                                                             *
+* DESCRIPTION    : Create acids list from obtained user acid  *
+*                                                             *
+* INPUT          : users_in        - users_in                 *
+*                  num_users_in    - number of entered users  *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : user_list                                  *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+/**************************************************************/
+
+static ESA_RC TSS_set_user_acids_list(ESA_DIAG_COMP_typ comp,
+                   TSS_TRAP_BUF_rec_typ              ** user_list,
+                   USER_typ                             users_in[1],
+                   short                                num_users_in,
+                   ADMIN_PARAMS_rec_typ               * admin_params,
+                   ERR_STRUCT_rec_typ                 * err)
+{
+
+ static char func[]="TSS_set_user_acids_list";
+ CTSAMSG_DEST_TABLE_rec_typ      * dest;
+ CTSAMSG_HANDLE_rec_typ          * msgs;
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                      rc = ESA_OK ;
+ TSS_TRAP_BUF_rec_typ      * tmp;
+ int                         i;
+ int                         buf_size = num_users_in + 2;
+ char                        acid[MAX_TSS_PARAM_LEN];
+
+ /*** For TSS_chk_acid ***/
+
+ char                        real_acid_type[TSS_ACID_TYPE_LEN+1]="";
+ OBJECT_TYPE_typ             real_obj_type = TYPE_IGNORE;
+
+
+/*
+ *  Initialize
+ */
+
+ ESA_DIAG_enter(comp, 3, func );
+
+ msgs = admin_params->ctsamsg_handle;
+ dest = admin_params->ctsamsg_dest;
+
+/*
+ *  Create buffer
+ */
+
+ rc = TSS_alloc_trap_handle (comp, buf_size, &tmp, dest, msgs );
+ if ( rc NE ESA_OK )
+   goto exit;
+
+ for (i=0; i LT num_users_in; i++ ) {
+
+   /*  Check user existance */
+
+   rc = TSS_chk_acid(comp, users_in[i],
+                     TSS_USER, TYPE_USER,
+                     OBJ_EXIST, TRUE, real_acid_type, &real_obj_type,
+                     admin_params, err);
+
+   ESA_DIAG_printf(ESA_COMP_GTUG2UC,1,
+                   "User %d.%s rc=%s", i,users_in[i], ESA_rc2str(rc) );
+
+   if (rc EQ ESA_OK) {
+     ESA_DIAG_printf(comp, 3, "Saved:%d.%s", i, users_in[i]);
+     strcpy(acid, "0");   /* Sort symbol */
+     strcat(acid, users_in[i]);
+     rc = TSS_save_output(comp,tmp, acid, dest, msgs);
+     if ( rc NE ESA_OK )
+       goto exit;
+   }
+ }
+
+ *user_list = tmp;
+
+/*
+ *  Finish
+ */
+
+ exit : ;
+
+ ESA_DIAG_exit(comp, 3, func, rc);
+
+ return rc ;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_set_pair_acids_list                    *
+*                                                             *
+* DESCRIPTION    : Create acids list from obtained user/ug    *
+*                                                             *
+* INPUT          : users_in        - users_in                 *
+*                  ugs_in          - ugs_in                   *
+*                  num_users_in    - number of entered users  *
+*                  num_ugs_in      - number of entered ugs    *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : user_list                                  *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+/**************************************************************/
+
+static ESA_RC TSS_set_pair_acids_list(ESA_DIAG_COMP_typ comp,
+                   TSS_TRAP_CNN_BUF_rec_typ          ** pair_list,
+                   USER_typ                             users_in[1],
+                   short                                num_users_in,
+                   UG_typ                               ugs_in[1],
+                   short                                num_ugs_in,
+                   ADMIN_PARAMS_rec_typ               * admin_params,
+                   ERR_STRUCT_rec_typ                 * err)
+{
+
+ static char func[]="TSS_set_pair_acids_list";
+ CTSAMSG_DEST_TABLE_rec_typ      * dest;
+ CTSAMSG_HANDLE_rec_typ          * msgs;
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                      rc = ESA_OK ;
+ ESA_RC                      rcu, rcg;
+ TSS_TRAP_CNN_BUF_rec_typ  * tmp;
+ int                         i;
+ int                         buf_size = num_users_in + 2;
+ char                        user_acid[MAX_TSS_PARAM_LEN];
+ char                        ug_acid[MAX_TSS_PARAM_LEN];
+
+ /*** For TSS_chk_acid ***/
+
+ char                        real_acid_type[TSS_ACID_TYPE_LEN+1]="";
+ OBJECT_TYPE_typ             real_obj_type = TYPE_IGNORE;
+
+/*
+ *  Initialize
+ */
+
+ ESA_DIAG_enter(comp, 3, func );
+
+ msgs = admin_params->ctsamsg_handle;
+ dest = admin_params->ctsamsg_dest;
+
+/*
+ *  Create buffer
+ */
+
+ rc = TSS_alloc_cnn_trap_handle (comp, buf_size, &tmp, dest, msgs );
+ if ( rc NE ESA_OK )
+   goto exit;
+
+ for (i=0; i LT num_users_in; i++ ) {
+
+   /*  Check user existance */
+
+   rcu = TSS_chk_acid(comp, users_in[i],
+                      TSS_USER, TYPE_USER,
+                      OBJ_EXIST, TRUE, real_acid_type, &real_obj_type,
+                      admin_params, err);
+
+   /*  Check ug existance */
+
+   rcg = TSS_chk_acid(comp, ugs_in[i],
+                      TSS_GROUP, TYPE_GROUP,
+                      OBJ_EXIST, TRUE, real_acid_type, &real_obj_type,
+                      admin_params, err);
+
+   ESA_DIAG_printf(ESA_COMP_GTUG2UC,1,
+                   "Pair %d.User=%s Group=%s rcu=%s rcg=%s",
+                   i, users_in[i],   ugs_in[i],
+                   ESA_rc2str(rcu),  ESA_rc2str(rcg) );
+
+   ESA_DIAG_printf(comp, 3, "Saved:%d.User=%s Group=%s",
+                   i, users_in[i], ugs_in[i]);
+
+   strcpy(user_acid, users_in[i]);
+   strcpy(ug_acid,   ugs_in[i]);
+   rc = TSS_save_user_cnn_list(comp, tmp,
+                               user_acid, ug_acid,
+                               dest, msgs );
+   if ( rc NE ESA_OK )
+     goto exit;
+
+   if ( (rcu NE ESA_OK) OR (rcg NE ESA_OK) )
+     tmp->c_data[tmp->used_entries-1].pos =  TSS_CNN_PAIR_NOT_VALID;
+ }
+
+ *pair_list = tmp;
+
+/*
+ *  Finish
+ */
+
+ exit : ;
+
+ ESA_DIAG_exit(comp, 3, func, rc);
+
+ return rc ;
+
+}
+
+
+  /*
+   *  ps0318 Self-learning extracts
+   */
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_EXtractTableInit                       *
+*                                                             *
+* DESCRIPTION    : Create Cache - Extract table               *
+*                                                             *
+* INPUT          : none                                       *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+/**************************************************************/
+
+static ESA_RC TSS_EXtractTableInit(CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                                   CTSAMSG_HANDLE_rec_ptr       msgs)
+{
+  ESA_RC          rc = ESA_OK;
+  /*static char func[]="TSS_EXtractTableInit";             /*IS0358*/
+
+
+  extract_table.entries = (TSS_EXTRACT_TABLE_ENTRY_typ   *)
+                          malloc( MAX_INITIAL_EXTRACT_TABLE *
+                                 sizeof(TSS_EXTRACT_TABLE_ENTRY_typ));
+
+  if ( NOT extract_table.entries ) {
+     CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                   "ExtractTable",
+                   MAX_INITIAL_EXTRACT_TABLE *
+                   sizeof(TSS_EXTRACT_TABLE_ENTRY_typ));
+
+     extract_table.allow_to_realloc = FALSE;
+     goto exit;
+  }
+  ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,                 /*IS0358*/
+         "malloc (%6X) bytes at address (%x) (%d,%s)", /*IS10027*/
+         sizeof(TSS_EXTRACT_TABLE_ENTRY_typ)*MAX_INITIAL_EXTRACT_TABLE,
+         extract_table.entries, __LINE__, __FILE__ );
+
+  extract_table.allow_to_realloc = TRUE;
+  extract_table.allocated        = MAX_INITIAL_EXTRACT_TABLE;
+  extract_table.used             = 0;
+
+  exit :;
+    return rc;
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_EXtractTableTerm                       *
+*                                                             *
+* DESCRIPTION    : Free   Cache - Extract table               *
+*                                                             *
+* INPUT          : none                                       *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+/**************************************************************/
+
+static ESA_RC TSS_EXtractTableTerm(CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                                   CTSAMSG_HANDLE_rec_ptr       msgs)
+{
+  ESA_RC                       rc = ESA_OK;
+  int                          i;
+  TSS_EXTRACT_TABLE_ENTRY_typ  temp;
+  /*static char func[]="TSS_EXtractTableTerm";             /*IS0358*/
+
+  if ( NOT extract_table.entries )
+     goto exit;
+
+  for (i=0; i LT extract_table.used; i++) {
+     memcpy( (char *)&temp,
+             (char *)&extract_table.entries[i],
+             sizeof(TSS_EXTRACT_TABLE_ENTRY_typ) );
+     ESA_DIAG_printf(ESA_COMP_GTUG2UC,3,
+                     "%d.free %s/%X",
+                     i, temp.acid, temp.list);
+     if ( temp.list )
+       {                                                   /*IS0358*/
+        ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,             /*IS0358*/
+          "Free address (%x) (%d,%s)",
+          temp.list, __LINE__, __FILE__ );
+
+        free(temp.list);
+       }                                                   /*IS0358*/
+  }
+
+  ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,                   /*IS0358*/
+          "Free address (%x) (%d,%s)",
+          extract_table.entries, __LINE__, __FILE__ );
+  free(extract_table.entries);
+  extract_table.entries = NULL;                            /*IS0358*/
+
+  exit :;
+    return rc;
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_EXtractTableRealloc                    *
+*                                                             *
+* DESCRIPTION    : Grow   Cache - Extract table               *
+*                                                             *
+* INPUT          : none                                       *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+/**************************************************************/
+
+static ESA_RC TSS_EXtractTableRealloc(CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                                      CTSAMSG_HANDLE_rec_ptr       msgs)
+{
+  ESA_RC                        rc = ESA_OK;
+  TSS_EXTRACT_TABLE_ENTRY_typ  *temp;
+  /*static char func[]="TSS_EXtractTableRealloc";            /*IS0358*/
+
+
+  if ( NOT extract_table.allow_to_realloc) {
+    rc = ESA_EOF;
+    goto exit;
+  }
+
+  if ( (extract_table.used + 2) GE extract_table.allocated) {
+     temp = extract_table.entries;
+     extract_table.allocated += MAX_INITIAL_EXTRACT_TABLE;
+     ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,                 /*IS0358*/
+      "Before realloc (%6X) bytes at address (%x) (%d,%s)", /*IS10027*/
+       sizeof(TSS_TRAP_CNN_BUF_rec_typ)*extract_table.allocated,
+       extract_table.entries, __LINE__, __FILE__ );
+     extract_table.entries = (TSS_EXTRACT_TABLE_ENTRY_typ  *)
+                     realloc( extract_table.entries,
+                              extract_table.allocated *
+                              sizeof(TSS_EXTRACT_TABLE_ENTRY_typ ) );
+
+     if ( NOT extract_table.entries ) {
+        CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                      "ExtractTable(Realloc)",
+                      MAX_INITIAL_EXTRACT_TABLE *
+                      sizeof(TSS_EXTRACT_TABLE_ENTRY_typ));
+        extract_table.entries          = temp;
+        extract_table.allocated       -= MAX_INITIAL_EXTRACT_TABLE;
+        extract_table.allow_to_realloc = FALSE;
+        rc = ESA_EOF;
+        goto exit;
+     }
+     ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,                 /*IS0358*/
+      "After realloc (%6X) bytes at address (%x) (%d,%s)", /*IS10027*/
+       sizeof(TSS_TRAP_CNN_BUF_rec_typ)*extract_table.allocated,
+       extract_table.entries, __LINE__, __FILE__ );
+     ESA_DIAG_printf(ESA_COMP_GTUG2UC,3,
+                     "Realloc: New amount of entries is %d",
+                     extract_table.allocated);
+  }
+
+  exit :;
+      return rc;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_EXtractTable_UGet                      *
+*                                                             *
+* DESCRIPTION    : Search Groups list connected to user       *
+*                  in Cache (key=user)                        *
+* INPUT          : none                                       *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+/**************************************************************/
+
+static ESA_RC TSS_ExtractTable_UGet(char                     *u_acid,
+                                   TSS_TRAP_CNN_BUF_rec_typ **user_data,
+                                   CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                                   CTSAMSG_HANDLE_rec_ptr       msgs)
+{
+
+     ESA_RC                       rc = ESA_EOF;
+     TSS_TRAP_CNN_BUF_rec_typ    *trap_data = (*user_data);
+     char                         g_acid[12];
+     int                          i;
+     int                          len;
+     char                        *wrk;
+     char                        *wrk1;
+     TSS_EXTRACT_TABLE_ENTRY_typ  temp;
+
+     if ( NOT extract_table.entries )
+        goto exit;
+     if ( NOT (*user_data) )
+        goto exit;
+
+     trap_data->used_entries = 0;
+     for (i=0; i LT extract_table.used; i++) {
+        memcpy( (char *)&temp,
+                (char *)&extract_table.entries[i],
+                sizeof(TSS_EXTRACT_TABLE_ENTRY_typ) );
+        ESA_DIAG_printf(ESA_COMP_GTUG2UC,3,
+                        "%d.acid=%s Looking for acid=%s",
+                         i, temp.acid, u_acid);
+        if ( strcmp(temp.acid, u_acid ) NE 0)
+           continue;
+
+        rc = ESA_OK;
+        wrk = temp.list;
+        if (NOT wrk)
+          goto exit;
+
+        while (TRUE) {
+          wrk1 = strchr(wrk, ADDINFO_LIST_ENTRY);
+          if (NOT wrk1) {
+            TSS_create_cnn_relative_info(ESA_COMP_GTUG2UC,
+                                         (*user_data) );
+            goto exit;
+          }
+
+          len = wrk1 - wrk;
+          if (len GT 0) {
+            memcpy(g_acid, wrk, len);
+            g_acid[len] = NULL_CHAR;
+            TSS_save_user_cnn_list(ESA_COMP_GTUG2UC,  (*user_data),
+                                   u_acid, g_acid, dest, msgs);
+            ESA_DIAG_printf(ESA_COMP_GTUG2UC,3,
+                            "Put to cnn_table:u_acid=%s g_acid=%s",
+                            u_acid, g_acid);
+            wrk = wrk1 + 1;
+          }
+        } /* while (TRUE)   */
+      }     /* for (i=0; i LT extract_table.used; i++)   */
+
+  exit:;
+      return rc;
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_EXtractTable_UPut                      *
+*                                                             *
+* DESCRIPTION    : Save Groups list connected to user         *
+*                  in Cache (key=user)                        *
+* INPUT          : none                                       *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+/**************************************************************/
+
+static ESA_RC TSS_ExtractTable_UPut(char                     *u_acid,
+                                   TSS_TRAP_CNN_BUF_rec_typ **user_data,
+                                   CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                                   CTSAMSG_HANDLE_rec_ptr       msgs)
+{
+
+     ESA_RC                       rc = ESA_OK;
+     TSS_TRAP_CNN_BUF_rec_typ    *trap_data = (*user_data);
+     int                          i;
+     int                          len;
+     char                        *wrk = NULL;
+     TSS_EXTRACT_TABLE_ENTRY_typ  temp;
+  /*static char func[]="TSS_EXtractTable_UPut";            /*IS0358*/
+
+     if ( NOT extract_table.entries )
+        goto exit;
+     if ( NOT (*user_data) )
+        goto exit;
+     if ( NOT extract_table.allow_to_realloc)
+        goto exit;
+
+     len = 0;
+     if  (trap_data->used_entries GT 0) {
+        for (i=0; i LT trap_data->used_entries; i++) {
+          len += strlen(trap_data->c_data[i].ug_acid) + 1;
+        }
+        len += 1;   /* Null-terminated string */
+        wrk = malloc(len);
+        if (NOT wrk) {
+          CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                        "ExtractTableEntry", len);
+
+          extract_table.allow_to_realloc = FALSE;
+          goto exit;
+        }
+        ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,      /*IS0358*/
+          "malloc (%6X) bytes at address (%x) (%d,%s)", /*IS10027*/
+          len, wrk, __LINE__, __FILE__ );
+
+        strcpy(temp.acid, u_acid);
+        strcpy(wrk, "");
+        for (i=0; i LT trap_data->used_entries; i++) {
+          strcat(wrk,   trap_data->c_data[i].ug_acid);
+          strcat(wrk,   sepc);
+        }
+     }
+
+     rc = TSS_EXtractTableRealloc(dest, msgs);
+     if (rc NE ESA_OK)
+         goto exit;
+
+     temp.list = wrk;
+     i = extract_table.used;
+     memcpy( (char *)&extract_table.entries[i],
+             (char *)&temp,
+             sizeof(TSS_EXTRACT_TABLE_ENTRY_typ) );
+
+     extract_table.used++;
+     if (temp.list)
+        ESA_DIAG_printf(ESA_COMP_GTUG2UC,3,
+                        "%d.Put.acid=%s List=%s",
+                         i, temp.acid, temp.list);
+     else
+        ESA_DIAG_printf(ESA_COMP_GTUG2UC,3,
+                        "%d.Put.acid=%s List=NULL",
+                         i, temp.acid);
+  exit:;
+      return rc;
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_EXtractTable_GGet                      *
+*                                                             *
+* DESCRIPTION    : Search Users  list connected to group      *
+*                  in Cache (key=group)                       *
+* INPUT          : none                                       *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+/**************************************************************/
+
+static ESA_RC TSS_ExtractTable_GGet(char                     *g_acid,
+                                   TSS_TRAP_CNN_BUF_rec_typ **ug_data,
+                                   CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                                   CTSAMSG_HANDLE_rec_ptr       msgs)
+{
+
+     ESA_RC                       rc = ESA_EOF;
+     TSS_TRAP_CNN_BUF_rec_typ    *trap_data = (*ug_data);
+     char                         u_acid[12];
+     char                         x_time[12];
+     int                          i;
+     int                          len;
+     char                        *wrk;
+     char                        *wrk1;
+     TSS_EXTRACT_TABLE_ENTRY_typ  temp;
+
+     if ( NOT extract_table.entries )
+        goto exit;
+     if ( NOT (*ug_data) )
+        goto exit;
+
+     trap_data->used_entries = 0;
+     for (i=0; i LT extract_table.used; i++) {
+        memcpy( (char *)&temp,
+                (char *)&extract_table.entries[i],
+                sizeof(TSS_EXTRACT_TABLE_ENTRY_typ) );
+        ESA_DIAG_printf(ESA_COMP_GTUG2UC,3,
+                        "%d.acid=%s Looking for acid=%s",
+                         i, temp.acid, g_acid);
+        if ( strcmp(temp.acid, g_acid ) NE 0)
+           continue;
+
+        rc = ESA_OK;
+        wrk = temp.list;
+        if (NOT wrk)
+          goto exit;
+
+        while (TRUE) {
+          wrk1 = strchr(wrk, ADDINFO_LIST_ENTRY);
+          if (NOT wrk1) {
+            TSS_create_cnn_relative_info(ESA_COMP_GTUG2UC,
+                                         (*ug_data) );
+            goto exit;
+          }
+
+          len = wrk1 - wrk;
+          if (len GT 0) {
+            memcpy(u_acid, wrk, len);
+            u_acid[len] = NULL_CHAR;
+
+            /* Get Expiration date */
+
+            x_time[0] = NULL_CHAR;
+            wrk = wrk1 + 1;
+            wrk1 = strchr(wrk, ADDINFO_LIST_ENTRY);
+            if (wrk1) {
+              len = wrk1 - wrk;
+              if (len GT 0) {
+                 memcpy(x_time, wrk, len);
+                 x_time[len] = NULL_CHAR;
+              }
+              wrk = wrk1 + 1;
+            }
+
+            TSS_save_ug_cnn_list(ESA_COMP_GTUG2UC,  (*ug_data),
+                                 g_acid, u_acid, x_time, dest, msgs);
+            ESA_DIAG_printf(ESA_COMP_GTUG2UC,3,
+                "Put to cnn_table:u_acid=%s g_acid=%s exp_time=%s",
+                 u_acid, g_acid, x_time);
+          }    /* if len of U-acid > 0 */
+        } /* while (TRUE) { */
+      }     /* for (i=0; i LT extract_table.used; i++) { */
+
+  exit:;
+      return rc;
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_EXtractTable_GPut                      *
+*                                                             *
+* DESCRIPTION    : Save Users  list connected to group        *
+*                  in Cache (key=group)                       *
+* INPUT          : none                                       *
+*                                                             *
+* OUTPUT         : none                                       *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+/**************************************************************/
+
+static ESA_RC TSS_ExtractTable_GPut(char                     *g_acid,
+                                   TSS_TRAP_CNN_BUF_rec_typ **ug_data,
+                                   CTSAMSG_DEST_TABLE_rec_ptr   dest,
+                                   CTSAMSG_HANDLE_rec_ptr       msgs)
+{
+
+     ESA_RC                       rc = ESA_OK;
+     TSS_TRAP_CNN_BUF_rec_typ    *trap_data = (*ug_data);
+     int                          i;
+     int                          len;
+     int                          leni;
+     char                        *wrk = NULL;
+     TSS_EXTRACT_TABLE_ENTRY_typ  temp;
+  /*static char func[]="TSS_EXtractTable_GPut";            /*IS0358*/
+
+     if ( NOT extract_table.entries )
+        goto exit;
+     if ( NOT (*ug_data) )
+        goto exit;
+     if ( NOT extract_table.allow_to_realloc)
+        goto exit;
+
+     len = 0;
+     if  (trap_data->used_entries GT 0) {
+        for (i=0; i LT trap_data->used_entries; i++) {
+          leni = strlen(trap_data->c_data[i].user_acid) + 1 +
+                 strlen(trap_data->c_data[i].expires)   + 1;
+          len += leni;
+        }
+        len += 1;   /* Null-terminated string */
+        wrk = malloc(len);
+        if (NOT wrk) {
+          CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                        "ExtractTableEntry", len);
+
+          extract_table.allow_to_realloc = FALSE;
+          goto exit;
+        }
+        ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,     /*IS0358*/
+          "malloc (%6X) bytes at address (%x) (%d,%s)",    /*IS10027*/
+          len, wrk, __LINE__, __FILE__ );
+
+        strcpy(temp.acid, g_acid);
+        strcpy(wrk, "");
+        for (i=0; i LT trap_data->used_entries; i++) {
+          strcat(wrk,   trap_data->c_data[i].user_acid);
+          strcat(wrk,   sepc);
+          strcat(wrk,   trap_data->c_data[i].expires);
+          strcat(wrk,   sepc);
+        }
+     }
+
+     rc = TSS_EXtractTableRealloc(dest, msgs);
+     if (rc NE ESA_OK)
+         goto exit;
+
+     temp.list = wrk;
+     i = extract_table.used;
+     memcpy( (char *)&extract_table.entries[i],
+             (char *)&temp,
+             sizeof(TSS_EXTRACT_TABLE_ENTRY_typ) );
+
+     extract_table.used++;
+     if (temp.list)
+        ESA_DIAG_printf(ESA_COMP_GTUG2UC,3,
+                        "%d.Put.acid=%s List=%.40s", /* IS10032 */
+                         i, temp.acid, temp.list);
+     else
+        ESA_DIAG_printf(ESA_COMP_GTUG2UC,3,
+                        "%d.Put.acid=%s List=NULL",
+                         i, temp.acid);
+  exit:;
+      return rc;
+}
+
+/* ps0395 */
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_do_r0600_list                          *
+ *                                                             *
+ * DESCRIPTION    : r0600 records proccessing                  *
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  get_handle- get handle                     *
+ *                  max_conns - max conns                      *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : actual_num - actual num                    *
+ *                  have_more  - have more flag                *
+ *                  u2ug_params- conn params                   *
+ *                  addinfo    - addinfo                       *
+ *                  obj_exist  - obj exist                     *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_do_r0600_list(ESA_DIAG_COMP_typ  comp,
+                            TSS_GET_HANDLE_typ    * get_handle,
+                            short                   max_conns,
+                            short                 * actual_num,
+                            HAVE_MORE_typ         * have_more,
+                            U2UG_PARAMS_rec_typ     u2ug_params[1],
+                            ADDINFO_rec_ptr         addinfo[1],
+                            OBJ_EXISTS_typ          objs_exist[1],
+                            ADMIN_PARAMS_rec_typ  * admin_params,
+                            ERR_STRUCT_rec_typ    * err)
+   /* commented by BS2518   int                   * this_is_a_restart)*/
+{
+
+ static char func[]="TSS_do_r0600_list";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                       rc   = ESA_OK ;
+ char                         r0600_record[100];
+ TSS_TRAP_CNN_DATA_typ        r0600_info;
+ TSS_TRAP_CNN_DATA_typ        cnn_data;
+ CTSAMSG_HANDLE_rec_typ     * msgs;
+ CTSAMSG_DEST_TABLE_rec_typ * dest;
+ int                          i = 0;
+ /* commented by BS2518 ps0495 */
+ /*char             restart_marker[TSS_CACHE_RESTART_MARKER_LEN]= "";*/
+
+ /*
+  *  Initialize
+  */
+
+  ESA_DIAG_enter(comp, 3, func );
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  *have_more = HAVE_MORE;
+
+  (*actual_num) = 0;
+  for (i=0; i LT max_conns; i++) {
+    fgets ( r0600_record, sizeof(r0600_record), get_handle->r0600);
+    if ( feof(get_handle->r0600) ) {
+      rc = ESA_OK;
+      fclose(get_handle->r0600);
+      get_handle->r0600 = NULL;
+      *have_more = NO_MORE;
+      goto exit;
+    }
+
+    if ( ferror(get_handle->r0600) ) {
+      CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                    "fgets", R0600_DD, strerror(errno) );
+      rc = ESA_FATAL;
+    }
+
+    /* commented by BS2518 */
+    /* start of ps0495 */
+    /* checking if the Get_User function was restarted, in which case*/
+    /* data in TSSCACHE file is incomplete so we do not use it.
+    strncpy(restart_marker,r0600_record,TSS_CACHE_RESTART_MARKER_LEN);
+    if (NOT strncmp(restart_marker,TSS_CACHE_RESTART_MARKER
+                     ,TSS_CACHE_RESTART_MARKER_LEN )) {
+       ESA_DIAG_printf(comp,3,
+     "download of users was restarted. TSSCACHE will not be used");
+       *this_is_a_restart = TRUE;
+       rc = ESA_OK;
+       goto exit;
+
+    /* end of ps0495 */
+    /* end of BS2518 */
+
+    rc = R0600_split_record(r0600_record, &r0600_info, msgs, dest);
+    if (rc EQ ESA_OK) {
+      R0600_build_cnn_data(get_handle, &r0600_info, &cnn_data);
+      TSS_put_connect_info(comp, i, &cnn_data,
+                           u2ug_params, addinfo,
+                           objs_exist, dest, msgs);
+      (*actual_num)++;
+    }
+  }
+
+ /*
+  *  Finish
+  */
+
+ exit : ;
+
+  ESA_DIAG_exit(comp, 3, func, rc);
+
+  return rc ;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : R0600_build_cnn_data                       *
+ *                                                             *
+ * DESCRIPTION    : Build Conn data from r0600 record          *
+ *                                                             *
+ * INPUT          : get_handle- get handle                     *
+ *                  r0600 current cnn info                     *
+ *                                                             *
+ * OUTPUT         : r0600 cnn data                             *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC R0600_build_cnn_data(TSS_GET_HANDLE_typ    * get_handle,
+                           TSS_TRAP_CNN_DATA_typ  * cnn_data_in,
+                           TSS_TRAP_CNN_DATA_typ  * cnn_data_out)
+{
+
+ static char func[]="TSS_do_r0600_list";
+ ESA_DIAG_COMP_typ  comp = ESA_COMP_GTUG2UC;
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                       rc   = ESA_OK ;
+
+ /*
+  *  Initialize
+  */
+
+  ESA_DIAG_enter(comp, 5, func );
+
+  ESA_DIAG_printf(comp,5,
+    "get_handle:user_acid=%s relative_profile=%s",
+     get_handle->r0600_cnn_data.user_acid,
+     get_handle->r0600_cnn_data.relative_profile);
+  ESA_DIAG_printf(comp,5,
+    "get_handle:relative_pos=%s ug_acid=%s pos=%d",
+     get_handle->r0600_cnn_data.relative_pos,
+     get_handle->r0600_cnn_data.ug_acid,
+     get_handle->r0600_cnn_data.pos);
+
+  ESA_DIAG_printf(comp,5,
+    "in:user_acid=%s ug_acid=%d exp_date=%s",
+    cnn_data_in->user_acid, cnn_data_in->ug_acid,
+    cnn_data_in->expires);
+
+  /* Build connection data */
+
+  strcpy(cnn_data_out->user_acid, cnn_data_in->user_acid);
+  strcpy(cnn_data_out->ug_acid,   cnn_data_in->ug_acid);
+  strcpy(cnn_data_out->expires,   cnn_data_in->expires);
+
+  /* Check if this connection belongs to current packet */
+
+  if (strcmp(get_handle->r0600_cnn_data.user_acid,
+             cnn_data_in->user_acid) EQ 0)         {
+    get_handle->r0600_cnn_data.pos++;
+    cnn_data_out->pos = get_handle->r0600_cnn_data.pos;
+    strcpy(cnn_data_out->relative_profile,
+           get_handle->r0600_cnn_data.ug_acid);
+    strcpy(cnn_data_out->relative_pos, TSS_CNN_REL_POS_AFTER);
+  }
+  else {
+    get_handle->r0600_cnn_data.pos = 1;
+    cnn_data_out->pos = get_handle->r0600_cnn_data.pos;
+    strcpy(cnn_data_out->relative_profile,  "");
+    strcpy(cnn_data_out->relative_pos, TSS_CNN_REL_POS_TOP);
+  }
+
+  /* Save cnn data for further processing */
+
+  strcpy(get_handle->r0600_cnn_data.user_acid,
+         cnn_data_out->user_acid);
+  strcpy(get_handle->r0600_cnn_data.ug_acid,
+         cnn_data_out->ug_acid);
+  strcpy(get_handle->r0600_cnn_data.relative_profile,
+         cnn_data_out->relative_profile);
+
+  ESA_DIAG_exit(comp, 5, func, rc);
+
+  return rc ;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : R0600_split_record                         *
+ *                                                             *
+ * DESCRIPTION    : Build Conn data from r0600 record          *
+ *                                                             *
+ * INPUT          : r0600 record                               *
+ *                                                             *
+ * OUTPUT         : r0600 cnn data                             *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC R0600_split_record(char                * r0600_record,
+                           TSS_TRAP_CNN_DATA_typ      * cnn_data_out,
+                           CTSAMSG_HANDLE_rec_typ     * msgs,
+                           CTSAMSG_DEST_TABLE_rec_typ * dest)
+{
+
+ static char func[]="R0600_split_record";
+ ESA_DIAG_COMP_typ  comp = ESA_COMP_GTUG2UC;
+
+/*
+ *   Variables
+ */
+
+ ESA_RC         rc   = ESA_OK ;
+ int            i;
+ char         * wptr;
+ char         * token;
+
+ /*
+  *  Initialize
+  */
+
+  ESA_DIAG_enter(comp, 5, func );
+
+  wptr = strchr(r0600_record, '\n');
+  if (wptr)
+   *wptr = '\0';
+   for (i=0; i LT strlen(r0600_record); i++) {
+    r0600_record[i] = ~r0600_record[i];
+  }
+
+  strcpy(cnn_data_out->user_acid, "");
+  strcpy(cnn_data_out->ug_acid,   "");
+  strcpy(cnn_data_out->expires,   "");
+
+  ESA_DIAG_printf(comp,5,
+                  "r0600:%s", r0600_record);
+
+  token = strtok(r0600_record, ", \n");
+  if (!token)
+    goto exit;
+
+  strcpy(cnn_data_out->user_acid, token);
+
+  token = strtok(NULL, ", \n");
+  if (!token)
+    goto exit;
+  strcpy(cnn_data_out->ug_acid,   token);
+
+  token = strtok(NULL, ", \n");
+  if (!token)
+    goto exit;
+
+  strcpy(cnn_data_out->expires,   token);
+  if (strlen(cnn_data_out->expires) GT 0)
+    TSS_ConvertDateTSS2ESS(ESA_COMP_GTUG2UC,
+                           cnn_data_out->expires,
+                           dest, msgs);
+
+  exit :;
+  ESA_DIAG_exit(comp, 5, func, rc);
+
+  return rc ;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : R0600_seek_recordd                         *
+ *                                                             *
+ * DESCRIPTION    : Locate record for Continue download        *
+ *                                                             *
+ * INPUT          : user, group                                *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC R0600_seek_record(TSS_GET_HANDLE_typ   * get_handle,
+                           char                       * user,
+                           char                       * group,
+                           CTSAMSG_HANDLE_rec_typ     * msgs,
+                           CTSAMSG_DEST_TABLE_rec_typ * dest)
+ {
+
+ static char func[]="R0600_seek_record";
+ ESA_DIAG_COMP_typ  comp = ESA_COMP_GTUG2UC;
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                       rc   = ESA_OK ;
+ char                         r0600_record[100];
+ TSS_TRAP_CNN_DATA_typ        r0600_info;
+
+ /*
+  *  Initialize
+  */
+
+  ESA_DIAG_enter(comp, 5, func );
+
+  ESA_DIAG_printf(comp,5, "user=%s", user);
+
+  while (TRUE) {
+    fgets ( r0600_record, sizeof(r0600_record), get_handle->r0600);
+    if ( ferror(get_handle->r0600) ) {
+      CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                    "fgets", R0600_DD, strerror(errno) );
+      rc = ESA_FATAL;
+      goto exit;
+    }
+
+    if ( feof(get_handle->r0600) ) {
+      CTSAMSG_print(TSS_ERR_NO_ACID, msgs, NULL, dest,
+                    "USER", user);
+      rc = ESA_ERR;
+      fclose(get_handle->r0600);
+      get_handle->r0600 = NULL;
+      goto exit;
+    }
+
+    rc = R0600_split_record(r0600_record, &r0600_info, msgs, dest);
+    if (rc EQ ESA_OK)
+     if (strcmp(r0600_info.user_acid, user) EQ 0) {
+       strcpy(get_handle->r0600_cnn_data.user_acid, user);
+       strcpy(get_handle->r0600_cnn_data.relative_profile, "");
+       strcpy(get_handle->r0600_cnn_data.relative_pos, "");
+       strcpy(get_handle->r0600_cnn_data.ug_acid, group);
+       strcpy(get_handle->r0600_cnn_data.expires, "");
+       get_handle->r0600_cnn_data.pos = 1;
+       break;
+     }
+
+  }     /* while (TRUE) */
+
+  exit :;
+
+  ESA_DIAG_exit(comp,5, func, rc);
+
+  return rc ;
+
+}
+

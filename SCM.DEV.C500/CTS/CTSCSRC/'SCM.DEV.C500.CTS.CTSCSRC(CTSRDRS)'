@@ -1,0 +1,282 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Delete a resorce(RACF)                   *
+ *                                                             *
+ * File Name        : ctsrdrs.c                                *
+ *                                                             *
+ * Author           : Doron Cohen, Alexander Shvartsman        *
+ *                                                             *
+ * Creation Date    : 06/05/96                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * PS0238   Alex    16/02/98  Refresh GENERIC                  *
+ * PS0252   Guy     13/04/98  Common code changes              *
+ * PS0498   ShmuelK 12/01/02  Remove GENERIC in RDELETE        *
+ * IS0270   AvnerL  09/06/04  Support quotes on DSN (ws2517)   *
+ * IS0272   Michael 10/06/04  Update RACF 3.2.0 with old fixes *
+ * IS10174  NuritY  31/12/17  Dynamic EXECOUT support.         *
+ * WS10082  AvnerL  19/04/23  Recompile & allow 16K volumes    *
+ **************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+ #include   TIME
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_API
+ #include ESA_API_CODES
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_OS_CLI
+
+ /*
+  *   RACF include files
+  */
+
+ #include RACF_CODES
+ #include API_ADDINFO
+ #include RACF
+ #include RACF_RES
+
+ static   char   component[]="DELRES";
+
+ /*
+  *     MKT for DELDSD/RDELETE
+  *         (Mandatory Keywords Table)
+  */
+
+ static ADDINFO_MKTE_rec_typ mkt[] = {
+       ""         /* a null string indicate end-of-mkt */
+  };
+
+ /*
+  *     KDT for DELDSD/RDELETE COMMAND
+  *         (Keyword Decscription Table)
+  */
+
+ static ADDINFO_KDTE_rec_typ kdt[] =      {
+
+  /*                                                            */
+  /* keyword             type   negative       value delimiters */
+  /*                             value                          */
+  /* =================== ====== ============== ================ */
+
+   {"GENERIC"              ,KDT_FLG ,""            ,""   ,"" },
+   {"SET"                  ,KDT_IGN ,""            ,""   ,"" },
+   {"NOSET"                ,KDT_FLG ,"SET"         ,""   ,"" },
+   {"VOLUME"               ,KDT_KEY ,""            ,"(" ,")" },
+   {""                     ,KDT_FLG ,""            ,""   ,"" }
+
+   };
+
+/****************************************************
+ * Procedure Name: CTSDelRes
+ * Description   : Deletes a resource with it's ACL info
+ * Input         : resource, addinfo_data.
+ * Output        : None
+ * Input/Output  : None
+ * Return Value  : ESA_RC
+ ***************************************************/
+
+ ESA_RC CTSDelRes (RES_PARAMS_rec_typ   * res_params_ess,
+          /*       ADDINFO_rec_typ      * addinfo_res_res,  PS0252 */
+                   ADDINFO_rec_typ      * addinfo_data,
+                   ADMIN_PARAMS_rec_typ * admin_params,
+                   ERR_STRUCT_rec_typ   * err)
+ {
+
+   static char                   func[]="CTSDelRes";
+
+  /*
+   *     Variables
+   */
+
+   ESA_RC                        rc, chk_rc;
+   ADDINFO_rec_typ             * addinfo_res = NULL;
+   RES_PARAMS_rec_typ            res_params_tmp;
+   RES_PARAMS_rec_typ          * res_params = &res_params_tmp;
+   char                          cmd_pref[MAX_API_ST];
+   CTSAMSG_HANDLE_rec_typ      * msgs;
+   CTSAMSG_DEST_TABLE_rec_typ  * dest;
+   ONE_FIELD_rec_typ           * cpair;
+   ADDINFO_rec_typ             * laddinfo = NULL;
+   ADDINFO_rec_ptr          addinfo_vec[2] = { NULL, NULL };
+   int                      generic_flag = 0;
+   ONE_FIELD_rec_ptr        gen_pair, vol_pair;
+   /*WS10082 char         volume[RCF_ADDINFO_VAL_LEN+1]=NULL_STRING;*/
+   char          volume[ADDINFO_16K_VAL_LEN+1]=NULL_STRING;/*WS10082*/
+
+   char                    racf_dataset_quotes[4];  /* IS0270 */
+  #define RACF_DATASET_QUOTES "RACF_DATASET_QUOTES" /* IS0270 */
+   ESA_RC prm_rc;                                   /* IS0270 */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_DELRES, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+  /*
+   *  Build addinfo_res from resource name
+   */
+
+   rc = RCFRES_build_res_addinfo(res_params_ess, res_params,
+                                 &addinfo_res, dest, msgs);
+   if (rc NE ESA_OK)
+     goto exit;
+
+   if (ESA_DIAG_get_debug_level(ESA_COMP_DELRES) GT 4) {
+
+       ESA_DIAG_printf(ESA_COMP_DELRES,0, "addinfo_res");
+       ADDINFO_dump(addinfo_res,1);
+
+       ESA_DIAG_printf(ESA_COMP_DELRES,0, "addinfo_data");
+       ADDINFO_dump(addinfo_data,1);
+   }
+
+  /*
+   *   Check resource existance
+   */
+
+   gen_pair = ADDINFO_search("GENERIC", RCF_ADDINFO_KWD_LEN,
+                              addinfo_res->pair,
+                              addinfo_res->num_pairs);
+   if ( gen_pair NE NULL)
+      if ( strcmp(gen_pair->value,KWD_FLAG_ON) EQ 0 )
+         generic_flag = 1;
+
+
+   if ( ( generic_flag EQ 0 ) AND
+        ( strcmp(res_params->restype, "DATASET" ) EQ 0 ) ) {
+
+     vol_pair = ADDINFO_search("VOLUME", RCF_ADDINFO_KWD_LEN,
+                                addinfo_res->pair,
+                                addinfo_res->num_pairs);
+     if ( vol_pair NE NULL)
+        strcpy( volume, vol_pair->value );
+
+   }
+
+   ESA_DIAG_printf(ESA_COMP_DELRES, 1,
+        "Checking resource %s %s existance generic=%d volume=%s",
+         res_params->restype, res_params->resource,
+         generic_flag, volume );
+
+   chk_rc = RACF_chk_res(res_params->restype, res_params->resource,
+                         volume, generic_flag,
+                         OBJ_EXIST, TRUE, dest, msgs);
+   if ( chk_rc NE ESA_OK ) {        /* Resource does not exist */
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *  Handle SET/NOSET
+   */
+
+   cpair = ADDINFO_search("SET", RCF_ADDINFO_KWD_LEN,
+                           addinfo_data->pair,
+                           addinfo_data->num_pairs);
+   if ( cpair NE NULL) {
+      if ( strcmp(cpair->value,KWD_FLAG_OFF) EQ 0 )
+        ADDINFO_insert(TYPE_1A, "NOSET",
+                       KWD_FLAG_ON, laddinfo,
+                       RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                       UNIQUE);
+   }
+
+  /*
+   *  Prepare command (dataset profile / general profile)
+   */
+
+   if (strcmp(res_params->restype,"DATASET") EQ 0)
+   {                                                       /* IS0270 */
+    prm_rc = admin_params->cs_func.rssprm_get_opt_ptr      /* is0270 */
+                                (admin_params->rss_name,   /* is0270 */
+                                RACF_DATASET_QUOTES,       /* is0270 */
+                                1,                         /* is0270 */
+                                racf_dataset_quotes,       /* is0270 */
+                                OPT_TRUE,                  /* is0270 */
+                                OPT_FALSE);                /* is0270 */
+    if (prm_rc NE ESA_OK)                                  /* is0270 */
+      racf_dataset_quotes[0] = 'N';             /* Default=N  is0270 */
+                                                           /* is0270 */
+    if ( racf_dataset_quotes[0] EQ 'Y')                    /* is0270 */
+      sprintf(cmd_pref,"DELDSD '%s' ",res_params->resource);/* is0270*/
+    else                                                   /* is0270 */
+      sprintf(cmd_pref,"DELDSD %s ",res_params->resource);
+   }                                                       /* IS0270 */
+   else /*ps0498*/ {
+       if  ( generic_flag EQ 1 ) {
+       ADDINFO_delete(addinfo_res,"GENERIC");
+       ESA_DIAG_printf(ESA_COMP_DELRES, 1,
+                   "GENERIC removed for RDELETE");
+
+       }
+       sprintf(cmd_pref,"RDELETE %s %s ", res_params->restype,
+               res_params->resource);
+        /*ps0498*/ }
+   ESA_DIAG_printf(ESA_COMP_DELRES, 1,
+                   "Command header prepared (%s)", cmd_pref);
+
+   addinfo_vec[0] = addinfo_res;
+   addinfo_vec[1] = addinfo_data;
+
+  /*
+   *   Execute DELDSD/RDELETE command
+   */
+
+   rc = racfcmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+                cmd_pref, MAX_OK_RC_4,
+                2, addinfo_vec, mkt, kdt,
+                admin_params, CMDOUT_YES, RACF_NO);      /* IS10174 */
+   /* IS10174   dest, msgs, CMDOUT_YES, RACF_NO);   */
+
+  /*
+   *   Refresh based on resource class
+   */
+
+   if ( rc EQ ESA_OK )
+    RACF_refresh(res_params_ess->resource,      /* ps0239 */
+                 res_params_ess->restype,       /* ps0239 */
+                 admin_params, dest,msgs);      /* ps0239 */
+
+  /*
+   *   Finish
+   */
+
+   exit:;
+
+   ADDINFO_free(&laddinfo);
+   ADDINFO_free(&addinfo_res);
+
+   ESA_DIAG_exit(ESA_COMP_DELRES, 1, func, rc);
+   return rc;
+
+ }
+

@@ -1,0 +1,298 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Update an ACE (RACF)                     *
+ *                                                             *
+ * File Name        : ctsruac.c                                *
+ *                                                             *
+ * Author           : Doron Cohen                              *
+ *                                                             *
+ * Creation Date    : 25/05/94                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * PS0238   Alex    16/02/98  Refresh GENERIC                  *
+ * PS0252   Guy     13/04/98  Common code changes              *
+ * WS10082  AvnerL  02/10/23  Recompile & allow 16K volumes    *
+ **************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+
+ /*
+  *   CONTROL-SA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_API
+ #include ESA_API_CODES
+
+ #include MVS_OS_CLI
+
+ #include RACF_CODES
+ #include API_ADDINFO
+ #include RACF
+ #include RACF_RES
+
+ static char component[]="UPDACE";
+
+ /**************************************************************
+ *                                                             *
+ * Procedure Name : updace                                     *
+ *                                                             *
+ * Description    : Update user/group to resource connection   *
+ *                                                             *
+ * Input          : resource, new ace, new ACE addinfo,        *
+ *                  old ace, old ACE addinfo                   *
+ *                                                             *
+ * Output         : err                                        *
+ *                                                             *
+ * Input/Output   :                                            *
+ *                                                             *
+ * Return Value   : ESA_RC                                     *
+ *                                                             *
+ * Side Effects   :                                            *
+ *                                                             *
+ * Comments       : 1. addinfo contains the permissions.       *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC CTSUpdACE (RES_PARAMS_rec_typ   * res_params_ess,
+        /*         ADDINFO_rec_typ      * res_addinfo_ess,  PS0252 */
+                   ACE_rec_typ          * new_ace,
+                   ADDINFO_rec_typ      * new_addinfo,
+                   ACE_rec_typ          * old_ace,
+                   ADDINFO_rec_typ      * old_addinfo,
+                   ADMIN_PARAMS_rec_typ * admin_params,
+                   ERR_STRUCT_rec_typ   * err)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC rc;
+   ESA_RC chk_rc;
+   static char   func[]="CTSUpdACE";
+   char          objid_old[RCF_USER_NAME_LEN+1];
+   char          objid_new[RCF_USER_NAME_LEN+1];
+   /*WS10082 char volume[RCF_ADDINFO_VAL_LEN+1]= NULL_STRING;       */
+   char       volume[ADDINFO_16K_VAL_LEN+1]=NULL_STRING;   /*WS10082*/
+   CTSAMSG_HANDLE_rec_ptr     msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr dest;
+   ADDINFO_rec_typ          * res_addinfo = NULL;
+   RES_PARAMS_rec_typ         res_params_tmp;
+   RES_PARAMS_rec_typ       * res_params = &res_params_tmp;
+   ONE_FIELD_rec_ptr          gen_pair;
+   ONE_FIELD_rec_ptr          vol_pair;
+   ONE_FIELD_rec_ptr          when_old       = NULL ;
+   ONE_FIELD_rec_ptr          when_new       = NULL ;
+   int                        generic_flag   = 0 ;
+   int                        need_check_ace ;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_UPDACE, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+  /*
+   *  Build addinfo_res from resource name
+   */
+
+   rc = RCFRES_build_res_addinfo(res_params_ess, res_params,
+                                 &res_addinfo, dest, msgs);
+   if (rc NE ESA_OK)
+     goto exit;
+
+  /*
+   *   Check for valid ACE (non duplicate WHEN.)
+   */
+
+   chk_rc = ADDINFO_dup_check(new_addinfo,"WHEN.", RCF_ADDINFO_KWD_LEN,
+                              FALSE,     /* ps0288 */
+                              &when_new, dest, msgs );
+   if (chk_rc NE ESA_OK ) {
+       rc = ESA_FATAL;
+       goto exit;
+   }    /* duplicate WHEN. */
+
+   chk_rc = ADDINFO_dup_check(old_addinfo,"WHEN.", RCF_ADDINFO_KWD_LEN,
+                              FALSE,     /* ps0288 */
+                              &when_old, dest, msgs );
+   if (chk_rc NE ESA_OK ) {
+       rc = ESA_FATAL;
+       goto exit;
+   }    /* duplicate WHEN. */
+
+  /*
+   *   Check user/group existance
+   */
+
+   if (new_ace->ace_type EQ ACE_TYPE_USER) {
+      ESA_DIAG_printf(ESA_COMP_UPDACE, 1,
+                     "Checking user %s existance", new_ace->user_name);
+      chk_rc = RACF_chk_user(new_ace->user_name, OBJ_EXIST, TRUE,
+                             dest, msgs);
+      strcpy(objid_new, new_ace->user_name);
+   }
+   else if (new_ace->ace_type EQ ACE_TYPE_GROUP) {
+      ESA_DIAG_printf(ESA_COMP_UPDACE, 1,
+                      "Checking group %s existance", new_ace->ug_name);
+      chk_rc = RACF_chk_group(new_ace->ug_name,OBJ_EXIST, TRUE,
+                              dest,msgs);
+      strcpy(objid_new, new_ace->ug_name);
+   }
+   else if (new_ace->ace_type EQ ACE_TYPE_WORLD) {
+      chk_rc = ESA_OK;
+      strcpy(objid_new, "*");
+   }
+   else {
+      CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component, func,
+                    "Invalid ACE", new_ace->ace_type, __LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   if ( chk_rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *   Obtain old user/group
+   */
+
+   if (old_ace->ace_type EQ ACE_TYPE_GROUP)
+      strcpy(objid_old, old_ace->ug_name);
+   else if (old_ace->ace_type EQ ACE_TYPE_USER)
+      strcpy(objid_old, old_ace->user_name);
+   else if (old_ace->ace_type EQ ACE_TYPE_WORLD)
+      strcpy(objid_old, "*");
+   else
+      strcpy(objid_old, old_ace->user_name);
+
+  /*
+   *   Check genric flag
+   */
+
+   gen_pair = ADDINFO_search("GENERIC", RCF_ADDINFO_KWD_LEN,
+                              res_addinfo->pair,
+                              res_addinfo->num_pairs);
+   if ( gen_pair NE NULL)
+      if ( strcmp(gen_pair->value,KWD_FLAG_ON) EQ 0 )
+         generic_flag = 1;
+
+  /*
+   *   Before we call delace, we need to check if the new ace
+   *   can be added . This check can take place only if :
+   *     1) old_id and new_id are not the same
+   *   or
+   *     2) old_id and new_id are the same, but have
+   *        a different condition (i.e. when.xxxxxx(yyyyy) )
+   *
+   *   Otherwise , this check is skiped
+   *
+   */
+
+   need_check_ace = 0;
+   if ( strcmp(objid_old, objid_new) NE 0 )
+      need_check_ace = 1;
+   else if ( (when_new NE NULL) AND (when_old NE NULL) ) {
+      if ( ( strcmp(when_new->keyword, when_old->keyword) NE 0) OR
+           ( strcmp(when_new->value,   when_old->value  ) NE 0)    )
+         need_check_ace = 1 ;
+   }
+   else if ( (when_new NE NULL) OR (when_old NE NULL))
+      need_check_ace = 1;
+
+
+   if (need_check_ace) {
+
+      if ( ( generic_flag EQ 0 ) AND
+           ( strcmp(res_params->restype, "DATASET" ) EQ 0 ) ) {
+
+        vol_pair = ADDINFO_search("VOLUME", RCF_ADDINFO_KWD_LEN,
+                                   res_addinfo->pair,
+                                   res_addinfo->num_pairs);
+        if ( vol_pair NE NULL)
+           strcpy( volume, vol_pair->value );
+
+      }
+
+      if ( when_new NE NULL )
+         chk_rc = RACF_chk_cond_ace(res_params->restype,
+                                    res_params->resource,
+                                    volume,
+                                    generic_flag,
+                                    objid_new,          /* res_object */
+                                    NULL,               /* res_access */
+                                    when_new->keyword,  /* res_wtype  */
+                                    when_new->value,    /* res_wname  */
+                                    OBJ_NOT_EXIST,
+                                    TRUE,               /* msg_flag   */
+                                    dest, msgs);
+      else
+         chk_rc = RACF_chk_ace(res_params->restype,
+                               res_params->resource,
+                               volume,
+                               generic_flag,
+                               objid_new,               /* res_object */
+                               NULL,                    /* res_access */
+                               OBJ_NOT_EXIST,
+                               TRUE,                    /* msg_flag   */
+                               dest, msgs);
+      if ( chk_rc NE ESA_OK ) {
+         rc = ESA_FATAL;
+         goto exit;
+      }
+   } /* check ace existance required */
+
+  /*
+   *   Delete the old ACE
+   */
+
+   rc = CTSDelACE (res_params_ess, /* res_addinfo_ess, PS0252 */
+                   old_ace, old_addinfo, admin_params, err);
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *   Recreate the new ACE
+   */
+
+   rc = CTSAddACE (res_params_ess, /* res_addinfo_ess, PS0252 */
+                   new_ace, new_addinfo,
+                   ACE_POS_FIRST, NULL, NULL, admin_params, err);
+
+  /*
+   *   Finish
+   */
+
+   exit:;
+
+   ADDINFO_free(&res_addinfo);
+   ESA_DIAG_exit(ESA_COMP_UPDACE, 1, func , rc);
+
+   return rc;
+
+ }
+

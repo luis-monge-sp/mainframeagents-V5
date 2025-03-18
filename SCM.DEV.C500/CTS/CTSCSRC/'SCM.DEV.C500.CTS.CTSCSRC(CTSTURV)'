@@ -1,0 +1,229 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Revoke a user (TSS)                      *
+ *                                                             *
+ * File Name        : ctsturv.c                                *
+ *                                                             *
+ * Author           : Alex Shvartsman                          *
+ *                                                             *
+ * Creation Date    : 08/07/96                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ *                   dd/mm/yy                                  *
+ * WS10009  MeirS    18/10/07 Support ru_locked & RU_SUSPENDED.*
+ * CIQ#6    SeligT   19/03/17 Account Aggr includes Connections*
+ * WS10082  MauriC   14/11/22 Recompile for new ADDINFO macros *
+ *                                                             *
+ **************************************************************/
+
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_API
+ #include ESA_API_CODES
+
+ #include MVS_ONLINE_INTERCEPTOR
+
+ #include API_ADDINFO
+
+ #include TSS
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : revuser                                    *
+ *                                                             *
+ * DESCRIPTION    : Revoke/Resume a user                       *
+ *                                                             *
+ * INPUT          :                                            *
+ *                                                             *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC CTSRevokeUser (USER_PARAMS_rec_typ  * user_params,
+                       ADDINFO_rec_typ      * addinfo,
+                       ADMIN_PARAMS_rec_typ * admin_params,
+                       ERR_STRUCT_rec_typ   * err)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                       rc = ESA_OK;
+   static char                  func[]="CTSRevokeUser";
+   CTSAMSG_HANDLE_rec_typ     * msgs;
+   CTSAMSG_DEST_TABLE_rec_typ * dest;
+   ADDINFO_rec_ptr              get_addinfo = NULL;
+   ADDINFO_rec_ptr              ess_addinfo = NULL;
+   TSS_CMD_HANDLE_typ         * cmd_handle  = NULL;
+
+  /*
+   *  Get User parameters
+   */
+
+   TSS_RTT_rec_typ          * rtt;
+   short                      rtt_num_items;
+   OBJ_EXISTS_typ             obj_exist  = OBJ_NOT_EXIST;
+   HAVE_MORE_typ              have_more  = NO_MORE;
+   void                     * handle     = NULL;
+   short                      actual_num = 0;
+   USER_PARAMS_rec_typ        user;
+   OE_typ                     oe         = "";
+   char                       get_conn   = 'N';             /* CIQ#6 */
+
+   /*** For TSS_chk_acid ***/
+
+   char                       real_acid_type[TSS_ACID_TYPE_LEN+1]="";
+   OBJECT_TYPE_typ            real_obj_type = TYPE_IGNORE;
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_REVUSER, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+  /*
+   * Initialize global parameters
+   */
+
+   rc = TSS_global_init (ESA_COMP_REVUSER, admin_params, err);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   rtt = TSS_get_global_rtt();
+   rtt_num_items  = TSS_get_global_rtt_num_items();
+
+  /*
+   *  Check user existance
+   */
+
+   rc = TSS_chk_acid(ESA_COMP_REVUSER, user_params->user,
+                     TSS_USER, TYPE_USER,
+                     OBJ_EXIST, TRUE, real_acid_type, &real_obj_type,
+                     admin_params, err);
+   if (rc NE ESA_OK)
+      goto exit;
+
+  /*
+   *   Create command handle
+   */
+
+   rc = TSS_alloc_cmd_handle (ESA_COMP_REVUSER,
+                              MAX_TSS_CMD_USER_ENTRIES,
+                              &cmd_handle, dest, msgs );
+   if ( rc NE ESA_OK )
+      goto exit;
+
+  /*
+   *   Build internal addinfo
+   */
+
+   rc = ADDINFO_alloc(func, addinfo->num_pairs,
+                      &ess_addinfo, dest, msgs);
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   ADDINFO_copy( ess_addinfo, addinfo );
+
+  /*
+   *   Update user processing
+   */
+
+  /*
+   *   Prepare parameters to obtain user info
+   */
+
+   rc = ADDINFO_alloc(func, rtt_num_items, &get_addinfo, dest, msgs);
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   rc = TSS_rtt_2_addinfo(ESA_COMP_REVUSER,
+                          rtt, get_addinfo, dest, msgs);
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *  Get user information
+   */
+
+   strcpy(user.user, user_params->user);
+   rc = CTSGetUsers ( GET_MANY_USERS, oe, 1, &actual_num,
+                      &have_more, &handle,
+                      1, user_params, &user, &get_addinfo, &obj_exist,
+                      admin_params, err,
+                      get_conn);                            /* CIQ#6 */
+
+   ESA_DIAG_printf(ESA_COMP_REVUSER, 1,
+                   "user=%s rc=%d exists=%d",
+                    user.user, rc, obj_exist);
+
+   if ( (obj_exist EQ OBJ_NOT_EXIST) OR ( rc NE ESA_OK )) {
+       rc = ESA_FATAL;
+       goto exit;
+   }
+
+   rc = TSS_do_revoke_status(ESA_COMP_REVUSER, cmd_handle, user_params,
+        /* WS10009     ess_addinfo, &user, get_addinfo, dest, msgs );*/
+        /* WS10009 */  ess_addinfo, &user, get_addinfo, dest, msgs,
+        /* WS10009 */  admin_params);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   rc = TSS_do_cmd( ESA_COMP_REVUSER, (char *)user_params->user,
+                    TYPE_USER,  TSS_EVNT_ACTION_UPDATE,
+                    cmd_handle, admin_params);
+   if ( rc NE ESA_OK )
+      goto exit;
+
+   exit:;
+
+
+   if (cmd_handle)
+      TSS_free_cmd_handle( ESA_COMP_REVUSER,
+                           &cmd_handle, dest, msgs);
+
+   if (get_addinfo)
+      ADDINFO_free(&get_addinfo);
+
+   if (ess_addinfo)
+      ADDINFO_free(&ess_addinfo);
+
+   ESA_DIAG_exit(ESA_COMP_REVUSER, 1, func, ESA_OK);
+
+   return rc;
+
+ }

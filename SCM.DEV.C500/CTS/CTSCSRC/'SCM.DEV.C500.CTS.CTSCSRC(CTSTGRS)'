@@ -1,0 +1,1108 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Get resource information (TSS)           *
+ *                                                             *
+ * File Name        : ctstgrs.c                                *
+ *                                                             *
+ * Author           : Alexander Shvartsman                     *
+ *                                                             *
+ * Creation Date    : 19/01/97                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * IS0358   YoniMa   17/8/06  memory leak.(BS2698)             *
+ * WS10082  MauriC   14/11/22 Recompile for new ADDINFO macros *
+ **************************************************************/
+
+ /*
+  *   Standard include files
+  */
+
+ #include   <globs.h>
+ #include   STDIO
+ #include   STDLIB
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include   ESA_API
+ #include   ESA_DIAG
+ #include   ESA_CTSAMSG
+ #include   ESA_API_CODES
+ #include   API_ADDINFO
+
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_COMP
+ #include MVS_OS_MVS
+
+ /*
+  *   TSS include files
+  */
+
+ #include TSS
+ #include TSS_XRES
+ #include TSS_CODES
+
+/*
+ * Internal functions prototypes
+ */
+
+ static ESA_RC TSS_do_res_list(ESA_DIAG_COMP_typ      comp,
+                            TSS_GET_RES_HANDLE_typ  * get_handle,
+                            RES_PARAMS_rec_typ      * res_params_in,
+                            ONE_FIELD_rec_typ       * cpair_type,
+                            short                     max_ress,
+                            short                   * actual_num,
+                            HAVE_MORE_typ           * have_more,
+                            RES_PARAMS_rec_typ        res_params[1],
+                            ADDINFO_rec_ptr           addinfo[1],
+                            ADMIN_PARAMS_rec_typ    * admin_params,
+                            ERR_STRUCT_rec_typ      * err);
+
+ static ESA_RC TSS_add_whohas_res(ESA_DIAG_COMP_typ   comp,
+                            RES_PARAMS_rec_typ      * res_in,
+                            TSS_GET_RES_HANDLE_typ  * get_handle,
+                            ADMIN_PARAMS_rec_typ    * admin_params,
+                            ERR_STRUCT_rec_typ      * err);
+
+ /*
+  *  Functions for ACID restype
+  */
+
+static ESA_RC TSS_get_acids_restype(ESA_DIAG_COMP_typ     comp,
+                                RES_PARAMS_rec_typ      * res_params_in,
+                                TSS_GET_RES_HANDLE_typ  * get_handle,
+                                ONE_FIELD_rec_typ       * cpair_type,
+                                ADMIN_PARAMS_rec_typ    * admin_params,
+                                ERR_STRUCT_rec_typ      * err);
+
+static ESA_RC TSS_select_wild_users_list(ESA_DIAG_COMP_typ   comp,
+                   TSS_TRAP_BUF_rec_typ            * users_list,
+                   RES_PARAMS_rec_typ              * res_params,
+                   CTSAMSG_DEST_TABLE_rec_typ      * dest,
+                   CTSAMSG_HANDLE_rec_typ          * msgs);
+
+static ESA_RC TSS_get_one_acid(ESA_DIAG_COMP_typ     comp,
+                   TSS_TRAP_BUF_rec_typ           ** users_list,
+                   RES_PARAMS_rec_typ              * res_params,
+                   ADMIN_PARAMS_rec_typ            * admin_params,
+                   ERR_STRUCT_rec_typ              * err);
+
+ static ESA_RC TSS_do_user_list(ESA_DIAG_COMP_typ     comp,
+                            TSS_GET_RES_HANDLE_typ  * get_handle,
+                            short                     max_ress,
+                            short                   * actual_num,
+                            HAVE_MORE_typ           * have_more,
+                            RES_PARAMS_rec_typ        res_params[1],
+                            ADDINFO_rec_ptr           addinfo[1],
+                            ADMIN_PARAMS_rec_typ    * admin_params,
+                            ERR_STRUCT_rec_typ      * err);
+
+ static char component[] = "CTSTGRS";
+
+/****************************************************
+ * Procedure Name: getres
+ * Description   : Get resource RSS info
+ * Input         : mode          - (only GET_FREE_HANDLE is supported)
+ *                 max_ress      - # of elements in res_params &
+ *                                addinfo_out arrays
+ *                 admin_params  -
+ *                 res_params_in - resource to retrieve
+ *                 addinfo_in    - additional retrieval parameters
+ * Output        : actual_num    - # of resources returned
+ *                 have_more     - HAVE_MORE if more resources
+ *                 res_params    - Returned resources
+ *                 err           - error indication, message, etc.
+ * Input/Output  : addinfo       - array of max_ress pointers:
+ *                                 add.info per resource, caller puts
+ *                                 requested keywords, callee returns
+ *                                 actual add.info, per resource.
+ *                 handle        - NULL on first call, filled by callee,
+ *                                 used by callee to keep track.
+ *                                 Freed by caller.
+ * Return Value  : ESA_RC
+ * Side Effects  : Function may allocate memory, return pointer in
+ *                 *handle; Caller MUST free when done.
+ * Comments      : 1. Data is returned as triplets -
+ *                    resource, add.info, objs_exist
+ ****************************************************/
+
+ ESA_RC CTSGetRes (GET_RESOURCE_MODE      mode,
+                   OE_typ                 oe,
+                   short                  max_ress,
+                   short                * actual_num,
+                   HAVE_MORE_typ        * have_more,
+                   void                ** handle,
+                   RES_PARAMS_rec_typ   * res_params_in,
+                   ADDINFO_rec_typ      * addinfo_in,
+                   RES_PARAMS_rec_typ     res_params[1],
+                   ADDINFO_rec_ptr        addinfo_out[1],
+                   ADMIN_PARAMS_rec_typ * admin_params,
+                   ERR_STRUCT_rec_typ   * err)
+  {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                      rc=ESA_OK ;
+   CTSAMSG_HANDLE_rec_ptr      msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr  dest;
+   TSS_GET_RES_HANDLE_typ    * get_handle = NULL;
+   static char                 func[]="CTSGetRes";
+   int                         i_dump;
+   ONE_FIELD_rec_typ         * cpair_type = NULL;
+
+  /*
+   *  Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_GETRES,1,func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   ESA_DIAG_printf(ESA_COMP_GETRES,1, "mode=%d handle=%X max_ress=%d",
+                   mode, *handle , max_ress);
+
+  *actual_num =  0;
+  *have_more  =  HAVE_MORE;
+
+ /*
+  *  Check resource type except for ACID
+  */
+
+  if (strcmp(res_params_in->restype, "ACID") NE 0) {
+     rc = TSS_check_restype(ESA_COMP_GETRES,
+                            res_params_in->restype);
+     if (rc NE ESA_OK) {
+       CTSAMSG_print(ERR_RES_TYPE, msgs, NULL, dest,
+                     res_params_in->restype, res_params_in->resource);
+       rc = ESA_FATAL;
+       goto exit;
+     }
+  }
+
+ /*
+  *   Check mode parameter
+  */
+
+  if ( mode NE GET_FREE_HANDLE_RESOURCES ) {
+     rc = TSS_init_res_handle( ESA_COMP_GETRES, &get_handle, handle ,
+                               admin_params, err );
+     if ( rc NE ESA_OK )
+        goto exit ;
+  }
+  else {
+     *have_more  =  NO_MORE;
+     rc = ESA_OK;
+     goto exit;
+  }
+
+ /*
+  *  GetRes Processing
+  */
+
+  cpair_type  = ADDINFO_search("GET.TYPE", TSS_ADDINFO_KWD_LEN,
+                                addinfo_in->pair,
+                                addinfo_in->num_pairs );
+
+  if (strcmp(res_params_in->restype, "ACID") NE 0) {
+     if ( get_handle->trap_buffer EQ NULL ) {
+       rc = TSS_get_res_list(ESA_COMP_GETRES,
+                             TSS_CMD_DEFAULT_MODE,
+                             TSS_WHOOWNS_LIST_ONLY,
+                             res_params_in, get_handle,
+                             TSS_SAVE_UNIQ_RES_NAME_ONLY,
+                             admin_params, err);
+       if ( rc NE ESA_OK )
+         goto exit;
+
+       rc = TSS_add_whohas_res(ESA_COMP_GETRES,
+                               res_params_in, get_handle,
+                               admin_params, err );
+       if ( rc NE ESA_OK )
+         goto exit;
+     }
+  }
+  else {
+    if ( get_handle->acid_buffer EQ NULL ) {
+       rc=TSS_get_acids_restype(ESA_COMP_GETRES, res_params_in,
+                                get_handle, cpair_type,
+                                admin_params, err );
+       if ( rc NE ESA_OK )
+          goto exit;
+    }
+  }
+
+ /*
+  *  Return list of resources to caller
+  */
+
+  if (strcmp(res_params_in->restype, "ACID") NE 0)
+    rc = TSS_do_res_list(ESA_COMP_GETRES, get_handle,
+                         res_params_in, cpair_type,
+                         max_ress,      actual_num,
+                         have_more,     res_params, addinfo_out,
+                         admin_params,  err);
+  else
+    rc = TSS_do_user_list(ESA_COMP_GETRES, get_handle,
+                          max_ress,      actual_num,
+                          have_more,     res_params, addinfo_out,
+                          admin_params,  err);
+
+ /*
+  *    Diagnostic
+  */
+
+  ESA_DIAG_printf(ESA_COMP_GETRES,1,
+                  "max_ress=%d actual num=%d",
+                  max_ress, *actual_num);
+
+  if ( ESA_DIAG_get_debug_level(ESA_COMP_GETRES) GE 1 ) {
+       for (i_dump=0; i_dump LT *actual_num; i_dump++) {
+         ESA_DIAG_printf(ESA_COMP_GETRES,0,
+                         "resource=%s class=%s",
+                         res_params[i_dump].resource,
+                         res_params[i_dump].restype);
+         if ( ESA_DIAG_get_debug_level(ESA_COMP_GETRES) GE 2 )
+              ADDINFO_dump(addinfo_out[i_dump],0);
+       }
+  }
+
+ /*
+  *  Finish
+  */
+
+  exit : ;
+
+
+  ESA_DIAG_printf(ESA_COMP_GETRES,1,
+                  "Exiting with rc=%d actual num=%d Have_More=%d",
+                   rc, *actual_num, *have_more );
+
+ /*
+  *  Cleanup
+  */
+
+  if ( (rc NE ESA_OK) OR (*have_more EQ NO_MORE) ) {
+      if ( *handle NE NULL ) {
+         TSS_free_res_handle(ESA_COMP_GETRES , handle, dest, msgs);
+         *handle    = NULL;
+         get_handle = NULL;
+      }
+      *have_more = NO_MORE ;
+  }
+
+  ESA_DIAG_exit(ESA_COMP_GETRES,1, func, rc );
+
+  return rc ;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_do_res_list                            *
+ *                                                             *
+ * DESCRIPTION    : res list processing (return res list to    *
+ *                  caller)                                    *
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  get_handle- get handle                     *
+ *                  max_res   - max res                        *
+ *                                                             *
+ * OUTPUT         : actual_num - actual num                    *
+ *                  have_more  - have more flag                *
+ *                  res_params - res  params                   *
+ *                  addinfo    - addinfo                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_do_res_list(ESA_DIAG_COMP_typ      comp,
+                            TSS_GET_RES_HANDLE_typ  * get_handle,
+                            RES_PARAMS_rec_typ      * res_params_in,
+                            ONE_FIELD_rec_typ       * cpair_type,
+                            short                     max_ress,
+                            short                   * actual_num,
+                            HAVE_MORE_typ           * have_more,
+                            RES_PARAMS_rec_typ        res_params[1],
+                            ADDINFO_rec_ptr           addinfo[1],
+                            ADMIN_PARAMS_rec_typ    * admin_params,
+                            ERR_STRUCT_rec_typ      * err)
+{
+
+ static char func[]="TSS_do_res_list";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                       rc   = ESA_OK ;
+ CTSAMSG_HANDLE_rec_typ     * msgs;
+ CTSAMSG_DEST_TABLE_rec_typ * dest;
+ TSS_TRAP_RES_BUF_typ       * trap_buff;
+ TSS_RES_INFO_typ           * res_info;
+ TSS_RES_NAMES_AREA_typ     * res_names;
+ char                       * wrk;
+ int                          j, k;
+ int                          put_info;
+
+
+ /*
+  *  Initialize
+  */
+
+  ESA_DIAG_enter(comp, 3, func );
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  *have_more = HAVE_MORE;
+
+  trap_buff = get_handle->trap_buffer;
+  res_info  = &(trap_buff->res_info);
+  res_names = &(trap_buff->res_names);
+
+  ESA_DIAG_printf(comp, 3,
+                  "Put info from index=%d max index=%d",
+                   get_handle->list_ind, res_info->used_items);
+
+ /*
+  *  After WHOHAS processing the resources placed without
+  *  res type, because this data cannot be obtained from output of
+  *  TSS WHOHAS command
+  */
+
+  ESA_DIAG_printf(comp, 3,
+                 "trap_buff->res_type=%d/%s res_params_in->restype=%s",
+                 strlen(trap_buff->res_type),
+                 trap_buff->res_type,
+                 res_params_in->restype);
+
+  if (strlen(trap_buff->res_type) EQ 0 )
+    strcpy(trap_buff->res_type, res_params_in->restype);
+
+  ESA_DIAG_printf(comp, 3,
+                 "trap_buff->res_type=%d/%s",
+                 strlen(trap_buff->res_type),
+                 trap_buff->res_type);
+
+  for (j = get_handle->list_ind;
+                  (j LT res_info->used_items ) AND
+                  ( (*actual_num) LT max_ress ); j++ )  {
+
+       k = (*actual_num);
+
+      /*
+       * Ref to resource name
+       */
+
+       wrk = res_names->res_names + res_info->res_items[j].ref_to_name;
+
+      /*
+       * cpair_type EQ NULL means get from Hot path,
+       * in this case we need return only exactly matched resource
+       */
+
+       put_info = FALSE;
+
+       if (cpair_type EQ NULL) {
+        if ((strcmp(trap_buff->res_type, res_params_in->restype) EQ 0)
+                                    AND
+            (strcmp(wrk, res_params_in->resource) EQ 0)    )
+         put_info = TRUE;
+       }
+       else if ( strcmp(cpair_type->value, "PREFIX") EQ 0 )
+         put_info = TRUE;
+       else if ( strcmp(cpair_type->value, "ID") EQ 0 ) {
+        if ((strcmp(trap_buff->res_type, res_params_in->restype) EQ 0)
+                                    AND
+            (strcmp(wrk, res_params_in->resource) EQ 0)    )
+         put_info = TRUE;
+       }
+
+       ESA_DIAG_printf(comp, 3, "put_info=%d %s/%s(res_in=%s/%s)",
+                       put_info, trap_buff->res_type, wrk,
+                       res_params_in->restype, res_params_in->resource);
+
+       if (put_info) {
+
+        /*
+         * Fill up resource parameters
+         */
+
+         strcpy(res_params[k].restype,   trap_buff->res_type);
+         strcpy(res_params[k].resource,  wrk );
+         strcpy(res_params[k].parent_oe, "" );
+
+        /*
+         *  Put addinfo parameters
+         */
+
+         TSS_put_to_addinfo(comp, TSS_RES_OWNER,
+                            res_info->res_items[j].owner, addinfo[k],
+                            0, dest, msgs );
+
+         TSS_put_to_addinfo(comp, TSS_RES_HAS_OWNER,
+                            res_info->res_items[j].has_owner,
+                            addinfo[k], 0, dest, msgs );
+
+         (*actual_num)++;
+
+         ESA_DIAG_printf(comp, 3, "j=%d actual_num=%d", j, *actual_num);
+       }     /* put info */
+  }
+
+  get_handle->list_ind = j;
+
+  ESA_DIAG_printf(comp, 3, "max_ress=%d actual_num=%d left=%d",
+                  max_ress, *actual_num, get_handle->list_ind);
+
+ /*
+  *  Check reason end-of-loop
+  */
+
+  if ( *actual_num GE max_ress) {
+      *have_more = HAVE_MORE ;
+      goto exit;
+  }
+
+  *have_more = NO_MORE;
+  rc = ESA_OK;
+
+ /*
+  *  Finish
+  */
+
+ exit : ;
+
+
+  ESA_DIAG_exit(comp, 3, func, rc);
+
+  return rc ;
+
+}
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_add_whohas_res                         *
+ *                                                             *
+ * DESCRIPTION    : Add to WHOOWNS resources list, WHOHAS res  *
+ *                  list                                       *
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  get_handle- get handle                     *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_add_whohas_res(ESA_DIAG_COMP_typ   comp,
+                            RES_PARAMS_rec_typ      * res_in,
+                            TSS_GET_RES_HANDLE_typ  * get_handle,
+                            ADMIN_PARAMS_rec_typ    * admin_params,
+                            ERR_STRUCT_rec_typ      * err)
+{
+
+ static char func[]="TSS_add_whohas_res";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                       rc   = ESA_OK ;
+ CTSAMSG_HANDLE_rec_typ     * msgs;
+ CTSAMSG_DEST_TABLE_rec_typ * dest;
+ TSS_RES_INFO_typ           * items;
+ TSS_RES_INFO_typ             tmp_items = {0, 0, NULL} ;
+ TSS_RES_NAMES_AREA_typ     * res_names;
+ RES_PARAMS_rec_typ           res;
+ TSS_TRAP_RES_BUF_typ       * trap_buff;
+ char                       * wrk;
+ int                          i;
+
+
+ /*
+  *  Initialize
+  */
+
+  ESA_DIAG_enter(comp, 3, func );
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  trap_buff = get_handle->trap_buffer;
+
+  items = &(trap_buff->res_info);
+
+  ESA_DIAG_printf(comp,3, "Res info area ptr=%x", items->res_items);
+
+  res_names = &(trap_buff->res_names);
+
+  ESA_DIAG_printf(comp,5,
+                  "Res names area:ptr=%x", res_names->res_names);
+
+  if (items->used_items EQ 0 ) {
+     CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                   component,func, "Empty resource list",
+                   16,__LINE__);
+     rc = ESA_FATAL ;
+     goto exit ;
+  }
+
+  /*
+   *   Initialize temporary res info table
+   */
+
+   rc = TSS_alloc_res_info_table (comp, items->used_items, &tmp_items,
+                                  dest, msgs);
+   if (rc NE ESA_OK ) {
+      rc = ESA_FATAL ;
+      goto exit ;
+   }
+
+  /*
+   *   Build  temporary res info table
+   */
+
+   for (i=0; i LT items->used_items; i++) {
+     wrk=res_names->res_names + items->res_items[i].ref_to_name;
+     ESA_DIAG_printf(comp,3, "Tmp items. %d.%s %s %s %s",
+                     i, wrk,
+                     items->res_items[i].owner,
+                     items->res_items[i].has_owner,
+                     items->res_items[i].ace_acid);
+
+     tmp_items.res_items[i].ref_to_name =
+                         items->res_items[i].ref_to_name;
+   }
+
+   memcpy( (char *)&res, (char *)res_in, sizeof(RES_PARAMS_rec_typ) );
+
+   tmp_items.used_items = items->used_items;
+
+  /*
+   *   ADD WHOHAS resources
+   */
+
+   for (i=0; i LT tmp_items.used_items; i++) {
+      wrk=res_names->res_names + tmp_items.res_items[i].ref_to_name;
+      ESA_DIAG_printf(comp,5, "WHOHAS. %d. %s",
+                      i, wrk);
+
+      strcpy( res.resource, wrk );
+      rc = TSS_get_res_list(comp,
+                          TSS_CMD_DEFAULT_MODE,
+                          TSS_WHOHAS_LIST_ONLY,
+                          &res, get_handle,
+                          TSS_SAVE_UNIQ_RES_NAME_ONLY,
+                          admin_params, err);
+      if ( rc NE ESA_OK ) {
+        goto exit;
+      }
+   }
+
+ /*
+  *  Finish
+  */
+
+ exit : ;
+
+  if (tmp_items.res_items ) {
+    ESA_DIAG_printf(comp,5,
+                    ">< Free(work tmp_items) ptr %x",
+                    tmp_items.res_items);
+   ESA_DIAG_printf(PLT_COMP_TSS_MEMORY,1,                 /*IS0358*/
+      "Free address (%x) (%d,%s)",
+       tmp_items.res_items, __LINE__, __FILE__ );
+    free(tmp_items.res_items);
+  }
+
+  ESA_DIAG_exit(comp, 3, func, rc);
+
+  return rc ;
+
+}
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_get_acids_restype                      *
+*                                                             *
+* DESCRIPTION    : Get list of USER's ACIDS                   *
+*                                                             *
+* INPUT          : comp      - diag component                 *
+*                  acid_type - acids type list                *
+*                  parent_oe - container                      *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : list      - list of acids                  *
+*                                                             *
+* RETURN VALUE   : ESA_RC                                     *
+*                                                             *
+**************************************************************/
+
+static ESA_RC TSS_get_acids_restype(ESA_DIAG_COMP_typ     comp,
+                                RES_PARAMS_rec_typ      * res_params_in,
+                                TSS_GET_RES_HANDLE_typ  * get_handle,
+                                ONE_FIELD_rec_typ       * cpair_type,
+                                ADMIN_PARAMS_rec_typ    * admin_params,
+                                ERR_STRUCT_rec_typ      * err)
+{
+
+ static char func[]="TSS_get_acids_restype";
+ TSS_TRAP_BUF_rec_typ            * user_list = NULL;
+ OE_typ                            dummy_oe = "";
+ ESA_RC                            rc = ESA_OK;
+ CTSAMSG_DEST_TABLE_rec_typ      * dest;
+ CTSAMSG_HANDLE_rec_typ          * msgs;
+
+ static TSS_GET_TYPES_rec_typ get_types[] = {     /* ACID restype */
+                       {  TSS_USER,   '0'     } ,
+                       {  TSS_DCA,    '0'     } ,
+                       {  TSS_VCA,    '0'     } ,
+                       {  TSS_ZCA,    '0'     } ,
+                       {  TSS_SCA,    '0'     } ,
+                       {  TSS_LSCA,   '0'     } ,
+                       {  NULL ,      '0'     }   };
+/*
+ *   Initialize
+ */
+
+ ESA_DIAG_enter(comp,3,func);
+
+ msgs = admin_params->ctsamsg_handle;
+ dest = admin_params->ctsamsg_dest;
+
+ if ( cpair_type NE NULL ) {
+   if ( strcmp(cpair_type->value, "PREFIX") EQ 0 ) {
+     rc=TSS_get_acids_list(comp, TSS_USER,
+                           &user_list, get_types,
+                           dummy_oe, admin_params, err );
+     if (rc NE ESA_OK) {
+        rc = ESA_FATAL;
+        goto exit;
+     }
+
+     rc = TSS_select_wild_users_list(comp, user_list, res_params_in,
+                                     dest, msgs);
+     if (rc NE ESA_OK) {
+        rc = ESA_FATAL;
+        goto exit;
+     }
+     goto exit;
+   }     /* if ( strcmp(cpair_type->value, "PREFIX") EQ 0 ) */
+ }
+
+ rc = TSS_get_one_acid(comp, &user_list, res_params_in,
+                       admin_params, err);
+ if (rc NE ESA_OK)
+   rc = ESA_FATAL;
+
+ /*
+  *    Finish
+  */
+
+ exit :;
+
+  get_handle->acid_buffer = user_list;
+  ESA_DIAG_printf(comp,1, "acid_buffer=%X", get_handle->acid_buffer);
+
+  ESA_DIAG_exit(comp, 3, func, rc );
+
+  return rc;
+
+ }
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_select_wild_acids_list                 *
+*                                                             *
+* DESCRIPTION    : Select users according obtained wild card  *
+*                                                             *
+* INPUT          : res_params      - res param struct         *
+*                  component                                  *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* INPUT / OUTPUT : users_list                                 *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+/**************************************************************/
+
+static ESA_RC TSS_select_wild_users_list(ESA_DIAG_COMP_typ   comp,
+                   TSS_TRAP_BUF_rec_typ            * users_list,
+                   RES_PARAMS_rec_typ              * res_params,
+                   CTSAMSG_DEST_TABLE_rec_typ      * dest,
+                   CTSAMSG_HANDLE_rec_typ          * msgs)
+{
+
+ static char func[]="TSS_select_wild_users_list";
+ RES_PARAMS_rec_typ      res_filter;
+ int                     res_filter_len;
+ char                   *wptr;
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                  rc = ESA_OK ;
+ int                     i, j;
+
+/*
+ *  Initialize
+ */
+
+ ESA_DIAG_enter(comp, 3, func );
+
+ strcpy(res_filter.resource, res_params->resource);
+
+ ESA_DIAG_printf(comp, 3,
+                 "trap handle: alloc entries=%d used=%d filter=%s",
+                  users_list->allocated_entries,
+                  users_list->used_entries,
+                  res_filter.resource);
+
+ /*
+  *   Resource filter processing
+  */
+
+  wptr = strchr(res_filter.resource, '*');
+  if (wptr)
+     *wptr = NULL_CHAR;
+
+  res_filter_len = strlen(res_filter.resource);
+  if (res_filter_len EQ 0)
+     goto exit;
+
+  if (res_filter_len GT TSSCFILE_ACID_LEN) {
+    CTSAMSG_print(ERR_RES_BAD_NAME , msgs, NULL, dest,
+                  res_params->resource);
+    rc = ESA_ERR;
+    goto exit;
+  }
+
+
+  ESA_DIAG_printf(comp, 3, "filter=%d/%s",
+                  res_filter_len, res_filter.resource);
+ /*
+  * Entire user's list
+  */
+
+  j = 0;
+  for (i=0; i LT users_list->used_entries; i++) {
+
+     ESA_DIAG_printf(comp, 8, "Filter=%s   user.acid=%d.%s",
+                     res_filter.resource,
+                     i, &users_list->trap_data[i].data[1]);
+
+    /*
+     *  User's ACID match to wild card
+     *  Attention ! The first symbol - sort symbol !
+     */
+
+     if (memcmp( &users_list->trap_data[i].data[1],
+                 res_filter.resource,
+                 res_filter_len) EQ 0 ) {
+        users_list->trap_data[i].used = TRUE;
+        j++;
+     }
+  }      /* for (i=0; i LT users_list->used_entries; i++) */
+
+ /*
+  * Wild card list is empty
+  */
+
+  if ( j EQ 0 ) {
+    CTSAMSG_print(TSS_ERR_NO_ACID, msgs, NULL, dest,
+                  "ACID restype",  res_params->resource);
+    rc = ESA_ERR;
+    goto exit;
+  }
+
+ /*
+  * When user's acid matches some of wild card , set flag
+  *      to NOT USED (YET) for further processing
+  * When user's acid does not matched any of wild card , set flag
+  *      to USED (ALREADY) for further processing
+  */
+
+  for (i=0; i LT users_list->used_entries; i++) {
+    if ( users_list->trap_data[i].used )
+      users_list->trap_data[i].used = FALSE;
+    else
+      users_list->trap_data[i].used = TRUE;
+  }
+
+ /*
+  *  Finish
+  */
+
+ exit : ;
+
+ ESA_DIAG_exit(comp, 3, func, rc);
+
+ return rc ;
+
+}
+
+
+/**************************************************************
+*                                                             *
+* PROCEDURE NAME : TSS_get_one_acid                           *
+*                                                             *
+* DESCRIPTION    : Create user list from one onbtained entry  *
+*                                                             *
+* INPUT          : res_params                                 *
+*                  dest                                       *
+*                  msgs                                       *
+*                                                             *
+* OUTPUT         : users_list                                 *
+*                                                             *
+* RETURN VALUE   : ESA_OK, ESA_FATAL                          *
+*                                                             *
+/**************************************************************/
+
+static ESA_RC TSS_get_one_acid(ESA_DIAG_COMP_typ     comp,
+                   TSS_TRAP_BUF_rec_typ           ** users_list,
+                   RES_PARAMS_rec_typ              * res_params,
+                   ADMIN_PARAMS_rec_typ            * admin_params,
+                   ERR_STRUCT_rec_typ              * err)
+{
+
+/*
+ *   Variables
+ */
+
+ static char func[]="TSS_get_one_acid";
+ char                              acid[MAX_TSS_PARAM_LEN];
+ TSS_TRAP_BUF_rec_typ            * tmp;
+ CTSAMSG_DEST_TABLE_rec_typ      * dest;
+ CTSAMSG_HANDLE_rec_typ          * msgs;
+
+ /*** For TSS_chk_acid ***/
+
+ char                    real_acid_type[TSS_ACID_TYPE_LEN+1]="";
+ OBJECT_TYPE_typ         real_obj_type = TYPE_IGNORE;
+ ESA_RC                  rc = ESA_OK ;
+
+/*
+ *  Initialize
+ */
+
+ ESA_DIAG_enter(comp, 3, func );
+
+ msgs = admin_params->ctsamsg_handle;
+ dest = admin_params->ctsamsg_dest;
+
+ /*
+  * Validate res name, For ACID restype the resname length
+  * must up to 8 chars
+  */
+
+  if (strlen(res_params->resource) GT TSSCFILE_ACID_LEN) {
+    CTSAMSG_print(ERR_RES_BAD_NAME , msgs, NULL, dest,
+                  res_params->resource);
+    rc = ESA_ERR;
+    goto exit;
+  }
+
+/*
+ *  Create buffer
+ */
+
+ rc = TSS_alloc_trap_handle (comp, 2, &tmp, dest, msgs );
+ if ( rc NE ESA_OK )
+   goto exit;
+
+ ESA_DIAG_printf(comp,1, "ACID=%s", res_params->resource);
+
+ /***  Check user existance  ***/
+
+ rc = TSS_chk_acid(comp, res_params->resource, TSS_USER, TYPE_USER,
+                   OBJ_EXIST, TRUE, real_acid_type, &real_obj_type,
+                   admin_params, err);
+ if (rc EQ ESA_OK)
+   strcpy(acid, "0");   /* Sort symbol */
+ else {
+   acid[0] = TSS_GET_MANY_SKIP_ITEM;
+   acid[1] = NULL_CHAR;
+ }
+
+ strcat(acid, res_params->resource);
+ rc = TSS_save_output(comp,tmp, acid, dest, msgs);
+ if ( rc NE ESA_OK )
+   goto exit;
+
+ *users_list = tmp;
+
+ /*
+  *  Finish
+  */
+
+ exit : ;
+
+ ESA_DIAG_exit(comp, 3, func, rc);
+
+ return rc ;
+
+}
+
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_do_user_list                           *
+ *                                                             *
+ * DESCRIPTION    : User list processing (ACID restype)        *
+ *                                                             *
+ * INPUT          : comp      - diag component                 *
+ *                  get_handle- get handle                     *
+ *                  max_res   - max res                        *
+ *                                                             *
+ * OUTPUT         : actual_num - actual num                    *
+ *                  have_more  - have more flag                *
+ *                  res_params - res  params                   *
+ *                  addinfo    - addinfo                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ static ESA_RC TSS_do_user_list(ESA_DIAG_COMP_typ     comp,
+                            TSS_GET_RES_HANDLE_typ  * get_handle,
+                            short                     max_ress,
+                            short                   * actual_num,
+                            HAVE_MORE_typ           * have_more,
+                            RES_PARAMS_rec_typ        res_params[1],
+                            ADDINFO_rec_ptr           addinfo[1],
+                            ADMIN_PARAMS_rec_typ    * admin_params,
+                            ERR_STRUCT_rec_typ      * err)
+{
+
+ static char func[]="TSS_do_user_list";
+
+/*
+ *   Variables
+ */
+
+ ESA_RC                       rc   = ESA_OK ;
+ CTSAMSG_HANDLE_rec_typ     * msgs;
+ CTSAMSG_DEST_TABLE_rec_typ * dest;
+ TSS_TRAP_BUF_rec_typ       * user_list = get_handle->acid_buffer;
+ int                          i, k;
+
+
+ /*
+  *  Initialize
+  */
+
+  ESA_DIAG_enter(comp, 3, func );
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  *have_more = HAVE_MORE;
+
+  ESA_DIAG_printf(comp, 3,
+                  "Put info from index=%d max index=%d",
+                   get_handle->list_ind, user_list->used_entries);
+
+
+  for (i = get_handle->list_ind;
+                  (i LT user_list->used_entries ) AND
+                  ( (*actual_num) LT max_ress ); i++ )  {
+
+
+
+      /***  The item does not match to obtained prefix  **/
+
+      if (user_list->trap_data[i].used) {
+         i++;
+         continue;
+      }
+
+      /***  The item may be does not exist  ***/
+
+      if (user_list->trap_data[i].data[0] EQ TSS_GET_MANY_SKIP_ITEM)
+      {
+         i++;
+         continue;
+      }
+
+      k = (*actual_num);
+
+      ESA_DIAG_printf(comp, 3, "ACID/%s",
+                      &user_list->trap_data[i].data[1]);
+
+     /*
+      * Fill up resource parameters
+      */
+
+      strcpy(res_params[k].restype,   "ACID");
+      strcpy(res_params[k].resource,  &user_list->trap_data[i].data[1]);
+      strcpy(res_params[k].parent_oe, "" );
+
+     /*
+      *  Put addinfo parameters
+      */
+
+      TSS_put_to_addinfo(comp, TSS_RES_OWNER,
+                         "", addinfo[k], 0, dest, msgs );
+
+      TSS_put_to_addinfo(comp, TSS_RES_HAS_OWNER,
+                         KWD_FLAG_OFF, addinfo[k], 0, dest, msgs );
+
+      (*actual_num)++;
+
+      ESA_DIAG_printf(comp, 3, "i=%d actual_num=%d", i, *actual_num);
+  }
+
+  get_handle->list_ind = i;
+
+  ESA_DIAG_printf(comp, 3, "max_ress=%d actual_num=%d left=%d",
+                  max_ress, *actual_num, get_handle->list_ind);
+
+ /*
+  *  Check reason end-of-loop
+  */
+
+  if ( *actual_num GE max_ress) {
+      *have_more = HAVE_MORE ;
+      goto exit;
+  }
+
+  *have_more = NO_MORE;
+  rc = ESA_OK;
+
+ /*
+  *  Finish
+  */
+
+ exit : ;
+
+
+  ESA_DIAG_exit(comp, 3, func, rc);
+
+  return rc ;
+
+}
+

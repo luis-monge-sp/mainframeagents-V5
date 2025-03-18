@@ -1,0 +1,640 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Isuuing TSS  commands                    *
+ *                                                             *
+ * File Name        : ctstcmm ( MODIFY cmd )                   *
+ *                                                             *
+ * Author           : Alexander Shvartsman                     *
+ *                                                             *
+ * Creation Date    : 16/06/96                                 *
+ *                                                             *
+ * Description      : TSS  issuing command                     *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * PS0388   AlexS    28/09/99 TSS 5.1 Support                  *
+ * sas750   AvnerL   23/11/09 Clear SAS/C 7.5 warnings.        *
+ * BS10107  AvnerL   20/08/20 Increase MAX_RDT_ENTRIES to 1024 *
+ * WS10082A AvnerL   12/11/23 Remove API_ADDINFO               *
+  **************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDIO
+ #include   STDLIB
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_CTSAMSG
+ #include ESA_API
+ #include ESA_API_CODES
+ #include API_AUTH
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_COMP
+ #include MVS_OS_MVS
+ /*WS10082A #include API_ADDINFO  --- not used */
+
+ /*
+  *   TSS include files
+  */
+
+ #include TSS
+ #include TSS_CODES
+
+ static char component[] = "CTSTCMM";
+
+ static char internal2_msg_buf[200];
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_get_modify_info                        *
+ *                                                             *
+ * DESCRIPTION    : Trap cmd and build modify related fields   *
+ *                                                             *
+ * INPUT          : admin_params                               *
+ *                  err                                        *
+ *                                                             *
+ * OUTPUT         : modify_info                                *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_get_modify_info(ESA_DIAG_COMP_typ            comp,
+                            TSS_MODIFY_RET_typ         * modify_info,
+                            ADMIN_PARAMS_rec_typ       * admin_params,
+                            ERR_STRUCT_rec_typ         * err)
+ {
+
+  static char func[]="TSS_get_modify_info";
+  TSS_CMD_BUF_rec_typ          cmd = { 0, 0, "" };
+  TSS_TRAP_BUF_rec_typ       * get_info = NULL;
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+  ESA_RC                       rc = ESA_OK;
+  int                          logout_done = 0;
+  static char                  vers[MAX_TSS_PARAM_LEN + 1];
+  static char                  dfrmt[MAX_TSS_PARAM_LEN + 1];
+
+  static TSS_MODIFY_VAR_typ tss9660i_vars[] = {
+   {TSS_GLOBAL_VERSION, "VERSION=", NULL, vers, NULL},
+   {NULL, NULL, NULL, NULL, NULL }   };
+  static TSS_MODIFY_REC_typ tss9660i_rec = {"TSS9660I", tss9660i_vars};
+
+  static TSS_MODIFY_VAR_typ tss9515i_vars[] = {
+   {TSS_GLOBAL_DATE_FORMAT, "DATE(", ")", dfrmt, NULL },
+   {NULL, NULL, NULL, NULL, NULL }   };
+  static TSS_MODIFY_REC_typ tss9515i_rec = {"TSS9515I", tss9515i_vars};
+
+  static TSS_MODIFY_REC_typ  *modify_recs[] = {
+                                     &tss9660i_rec,
+                                     &tss9515i_rec,
+                                     NULL};
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(comp,10,func);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  vers[0]  = NULL_CHAR;
+  dfrmt[0] = NULL_CHAR;
+
+  rc = CTSCRSS_set_authority( &logout_done,
+                              SET_TO_STARTED_TASK_AUTH,
+                              admin_params, err );
+  if ( rc NE ESA_OK )
+      goto exit;
+
+ /*
+  *   MODIFY command
+  */
+
+  strcpy(cmd.buffer, "MODIFY ");
+
+  cmd.max_len = strlen(cmd.buffer);
+  cmd.use_len = strlen(cmd.buffer);
+
+  rc = TSS_trap_cmd(comp, &cmd, &get_info, NULL, dest, msgs );
+  if ( rc NE ESA_OK )
+   goto exit;
+
+  if ( get_info EQ NULL ) {
+     CTSAMSG_print(TSS_CMD_RESULT_ERR, msgs, NULL, dest, cmd.buffer);
+     rc = ESA_FATAL;
+     OS_MVS_btrace();
+     goto exit;
+  }
+
+  rc = TSS_make_modify_vars( comp, get_info, modify_recs,
+                             dest, msgs );
+  if ( rc NE ESA_OK )
+    goto exit;
+
+ /*
+  * Fill up the structure
+  */
+
+  strcpy(modify_info->version,     vers);
+  strcpy(modify_info->date_format, dfrmt);
+
+ /*
+  *    Finish
+  */
+
+ exit :;
+
+  if (logout_done)
+    CTSCRSS_set_authority( &logout_done,
+                           RETURN_FROM_STARTED_TASK_AUTH,
+                           admin_params, err );
+
+  if (get_info)
+    TSS_free_trap_handle(comp, &get_info, dest, msgs);
+
+  ESA_DIAG_exit(comp, 10, func, rc );
+  return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_make_modify_vars                       *
+ *                                                             *
+ * DESCRIPTION    : MODIFY cmd output processing               *
+ *                                                             *
+ * INPUT          : get_info    - trap buffer                  *
+ *                  modify_info - modify line desc             *
+ *                  dest                                       *
+ *                  msgs                                       *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ #if 0              /* Delete By PS0388 */
+ ESA_RC TSS_make_modify_vars(ESA_DIAG_COMP_typ       comp,
+                        TSS_TRAP_BUF_rec_typ       * get_info,
+                        TSS_MODIFY_REC_typ         * modify_info[1],
+                        CTSAMSG_DEST_TABLE_rec_typ * dest,
+                        CTSAMSG_HANDLE_rec_typ     * msgs)
+ {
+
+  static char func[]="TSS_make_modify_vars";
+  char                      rec_id[10];
+  char                     *wrk;
+  char                     *wl;
+  char                     *wlx;
+  char                     *wr;
+  int                       len;
+  TSS_MODIFY_REC_typ       *modify_rec;
+  TSS_MODIFY_VAR_typ       *vars;
+  char                      param[MAX_TSS_PARAM_LEN + 1];
+  CNV_VAR_FUNC_typ         *cfunc;
+  ESA_RC                    rc  = ESA_OK;
+  ESA_RC                    rc1 = ESA_OK;
+  int                       found;
+  int                       i;
+  int                       j;
+
+ /*
+  *    Initialize
+  */
+
+  ESA_DIAG_enter(comp, 10, func);
+
+ /*
+  *   Loop through TSS output lines
+  */
+
+  for (i=0; i LT get_info->used_entries; i++ ) {
+
+     memcpy(rec_id, get_info->trap_data[i].data, sizeof(rec_id) );
+     wrk = strchr(rec_id, ' ');
+     if ( wrk )
+       *wrk = NULL_CHAR;
+     else
+       continue;
+
+     ESA_DIAG_printf (comp, 10, "i=%d %s data=%s",
+                      i , rec_id, get_info->trap_data[i].data);
+
+    /*
+     *   Loop through TSS MODIFY lines  description
+     */
+
+     found = 0;
+     for (j=0; modify_rec = modify_info[j]; j++ ) {
+
+       ESA_DIAG_printf (comp, 10, "Waiting for rec id=%s",
+                        modify_rec->rec_id);
+
+       if (strcmp(rec_id, modify_rec->rec_id) EQ 0 ) {
+          found = 1;
+          break;
+       }
+     }
+
+     if ( NOT found )
+       continue;
+
+     vars = modify_rec->vars;
+
+    /*
+     *   Make vars
+     */
+
+     for (j=0; vars[j].param; j++ ) {
+        wl = strstr(get_info->trap_data[i].data, vars[j].tleft);
+
+        ESA_DIAG_printf (comp, 10, "tleft=%s wl=%x",
+                         vars[j].tleft, wl );
+
+        if ( wl EQ NULL ) {
+            sprintf(internal2_msg_buf,
+                    "Unable to locate %s in rec id=%s",
+                    vars[j].tleft, rec_id);
+            CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                        component, func, internal2_msg_buf,
+                        4, __LINE__);
+            OS_MVS_btrace();
+            break;
+        }
+
+        wl += strlen(vars[j].tleft);
+
+       /*
+        * Skip leading blanks
+        */
+
+        wlx = wl + strlen(wl);
+        for (wl ; (*wl EQ ' ') AND (wl LT wlx); wl++);
+
+        if ( vars[j].tright )
+          wr = strstr(wl, vars[j].tright);
+        else
+          wr = strstr(wl, " ");
+
+        ESA_DIAG_printf (comp, 10, "wr=%x", wr );
+
+        if ( wr EQ NULL ) {
+            sprintf(internal2_msg_buf,
+                    "Unable to locate %s in rec id=%s",
+                    vars[j].tright, rec_id);
+            CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                        component, func, internal2_msg_buf,
+                        4, __LINE__);
+            OS_MVS_btrace();
+            break;
+        }
+
+        len = wr - wl;  /* Field value length */
+
+        ESA_DIAG_printf (comp, 10, "len=%d", len);
+
+        rc=TSS_check_param_overflow(comp, NULL, NULL, NULL,
+                                    len, sizeof(param), dest,msgs);
+        if ( rc NE ESA_OK )
+          break;
+
+        memcpy(param, wl, len);
+        param[len] = NULL_CHAR;
+        ESA_DIAG_printf(comp,  10, "%d-%d. %s=%s", i, j,
+                        vars[j].param, param);
+
+        if ( vars[j].cfunc NE NULL ) {
+           cfunc = (CNV_VAR_FUNC_typ *)vars[j].cfunc;
+           rc1 = (cfunc)(comp, param, dest, msgs);
+           if ( rc1 EQ ESA_OK )
+              strcpy(vars[j].result, param);
+        }
+        else
+              strcpy(vars[j].result, param);
+     }    /* vars loop */
+  }    /* TSS output trap buffer */
+
+ /*
+  *    Finish
+  */
+
+  exit:;
+
+   ESA_DIAG_exit(comp, 10, func, rc);
+
+   return rc;
+
+ }
+ #endif             /* Delete By PS0388 */
+
+ /* Added By PS0388 */
+ ESA_RC TSS_make_modify_vars(ESA_DIAG_COMP_typ       comp,
+                        TSS_TRAP_BUF_rec_typ       * get_info,
+                        TSS_MODIFY_REC_typ         * modify_info[1],
+                        CTSAMSG_DEST_TABLE_rec_typ * dest,
+                        CTSAMSG_HANDLE_rec_typ     * msgs)
+ {
+
+  static char func[]="TSS_make_modify_vars";
+  char                     *wl;
+  char                     *wlx;
+  char                     *wr;
+  int                       len;
+  TSS_MODIFY_REC_typ       *modify_rec;
+  TSS_MODIFY_VAR_typ       *vars;
+  char                      param[MAX_TSS_PARAM_LEN + 1];
+  CNV_VAR_FUNC_typ         *cfunc;
+  ESA_RC                    rc  = ESA_OK;
+  ESA_RC                    rc1 = ESA_OK;
+  int                       i;
+  int                       j;
+  int                       k;
+
+ /*
+  *    Initialize
+  */
+
+  ESA_DIAG_enter(comp, 10, func);
+
+ /*
+  *   Loop through TSS output lines
+  */
+
+  for (i=0; i LT get_info->used_entries; i++ ) {
+
+     /* Loop through TSS MODIFY lines  description */
+
+     for (k=0; modify_rec = modify_info[k]; k++ ) {
+
+       ESA_DIAG_printf (comp, 10, "Checking for rec id=%s",
+                        modify_rec->rec_id);
+
+       vars = modify_rec->vars;
+
+       /* Make vars */
+
+       for (j=0; vars[j].param; j++ ) {
+         wl = strstr(get_info->trap_data[i].data, vars[j].tleft);
+
+         ESA_DIAG_printf (comp, 10, "tleft=%s wl=%x",
+                          vars[j].tleft, wl );
+
+         if (wl NE NULL )  {      /* Found string */
+            wl += strlen(vars[j].tleft);
+
+            /* Skip leading blanks */
+
+            wlx = wl + strlen(wl);
+            /*sas750 for (wl ; (*wl EQ ' ') AND (wl LT wlx); wl++);*/
+            for ( ; (*wl EQ ' ') AND (wl LT wlx); wl++);   /*sas750*/
+
+            if ( vars[j].tright )
+              wr = strstr(wl, vars[j].tright);
+            else
+              wr = strstr(wl, " ");
+
+            ESA_DIAG_printf (comp, 10, "wr=%x", wr );
+
+            if ( wr EQ NULL ) {
+               sprintf(internal2_msg_buf,
+                       "Unable to locate %s-%s",
+                       vars[j].tleft,
+                       vars[j].tright);
+               CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                             component, func, internal2_msg_buf,
+                             4, __LINE__);
+               OS_MVS_btrace();
+               break;
+          }
+
+          len = wr - wl;  /* Field value length */
+
+          ESA_DIAG_printf (comp, 10, "len=%d", len);
+
+          rc=TSS_check_param_overflow(comp, NULL, NULL, NULL,
+                                      len, sizeof(param), dest,msgs);
+          if ( rc NE ESA_OK )
+            break;
+
+          memcpy(param, wl, len);
+          param[len] = NULL_CHAR;
+          ESA_DIAG_printf(comp,  10, "%d-%d. %s=%s", i, j,
+                          vars[j].param, param);
+
+          if ( vars[j].cfunc NE NULL ) {
+             cfunc = (CNV_VAR_FUNC_typ *)vars[j].cfunc;
+             rc1 = (cfunc)(comp, param, dest, msgs);
+             if ( rc1 EQ ESA_OK )
+                strcpy(vars[j].result, param);
+          }
+          else
+               strcpy(vars[j].result, param);
+         }    /* Found string           */
+       }      /* Make vars loop         */
+     }        /* Lines loop             */
+  }           /* TSS output trap buffer */
+
+ /*
+  *    Finish
+  */
+
+  exit:;
+
+   ESA_DIAG_exit(comp, 10, func, rc);
+
+   return rc;
+
+ }
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : TSS_get_rdt_table                          *
+ *                                                             *
+ * DESCRIPTION    : Get RDT table and save allowed restypes    *
+ *                                                             *
+ * INPUT          : admin_params                               *
+ *                                                             *
+ * OUTPUT         : global_rdt_table_entries_number            *
+ *                  rdt_table                                  *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC TSS_get_rdt_table(ESA_DIAG_COMP_typ          comp,
+                          int                      * rdt_table_entries,
+                          RDT_RESTYPE_typ            rdt_table[1],
+                          ADMIN_PARAMS_rec_typ     * admin_params,
+                          ERR_STRUCT_rec_typ       * err)
+ {
+
+  static char func[]="TSS_get_rdt_table";
+  TSS_LIST_HANDLE_rec_typ      handle;
+  TSS_CMD_BUF_rec_typ          cmd = { 0, 0, "" };
+  TSS_CMD_BUF_rec_typ          ret_buf;
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+  ESA_RC                       rc     = ESA_OK;
+  ESA_RC                       rc1    = ESA_OK;
+  ESA_RC                       rc_cmd = ESA_OK;
+  ESA_RC                       rc_p   = ESA_OK;
+  ESA_RC                       rc_f   = ESA_OK;
+  char                         cmd_handle[TSS_CMD_HANDLE_LEN];
+  int                          logout_done = 0;
+  int                          i_trap = 0;
+  char                       * token;
+
+ /*******************************************************************
+  * RESOURCE CLASS = APPCLU                                         *
+  *  RESOURCE CODE = X(9D)                                          *
+  *    ATTRIBUTE = NOMASK,ACCESS,LONG                               *
+  *       ACCESS = NONE(0000),CONTROL(0400),UPDATE(8000),READ(4000) *
+  *       ACCESS = ALL(FFFF)                                        *
+  *       DEFACC = READ                                             *
+  *******************************************************************/
+
+  static RDT_RESTYPE_typ res_type;
+  static char           *rescls_k[]={"RESOURCE", "CLASS", "=", NULL};
+  static TSS_OUTP_typ    rescls_d[] = {
+                     { sizeof(res_type), res_type  },
+                     { 0,                NULL      }
+                                       };
+  TSS_LIST_LINE(rescls, LIST_RDT, CURRENT_LINE);
+
+  static TSS_OUTPUT_typ  line_desc[] = {
+        { &rescls,    NULL   },
+        { NULL,       NULL   } };
+
+ /*
+  *   Initialize
+  */
+
+  ESA_DIAG_enter(comp, 5,func);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+
+  rc = CTSCRSS_set_authority( &logout_done,
+                              SET_TO_STARTED_TASK_AUTH,
+                              admin_params, err );
+  if ( rc NE ESA_OK )
+      goto exit;
+
+  /***   LIST(RDT) command  ***/
+
+  strcpy(cmd.buffer, "LIST(RDT) ");
+
+  cmd.max_len = strlen(cmd.buffer);
+  cmd.use_len = strlen(cmd.buffer);
+
+  /**  Send cmd to TSS  **/
+
+  rc_cmd = TSS_send_cmd(comp, TSS_CMD_WEAK_QUIET_MODE,
+                        &cmd, cmd_handle, FALSE, dest, msgs);
+   if ( rc_cmd NE ESA_OK )
+      goto exit;
+
+  /**  Save obtained info  **/
+
+  rc_p = TSS_get_output(comp, cmd_handle, &ret_buf, dest, msgs);
+  if ( rc_p EQ ESA_FATAL )
+    goto exit;
+
+  while (rc_p NE ESA_EOF) {
+     if ( rc_p EQ ESA_OK)  {
+       handle.start_line_ptr   = ret_buf.buffer;
+       handle.current_line_ptr = ret_buf.buffer;
+
+       ESA_DIAG_printf (comp, 10, "Obtained data=%s",ret_buf.buffer);
+
+       rc1 = TSS_identify_rec(comp, &handle, &line_desc[0],dest,msgs);
+       if ( rc1 NE ESA_SKIP ) {      /* Record found */
+
+         token = handle.current_line_ptr;
+
+         ESA_DIAG_printf (comp, 10,
+                          "var=%d/%s max_var_len=%d",
+                          strlen(token), token , sizeof(res_type) );
+
+         rc=TSS_check_param_overflow(comp, NULL, NULL, NULL,
+                                     strlen(token), sizeof(res_type),
+                                     dest,msgs);
+         if ( rc NE ESA_OK )
+           goto exit;
+         else
+            strcpy(res_type, token);
+
+         ESA_DIAG_printf (comp, 5, "%d.res_type=%s",
+                          i_trap, res_type);
+
+         if ( (i_trap + 1) GT MAX_RDT_ENTRIES  )  {
+             sprintf(internal2_msg_buf,
+                     "Overflow RDT table. Max allowed entries=%d",
+                     MAX_RDT_ENTRIES);
+
+             CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                        component, func, internal2_msg_buf,
+                        4, __LINE__);
+             rc = ESA_FATAL;
+             goto exit;
+         }
+
+         if (strcmp(res_type, "RESERVED") NE 0) {
+           strcpy( rdt_table[i_trap], res_type );
+           i_trap++;
+         }
+
+       } /* record identified */
+     } /* rc = ESA_OK after get_output */
+     else  if ( rc_p EQ ESA_FATAL)
+       goto exit;
+
+     rc_p = TSS_get_output(comp, cmd_handle, &ret_buf, dest, msgs);
+  }
+
+  rc_p = ESA_OK;
+
+ /*
+  *    Finish
+  */
+
+ exit :;
+
+  rc_f = TSS_free_output(comp, cmd_handle, dest, msgs);
+
+  if ( ( rc_cmd NE ESA_OK ) OR
+       ( rc_p   NE ESA_OK ) OR
+       ( rc_f   NE ESA_OK )  )
+     rc = ESA_FATAL;
+
+  if (logout_done)
+    CTSCRSS_set_authority( &logout_done,
+                           RETURN_FROM_STARTED_TASK_AUTH,
+                           admin_params, err );
+
+  (*rdt_table_entries) = i_trap;
+  ESA_DIAG_exit(comp, 5, func, rc );
+  return rc;
+
+ }
+

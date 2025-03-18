@@ -1,0 +1,471 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Update user to group connection (RACF)   *
+ *                                                             *
+ * File Name        : ctsrucn.c                                *
+ *                                                             *
+ * Author           : Doron Cohen                              *
+ *                                                             *
+ * Creation Date    : 11/04/94                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ *                                                             *
+ * BS2027   AS       01/06/97 Update fails when no changes     *
+ *                            of connection was done           *
+ * ws2549   Yonatan  09/11/05 New parm MSG_CONNGRP_ERR.        *
+ * WS10070  KailasP  17/03/18 Support CONNECTION_ATTRIBUTE     *
+ * IS10174  NuritY   31/12/17 Dynamic EXECOUT support.         *
+ * WS10082  MauriC   07/11/22 Recompile for new ADDINFO macros *
+ **************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+
+ /*
+  *   CONTROL-SA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_API
+
+ #include MVS_OS_CLI
+
+ #include RACF_CODES
+ #include API_ADDINFO
+ #include RACF
+
+ /*
+  *     MKT for CONNECT
+  *         (Mandatory Keywords Table)
+  */
+
+ static ADDINFO_MKTE_rec_typ mkt[] = {
+   /*  "GROUP",    Removed by BS2027   */
+    ""         /* a null string indicate end-of-mkt */
+  };
+
+ /*
+  *     RKT for UPDU2UG
+  *         (Reserved Keywords Table)
+  */
+
+ static ADDINFO_RKTE_rec_typ rkt[] = {
+    "GROUP",
+    "REVOKE",
+    "RESUME",
+    "SPECIAL",
+    "AUDITOR",
+    ""         /* a null string indicate end-of-rkt */
+  };
+
+ /*
+  *     KDT for CONNECT COMMAND
+  *         (Keyword Decscription Table)
+  */
+
+ static ADDINFO_KDTE_rec_typ kdt[] =      {
+
+  /*                                                            */
+  /* keyword             type   negative       value delimiters */
+  /*                             value                          */
+  /* =================== ====== ============== ================ */
+
+   {"RESUME_DATE"      ,KDT_IGN ,""               ,"(" , ")" },
+   {"REVOKE_DATE"      ,KDT_IGN ,""               ,"(" , ")" },
+   {"REVOKED"          ,KDT_IGN ,""               ,"(" , ")" },
+   {"ADSP"             ,KDT_FLG ,"NOADSP"         ,""  , " " },
+   {"AUDITOR"          ,KDT_FLG ,"NOAUDITOR"      ,""  , ""  },
+   {"AUTHORITY"        ,KDT_KEY ,"AUTHORITY(USE)" ,"(" , ")" },
+   {"GROUP"            ,KDT_KEY ,"GROUP()"        ,"(" , ")" },
+   {"GRPACC"           ,KDT_FLG ,"NOGRPACC"       ,""  , " " },
+   {"OPERATIONS"       ,KDT_FLG ,"NOOPERATIONS"   ,"(" , ")" },
+   {"OWNER"            ,KDT_KEY ,"OWNER()"        ,"(" , ")" },
+   {"RESUME"           ,KDT_KEY ,"RESUME"         ,"(" , ")" },
+   {"REVOKE"           ,KDT_KEY ,"REVOKE"         ,"(" , ")" },
+   {"SPECIAL"          ,KDT_FLG ,"NOSPECIAL"      ,"(" , ")" },
+   {"UACC"             ,KDT_KEY ,"UACC()"         ,"(" , ")" },
+   /* WS10070 */
+   {"CONNECTION_ATTRIBUTES" ,KDT_IGN ,""          ,"" , ""   },
+   {""                 ,KDT_FLG ,""               ,""  , ""  }  };
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : updu2ug                                    *
+ *                                                             *
+ * DESCRIPTION    :                                            *
+ *                                                             *
+ * INPUT          :                                            *
+ *                                                             *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC CTSUpdUserToUG (U2UG_PARAMS_rec_typ  * u2ug_params,
+                        ADDINFO_rec_typ      * addinfo,
+                        ADMIN_PARAMS_rec_typ * admin_params,
+                        ERR_STRUCT_rec_typ   * err)
+ {
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                     rc, chk_rc;
+   char                       cmd[MAX_API_ST];
+   static char                func[]="CTSUpdUserToUG";
+   ONE_FIELD_rec_typ          *rev_pair, *res_pair, *stt_pair;
+   char                       racf_date[10];
+   ADDINFO_rec_ptr            laddinfo = NULL;
+   ADDINFO_rec_ptr            addinfo_vec[2] = { NULL, NULL };
+   CTSAMSG_HANDLE_rec_ptr     msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr dest;
+   /*WS10070 start*/
+   ONE_FIELD_rec_ptr      capair, opair;
+   char kwd_flag[2] = NULL_STRING;
+   char attr[13] = NULL_STRING;
+   char *caPtr,*attrPtr;
+   /* WS10070 end*/
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_UPDU2UG, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+  /*
+   *   Check that Reserved Keywords were not used
+   */
+
+   if (ADDINFO_rkt_check(func,1,&addinfo,rkt,
+                         dest, msgs ) NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *   Check connection existance
+   */
+
+   ESA_DIAG_printf(ESA_COMP_UPDU2UG, 1,
+                   "Checking connection existance (%s/%s)",
+                   u2ug_params->group, u2ug_params->user);
+   chk_rc = RACF_chk_conn(u2ug_params->user, u2ug_params->group,
+                          OBJ_EXIST, TRUE, dest, msgs,
+                          admin_params);       /* ws2549 */
+   if ( chk_rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+  /*
+   *   Obtain a local addinfo buffer
+   */
+
+   if (ADDINFO_alloc(func,10, &laddinfo, dest, msgs) NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+
+   addinfo_vec[0] = laddinfo;
+   addinfo_vec[1] = addinfo;
+
+  /*
+   *   Add  reserved keywords to local addinfo
+   */
+
+   ESA_DIAG_printf(ESA_COMP_UPDU2UG, 1,
+                   "Inserting paramters to local addinfo");
+
+  /*
+   * Removed by BS2027
+   * ADDINFO_insert(TYPE_1A,"GROUP",u2ug_params->group, laddinfo,
+   *                RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+   *                UNIQUE);
+   */
+
+   rev_pair = ADDINFO_search("REVOKE_DATE",   RCF_ADDINFO_KWD_LEN,
+                             addinfo->pair,
+                             addinfo->num_pairs);
+   res_pair = ADDINFO_search("RESUME_DATE",   RCF_ADDINFO_KWD_LEN,
+                             addinfo->pair,
+                             addinfo->num_pairs);
+   stt_pair = ADDINFO_search("REVOKED",       RCF_ADDINFO_KWD_LEN,
+                             addinfo->pair,
+                             addinfo->num_pairs);
+
+   if (rev_pair NE NULL)
+      ESA_DIAG_printf(ESA_COMP_UPDU2UG, 1,
+                      "REVOKE_DATE found. %s=%s",
+                      rev_pair->keyword, rev_pair->value);
+   if (res_pair NE NULL)
+      ESA_DIAG_printf(ESA_COMP_UPDU2UG, 1,
+                      "RESUME_DATE found. %s=%s",
+                      res_pair->keyword, res_pair->value);
+   if (stt_pair NE NULL)
+      ESA_DIAG_printf(ESA_COMP_UPDU2UG, 1,
+                      "REVOKED found. %s=%s",
+                      stt_pair->keyword, stt_pair->value);
+
+  /*
+   *   Add Administration flags to local addinfo (AUDITOR/SPECIAL)
+   */
+
+    /* WS10070 - start */
+   capair = ADDINFO_search("CONNECTION_ATTRIBUTES",
+                           RCF_ADDINFO_KWD_LEN,
+                           addinfo->pair, addinfo->num_pairs);
+   if (capair NE NULL)
+   {
+      ESA_DIAG_printf(ESA_COMP_UPDU2UG, 4,
+                     "CONNECTION_ATTRIBUTES keyword located - %s",
+                     capair->value);
+
+      /* If CONNECTION_ATTRIBUTE is populated, we dont want to give *
+       * other ways to define SPECIAL,OPERATIONS,AUDITOR attributes *
+       * Since OPERATIONS is defined in separate attribute and not  *
+       * in u2ug_params, we want to remove OPERATIONS from addinfo  */
+
+      opair= ADDINFO_search("OPERATIONS", RCF_ADDINFO_KWD_LEN,
+                            addinfo->pair, addinfo->num_pairs);
+      if ( opair NE NULL )
+      {
+          ADDINFO_delete( addinfo, "OPERATIONS" );
+          ESA_DIAG_printf(ESA_COMP_UPDU2UG, 1,
+                          "OPERATIONS attribute ignored.");
+      }
+
+      caPtr = NULL;
+      do
+      {
+
+         chk_rc = ADDINFO_list_getnextvalue(capair, ADDINFO_LIST_ENTRY,
+                                   attr, &caPtr);
+
+         if( *attr EQ NULL_CHAR )
+              continue;
+         else
+         {
+            if ( (strlen(attr) GT 2) AND (strncmp(attr,"NO",2) EQ 0) )
+            {
+               strcpy(kwd_flag , KWD_FLAG_OFF);
+               attrPtr =attr+2; /*Ignore two characters to get */
+            }                   /* keyword name */
+            else
+            {
+               strcpy(kwd_flag , KWD_FLAG_ON);
+               attrPtr = attr;
+            }
+         }
+
+         ESA_DIAG_printf(ESA_COMP_UPDU2UG, 9,
+                         "kwd_flag - %s, attr - %s",
+                          kwd_flag, attrPtr);
+
+         ADDINFO_insert(TYPE_1A, attrPtr , kwd_flag, laddinfo,
+                        RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                        UNIQUE);
+
+      } while( chk_rc EQ ESA_OK );
+   }
+   else
+   { /* WS10070 - end */
+      switch ( u2ug_params->u2ug_admin_data ) {
+
+        case U2UG_ADM_ALL :
+             ADDINFO_insert(TYPE_1A, "SPECIAL", KWD_FLAG_ON, laddinfo,
+                            RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                            UNIQUE);
+             ADDINFO_insert(TYPE_1A, "AUDITOR", KWD_FLAG_ON, laddinfo,
+                            RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                            UNIQUE);
+             break ;
+
+        case U2UG_ADM_ADMIN:
+             ADDINFO_insert(TYPE_1A, "SPECIAL", KWD_FLAG_ON, laddinfo,
+                            RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                            UNIQUE);
+             ADDINFO_insert(TYPE_1A, "AUDITOR", KWD_FLAG_OFF,laddinfo,
+                            RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                            UNIQUE);
+             break ;
+
+        case U2UG_ADM_AUDIT:
+             ADDINFO_insert(TYPE_1A, "AUDITOR", KWD_FLAG_ON, laddinfo,
+                            RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                            UNIQUE);
+             ADDINFO_insert(TYPE_1A, "SPECIAL", KWD_FLAG_OFF,laddinfo,
+                            RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                            UNIQUE);
+             break ;
+
+        case U2UG_ADM_NONE:
+             ADDINFO_insert(TYPE_1A, "AUDITOR", KWD_FLAG_OFF, laddinfo,
+                            RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                            UNIQUE);
+             ADDINFO_insert(TYPE_1A, "SPECIAL", KWD_FLAG_OFF,laddinfo,
+                            RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                            UNIQUE);
+             break ;
+
+        default :
+             break ;
+
+      }
+   }
+  /*
+   *  Handle REVOKED change
+   */
+
+   if (stt_pair NE NULL) {
+
+     /*
+      *  REVOKE
+      */
+
+      if (strcmp(stt_pair->value, KWD_FLAG_ON) EQ 0) {
+         ADDINFO_insert( TYPE_1A, "REVOKE", "", laddinfo,
+                         RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                         UNIQUE);
+         if (res_pair NE NULL)
+            if (strlen(res_pair->value) GT 0) {
+               rc = RACF_revoke_date(res_pair->value, racf_date, dest,
+                                     msgs);
+               if (rc NE ESA_OK) {
+                  rc = ESA_FATAL;
+                  goto exit;
+               }
+               ADDINFO_insert(TYPE_1A, "RESUME", racf_date, laddinfo,
+                              RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                              UNIQUE);
+            } /* resume_date specified */
+         if (rev_pair NE NULL)
+            CTSAMSG_print(RACF_REVDATE_IGN,   msgs, NULL, dest);
+      } /* revoked = Y */
+
+     /*
+      *  RESUME
+      */
+
+      else {
+         ADDINFO_insert( TYPE_1A, "RESUME", "", laddinfo,
+                         RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                         UNIQUE);
+         if (rev_pair NE NULL)
+            if (strlen(rev_pair->value) GT 0) {
+               rc = RACF_revoke_date(rev_pair->value, racf_date,
+                                     dest, msgs);
+               if (rc NE ESA_OK) {
+                  rc = ESA_FATAL;
+                  goto exit;
+               }
+               ADDINFO_insert(TYPE_1A, "REVOKE", racf_date, laddinfo,
+                              RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                              UNIQUE);
+            } /* revoke_date specified */
+         if (res_pair NE NULL)
+            CTSAMSG_print(RACF_RESDATE_IGN,   msgs, NULL, dest);
+      } /* revoked = N */
+   } /* revoked was specified */
+
+  /*
+   *  Handle REVOKE_DATE change
+   */
+
+   else if (rev_pair NE NULL) {
+     if (strlen(rev_pair->value) GT 0) {
+        rc = RACF_revoke_date(rev_pair->value, racf_date, dest, msgs);
+        if (rc NE ESA_OK) {
+           rc = ESA_FATAL;
+           goto exit;
+        }
+        ADDINFO_insert(TYPE_1A, "REVOKE", racf_date, laddinfo,
+                       RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                       UNIQUE);
+     }
+     else {
+        CTSAMSG_print(RACF_REVOKE_CLEAR,   msgs, NULL, dest,
+                      rev_pair->keyword);
+        rc = ESA_FATAL;
+        goto exit;
+     } /* revoke_date was cleared */
+   }
+
+  /*
+   *  Handle RESUME_DATE change
+   */
+
+   else if (res_pair NE NULL) {
+     if (strlen(res_pair->value) GT 0) {
+        rc = RACF_revoke_date(res_pair->value, racf_date, dest, msgs);
+        if (rc NE ESA_OK) {
+           rc = ESA_FATAL;
+           goto exit;
+        }
+        ADDINFO_insert(TYPE_1A, "RESUME", racf_date, laddinfo,
+                       RCF_ADDINFO_KWD_LEN, RCF_ADDINFO_VAL_LEN,
+                       UNIQUE);
+     }
+     else {
+        CTSAMSG_print(RACF_REVOKE_CLEAR,   msgs, NULL, dest,
+                      res_pair->keyword);
+        rc = ESA_FATAL;
+        goto exit;
+     } /* revoke_date was cleared */
+   }
+
+  /*
+   *  CONNECT command
+   */
+
+  /*
+   * Removed by BS2027
+   * sprintf(cmd,"CONNECT %s ", u2ug_params->user);
+   */
+
+   sprintf(cmd,"CONNECT %s GROUP(%s) ", u2ug_params->user,  /*BS2027*/
+                                        u2ug_params->group);/*BS2027*/
+
+   ESA_DIAG_printf(ESA_COMP_UPDU2UG, 1,
+                   "Command header prepared (%s)", cmd);
+
+   rc = racfcmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+                cmd, MAX_OK_RC_0,
+                2, addinfo_vec, mkt, kdt,                /* IS10174 */
+                admin_params,                            /* IS10174 */
+                CMDOUT_YES, RACF_YES);
+    /* IS10174  2, addinfo_vec, mkt, kdt, dest, msgs,               */
+
+  /*
+   *   Finish
+   */
+
+   exit:;
+
+   ADDINFO_free(&laddinfo);
+
+   ESA_DIAG_exit(ESA_COMP_UPDU2UG, 1, func , rc);
+
+   return rc;
+
+ }
