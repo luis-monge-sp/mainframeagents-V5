@@ -1,0 +1,657 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Delete an ACE from a resource ACL (ACF2) *
+ *                                                             *
+ * File Name        : ctsbdac.c                                *
+ *                                                             *
+ * Author           : Guy Shavitt                              *
+ *                                                             *
+ * Creation Date    : 01/02/1998                               *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who    When       Description                      *
+ * -------- ------ ---------- -------------------------------- *
+ * PS0252   Guy    13/04/1998 Common code changes              *
+ * PS0278   Guy    15/06/1998 Added rule backup                *
+ * WS2333   Guy    02/08/1998 No more Get_Dsn_Resource         *
+ * PS0347   Guy    03/12/1998 Changed parms of Compile_Ruleset *
+ * WS2358   Guy    14/10/1999 Support for the virtual resource *
+ * IS10122  NuritY 16/06/2014 Ignore ROLESET rules.            *
+ * BS10097  SeligT 19/11/2018 ACF2 Group Aggregation Endless   *
+ *                            Loop.                            *
+ * IS10178  SeligT 18/12/2018 Supporting LID Anywhere in UID.  *
+ * IS10178P SeligT 16/01/2019 This fix also omits the ADDINFO  *
+ *                            "POS" and deleted_ace_pos        *
+ *                            checking.  We no longer check    *
+ *                            the position field at all.  We   *
+ *                            delete the permission regardless *
+ *                            of the position it is in (if all *
+ *                            permission parameters match).    *
+ * IS10178B SeligT 20/01/2019 Permission Which Ends With a     *
+ *                            LID Which Ends With a Blank Will *
+ *                            Be Replaced With This Character: *
+ *                            rssparm_REPL_END_BLNK            *
+ * WS10075  KailasP 15/10/19  Parse the resource name and KPT  *
+ *                            keyword and populate res_name,   *
+ *                            res_type, RESMASK, key, prefix   *
+ *                            and type of rule.                *
+ * WS10084  ThomaS  19/08/23  Replace ACFRPTRX                 *
+ * WS10082  MauriC  07/11/22  Recompile for new ADDINFO macros *
+ **************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_CTSAMSG
+ #include ESA_API
+ #include ESA_API_CODES
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_OS_CLI
+ #include MVS_COMP
+
+ /*
+  *   ACF2 include files
+  */
+
+ #include API_ADDINFO
+ #include API_AUTH
+
+ #include ACF2_CODES
+ #include ACF2
+
+ static char component[]="DELACE"  ;
+ /**************************************************************
+ *                                                             *
+ * Procedure Name : delace                                     *
+ *                                                             *
+ * Description    : Disconnect user/group from resource        *
+ *                                                             *
+ * Input          : resource, ACE, addinfo, admin              *
+ *                                                             *
+ * Output         : err                                        *
+ *                                                             *
+ * Return Value   : ESA_RC                                     *
+ *                                                             *
+ * Side Effects   :                                            *
+ *                                                             *
+ * Comments       : 1. addinfo contains the requested          *
+ *                     permissions.                            *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC CTSDelACE (RES_PARAMS_rec_typ   * res_params,
+              /*   ADDINFO_rec_typ      * res_addinfo,    PS0252 */
+                   ACE_rec_typ          * ace,
+                   ADDINFO_rec_typ      * addinfo,
+                   ADMIN_PARAMS_rec_typ * admin_params,
+                   ERR_STRUCT_rec_typ   * err)
+ {
+
+   static char                func[]="CTSDelACE";
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                     rc = ESA_OK;
+   CTSAMSG_HANDLE_rec_ptr     msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr dest;
+
+   ACF2_Get_ResACL_Handle     *h = NULL;
+   ONE_FIELD_rec_ptr           pair = NULL;
+   ADDINFO_rec_ptr             ace_addinfo = NULL, laddinfo = NULL;
+   ADDINFO_rec_ptr             filtered_addinfo = NULL;
+   RESOURCE_typ                current_key = "";
+   ACE_rec_typ                 curr_ace;
+   FILE                       *rule_file = NULL;
+   char                       *obj_buffer = NULL;
+   char                        msg[256]="";
+   char                        errmsg[256]="";
+   int                         iterate, ace_deleted;
+   int                         deleted_ace_pos, num_rules;
+   int                         LID_In_UID, LID_Offset;    /* BS10097 */
+   int                         LID_Length;                /* IS10178 */
+   UIDMASK                     uidmask="";               /* IS10178P */
+   ACF2_PARAMS_rec_typ       * params_ptr = NULL;         /* BS10097 */
+   /* WS10075 - Start */
+   char       resource_type [MAX_RSS_RESTYPE_NAME_LEN + 1] =  "";
+   char       KPT [ACF2_RESRULE_KEY_SIZE + ACF2_RESRULE_KEY_SIZE]="";
+   char       key [ACF2_RESRULE_KEY_SIZE] = "";
+   char       RESMASK [ACF2_RESRULE_KEY_SIZE] = "";
+   char       prefix [ACF2_RESRULE_KEY_SIZE] = "";
+   /* WS10075 - Ends */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_DELACE, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+   /* IS10178 adding ug_name to this diagnostic message              */
+   ESA_DIAG_printf(ESA_COMP_DELACE, DEBUG_SHOW_IMPORTANT,
+            "ACE type(%d) user_name(%s) ug_name(%s)",
+            ace->ace_type, ace->user_name, ace->ug_name);
+
+   if (ace->ace_type EQ ACE_TYPE_GROUP)                   /* IS10178 */
+     {
+       /* IS10178 change this because when ACE_TYPE_GROUP, the
+                  ug_name field will have the name of the group
+       RESTORE_ENDING_BLANK(ace->user_name,                          */
+       RESTORE_ENDING_BLANK(ace->ug_name,                 /* IS10178 */
+                            ESA_COMP_DELACE);             /* BS10097 */
+     }
+
+   pair = ADDINFO_search ("UID",                          /* BS10097 */
+                          ACF_ADDINFO_KWD_LEN,            /* BS10097 */
+                          addinfo->pair,                  /* BS10097 */
+                          addinfo->num_pairs);            /* BS10097 */
+
+   if (pair EQ NULL)             goto skip_UID;           /* BS10097 */
+   if (pair->value EQ NULL_CHAR) goto skip_UID;           /* BS10097 */
+
+   RESTORE_ENDING_BLANK(pair->value,
+                        ESA_COMP_DELACE);                 /* BS10097 */
+   RESTORE_PRMSN_LID_EB(pair->value,                      /* IS10178B*/
+                        ESA_COMP_DELACE);                 /* IS10178B*/
+
+   ESA_DIAG_printf(ESA_COMP_DELACE, DEBUG_SHOW_IMPORTANT, /* BS10097 */
+                   "ACE UIDMASK: (%s)", pair->value);     /* BS10097 */
+
+   strcpy(uidmask, pair->value);                         /* IS10178P */
+
+   skip_UID:                                              /* BS10097 */
+
+   /* WS10075 - Start                                      *
+    * Parse the resource field if the keyword KPT exists   *
+    * exists in add info.                                  */
+
+   pair = ADDINFO_search ("KPT", ACF_ADDINFO_KWD_LEN,
+                           addinfo->pair,addinfo->num_pairs);
+   if ( (pair EQ NULL)
+              OR
+        (pair->value EQ NULL_CHAR) )
+   {
+      /* Nothing to do */
+      ESA_DIAG_printf(ESA_COMP_DELACE, 1,
+                      "No value to KPT attribute");
+   }
+   else
+   {
+      memset(resource_type, 0x00, sizeof(resource_type));
+      memset(key, 0x00, sizeof(key));
+      memset(prefix, 0x00, sizeof(prefix));
+      memset(RESMASK, 0x00, sizeof(RESMASK));
+
+      /* parse the resource and KPT field */
+      rc = Permission_dsnrsrc_key_prefix_handler(
+                                        "PARSE",
+                                        res_params->resource,
+                                        resource_type,
+                                        key,
+                                        sizeof(key),
+                                        prefix,
+                                        sizeof(prefix),
+                                        RESMASK,
+                                        sizeof(RESMASK),
+                                        pair->value,
+                                        0,
+                       /* WS10084 */    NULL_CHAR,
+                       /* WS10084 */    NULL_CHAR,
+                       /* WS10084 */    0,
+                                        ESA_COMP_DELACE,
+                                        admin_params );
+
+      ESA_DIAG_printf(ESA_COMP_DELACE, 3,
+      "res_type-%s, key-%s, prefix-%s, RESMASK-%s",
+      resource_type,  key, prefix, RESMASK);
+      /* Copy the values to res_params structure and add *
+      * RESMASK to add info                             */
+
+      memcpy(res_params->resource,key,sizeof(key));
+      memcpy(res_params->restype,resource_type,sizeof(resource_type));
+      pair = ADDINFO_search ("RESMASK", ACF_ADDINFO_KWD_LEN,
+                             addinfo->pair,addinfo->num_pairs);
+      if (pair EQ NULL)
+      {
+         ADDINFO_insert(TYPE_1A, "RESMASK", RESMASK,
+                        addinfo, ACF_ADDINFO_KWD_LEN,
+                        ACF_ADDINFO_VAL_LEN,
+                        UNIQUE);
+      }
+      else
+      {
+         if (pair->value EQ NULL_CHAR)
+         {
+            ADDINFO_updval(RESMASK, ACF_ADDINFO_VAL_LEN, pair);
+            ESA_DIAG_printf(ESA_COMP_DELACE, 3,
+                        "Updated value of RESMASK - %s", pair->value);
+         }
+         else
+         {
+            ESA_DIAG_printf(ESA_COMP_DELACE, 3,
+                        "Not updating RESMASK. Value of RESMASK - %s",
+                        pair->value);
+         }
+      }
+   }
+   /* WS10075 - Ends */
+
+   /*************************************************************
+   * Allocate handle for Get_ACE operation and initialize it    *
+   **************************************************************/
+   rc = Init_ACE_Handle (&h,
+                         msgs,
+                         dest);
+
+   if (rc NE ESA_OK)
+     goto exit;
+
+   /*************************************************************
+   * Allocate a local addinfo for resource fields               *
+   **************************************************************/
+   if (ADDINFO_alloc(func, ACF2_ADDINFO, &laddinfo, NULL, NULL)
+    NE ESA_OK)
+   {
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+   ADDINFO_empty(laddinfo);
+
+   /*************************************************************
+   * Fill local addinfo with all the resource keywords          *
+   **************************************************************/
+   Fill_Res_Keywords(laddinfo);
+
+   /*************************************************************
+   * Get current fields of resource                             *
+   **************************************************************/
+   ESA_DIAG_printf(ESA_COMP_DELACE, DEBUG_SHOW_IMPORTANT, /* BS10097 */
+                   "resource(%s) restype(%s)",            /* BS10097 */
+                   res_params->resource, res_params->restype);
+
+   rc = ACF2_Get_Resource(res_params->resource,
+                          ACF2_Object_is_Not_Masked,
+                          res_params->restype,
+                          ACF2_Return_Ruleset,
+                          NULL,
+                          NULL,                           /* WS2333 */
+                          current_key,
+                          NULL,
+                          laddinfo,
+                          errmsg,
+                          admin_params);
+
+   /*************************************************************
+   * Check result of GET operation                              *
+   **************************************************************/
+   switch(rc)
+   {
+      case ACF2_OK:
+        break;
+
+      case ACF2_Not_Found:
+        /* IS10122 - start */
+        if ( strcmp(errmsg, ACF2_ROLESET_IGNORED_MSG) EQ 0 )
+          CTSAMSG_print(ACF2_RES_ROLESET_IGNORED, msgs, NULL, dest,
+                        res_params->resource, res_params->restype);
+        else
+        /* IS10122 - end */
+          CTSAMSG_print(ERR_RES_NOT_EXIST, msgs, NULL, dest,
+                        res_params->resource);
+        rc = ESA_FATAL;
+        goto exit;
+
+      default:
+        sprintf(msg,"Get Res fail res=%s rc=%d msg=%s",
+                  res_params->resource, rc, errmsg);
+        CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,
+               func, msg, 16,__LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+   }
+
+   /*************************************************************
+   * Get the deleted ACE position                               *
+   * IS10178P We are deleting this piece of code because we no  *
+   *          longer care about the position slot of the ACE.   *
+   *          The reason we no longer care about the position   *
+   *          is because we noticed that after a permission is  *
+   *          deleted, the other permissions in the same rule   *
+   *          (following the deleted permission) are now in a   *
+   *          different position in ACF2. However, unless we    *
+   *          again do target agggregation, the positions of    *
+   *          the other permissions in IIQ will remain the      *
+   *          same.  Thus, the position field of ACF2 and IIQ   *
+   *          will not match and deleting the other permissions *
+   *          (following the deleted permission) will not be    *
+   *          possible.                                         *
+   **************************************************************
+   pair = ADDINFO_search ("POS",
+                          ACF_ADDINFO_KWD_LEN,
+                          addinfo->pair,
+                          addinfo->num_pairs);
+
+   if (pair EQ NULL)
+   {
+     CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component, func,
+           "Mandatory keyword POS missing in ACE ADDINFO",
+           16,__LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+   deleted_ace_pos = (atoi (pair->value)) - 1;
+
+   ESA_DIAG_printf(ESA_COMP_DELACE, DEBUG_SHOW_IMPORTANT,
+                 "ACE to delete is in internal position(%d)",
+                 deleted_ace_pos);                                   */
+
+   /*************************************************************
+   * Allocate addinfo for the resource ACE's                    *
+   **************************************************************/
+   if (ADDINFO_alloc(func, ACF2_ADDINFO, &ace_addinfo, NULL, NULL)
+    NE ESA_OK)
+   {
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+   ADDINFO_empty(ace_addinfo);
+
+   /*************************************************************
+   * Allocate addinfo for filter process                        *
+   **************************************************************/
+   if (ADDINFO_alloc(func, ACF2_ADDINFO, &filtered_addinfo, NULL, NULL)
+    NE ESA_OK)
+   {
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+   ADDINFO_empty(filtered_addinfo);
+   ADDINFO_copy(filtered_addinfo, addinfo);
+
+   ACF2_Filter_ADDINFO (res_params->restype,
+                        filtered_addinfo);
+
+   /*************************************************************
+   * Fill ACE addinfo with all the ACE keywords                 *
+   **************************************************************/
+   Fill_ACE_Keywords (ace_addinfo);
+
+   /*****************************************************************
+   * Prepare ACF2IN file for output                                 *
+   ******************************************************************/
+   rc = Prepare_ACF2IN_File (&rule_file,
+                             msgs,
+                             dest);
+   if (rc NE ESA_OK)
+     goto exit;
+
+   /*************************************************************
+   * Write ruleset header data to file                          *
+   **************************************************************/
+   rc = Build_Ruleset (res_params->resource,              /* WS2358 */
+                       res_params->restype,               /* WS2358 */
+                       laddinfo,
+                       rule_file,
+                       msgs,
+                       dest);
+
+   if (rc NE ESA_OK)
+   {
+     sprintf(msg,"Del ACE fail res=%s msg=Build ruleset header failed",
+               res_params->resource);
+     CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,
+            func, msg, 16,__LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+   /*************************************************************
+   * Obtain storage for rule object buffer                      *
+   **************************************************************/
+   obj_buffer = (char *) malloc (ACF2_RULE_BUFFER_LENGTH);
+
+   if (obj_buffer EQ NULL)
+   {
+     CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                  "RULE OBJECT BUFFER",
+                  ACF2_RULE_BUFFER_LENGTH);
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+   /*************************************************************
+   * Get all ACEs of the resource.                              *
+   * Compare the ACE in the given position to our ACE.          *
+   * If there is a match, do not write it to the file (=delete) *
+   *                                                            *
+   * IS10178P We are deleting the "POS" ADDINFO slot and we are *
+   *          no longer checking the ACE position field because *
+   *          of the reason described above.                    *
+   **************************************************************/
+   iterate = TRUE;
+
+   num_rules = 0;
+
+   ace_deleted = FALSE;
+
+   while (iterate)
+   {
+     ADDINFO_clear(ace_addinfo);
+
+     rc = ACF2_Get_Resource(res_params->resource,
+                            ACF2_Object_is_Not_Masked,
+                            res_params->restype,
+                            ACF2_Return_Rule_Entries,
+                            h,
+                            NULL,                         /* WS2333 */
+                            current_key,
+                            &curr_ace,
+                            ace_addinfo,
+                            errmsg,
+                            admin_params);
+
+     switch(rc)
+     {
+        case ACF2_OK:
+          break;
+
+        case ACF2_Not_Found:
+          /* IS10122 - start */
+          if ( strcmp(errmsg, ACF2_ROLESET_IGNORED_MSG) EQ 0 )
+            CTSAMSG_print(ACF2_RES_ROLESET_IGNORED, msgs, NULL, dest,
+                          res_params->resource, res_params->restype);
+          else
+          /* IS10122 - end */
+            CTSAMSG_print(ERR_RES_NOT_EXIST, msgs, NULL, dest,
+                          res_params->resource);
+          rc = ESA_FATAL;
+          goto exit;
+
+        default:
+          sprintf(msg,"Get ResACL fail res=%s rc=%d msg=%s",
+                    res_params->resource, rc, errmsg);
+          CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,
+                 func, msg, 16,__LINE__);
+          rc = ESA_FATAL;
+          goto exit;
+     }
+
+     if (strcmp (errmsg, "NO MORE ACES") EQ 0)
+       iterate = FALSE;
+     else
+     {
+       /* IS10178P Remove this check entirely
+       if ((NOT ace_deleted) AND
+           ((h->Current_ACE_Pos-1) EQ deleted_ace_pos))              */
+
+         ADDINFO_delete(ace_addinfo, "POS");             /* IS10178P */
+         ADDINFO_delete(filtered_addinfo, "POS");        /* IS10178P */
+
+         if (ACES_Match (&curr_ace,
+                         ace_addinfo,
+                         ace,
+                         filtered_addinfo))
+         {
+           /* IS10178P Change the diagnostic message
+           ESA_DIAG_printf(ESA_COMP_DELACE, DEBUG_SHOW_IMPORTANT,
+                         "ACES match. ACE(%d) not written to file",
+                         deleted_ace_pos);                           */
+           ESA_DIAG_printf(ESA_COMP_DELACE, DEBUG_SHOW_IMPORTANT,
+                         "ACES match. UID(%s) not written to file",
+                         uidmask);                       /* IS10178P */
+
+           ace_deleted = TRUE;
+         }
+         else
+         {
+           /* IS10178P We will move this error message to another
+                       part of the code - after the loop which
+                       returns all permissions of a specific rule
+           CTSAMSG_print(ERR_ACE_NOT_FOUND, msgs, NULL, dest,
+                         res_params->resource);
+           rc = ESA_FATAL;
+           goto exit;                                                */
+           ESA_DIAG_printf(ESA_COMP_DELACE, DEBUG_SHOW_IMPORTANT,
+                         "ACES did not match. num_rules=%d",
+                         num_rules);                     /* IS10178P */
+
+           rc = Build_Rule_Entry (&curr_ace,
+                                  ace_addinfo,
+                                  res_params->restype,
+                                  rule_file,
+                                  msgs,
+                                  dest);
+           if (rc NE ESA_OK)
+           {
+             rc = ESA_FATAL;
+             goto exit;
+           };
+         };
+     };
+     num_rules++;
+   };
+
+   /*************************************************************
+   * Let us check whether we found an ACE match or not IS10178P *
+   **************************************************************/
+   if (NOT ace_deleted)                                  /* IS10178P */
+      {                                                  /* IS10178P */
+         CTSAMSG_print(ERR_ACE_NOT_FOUND, msgs, NULL, dest,
+                       res_params->resource);            /* IS10178P */
+         rc = ESA_FATAL;                                 /* IS10178P */
+         goto exit;                                      /* IS10178P */
+      }                                                  /* IS10178P */
+
+   fclose (rule_file);
+   rule_file = NULL;
+
+   /*************************************************************
+   * Back up the rule before updating it                        *
+   **************************************************************/
+   rc = Rule_Backup ("DELACE",
+                     res_params -> resource,
+                     res_params -> restype,
+                     admin_params);
+
+   if (rc NE ESA_OK)
+     goto exit;
+
+   /*************************************************************
+   * Compile the ruleset and store it                           *
+   **************************************************************/
+   num_rules = num_rules + 50;
+
+   rc = Compile_Ruleset (res_params->resource,
+                         res_params->restype,
+                         ACF2_Replace_Rule,
+                         num_rules,
+                         obj_buffer,
+                         errmsg,
+                         admin_params);                   /* PS0347 */
+
+   if (rc NE ESA_OK)
+   {
+     if (rc EQ ESA_ERR)
+     {
+       CTSAMSG_print(ERR_RES_NOT_EXIST, msgs, NULL, dest,
+                     res_params->resource);
+     }
+     else
+     {
+       if (strcmp (errmsg, "ACF2 Compiler Error") NE 0)
+       {
+         sprintf(msg,"Del ACE fail res=%s msg=%s",
+                   res_params->resource, errmsg);
+         CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,
+                func, msg, 16,__LINE__);
+       };
+     };
+
+     rc = ESA_FATAL;
+     goto exit;
+   };
+
+  /*
+   *   Finish
+   */
+
+   exit:;
+
+   if (rule_file NE NULL)
+     fclose (rule_file);
+
+   if (obj_buffer NE NULL)
+     free (obj_buffer);
+
+   if (h NE NULL)
+   {
+     if (h->Rule_Buffer NE NULL)
+       free(h->Rule_Buffer);
+
+     free(h);
+   };
+
+   if (ace_addinfo NE NULL)
+    ADDINFO_free(&ace_addinfo);
+
+   if (filtered_addinfo NE NULL)
+    ADDINFO_free(&filtered_addinfo);
+
+   if (laddinfo NE NULL)
+    ADDINFO_free(&laddinfo);
+
+   ESA_DIAG_exit(ESA_COMP_DELACE, 1, func, rc);
+
+   return rc;
+
+ }
+

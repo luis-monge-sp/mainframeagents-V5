@@ -1,0 +1,562 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Revoke a user (ACF2)                     *
+ *                                                             *
+ * File Name        : ctsrurv.c                                *
+ *                                                             *
+ * Author           : Yishay Yovel                             *
+ *                                                             *
+ * Creation Date    : 20/05/97                                 *
+ *                                                             *
+ * Description      : Revoke a User in ACF2 (Set "SUSPEND"     *
+ *                    LOGONID Record Variable)                 *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations : Called by "CTSUpdUser" API function for  *
+ *                    Revoke processing.                       *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------- -------------------------------- *
+ * WS2300   Guy      29/10/97 Zero user's PSWD-VIO if active   *
+ * PS0364   Guy      24/12/98 Remove EMULATE stuff             *
+ * PS0471   Michael  20/06/01 Support Revoke_type-Cancel/Suspend *
+ * BS2548   AvnerL   02/10/02 Fix PS0471 logic (BSAM102548)    *
+ * BS2553   AvnerL   01/04/03 revoke_type not received from ESS*
+ * IS10005  AvnerL   08/05/07 Support RU_LOCKED & RU_SUSPENDED.*
+ * IS10147A SeligT   18/06/17 Add support for password phrase  *
+ * IS10174  NuritY   15/01/18 Dynamic EXECOUT support.         *
+ * WS10082  MauriC   07/11/22 Recompile for new ADDINFO macros *
+ **************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+
+ /*
+  *   CONTROL-SA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_API
+ #include ESA_API_CODES       /* bs2553 - msg from common code */
+ #include ESA_CTSAMSG
+ #include API_ADDINFO
+
+ #include MVS_OS_CLI
+
+ #include ACF2_CODES
+ #include ACF2
+
+ /*
+  *     MKT for Revoke User
+  *         (Mandatory Keywords Table)
+  */
+
+ static ADDINFO_MKTE_rec_typ mkt[] = {
+    "" };      /* a null string indicate end-of-mkt */
+
+ /*
+  *     RKT for Revoke User
+  *         (Reserved Keywords Table)
+  */
+
+ static ADDINFO_RKTE_rec_typ rkt[] = {
+    "" };      /* a null string indicate end-of-rkt */
+
+
+ /*
+  *     KDT for Revoke User
+  *         (Keyword Decscription Table)
+  */
+
+ static ADDINFO_KDTE_rec_typ kdt[] =     {
+
+  /*                                                            */
+  /* keyword             type   negative       value delimiters */
+  /*                             value                          */
+  /* =================== ====== ============== ================ */
+
+    {"SUSPEND"         , KDT_FLG , "NOSUSPEND"  ,""    ,""    },
+                                                           /* PS0471 */
+    {"CANCEL"          , KDT_FLG , "NOCANCEL"  ,""    ,""    },
+    {"PSWD-VIO"        , KDT_KEY , ""           ,"("   ,")"   },
+    {"PWP-VIO"         , KDT_KEY , ""           ,"("   ,")"   },/*IS10147A*/
+    {""                , KDT_FLG , ""           ,""    ,""    }
+    };
+
+                          /* WS2300 - added PSWD-VIO keyword        */
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : CTSRevokeUser                              *
+ *                                                             *
+ * DESCRIPTION    : Revoke/Resume an ACF2 User                 *
+ *                                                             *
+ * INPUT          : user_params - Revoked User Info            *
+ *                  addinfo     - User addinfo                 *
+ *                  admin       - admin stru                   *
+ *                  err         - err   stru                   *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+ ESA_RC CTSRevokeUser (USER_PARAMS_rec_typ  * user_params,
+                       ADDINFO_rec_typ      * addinfo,
+                       ADMIN_PARAMS_rec_typ * admin_params,
+                       ERR_STRUCT_rec_typ   * err)
+{
+
+   static char                func[]="CTSRevokeUser";
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                     rc = ESA_OK;
+   ADDINFO_rec_ptr            laddinfo = NULL;
+   char                       cmd[MAX_API_ST];
+   CTSAMSG_HANDLE_rec_typ     * msgs;
+   CTSAMSG_DEST_TABLE_rec_typ * dest;
+   ONE_FIELD_rec_ptr  pair, pair_t;                /* PS0471 IS10005*/
+   int revoke_type_received = 1; /* revoke_type rec from ESS-bs2553 */
+   ACF2_PARAMS_rec_typ * params_ptr = NULL;              /* IS10005 */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_REVUSER, 1, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+  /*
+   *   Obtain a local addinfo buffer
+   */
+
+   if (ADDINFO_alloc(func,ACF2_ADDINFO,&laddinfo, dest, msgs) NE ESA_OK)
+    {
+      rc = ESA_FATAL;
+      goto exit;
+    };
+
+   /***********************************************************/
+   /********************* IS10005 starts **********************/
+   /***********************************************************/
+   pair = ADDINFO_search ( "RU_SUSPENDED", ACF_ADDINFO_KWD_LEN,
+                          addinfo->pair,
+                          addinfo->num_pairs );
+   if ( pair NE NULL)
+   {
+    pair_t = pair;
+    ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+                     "RU_SUSPENDED found");
+    params_ptr = admin_params->apiinit_handle;
+    if (strcmp(pair->value,KWD_FLAG_ON) EQ 0)
+    { /* RU_SUSPENDED = 'Y' is received */
+     ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+                  "RU_SUSPENDED is Y");
+
+     /****************************************************/
+     /* RU_SUSPENDED=Y & SUSPEND_IS_LOCKED=Y, set CANCEL */
+     /****************************************************/
+     if (params_ptr->rssparm_SUSPEND_IS_LOCKED[0] EQ 'Y')
+     {
+        /* set CANCEL */
+        ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+          "Revoke:RU_SUSPENDED=Y & SUSPEND_IS_LOCKED=Y, set CANCEL");
+        ADDINFO_insert(TYPE_1A, "CANCEL", KWD_FLAG_ON, laddinfo,
+                    ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                    UNIQUE);
+     }
+     else /*params_ptr->rssparm_SUSPEND_IS_LOCKED[0]=='N'        */
+     {
+     /* set suspend or cancel based on REVOKE_TYPE keyword */
+     pair = ADDINFO_search("REVOKE_TYPE", ACF_ADDINFO_KWD_LEN,
+                          addinfo->pair,
+                          addinfo->num_pairs);
+     if (pair NE NULL)
+     {
+      ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+          "Revoke: Revoke type is %s", pair->value);
+
+      if ( strcmp(pair->value,"SUSPEND") EQ 0 ||
+           strcmp(pair->value,"BOTH") EQ 0 ||
+           strlen(pair->value) EQ 0 ) /* use default */
+        /* set SUSPEND */
+        ADDINFO_insert(TYPE_1A, "SUSPEND", KWD_FLAG_ON, laddinfo,
+                    ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                    UNIQUE);
+
+      if ( strcmp(pair->value,"CANCEL") EQ 0 ||
+           strcmp(pair->value,"BOTH") EQ 0 )
+        /* set CANCEL */
+        ADDINFO_insert(TYPE_1A, "CANCEL", KWD_FLAG_ON, laddinfo,
+                    ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                    UNIQUE);
+     }
+     else
+     {
+      ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+       "Revoke_type not received from IIQ/IDN, use SUSPEND as default.");
+        /* set SUSPEND */
+        ADDINFO_insert(TYPE_1A, "SUSPEND", KWD_FLAG_ON, laddinfo,
+                    ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                    UNIQUE);
+     }
+     } /* params_ptr->rssparm_SUSPEND_IS_LOCKED[0]=='N'        */
+    }  /* end of: RU_SUSPENDED = 'Y' is received */
+
+    pair = pair_t; /* make sure it's -> RU_SUSPENDED's pair        */
+    if (strcmp(pair->value,KWD_FLAG_OFF) EQ 0)
+    { /* RU_SUSPENDED = 'N' is received */
+     ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+                  "RU_SUSPENDED is N");
+
+      /******************************************/
+      /*** Restore when SUSPEND_IS_LOCKED='Y' ***/
+      /******************************************/
+      if (params_ptr->rssparm_SUSPEND_IS_LOCKED[0] EQ 'Y')
+      {
+       ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+          "SUSPEND_IS_LOCKED = Y");
+       if (params_ptr->rssparm_DISR_RU_SUSPENDED[0] EQ 'N')
+       { /* do restore with CANCEL */
+           ADDINFO_insert(TYPE_1A, "CANCEL", KWD_FLAG_OFF, laddinfo,
+                       ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                       UNIQUE);
+           ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+            "NOCANCEL is set");
+       }
+       else /*params_ptr->rssparm_DISR_RU_SUSPENDED[0] EQ 'Y' */
+       {
+       pair = ADDINFO_search("RESTORE_FORCE", ACF_ADDINFO_KWD_LEN,
+                             addinfo->pair, addinfo->num_pairs);
+       if (pair NE NULL)
+       { /* RESTORE_FORCE is received */
+        ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+          "RESTORE_FORCE is received.");
+        if (strcmp(pair->value,KWD_FLAG_ON) EQ 0)
+        { /* RESTORE_FORCE = 'Y' is received do restore. */
+         ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+                     "RESTORE_FORCE is Y");
+         /* set NOCANCEL */
+         ADDINFO_insert(TYPE_1A, "CANCEL", KWD_FLAG_OFF, laddinfo,
+            ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN, UNIQUE);
+         }  /* do restore as usual */
+        else /* RESTORE_FORCE = 'N' */
+        {
+          ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+               "RESTORE_FORCE is not Y. Passport request disregarded");
+          CTSAMSG_print(DISREGARD_RU_SUSPENDED,msgs, NULL, dest);
+        }
+       } /* end of RESTORE_FORCE is received */
+        else /* RESTORE_FORCE not received */
+        {
+          ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+               "RESTORE_FORCE is not Y. Passport request disregarded");
+          CTSAMSG_print(DISREGARD_RU_SUSPENDED,msgs, NULL, dest);
+        }
+      } /*end of params_ptr->rssparm_DISR_RU_SUSPENDED[0] EQ 'Y' */
+      } /*end of params_ptr->rssparm_SUSPEND_IS_LOCKED[0]=='Y' */
+
+      /******************************************/
+      /*** Restore when SUSPEND_IS_LOCKED='N' ***/
+      /******************************************/
+      else /*params_ptr->rssparm_SUSPEND_IS_LOCKED[0]=='N'         */
+      {
+      /*** end of Restore when SUSPEND_IS_LOCKED='Y' ***/
+      ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+          "SUSPEND_IS_LOCKED = N");
+      if (params_ptr->rssparm_DISR_RU_SUSPENDED[0] EQ 'N')
+      { /* do restore as usual */
+        /* set nosuspend or nocancel based on REVOKE_TYPE keyword */
+        pair = ADDINFO_search("REVOKE_TYPE", ACF_ADDINFO_KWD_LEN,
+                             addinfo->pair,
+                             addinfo->num_pairs);
+        if (pair NE NULL)
+        {
+         ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+             "Revoke: Revoke type is %s", pair->value);
+
+         if ( strcmp(pair->value,"SUSPEND") EQ 0 ||
+              strcmp(pair->value,"BOTH") EQ 0 ||
+              strlen(pair->value) EQ 0 ) /* use default */
+           /* set NOSUSPEND */
+           ADDINFO_insert(TYPE_1A, "SUSPEND", KWD_FLAG_OFF, laddinfo,
+                       ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                       UNIQUE);
+
+         if ( strcmp(pair->value,"CANCEL") EQ 0 ||
+              strcmp(pair->value,"BOTH") EQ 0 )
+           /* set NOCANCEL */
+           ADDINFO_insert(TYPE_1A, "CANCEL", KWD_FLAG_OFF, laddinfo,
+                       ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                       UNIQUE);
+        }
+        else
+        {
+         ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+          "Revoke_type not received, do NOSUSPEND + NOCANCEL as def.");
+           /* set NOSUSPEND */
+         ADDINFO_insert(TYPE_1A, "SUSPEND", KWD_FLAG_OFF, laddinfo,
+                       ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                       UNIQUE);
+         ADDINFO_insert(TYPE_1A, "CANCEL", KWD_FLAG_OFF, laddinfo,
+                       ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                       UNIQUE);
+        }
+      } /* end of: do restore as usual */
+      if (params_ptr->rssparm_DISR_RU_SUSPENDED[0] EQ 'Y')
+      {
+       pair = ADDINFO_search("RESTORE_FORCE", ACF_ADDINFO_KWD_LEN,
+                             addinfo->pair,
+                             addinfo->num_pairs);
+       if (pair NE NULL)
+       { /* RESTORE_FORCE is received */
+        ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+          "RESTORE_FORCE is received.");
+        if (strcmp(pair->value,KWD_FLAG_ON) EQ 0)
+        { /* RESTORE_FORCE = 'Y' is received do restore. */
+         ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+                     "RESTORE_FORCE is Y");
+         /* set suspend or cancel based on REVOKE_TYPE keyword */
+         pair = ADDINFO_search("REVOKE_TYPE", ACF_ADDINFO_KWD_LEN,
+                             addinfo->pair,
+                             addinfo->num_pairs);
+         if (pair NE NULL)
+         {
+          ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+              "Revoke: Revoke type is %s", pair->value);
+
+          if ( strcmp(pair->value,"SUSPEND") EQ 0 ||
+               strcmp(pair->value,"BOTH") EQ 0 ||
+               strlen(pair->value) EQ 0 ) /* use default */
+            /* set SUSPEND */
+            ADDINFO_insert(TYPE_1A, "SUSPEND", KWD_FLAG_OFF, laddinfo,
+                        ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                        UNIQUE);
+
+          if ( strcmp(pair->value,"CANCEL") EQ 0 ||
+               strcmp(pair->value,"BOTH") EQ 0 )
+            /* set CANCEL */
+            ADDINFO_insert(TYPE_1A, "CANCEL", KWD_FLAG_OFF, laddinfo,
+                        ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                        UNIQUE);
+         }
+         else
+         {
+          ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+          "Revoke_type not received, do NOSUSPEND + NOCANCEL as def.");
+          /* set SUSPEND */
+          ADDINFO_insert(TYPE_1A, "SUSPEND", KWD_FLAG_OFF, laddinfo,
+                      ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                      UNIQUE);
+          ADDINFO_insert(TYPE_1A, "CANCEL", KWD_FLAG_OFF, laddinfo,
+                       ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                       UNIQUE);
+         } /* end of REVOKE_TYPE handling */
+        } /* end of RESTORE_FORCE = 'Y' */
+      else /* RESTORE_FORCE = 'N' */
+        {
+          ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+               "RESTORE_FORCE is not Y. Passport request disregarded");
+          CTSAMSG_print(DISREGARD_RU_SUSPENDED,msgs, NULL, dest);
+        }
+       }  /* end of: RESTORE_FORCE is received */
+       else
+        {  /* RESTORE_FORCE not received */
+          ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+            "RESTORE_FORCE not received. Passport request disregarded");
+          CTSAMSG_print(DISREGARD_RU_SUSPENDED,msgs, NULL, dest);
+        }
+      } /* end of: params_ptr->rssparm_DISR_RU_SUSPENDED[0] EQ 'Y' */
+      } /*end of params_ptr->rssparm_SUSPEND_IS_LOCKED[0]=='N'         */
+    } /* end of:RU_SUSPENDED = 'N' is received */
+    ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+    "RU_SUSPENDED received and handled. Skip old revoked code.");
+    goto acf2cmd;   /* skip old "revoked" keyword code */
+   } /* end of: RU_SUSPENDED received. */
+   /********************* IS10005 ends ************************/
+  /*
+   *   Check ESS_Strcuture rev_status field
+   */
+
+   switch(user_params->rev_status)
+    {
+                                       /* Start PS0471 */
+   /*
+    * Add SUSPEND = Y  or  CANCEL = Y to addinfo
+    * when user should be revoked
+    */
+
+    case USER_STAT_REVOKED:
+       pair = ADDINFO_search("REVOKE_TYPE", ACF_ADDINFO_KWD_LEN,
+                             addinfo->pair,
+                             addinfo->num_pairs);
+       if (pair NE NULL)
+       {
+         ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+             "Revoke: Revoke type is %s", pair->value);
+         if ( strcmp(pair->value,"SUSPEND") EQ 0 ||
+              strcmp(pair->value,"BOTH") EQ 0 ||
+              strlen(pair->value) EQ 0 ) /* use default */
+          ADDINFO_insert(TYPE_1A, "SUSPEND", KWD_FLAG_ON, laddinfo,
+                         ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                         UNIQUE);
+         if ( strcmp(pair->value,"CANCEL") EQ 0 ||
+              strcmp(pair->value,"BOTH") EQ 0 )
+          ADDINFO_insert(TYPE_1A, "CANCEL", KWD_FLAG_ON, laddinfo,
+                         ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                         UNIQUE);
+       }
+       else
+       {
+         ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+           "Revoke: keyword Revoke_type was not received from IIQ/IDN");
+                                   /* bs2553 - required keyword for  */
+         revoke_type_received = 0; /* ACF2 cmd-not received from ESS */
+       }
+          break;
+   /*
+    * Add Suspend = N and Cancel = N
+      to addinfo when user should be restored
+    */
+
+    case USER_STAT_ACTIVE:
+       ADDINFO_insert(TYPE_1A, "PSWD_VIO", "0", laddinfo,
+                       ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                       UNIQUE);                         /* WS2300 */
+       ADDINFO_insert(TYPE_1A, "PWP_VIO", "0", laddinfo,
+                       ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                       UNIQUE);                          /* IS10147A */
+       ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+             "PSWD_VIO and PWP_VIO ADDINFO fields set to 0");
+
+    /*  BS2548 (part 1) fix follows  */
+       pair = ADDINFO_search("REVOKE_TYPE", ACF_ADDINFO_KWD_LEN,
+                             addinfo->pair,
+                             addinfo->num_pairs);
+       if (pair NE NULL)
+       {
+         ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+             "Revoke: Revoke type is %s", pair->value);
+
+         if ( strcmp(pair->value,"SUSPEND") EQ 0 ||
+              strcmp(pair->value,"BOTH") EQ 0 ||
+              strlen(pair->value) EQ 0 ) /* use default */
+       ADDINFO_insert(TYPE_1A, "SUSPEND", KWD_FLAG_OFF, laddinfo,
+                       ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                       UNIQUE);
+
+         if ( strcmp(pair->value,"CANCEL") EQ 0 ||
+              strcmp(pair->value,"BOTH") EQ 0 )
+       ADDINFO_insert(TYPE_1A, "CANCEL", KWD_FLAG_OFF, laddinfo,
+                       ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                       UNIQUE);
+       }
+       else
+       {
+         ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+           "Revoke: keyword Revoke_type was not received from IIQ/IDN");
+                                   /* bs2553 - required keyword for  */
+         revoke_type_received = 0; /* ACF2 cmd-not received from ESS */
+       }
+       /* BS2548 end of part 1 */
+       break;
+
+    /* If there is no change in "Revoked" we still have to check  */
+    /* changes in REVOKE_TYPE                                     */
+    default:
+       pair = ADDINFO_search("REVOKE_TYPE", ACF_ADDINFO_KWD_LEN,
+                             addinfo->pair,
+                             addinfo->num_pairs);
+       if (pair NE NULL)
+       {
+         ESA_DIAG_printf(ESA_COMP_REVUSER, 3,
+             "Revoke_type: Revoke type is %s", pair->value);
+         if ( strcmp(pair->value,"SUSPEND") EQ 0)
+         {
+           ADDINFO_insert(TYPE_1A, "SUSPEND", KWD_FLAG_ON, laddinfo,
+                         ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                         UNIQUE);
+           /* don't change cancel status HOU753365 m&t bank avnerl */
+           /* BS2548 part 2 starts */
+        /* ADDINFO_insert(TYPE_1A, "CANCEL", KWD_FLAG_OFF, laddinfo,
+                         ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                         UNIQUE);  */
+           /* BS2548 part 2 ends   */
+         }
+         if ( strcmp(pair->value,"CANCEL") EQ 0)
+         {
+           ADDINFO_insert(TYPE_1A, "CANCEL", KWD_FLAG_ON, laddinfo,
+                         ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                         UNIQUE);
+           /* don't change suspend status HOU753365 m&t bank avnerl */
+           /* BS2548 part 3 starts */
+      /*   ADDINFO_insert(TYPE_1A, "SUSPEND", KWD_FLAG_OFF, laddinfo,
+                         ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                         UNIQUE);    */
+           /* BS2548 part 3 ends   */
+         }
+         if ( strcmp(pair->value,"BOTH") EQ 0)
+         {
+           ADDINFO_insert(TYPE_1A, "CANCEL", KWD_FLAG_ON, laddinfo,
+                         ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                         UNIQUE);
+           ADDINFO_insert(TYPE_1A, "SUSPEND", KWD_FLAG_ON, laddinfo,
+                         ACF_ADDINFO_KWD_LEN, ACF_ADDINFO_VAL_LEN,
+                         UNIQUE);
+         }
+       }
+
+   };
+                                       /* End PS0471 */
+
+acf2cmd:                                                   /*IS10005*/
+  /*
+   *   Build and issue ACF2 CHANGE command
+   */
+
+   if (revoke_type_received) { /* bs2553 if revoke_type rec, do cmd */
+   sprintf(cmd,"ACF2 LID CHANGE %s ",user_params->user);
+   ESA_DIAG_printf(ESA_COMP_REVUSER, 1,
+                   "Command header prepared (%s)", cmd);
+   rc = ACF2cmd(func, EXECOUT_DDNAME, admin_params->admin_uname,
+                cmd, MAX_OK_RC_0,
+                1, &laddinfo, mkt, kdt, admin_params,    /* IS10174 */
+                CMDOUT_YES, ACF2_YES);
+    /* IS10174  1, &laddinfo, mkt, kdt, dest, msgs,                 */
+   } /* bs2553 */
+   else {                /* bs2553  notify agent log & ess */
+        rc = ESA_FATAL ; /* bs2553 make sure ESS knows revoke fails */
+        CTSAMSG_print(ERR_ADI_MANDATORY_MISS ,msgs, NULL, dest,
+                      "REVOKE_TYPE");
+   } /* bs2553 ends */
+  /*
+   *   Finish
+   */
+
+   exit:;
+
+  /*
+   *   Free Local ADDINFO strcuture
+   */
+   ADDINFO_free(&laddinfo);
+
+  /*
+   *   Issue Diag message and Return with RC
+   */
+   ESA_DIAG_exit(ESA_COMP_REVUSER, 1, func, ESA_OK);
+
+   return rc;
+}

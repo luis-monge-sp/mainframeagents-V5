@@ -1,0 +1,1450 @@
+/**************************************************************
+*                                                             *
+* Title            : ACF2 interception function               *
+*                                                             *
+* File Name        : ctsbint.c                                *
+*                                                             *
+* Author           : Michael Cohen                            *
+*                                                             *
+* Creation Date    : 31/10/01                                 *
+*                                                             *
+**************************************************************/
+
+/**************************************************************
+* Mod.Id   Who      When     Description                      *
+* -------- -------- -------  -------------------------------- *
+* ws2431   Michael  30/10/01 Initial                          *
+* ws2451   Yonatan  15/01/02 make password violation -        *
+*                            interception optional            *
+* BS2509   RamiK  03/03/2002 internal errors in online intrcptr*
+* BS2556   AvnerL   14/10/02 send acf2 original error msg     *
+* BS2626   AvnerL   21/11/03 return original rc.              *
+* is0279   AvnerL   30/09/05 implement ws2538.                *
+*                          - allow pswd-vio chg by option.    *
+* ws10006  AvnerL   05/08/07 Disregard connect/disconnect.    *
+* SAS2IBMA AvnerL   17/07/16 SAS/C to IBM/C                   *
+* WS10064  MeirS    21/01/18 Password Phrase Support          *
+* WS10067  SeligT   21/01/18 Update GDB dynamically when      *
+*                            access or resource rules are     *
+*                            added/modified                   *
+* BS10092  NuritY   01/08/18 Close GDB and UDB at event end   *
+* BS10097  SeligT   19/11/18 ACF2 Group Aggregation Endless   *
+*                            Loop                             *
+* IS10178  SeligT   18/12/18 Supporting LID Anywhere in UID   *
+* IS10182  AvnerL   17/07/19 S0C4/S0C1 due to DIAG vsprintf   *
+* WS10076  SeligT   19/01/20 Manage Permissions as Account    *
+*                            and Group Attributes - Phase 2   *
+* WS10079  AvnerL   16/03/21 JPMC phase2 - fix WS10076        *
+* WS10079N ThomaS   17/03/21 JPMC phase2 - fix WS10076        *
+* IS10184  NuritY   31/08/21 Improve scripts performance      *
+* WS10084  ThomaS   13/07/23  Replace ACFRPTRX                *
+* WS10082  MauriC   07/11/22 Recompile for new ADDINFO macros *
+* BS10136  NuritY   02/06/24 Abend S0C1 in CTSAONI after WS10082
+**************************************************************/
+#define _ISOC99_SOURCE                                   /* WS10076N*/
+#include <globs.h>
+
+/*
+ *   Standard header files
+ */
+
+#include STRING
+#include STDIO
+#include STDLIB
+#include CTYPE
+
+/*
+ *   Common code header files
+ */
+
+#include ESA_API
+#include ESA_DIAG
+#include ESA_INIT
+#include ESA_API_CODES
+
+/*
+ *   Platform header files
+ */
+
+#include MVS_CODES
+#include MVS_INTERCEPTOR
+#include MVS_OS_DYNAM                                     /* WS10067 */
+#include MVS_OS_CLI                                       /* WS10067 */
+
+ /*
+  *   ACF2 include files
+  */
+
+ #include   API_ADDINFO
+ #include   ACF2_CODES
+ #include   ACF2
+
+static char comp[]= "CTSBINT";
+#define SEND_PASS_VIOLATION "SEND_PASS_VIOLATION"
+/* IS10184 #define TSO_SERVICES_MODULE "CTSATSO "        * WS10067 * */
+
+  ACF2_API_Return_Codes
+ ACF2_Get_User_Groups(GDB_Locate_Mode               mode,
+                      char                        * UID,
+                      UG_typ                        Group,
+                      ADDINFO_rec_ptr               laddinfo,
+ /*WS10076A*/         ADMIN_PARAMS_rec_typ        * admin_params);
+ /*WS10076A           CTSAMSG_DEST_TABLE_rec_typ  * dest,
+                      CTSAMSG_HANDLE_rec_typ      * msgs); */
+
+static ESA_RC Get_User_All_Groups(char            *UID,
+                                  char            *groups,
+                                  ADDINFO_rec_ptr  laddinfo,
+                    /* WS10076 */ ADMIN_PARAMS_rec_typ * admin_params);
+                    /* WS10076    CTSAMSG_DEST_TABLE_rec_typ * dest,
+                                  CTSAMSG_HANDLE_rec_typ     * msgs);*/
+
+  /* * * * * * * Start WS10067 * * * * * * */
+/**************************************************************
+*                                                             *
+* Subroutine name : CTSCINT_ACF2_Init                         *
+*                                                             *
+* DESCRIPTION     : Initialize ACF2 environment               *
+*                                                             *
+* INPUT           : admin_params                              *
+*                                                             *
+* OUTPUT          :                                           *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+
+ ESA_RC CTSCINT_ACF2_Init(ESA_DIAG_COMP_typ      comp,
+                          ADMIN_PARAMS_rec_typ  *admin_params)
+{
+
+  char                  func[]      = "CTSCINT_ACF2_Init";
+  ESA_RC                rc          = ESA_OK;
+  ESA_RC                ini_rc      = ESA_OK;
+  int                   load_rc     = 0;
+  char                  errmsg[256] = "";
+  ERR_STRUCT_rec_typ  * err;
+  /*WS10076N ASM_RTN_TYP         * asmfp;                            */
+  API_LOAD_FUNC_TYP   * cfptr;                            /* WS10076 */
+  ENVIRONMENT_rec_typ * envir_ptr;
+
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+
+  /*
+   *  Initialization
+   */
+  admin_params->cs_func.DIAG_enter_ptr(comp, 1, func);
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+  err = (ERR_STRUCT_rec_typ *) (&errmsg);
+  CS_get_envir_address (&envir_ptr);
+  memset (&envir_ptr->func_ptr, '\0', sizeof (FUNC_PTR_rec_typ));
+
+  ADDINFO_spi_init(admin_params); /* store ptr              BS10136 */
+  /*
+   *  Load and call CTSCACF. (This actually calls CTSBLOD which sets up
+   *  the pointers to all of the ACF2 SPI's routines.)
+   *  Then, call ACF2's flavor of CTSAPIInit.
+   */
+  load_rc = (*(ASM_RTN_TYP *)&ctsaldm)
+            ("CTSCACF ", "       ", &cfptr);            /* WS10076N */
+  /*  WS10076N        ("CTSCACF ", "       ", &asmfp);  */
+
+  if (load_rc NE 0) {
+     CTSAMSG_print(DYNAMIC_LOAD_FAILED, msgs, NULL, dest,
+                   "CTSCACF");
+     rc = ESA_FATAL;
+     goto exit;
+  }
+  else {
+  /* WS10076 ini_rc = (*asmfp)(&envir_ptr->rss_name,                 */
+     ini_rc = (*cfptr)(envir_ptr->rss_name,               /* WS10076 */
+                       &envir_ptr->func_ptr,
+                       &envir_ptr->rss_limits,
+                       &envir_ptr->msg_admin_param,
+                       &envir_ptr->msg_err);          /* Call CTSBLOD */
+
+     if (ini_rc NE ESA_OK) {
+        CTSAMSG_print(ERR_INTERNAL2,msgs, NULL,
+                dest, "CTSBINT", func, errmsg, 16, __LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+     }
+     else {
+        ini_rc = envir_ptr->func_ptr.apiinit_ptr
+                            (admin_params, err);  /* Call CTSAPIInit */
+
+        if (ini_rc NE ESA_OK) {
+           CTSAMSG_print(ERR_INTERNAL2,msgs, NULL,
+                   dest, "CTSBINT", func, errmsg, 16, __LINE__);
+           rc = ESA_FATAL;
+           goto exit;
+        }
+     }
+  }
+
+  /*
+   *  The following is needed because the global variables are static
+   *  and they currently live in another module, CTSCACF.
+   *  (The relevant fields reside in ACF2_Global_Data in CTSBGLB.)
+   */
+  rc = ACF2_Set_Global_Data(admin_params, err);
+  Initialize_UID_Definitions(admin_params);
+  /* IS10178 We are adding admin_parms to the routine's parameter list
+  ACF2_Set_LID_In_UID();                                            */
+  ACF2_Set_LID_In_UID(admin_params);                     /* IS10178 */
+
+  /*
+   *  Return
+   */
+  exit:
+  admin_params->cs_func.DIAG_exit_ptr(comp, 1, func, rc);
+  return rc;
+
+}  /* CTSCINT_ACF2_Init */
+
+/**************************************************************
+*                                                             *
+* Subroutine name : CTSCINT_ACF2_Term                         *
+*                                                             *
+* DESCRIPTION     : Terminate ACF2 environment                *
+*                                                             *
+* INPUT           :                                           *
+*                                                             *
+* OUTPUT          :                                           *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+
+ ESA_RC CTSCINT_ACF2_Term(ESA_DIAG_COMP_typ      comp,
+                          ADMIN_PARAMS_rec_typ  *admin_params)
+{
+
+  char                  func[]      = "CTSCINT_ACF2_Term";
+  ESA_RC                rc          = ESA_OK ;
+  ESA_RC                trm_rc      = ESA_OK;
+  int                   load_rc     = 0;
+  char                  errmsg[256] = "";
+  ERR_STRUCT_rec_typ  * err;
+  /* WS10076 ASM_RTN_TYP         * asmfp;                            */
+  ENVIRONMENT_rec_typ * envir_ptr;
+
+  CTSAMSG_HANDLE_rec_typ     * msgs;
+  CTSAMSG_DEST_TABLE_rec_typ * dest;
+
+  /*
+   *  Initialization
+   */
+  admin_params->cs_func.DIAG_enter_ptr(comp, 1, func);
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+  err = (ERR_STRUCT_rec_typ *) (&errmsg);
+  CS_get_envir_address (&envir_ptr);
+
+  /*
+   *  Call ACF2's flavor of CTSAPITerm. Then, delete CTSCACF.
+   */
+  trm_rc = envir_ptr->func_ptr.apiterm_ptr
+                      (admin_params, err);        /* Call CTSAPITerm */
+  if (trm_rc NE ESA_OK) {
+     CTSAMSG_print(ERR_INTERNAL2,msgs, NULL,
+             dest, "CTSBINT", func, errmsg, 16, __LINE__);
+     rc = ESA_FATAL;
+     goto exit;
+  }
+  load_rc = (*(ASM_RTN_TYP *)&ctsadlm)("CTSCACF ");
+
+  if (load_rc NE 0) {
+    CTSAMSG_print(DYNAMIC_DEL_LOAD_FAILED, msgs, NULL, dest,
+                 "CTSCACF");
+    rc = ESA_FATAL;
+    goto exit;
+  }
+
+  /*
+   *  Return
+   */
+  exit:
+  admin_params->cs_func.DIAG_exit_ptr(comp, 1, func, rc);
+  return rc;
+
+}  /* CTSCINT_ACF2_Term */
+  /* * * * * * * End WS10067 * * * * * * */
+
+/**************************************************************
+*                                                             *
+* Subroutine name : CTSCINT_ACF2_event                        *
+*                                                             *
+* DESCRIPTION     : Notify of ACF2 event to Control-SA        *
+*                                                             *
+* INPUT           :                                           *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+
+ESA_RC CTSCINT_ACF2_event (char                           type,
+                           char                         * group,
+                           char                         * user,
+                           ACTION_typ                     action,
+                           int                            msg_flag,
+                           INTERCEPT_RSS_PARAMS_rec_typ * rss_parm,
+                           ADMIN_PARAMS_rec_typ         * admin_params,
+                           char                         * conn,
+                           char              * partial_old_UID,
+                           char              * pswd_vio,
+                           char              * res_type,  /* WS10067 */
+                           char              * res_name)  /* WS10067 */
+                                                       /*ws2451*/
+{
+
+  /*
+   *   Variables
+   */
+
+  /* WS10076 - start */
+  /* The following values should match the length of the res_name and
+     res_type fields as defined in INTERCEPT_EVENT_rec_typ (evt)    */
+  #define INPUT_RESNAME_LEN  256
+  #define INPUT_RESTYPE_LEN  64
+  /* WS10076 - end   */
+
+  static char func[] = "CTSCINT_ACF2_event";
+  static char component[]="CTSBINT " ;
+  ESA_RC      rc = ESA_OK;                             /* is0279 */
+  ACF2_API_Return_Codes      ACF2_rc;
+  /* BS10092
+  static int GDB_Opened = FALSE;
+  static int UDB_Opened = FALSE;
+  */
+  int GDB_Opened = FALSE;                                 /* BS10092 */
+  int UDB_Opened = FALSE;                                 /* BS10092 */
+  CTSAMSG_HANDLE_rec_ptr     msgs;
+  CTSAMSG_DEST_TABLE_rec_ptr dest;
+  ADDINFO_rec_ptr       laddinfo = NULL;
+  /* WS10076 delete the following variable:
+  NEW_GRP_TABLE_rec_typ * new_grp_table = NULL;           // WS10067 */
+  char   errmsg[256] = "";
+  ERR_STRUCT_rec_typ * err;
+  char   parm_UID[ACF2_UID_SIZE] = "";
+  char   current_UID[ACF2_UID_SIZE] = "";
+  char   old_UID[ACF2_UID_SIZE] = "";
+  char   Empty_UID[ACF2_UID_SIZE] ={1,1,1,1,1,1,1,1,1,1,1,1,
+                                    1,1,1,1,1,1,1,1,1,1,1,1,0};
+  char   UIDs_List[9600];
+  char   old_groups[1024]="";
+  char   current_groups[1024]="";
+  char   add_groups[1024]="";
+  char   del_groups[1024]="";
+  USER_typ  current_user ="";
+  char   item[ADDINFO_LIST_MAX_ITEM+1];
+  char   null_phrase[101]="";           /* WS10064 */
+  int    off;
+  int    max_off;
+  int    len;
+  int    i;
+  int    API_initialized = 0;
+  char   grp_delim[2] = {ADDINFO_LIST_ENTRY, 0};
+  static int    first_call = 1;         /* ws2451 */
+  static char * send_pass_vio = " ";    /* ws2451 */
+  static int    tso_env_exists = FALSE;                   /* IS10184 */
+  ESA_RC prm_rc = ESA_OK;               /* ws2451 */
+  ESA_RC rc_add, rc_del = ESA_OK;
+  char   acf2_groups [2] ;               /*ws10006*/
+  int    tso_r15, tso_rc, tso_rs, tso_ab;                 /* WS10067 */
+  char   tso_chkenv[] = "CHKENV  ";                       /* WS10067 */
+  int    tso_dbg = 0;                                     /* WS10067 */
+  /* WS10076 delete the following variable:
+  int    slot = 0;                                        // WS10067 */
+  char   resname [INPUT_RESNAME_LEN + 1] = "";            /* WS10076 */
+  char   restype [INPUT_RESTYPE_LEN + 1] = "";            /* WS10076 */
+  short                  actual          = 0;             /* WS10067 */
+  void                 * handle          = (void *)NULL;  /* WS10067 */
+  HAVE_MORE_typ          have_more;                       /* WS10067 */
+  short                  num_ugs;                         /* WS10067 */
+  USER_typ             * users_in        = NULL;          /* WS10067 */
+/*ADDINFO_rec_ptr      * addinfo_ptr_array = NULL;        // WS10067 */
+  UG_typ                 ugs_in          [1];             /* WS10067 */
+  OBJ_EXISTS_typ         obj_exist_array [1];             /* WS10067 */
+  U2UG_PARAMS_rec_typ    u2ug_out        [1];             /* WS10067 */
+  ENVIRONMENT_rec_typ  * envir_ptr;                       /* WS10067 */
+  int                    LID_In_UID, LID_Offset;          /* BS10097 */
+  int                    LID_Length;                      /* IS10178 */
+  char                   parm_get[81] = "";               /* WS10076 */
+  PBhandle_typ         * PBh = NULL;                      /* WS10076 */
+  GDB_Codes              GDB_rc   = GDB_OK;               /* WS10076 */
+  ESA_RC                 GG_rc = ESA_OK;                  /* WS10076 */
+  UG_typ                 Current_Group;                   /* WS10076 */
+  ACF2_PARAMS_rec_typ  * params_ptr = NULL;              /* BS10097 */
+  ASM_RTN_TYP * p_ctsatso;                               /* IS10184 */
+  COMMON_PARAMS_rec_typ  * cmnprms = NULL;               /* IS10184 */
+  PB_Build_Request_typ   PB_Build_Req;                   /* WS10084 */
+
+  ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT,1, func);
+
+  msgs = admin_params->ctsamsg_handle;
+  dest = admin_params->ctsamsg_dest;
+  CS_get_envir_address (&envir_ptr);                      /* WS10067 */
+
+  err = (ERR_STRUCT_rec_typ *) (&errmsg);
+
+  ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,     /* is0279 */
+   "Evt:Typ(%c),User(%s),Grp(%s),Act(%d),pvio(%c),first(%x)",
+                          type,                      /*bs2626*/
+                          user,
+                          group,
+                          action,
+                          pswd_vio[0],
+                          first_call);
+  ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,              /* WS10067 */
+   "    ResType(%s),ResName(%s)",                         /* WS10067 */
+                          res_type,                       /* WS10067 */
+                          res_name);                      /* WS10067 */
+
+  /* ws2451
+   * Check if the event is password violation
+   * If it is, check the SEND_PASS_VIOLATION parameter.
+   * if it is set to N, ignore this event.
+   */
+
+   if (pswd_vio[0] EQ 'Y')
+     {
+      if (first_call) {
+/*WS10067 The following is an old mistake.  Instead of rc = rssprm_...,
+/*WS10067 it should be prm_rc = rssprm_....
+/*WS10067rc = rssprm_get_opt (rss_parm->name, SEND_PASS_VIOLATION,   */
+         prm_rc =                                         /* WS10067 */
+              rssprm_get_opt (rss_parm->name, SEND_PASS_VIOLATION,
+                         sizeof(send_pass_vio),
+                         send_pass_vio,
+                         OPT_TRUE,
+                         OPT_FALSE);
+         if (prm_rc NE ESA_OK)
+           {                                           /* is0279 */
+            ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6, /* is0279 */
+                            "SEND_PASS_VIOLATION = Y by default.");
+            send_pass_vio[0] = 'Y'; /* default is send interception */
+           }                                           /* is0279 */
+         first_call = 0;
+       }
+       if (send_pass_vio[0] EQ 'N')
+          {                                            /* is0279 */
+            ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6, /* is0279 */
+                            "SEND_PASS_VIOLATION = N in RSSPARM.");
+            goto exit;                                 /* is0279 */
+          }                                            /* is0279 */
+       else                                            /* is0279 */
+          {                                            /* is0279 */
+            ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6, /* is0279 */
+                            "SEND_PASS_VIOLATION = Y in RSSPARM.");
+          }   /* end of is0279 */
+    } /* end of ws2451 */
+
+  /* * * * * * * Start WS10067 * * * * * * */
+  /*
+   *  If type = 'S' (resource), initialize the TSO environment (if
+   *  necessary) and call ACF2_Refresh_GDB and CTSCINT_write_event
+   *  (for each new group). Also, for each new group, call
+   *  CTSGetConns and CTSCINT_write_event (connection add) to
+   *  update each user-group connection.
+   */
+
+  if (type EQ 'S') {
+
+     ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+                     "access/resource rule interception event");
+
+     /* WS10076 There is no need to initialize the TSO environment
+                before checking that REFRESH_GDB is set to 'Y'.
+                Therefore, we will move this code down below.
+     //
+      * Check if the TSO environment is initialized yet.  If not yet
+      * initialized, initialize the TSO environment now.
+      //
+
+     tso_r15 = (*(ASM_RTN_TYP *)&OS_DYNAM_call)
+                            (TSO_SERVICES_MODULE, 1, tso_chkenv,
+                             &tso_rc, &tso_rs, &tso_ab, &tso_dbg);
+
+     ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+                     "CTSATSO CHKENV rc=%d", tso_r15 );
+
+     if (tso_r15 NE 0) {
+        rc = ESA_CLI_init_tso(&tso_r15, &tso_rc, &tso_rs);
+
+        ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+                     "CTSATSO INIT rc=%d. TSO r15=%d rc=%d rs=%d",
+                         rc, tso_r15, tso_rc, tso_rs );
+        if (rc NE ESA_OK) {
+           CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+                "ESA_CLI_init_tso failed", 16,__LINE__);
+           rc = ESA_FATAL;
+           goto exit;
+        }
+     }                                                               */
+
+     /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+     /* WS10076: We will no longer call ACF2_Refresh_GDB.  We will  */
+     /* build the Permissions Block by calling the ACF2_Get_Group   */
+     /* routine.  Once built, that routine will return one group    */
+     /* at a time.  Here, in this routine, for each group returned, */
+     /* we will insert the group into the GDB.  If we are not       */
+     /* successful, this means that it's not a new group and we     */
+     /* continue (this is normal).  If we are successful, this      */
+     /* means that this is a new group and we call the              */
+     /* CTSCINT_write_event ('G') and CTSGetConns routines for each */
+     /* connection.                                                 */
+     /* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * */
+
+     /* WS10076: As mentioned above, the following code is deleted.
+     //
+      * Call the ACF2_Refresh_GDB routine.  The routine will insert
+      * new groups into the GDB and will update the new_grp_table
+      * with those new groups.
+      //
+
+     rc = ACF2_Refresh_GDB("SGI", res_type, res_name, &new_grp_table,
+                           admin_params, err);
+
+     if (rc NE ESA_OK) {
+        ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+                     "ACF2_Refresh_GDB failed with rc=%d", rc);
+        CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+                "ACF2_Refresh_GDB failed", 16,__LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+     }
+
+     ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+      "ACF2_Refresh_GDB: rc=%d  new_grp_table=%8X  used_slots=%d",
+      rc, new_grp_table,
+      new_grp_table EQ NULL ? 0 : new_grp_table->used_slots);        */
+
+     /* * * * * * WS10076 start * * * * * */
+
+     /*----------------------------------------------------------*/
+     /* Implement refresh GDB and REFRESH_GDB is set to "Y" and  */
+     /* all its pre-requisite conditions are met.                */
+     /*----------------------------------------------------------*/
+
+     prm_rc = rssprm_get_opt (admin_params->rss_name,
+                              "REFRESH_GDB",
+                              sizeof(parm_get),
+                              parm_get,
+                              OPT_TRUE,
+                              OPT_TRUE);
+     if ( (prm_rc EQ ESA_OK) AND
+          (strcmp (parm_get, "Y") EQ 0) AND
+          (Global_UDB_Active() EQ TRUE) )
+     {
+        ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+                        "will implement refresh GDB process");
+
+        /*----------------------------------------------------------*/
+        /* This code was moved from above.                          */
+        /*                                                          */
+        /* Check if the TSO environment is initialized yet.  If it  */
+        /* was not yet initialized, initialize the TSO environment  */
+        /* now.                                                     */
+        /*----------------------------------------------------------*/
+        /* IS10184 - start */
+        /* tso_r15 = (*(ASM_RTN_TYP *)&OS_DYNAM_call)
+                            (TSO_SERVICES_MODULE, 1, tso_chkenv,
+                             &tso_rc, &tso_rs, &tso_ab, &tso_dbg); */
+        if (NOT tso_env_exists)
+        {
+          /* Get CTSATSO routine address and call it.   */
+          GET_CMNPRMS_PROG(admin_params, cmnprms, p_ctsatso,
+                           p_ctsatso, rc, errmsg)
+          if (rc NE ESA_OK)              /* Emvironmental error ? */
+          {
+            CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                          component, func, errmsg,
+                          rc, __LINE__);
+            goto exit;
+          };
+
+          tso_r15 = (*p_ctsatso)(tso_chkenv,
+                                 &tso_rc, &tso_rs,
+                                 &tso_ab, &tso_dbg);
+          /* IS10184 - end */
+
+          ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+                       "CTSATSO CHKENV rc=%d", tso_r15 );
+
+          if (tso_r15 NE 0) {
+             prm_rc = ESA_CLI_init_tso(&tso_r15, &tso_rc, &tso_rs);
+
+            ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+                     "CTSATSO INIT rc=%d. TSO r15=%d rc=%d rs=%d",
+                         prm_rc, tso_r15, tso_rc, tso_rs );
+            if (prm_rc NE ESA_OK) {
+               CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,
+                 func, "ESA_CLI_init_tso failed", 16,__LINE__);
+               rc = ESA_FATAL;
+               goto exit;
+            }
+            else   /* tso environment init done. */       /* IS10184 */
+              tso_env_exists - TRUE;                      /* IS10184 */
+          }
+          else  /* tso environment exists */              /* IS10184 */
+            tso_env_exists = TRUE;                        /* IS10184 */
+
+        };                                                /* IS10184 */
+
+        /* remove trailing blanks from resource name and type */
+        len = (strlen(res_name) LT INPUT_RESNAME_LEN?
+                           strlen(res_name) : INPUT_RESNAME_LEN);
+        TRIM_BLANKS(res_name, resname, len, i);
+        ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+                        "resname = |%.*s|, |%s|",
+                        len, res_name, resname);
+
+        /* WS10079T start */
+        /*
+        len - (strlen(res_type) LT INPUT_RESTYPE_LEN?
+                           strlen(res_type) : INPUT_RESTYPE_LEN),*/
+        len = (strlen(res_type) LT INPUT_RESTYPE_LEN?
+                           strlen(res_type) : INPUT_RESTYPE_LEN);
+        /* WS10079T end   */
+        TRIM_BLANKS(res_type, restype, len, i);
+        ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+                        "restype = |%.*s|, |%s|",
+                        len, res_type, restype);
+
+        if ( (strlen(resname) GE sizeof(PBh->resource_name)) OR
+             (strlen(restype) GE sizeof(PBh->resource_type)) )
+        {
+          snprintf (errmsg, sizeof(errmsg)-1,
+              "resource name (%s) or resource type (%s) is too long",
+              resname, restype);
+          CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                        component, func, errmsg, 16,__LINE__);
+           rc = ESA_FATAL;
+           goto exit;
+        };
+
+        /*----------------------------------------------------------*/
+        /* Allocate PBhandle and set several PBhandle fields        */
+        /*----------------------------------------------------------*/
+        PBh = (PBhandle_typ *)calloc (1, sizeof(PBhandle_typ));
+
+        if (NOT PBh)
+        {
+           CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+                   "PBhandle", sizeof(PBhandle_typ));
+           rc = ESA_FATAL;
+           goto exit;
+        };
+
+        strcpy (PBh->uid, "*");
+        strcpy (PBh->resource_name, resname);
+        strcpy (PBh->resource_type, restype);
+        PBh->WithPermissions = 'N';
+        /* WS10084  start */
+        PB_Build_Req.Groups_PBhandle_ptr  = PBh;
+        PB_Build_Req.Users_PBhandle_ptr   = NULL;
+        PB_Build_Req.Roles_XBhandle_ptr   = NULL;
+        PB_Build_Req.GroupDirect          = FALSE;
+        PB_Build_Req.AccountDirect        = FALSE;
+        PB_Build_Req.AccountIndirect      = FALSE;
+        PB_Build_Req.AccountRoleDirect    = FALSE;
+        PB_Build_Req.AccountRoleIndirect  = FALSE;
+        PB_Build_Req.RoleDirect           = FALSE;
+        PB_Build_Req.PB_rules_nf          = FALSE;
+        PB_Build_Req.PB_xref_nf           = FALSE;
+        PB_Build_Req.PBbldErr             = FALSE;
+        PB_Build_Req.PBErr                = FALSE;
+        PB_Build_Req.RequiredRoles        = NULL_CHAR;
+        /* WS10084  end   */
+
+        if (ADDINFO_alloc(func, ACF2_ADDINFO, &(laddinfo), dest, msgs)
+                           NE ESA_OK)
+           {
+              CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                      func, "laddinfo alloc failed", 16, __LINE__);
+              rc = ESA_FATAL;
+              goto free_all_and_exit;
+           }
+
+        Current_Group[0] = NULL_CHAR;
+
+        while (GG_rc EQ ESA_OK)
+        {
+           ADDINFO_empty(laddinfo);
+
+           GG_rc = ACF2_Get_Group(GDB_Next_Locate,
+                                  Current_Group,
+                                  laddinfo,
+                                  NULL,
+                                /*PBh,                       WS10084 */
+                                  &PB_Build_Req,          /* WS10084 */
+                                  admin_params);
+
+           if (GG_rc EQ ACF2_Not_Found)
+              break;  /* EOF reached - free all and return to caller */
+           else if (GG_rc NE ACF2_OK)
+           {
+              sprintf(errmsg,"ACF2_Get_Group failed (rc = %d)", GG_rc);
+              CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                            func, errmsg, 16, __LINE__);
+              rc = ESA_FATAL;
+              break;        /* error - free all and return to caller */
+           };
+
+           /*-------------------------------------------------------*/
+           /* Insert Current_Group (uid AKA group) into GDB         */
+           /*-------------------------------------------------------*/
+
+           prm_rc = GDB_Convert_to_Record(GDB_RECORD_TYPE_GROUP,
+                                          Current_Group,
+                                          laddinfo);
+
+           if (prm_rc NE ESA_OK)
+           {
+              sprintf(errmsg,"Build GDB Record Failed");
+              CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                            func, errmsg, 16, __LINE__);
+              rc = ESA_FATAL;
+              break;        /* error - free all and return to caller */
+           };
+
+           ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+                    "GDB_Insert of group |%s|", Current_Group);
+
+          /*----------------------------------------------------------*/
+          /* Open GDB for ReadWrite, if needed, and try to Insert.    */
+          /*----------------------------------------------------------*/
+
+           if (GDB_Opened EQ FALSE)
+           {
+             GDB_rc = GDB_Set_Mode(GDB_ReadWrite,admin_params,err);
+
+             if (GDB_rc EQ GDB_OK)
+
+             {
+               ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+                               "Opened GDB before Insert");
+               GDB_Opened = TRUE;
+             }
+             else
+             {
+               CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                     func, "Open GDB (ReadWrite) failed", 16, __LINE__);
+               rc = ESA_FATAL;
+               goto free_all_and_exit;
+             }
+           };
+
+           GDB_rc = GDB_Insert();
+
+           ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+                    "GDB_Insert for group |%s| rc = %d",
+                    Current_Group, GDB_rc);
+
+
+           if (GDB_rc NE GDB_OK)        /* insert did not work      */
+           {
+             if (GDB_rc EQ GDB_Duplicate_Key) /* gorup in GDB     */
+             {
+               ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+                        "Group |%s| already present in the GDB",
+                         Current_Group);
+               continue;
+             }
+             else                             /* Insert failed   */
+             {
+               sprintf(errmsg,"Insert failed for Group |%s| (rc=%d)",
+                        Current_Group, GDB_rc);
+               CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                              func, errmsg, 16,__LINE__);
+               rc = ESA_FATAL;
+               break;        /* error - free all and return to caller */
+             }
+
+           };
+
+           /*
+            *   GDB_Insert was successful - we have a new group.
+            */
+           ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+                    "Group |%s| added to the GDB",
+                    Current_Group);
+           action = ACT_ADD;
+
+           prm_rc = CTSCINT_write_event ('G', Current_Group, user,
+                                         action, msg_flag, rss_parm,
+                                         admin_params, null_phrase);
+           /*
+            *  The user field is the userid that updated the access
+            *  or resource rule.  It is not necessarily related to
+            *  the userid(s) which are connected to the new group.
+            */
+           ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+  "Write event: Type(G), UpdtUser(%s), Group(%s), Action(%d), RC(%d)",
+                      user, Current_Group, action, prm_rc);
+           if (prm_rc NE ESA_OK) {
+              CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                    component, func, "Write event (type G) failed",
+                    16,__LINE__);
+              break;     /* error - free all and return to caller */
+           }
+
+           num_ugs = 1;
+           strcpy (ugs_in[0], Current_Group);
+
+              /* * * * * * WS10076 end * * * * * */
+     /* WS10076 We are deleting this small section of code
+                because we have already done it above in a
+                slightly different way.
+     action = ACT_ADD;
+
+     if (new_grp_table NE NULL) {
+        for (slot = 0; slot LT new_grp_table->used_slots; slot++) {
+          rc = CTSCINT_write_event ('G', new_grp_table->table[slot],
+                                    user, action, msg_flag, rss_parm,
+                                    admin_params, null_phrase);
+          //
+           *  The user field is the userid that updated the access or
+           *  resource rule.  It is not necessarily related to the
+           *  userid(s) which are connected to the new group.
+           //
+         ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+         "Write event:Type(G),UpdtUser(%s),Group(%s),Action(%d),RC(%d)",
+                         user, new_grp_table->table[slot], action, rc);
+          if (rc NE ESA_OK) {
+             CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,
+                     func, "Write event (type G) failed", 16,__LINE__);
+             goto exit;
+          }
+          num_ugs = 1;
+          strcpy (ugs_in[0], new_grp_table->table[slot]);             */
+
+          /* WS10076N - start */
+          /* Close the GDB and release the ENQ, because GetConn while
+             doing enq/open/close/deq will release our enq...         */
+          if (GDB_Opened EQ TRUE)
+          {
+            GDB_Set_Mode(GDB_Closed,admin_params,err);
+            GDB_Opened = FALSE;
+            ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+                          "Just closed the GDB file before GetConn");
+          };
+          /* WS10076N - end   */
+           ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+            "Calling CTSGetConns to get connections for group |%s|",
+            ugs_in[0]);
+           have_more = HAVE_MORE;
+
+           while (have_more EQ HAVE_MORE) {
+              u2ug_out[0].user[0] = NULL_CHAR;
+              actual = 0;
+              prm_rc = envir_ptr->func_ptr.gtug2uc_ptr
+                                   (GET_GROUPS_CONNS,
+                                    1,            &actual,
+                                    &have_more,   &handle,
+                                    num_ugs,      1,
+                                    &ugs_in[0],   users_in,
+                                    &u2ug_out[0], NULL,
+                                    obj_exist_array,
+                                    admin_params, err);
+              if (prm_rc NE ESA_OK) {
+                sprintf(errmsg,                           /* WS10076N*/
+                 "Call to gtug2uc for group |%s| failed", /* WS10076N*/
+                  ugs_in[0]);                             /* WS10076N*/
+                CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                               component, func, errmsg,   /* WS10076N*/
+                               16, __LINE__);
+                 /* WS10076N  "Call to gtug2uc failed",            */
+                 /* We decided that if there is a         WS10076
+                    CTSGetConns error, we should not      WS10076
+                    stop processing this interception.    WS10076
+                    Instead, we should break out of       WS10076
+                    this internal loop and continue       WS10076
+                    with the next group we get from       WS10076
+                    ACF2_Get_Group.                       WS10076
+                 goto exit;                                       */
+                break;                                /* WS10076 */
+              }
+              else {
+                 ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+  "CTSGetConns returned with rc=%d actual=%d group=%s user=%s",
+                    prm_rc, actual, u2ug_out[0].group,
+                    u2ug_out[0].user);
+
+                 if (actual EQ 0)
+                 /* WS10076 goto next_ngt_slot; */
+                    break;                             /* WS10076 */
+
+                 /* REPLACE_ENDING_BLANK needs params_ptr */
+                 REPLACE_ENDING_BLANK(u2ug_out[0].group,
+                              ESA_COMP_RSS_INTERCEPT); /* BS10097 */
+
+                 prm_rc = CTSCINT_write_event ('C',
+                          u2ug_out[0].group, u2ug_out[0].user,
+                          action, msg_flag, rss_parm,
+                          admin_params, null_phrase);
+                 ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+  "Write event: Type(C), User(%s), Group(%s), Action(%d), RC(%d)",
+                 u2ug_out[0].user, u2ug_out[0].group,
+                 action, prm_rc);
+                 if (prm_rc NE ESA_OK) {
+                  sprintf(errmsg,                        /* WS10076N */
+              "Write event (type C) for group |%s| and user %s failed.",
+                    u2ug_out[0].group, u2ug_out[0].user); /* WS10076N */
+                    CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest,
+                        component, func,
+                        errmsg, 16,__LINE__);            /* WS10076N */
+          /* WS10076N   "Write event (type C) failed", 16,__LINE__);*/
+                    /* We decided that if there is a      WS10076
+                       CTSCINT_write_event error, we      WS10076
+                       should not stop processing this    WS10076
+                       interception. Instead, we should   WS10076
+                       break out of this internal loop    WS10076
+                       and continue with the next group   WS10076
+                       we get from ACF2_Get_Group.        WS10076
+                    goto exit;                                    */
+                    break;                             /* WS10076 */
+                 }
+              } /* else */
+           } /* while for connections */
+              /* At this point, the new group we encountered WS10076 */
+              /* has no more connections                     WS10076 */
+              /* WS10076 Our if/else and do whiles are different so
+                         we will delete the next few lines
+          next_ngt_slot:;
+        } // for //
+     } // if (new_grp_table NE NULL) //
+
+     if (new_grp_table NE NULL)
+        free ( (new_grp_table) );                                    */
+
+     /* * * * * * WS10076 start * * * * * */
+        } /* while (GG_rc EQ ESA_OK) */
+
+       /*  Cleanup for refresh GDB process */
+       free_all_and_exit:
+        if (PBh NE NULL)
+        {
+           Permissions_block_Build ("FREE",
+                                  /*PBh,               WS10084 */
+                                    &PB_Build_Req,  /* WS10084 */
+                                    ESA_COMP_RSS_INTERCEPT,
+                                    admin_params);
+
+           free(PBh);
+        };
+
+        if (laddinfo NE NULL)
+           ADDINFO_free(&laddinfo);
+
+        if (GDB_Opened EQ TRUE)
+        {
+          GDB_Set_Mode(GDB_Closed,admin_params,err);
+          GDB_Opened = FALSE;
+          ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+                          "Just closed the GDB file");
+        };
+     } /* End of refresh_GDB processing */
+     else     /* no refresh GDB processing */
+     {
+        ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 6,
+            "will not implement refresh GDB process");
+     }
+     /* * * * * * WS10076 end * * * * * */
+
+     goto exit;
+  } /* if (type EQ 'S') */
+
+  /* * * * * * * End WS10067 * * * * * * */
+
+  /*
+   *  Write event asis
+   */
+
+  rc = CTSCINT_write_event (type, group, user, action,
+       /* WS10064           msg_flag, rss_parm, admin_params);     */
+       /* WS10064 */        msg_flag, rss_parm, admin_params,
+       /* WS10064 */        null_phrase);
+
+  ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, DEBUG_SHOW_IMPORTANT,
+        "Write event: Type(%c),User(%s),Group(%s),Action(%d),RC(%d)",
+                          type,                      /*bs2626*/
+                          user,
+                          group,
+                          action,
+                          rc);
+  /* bs2626 starts */
+  /* when rc ne 0, return to caller with original rc ! */
+  if (rc NE ESA_OK) goto exit;
+  /* bs2626 ends   */
+  /*
+   * Handle 'User' events only
+   */
+
+  if (type != 'U')
+  {
+  /*  rc = ESA_OK;      bs2626 */
+      goto exit;
+   }
+
+  if (action != ACT_UPDATE   AND
+      action != ACT_ADD)
+  {
+  /*  rc = ESA_OK;      bs2626 */
+      goto exit;
+   }
+
+  /*
+   *                      ws10006 start
+   * Disregard connect/disconnect when ACF2_GROUPS = N
+   */
+   rc = admin_params->cs_func.rssprm_get_opt_ptr(
+                   admin_params->rss_name,
+                   "ACF2_GROUPS",
+                   sizeof(acf2_groups),
+                   acf2_groups,
+                   OPT_TRUE,
+                   OPT_TRUE) ;
+   /*admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_RSS_INTERCEPT,3,*/
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,3,            /*IS10182*/
+      "ACF2_GROUPS = <%c> ,rc = <%d> ",
+      *acf2_groups, rc);
+
+   if ((rc NE ESA_OK) OR  /* default for ACF2_GROUPS is 'Y' */
+       (rc EQ ESA_OK  AND
+        acf2_groups[0] NE 'N' AND
+        acf2_groups[0] NE 'Y')) {
+          acf2_groups[0] = 'Y';
+          /*SAS2IBMA acf2_groups[1] = NULL; */
+          acf2_groups[1] = (char) NULL; /*SAS2IBMA*/
+          rc = ESA_OK; /*parm is not mandatory, set rc=0 */
+      }
+   /*admin_params->cs_func.DIAG_printf_ptr(ESA_COMP_RSS_INTERCEPT,3,*/
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,3,            /*IS10182*/
+      "ACF2_GROUPS = <%c> ", *acf2_groups);
+
+   if (acf2_groups[0] == 'N')  goto exit;
+   /***                    end of WS10006                    ***/
+
+  /*
+   * Copy partial UID from parameter.
+   */
+
+  /*
+   * If partial UID string is all 0x01   (action must be update),
+   * no change in UID string was done and we can finish.
+   */
+   if (memcmp(partial_old_UID ,Empty_UID, ACF2_UID_SIZE-1 ) == 0)
+   {
+  /*  rc = ESA_OK;      bs2626 */
+      goto exit;
+   }
+
+  /*
+   * Initialization
+   */
+
+
+   memset(old_UID,  0, ACF2_UID_SIZE);
+   memset(parm_UID, 0, ACF2_UID_SIZE);
+   memcpy(parm_UID, partial_old_UID, ACF2_UID_SIZE-1);
+
+
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, DEBUG_SHOW_IMPORTANT,
+            "Partial UID from EVT(%s)",
+                  parm_UID);
+
+   if (ADDINFO_alloc(func, ACF2_ADDINFO, &(laddinfo), dest, msgs)
+                    NE ESA_OK)
+    {
+      CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+               "laddinfo alloc failed", 16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+    };
+
+  /*
+   * Initialize ACF2 environment
+   * This is no longer done here. It is now done in the         WS10067
+   * CTSCINT_ACF2_Init routine.                                 WS10067
+   */
+
+/*    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+          "calling CTSAPIInit");  */
+     /* WS10067 This is no longer done here
+      rc = CTSAPIInit(admin_params, err);
+
+      if (rc NE ESA_OK)
+        {
+           CTSAMSG_print(ERR_INTERNAL2,msgs, NULL,
+                 dest, component,func,
+                 errmsg, 16,__LINE__);
+
+           ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, DEBUG_SHOW_IMPORTANT,
+            "CTSAPIInit failed(%d)",
+                  rc);
+
+           rc = ESA_FATAL;
+           goto exit;
+        }
+     API_initialized = 1;                                            */
+
+     if (GDB_Set_Mode(GDB_ReadOnly,admin_params,err) NE GDB_OK)
+      {
+       CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+                "Open GDB for READ failed", 16,__LINE__);
+       rc = ESA_FATAL;
+       goto exit;
+      };
+     GDB_Opened = TRUE;
+
+     if (Global_UDB_Active() EQ TRUE)
+      if (UDB_Set_Mode(UDB_ReadOnly,admin_params,err) NE UDB_OK)
+       {
+        CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, component,func,
+                 "Open UDB for READ failed", 16,__LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+       };
+     UDB_Opened = TRUE;
+
+  /*
+   * Get current ACF2 User UID string
+   */
+       ADDINFO_empty(laddinfo);
+
+       ACF2_rc = ACF2_Get_User_UID(user,
+                                   current_UID,
+                                   current_user,
+                                   "",
+                                   UIDs_List,
+                                   laddinfo,
+                                   admin_params);       /*bs2556*/
+
+
+       ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, DEBUG_SHOW_IMPORTANT,
+            "rc from ACF2_Get_User_UID(%d)",
+                  ACF2_rc);
+
+       switch(ACF2_rc)
+        {
+         case ACF2_OK:
+           ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, DEBUG_SHOW_IMPORTANT,
+                          "User(%s) UID(%s) UIDs_List(%s)",
+                          user,
+                          current_UID,
+                          UIDs_List);
+
+          break;
+
+         case ACF2_Not_Found:
+           sprintf(errmsg,"User %s not found in ACF2\n",user);
+           CTSAMSG_print(ERR_INTERNAL2,msgs, NULL,
+                 dest, component,func,
+                 errmsg, 16,__LINE__);
+           rc = ESA_FATAL;
+           goto exit;
+           break;
+         /*------------------------------------------------------
+          * ACF2 DB Read ERROR
+          -------------------------------------------------------*/
+         default:
+           CTSAMSG_print(ERR_INTERNAL2,msgs, NULL,
+                 dest, component,func,
+                 "Get User UID failed", 16,__LINE__);
+           rc = ESA_FATAL;
+           goto exit;
+        };
+  /*
+   * Build old UID string from  Current UID string and
+   * the partial old UID string (parameter from EVT)
+   */
+
+   strcpy(old_UID, parm_UID);
+
+   for (i=0 ; i < ACF2_UID_SIZE-1 ; ++i)
+    {
+      if (old_UID[i] == 0x01)
+          old_UID[i] = current_UID[i];
+    }
+
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, DEBUG_SHOW_IMPORTANT,
+            "User(%s) Old UID(%s) Current UID(%s)",
+             user, old_UID, current_UID);
+
+  /*
+   * Build a list of groups from old UID string (if action is not ADD)
+   */
+
+   strcpy(old_groups,"");
+   if (action == ACT_UPDATE)
+   {
+      rc = Get_User_All_Groups(old_UID,
+                               old_groups,
+                               laddinfo,
+                 /* WS10076 */ admin_params);
+                 /* WS10076    dest,
+                               msgs);                                */
+
+      if (rc NE ESA_OK)
+         goto exit;
+
+
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, DEBUG_SHOW_IMPORTANT,
+            "Old groups(%s)",
+             old_groups);
+   }
+
+  /*
+   * Build a list of groups from current UID string
+   */
+
+   strcpy(current_groups,"");
+   rc = Get_User_All_Groups(current_UID,
+                            current_groups,
+                            laddinfo,
+              /* WS10076 */ admin_params);
+              /* WS10076    dest,
+                            msgs);                                   */
+
+   if (rc NE ESA_OK)
+         goto exit;
+
+
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, DEBUG_SHOW_IMPORTANT,
+            "Current groups(%s)",
+             current_groups);
+
+  /*
+   * Build a list of groups that are in the old groups list only.
+   * These are the deleted groups.
+   */
+
+   if (action == ACT_UPDATE)
+   {
+      rc_del = ADDINFO_list_diff(old_groups,
+                                 current_groups,
+                                 del_groups,
+                                 ADDINFO_LIST_ENTRY,
+                                 ADDINFO_LIST_ENTRY);
+
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, DEBUG_SHOW_IMPORTANT,
+               "Del groups(%s)",
+                del_groups);
+   }
+
+  /*
+   * Build a list of groups that are in the new groups list only.
+   * These are the added groups.
+   */
+   rc_add = ADDINFO_list_diff(current_groups,
+                              old_groups,
+                              add_groups,
+                              ADDINFO_LIST_ENTRY,
+                              ADDINFO_LIST_ENTRY);
+
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, DEBUG_SHOW_IMPORTANT,
+            "Add groups(%s)",
+             add_groups);
+
+  /*
+   * If user action is 'update' (not 'add')
+   * Generate a 'connection delete' for each group in the
+   * 'delete' list.
+   */
+   if (action == ACT_UPDATE   AND   rc_del == ESA_OK)
+   {
+       max_off = strlen(del_groups);
+       off = strspn(del_groups,grp_delim);
+       while ( off LT max_off )
+        {
+         len = strcspn(del_groups+off, grp_delim);
+         if (len GT 0)
+          {
+            strncpy(item,del_groups+off,len);
+            item[len] = NULL_CHAR;
+
+            REPLACE_ENDING_BLANK(item,
+                                 ESA_COMP_RSS_INTERCEPT); /* BS10097 */
+
+            rc = CTSCINT_write_event ( 'C', item, user,
+                                        ACT_DELETE,
+            /* WS10064           msg_flag, rss_parm, admin_params); */
+            /* WS10064 */        msg_flag, rss_parm, admin_params,
+            /* WS10064 */               null_phrase);
+
+            ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,
+                    DEBUG_SHOW_IMPORTANT,
+                    "Write event: Delete, RC(%d), Group(%s), User(%s)",
+                     rc, item, user);
+
+            /* bs2626 starts */
+            /* when rc ne 0, return to caller with original rc ! */
+            if (rc NE ESA_OK) goto exit;
+            /* bs2626 ends   */
+
+            off += len;
+          }
+         off += strspn(del_groups+off,grp_delim);
+        } /*while*/
+   }
+  /*
+   * Generate a 'connection add' for each group in the 'added' list.
+   */
+  if  (rc_add EQ ESA_OK)
+   {
+       max_off = strlen(add_groups);
+       off = strspn(add_groups,grp_delim);
+       while ( off LT max_off )
+        {
+         len = strcspn(add_groups+off, grp_delim);
+         if (len GT 0)
+          {
+            strncpy(item,add_groups+off,len);
+            item[len] = NULL_CHAR;
+
+            REPLACE_ENDING_BLANK(item,
+                                 ESA_COMP_RSS_INTERCEPT); /* BS10097 */
+
+            rc = CTSCINT_write_event ( 'C', item, user,
+                                        ACT_ADD,
+            /* WS10064           msg_flag, rss_parm, admin_params); */
+            /* WS10064 */        msg_flag, rss_parm, admin_params,
+            /* WS10064 */               null_phrase);
+
+            ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,
+                    DEBUG_SHOW_IMPORTANT,
+                    "Write event: Add, RC(%d), Group(%s), User(%s)",
+                     rc, item, user);
+
+            /* bs2626 starts */
+            /* when rc ne 0, return to caller with original rc ! */
+            if (rc NE ESA_OK) goto exit;
+            /* bs2626 ends   */
+
+            off += len;
+          }
+         off += strspn(add_groups+off,grp_delim);
+        } /*while*/
+   }
+  exit:
+
+  if (laddinfo NE NULL)      /* BS2509 */
+   ADDINFO_free(&laddinfo);  /* BS2509 */
+
+  if (GDB_Opened)                                         /* BS10092 */
+    GDB_Set_Mode(GDB_Closed,admin_params,err);            /* BS10092 */
+                                                          /* BS10092 */
+  if (UDB_Opened)                                         /* BS10092 */
+    UDB_Set_Mode(UDB_Closed,admin_params,err);            /* BS10092 */
+
+  /*
+   * Terminate ACF2 environment
+   * This is no longer done here. It is now done in the         WS10067
+   * CTSCINT_ACF2_Term routine.                                 WS10067
+   */
+
+  /* WS10067 This is no longer done here
+  if (API_initialized)
+   {
+  //ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+        "calling CTSAPITerm");  //
+    rc = CTSAPITerm(admin_params, err);
+
+    if (rc NE ESA_OK)
+       {
+          CTSAMSG_print(ERR_INTERNAL2,msgs, NULL,
+                dest, component,func,
+                errmsg, 16,__LINE__);
+
+          ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, DEBUG_SHOW_IMPORTANT,
+           "CTSAPITerm failed(%d)",
+                 rc);
+
+          rc = ESA_FATAL;
+        }
+    }                                                                */
+
+  ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT,1, func, rc );
+
+  return rc;
+
+}
+
+/******************************************************************
+ * Procedure Name:  Get_User_All_Groups
+ ******************************************************************
+ * Description   : Get all groups connected to a user
+ *
+ * Input         : UID          - UID string to match groups
+ * Output        : groups       - string of groups
+ *
+ * Return Value  : None.
+ ******************************************************************/
+
+static ESA_RC Get_User_All_Groups(char            *UID,
+                                  char            *groups,
+                                  ADDINFO_rec_ptr  laddinfo,
+                    /* WS10076 */ ADMIN_PARAMS_rec_typ * admin_params)
+                    /* WS10076    CTSAMSG_DEST_TABLE_rec_typ  * dest,
+                                  CTSAMSG_HANDLE_rec_typ      * msgs) */
+{
+ESA_RC    rc;
+char      current_grp[256];
+char      more_groups ;
+char      grp_delim[2] = {ADDINFO_LIST_ENTRY, 0};
+
+      /*----------------------------------------------------------*/
+      /* Get User Groups by reading groups database               */
+      /*----------------------------------------------------------*/
+      rc = ESA_OK ;
+      strcpy(groups, "");
+      strcpy(current_grp, "");
+      more_groups = 1;
+      while(more_groups)
+      {
+         ADDINFO_empty(laddinfo);
+
+         rc = ACF2_Get_User_Groups(GDB_Generic_Locate,
+                                   UID,
+                                   current_grp,
+                                   laddinfo,
+                                   admin_params);        /*WS10076A*
+                                   dest,
+                                   msgs);                          */
+         switch(rc)
+          {
+           case ACF2_OK:
+            strcat(groups,grp_delim);
+            strcat(groups,current_grp);
+
+            ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,
+                    DEBUG_SHOW_IMPORTANT,
+                    "Get_All_User_Groups: Groups(%s)",
+                     groups);
+
+            break;
+
+           case ACF2_Not_Found:
+            more_groups = 0;
+            rc = ESA_OK;
+            break;
+
+           default:
+            more_groups = 0;
+
+            ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,
+                    DEBUG_SHOW_IMPORTANT,
+                    "Error in ACF2_Get_User_Groups. rc %d",
+                     rc);
+
+            break;
+          }
+      }
+return rc;
+}

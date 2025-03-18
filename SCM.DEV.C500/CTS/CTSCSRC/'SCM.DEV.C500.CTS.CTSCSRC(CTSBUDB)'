@@ -1,0 +1,1129 @@
+/**************************************************************
+*                                                             *
+* Title            : Manage UID-cache Database(ACF2)          *
+*                                                             *
+* File Name        : ctsbudb.c                                *
+*                                                             *
+* Author           : Yishay Yovel                             *
+*                                                             *
+* Creation Date    : 20/07/97                                 *
+*                                                             *
+* Description      : Manage access for API specific Database  *
+*                    implemented on VSAM KSDS dataset         *
+*                    This DB contains pairs of USER-UID. It is*
+*                    used to fetch user's UID when calculating*
+*                    connections without fetching ACF2 records*
+*                                                             *
+*           WS2338 : All user UIDs (if multivalued) are loaded*
+*                    as pairs of LID-UID. The key of each     *
+*                    record is LIDxxxx, where xxxx is a       *
+*                    unique number for each LID-UID pair.     *
+*                    This number starts from 0001 for each    *
+*                    user, in its first LID-UID record.       *
+*                    The LIDs are always padded with blanks.  *
+*                                                             *
+*                    The data in the file is totaly redundant.*
+*                                                             *
+* Assumptions and Considerations:                             *
+*  This package is a simplified version of GDB package. The   *
+*  record does not have the dynamic strcuture of GDB record.  *
+**************************************************************/
+
+/**************************************************************
+* Mod.Id   Who      When     Description                      *
+* -------- -------- -------- -------------------------------- *
+* WS2338   Guy      02/11/98 Support multivalued fields in    *
+*                            groups processing                *
+* PS0338   Guy      25/11/98 Remove NULL between LID and URID *
+* PS0339   Guy      30/11/98 Fix URID size                    *
+* BS2433   Alex     10/10/00 SA-Agent abend fix               *
+* BS2499   Yoni     28/11/01 Abend S0C4 in get connections    *
+* WS10054  SeligT   04/08/16 Add ENQ/DEQ SYSTEMS RNL Parameter*
+* SAS2IBMT SeligT   12/07/16 SAS/C to IBM C Conversion Project*
+* IS10139  SeligT   28/08/16 Update OS Functions for Agents   *
+* IS10156  SeligT   13/09/17 Allocate ADDINFO Size Correctly: *
+*                            just changing print_amrc diag    *
+*                            levels from 0 to 1 in 5 places   *
+* BS10076  SeligT   11/12/17 Organize Connector Locking       *
+*                            Functions and Structures         *
+* IS10176  SeligT   16/10/18 Potential Locking Problem With   *
+*                            ACF2 Files, UDB and GDB          *
+* BS10112  NuritY   24/12/20 Abend S0C4 when user UID is      *
+*                            24 characters long.              *
+**************************************************************/
+
+/*
+ * Support OS-level functions and VSAM access
+ */
+
+#include <globs.h>
+ /* SAS2IBMT #include <lcio.h>                                       */
+#include <errno.h>
+ /* SAS2IBMT #include <lclib.h>                                      */
+ /* SAS2IBMT #include <ostask.h>                                     */
+ /* #undef OR                                                        */
+
+/*
+ * Standard Include files
+ */
+
+#include STDLIB
+#include STDIO
+#include STRING
+#include CTYPE
+
+#include ESA_DIAG
+#include ESA_API
+#include ESA_API_CODES
+#include ESA_CS_OS                                       /* WS10054 */
+
+#include MVS_OS_MVS                                      /* WS10054 */
+#include MVS_COMP
+
+#include API_ADDINFO
+#include API_AUTH
+
+/* IS10139 #include <CTSCSRV.h>                              WS10054 */
+#include ACF2
+
+/*
+ * Local pre-processor defintions
+ */
+
+#define CTSAUDB "dd:CTSAUDB"     /* used to be "ddn:CTSAUDB" SAS2IBMT */
+#define UDB_READONLY  "rb,type=record"  /* used to be "rk"   SAS2IBMT */
+#define UDB_READWRITE "r+b,type=record" /* used to be "r+k"  SAS2IBMT */
+/* BS10076
+#define LOCK_INTERVAL 600 // Seconds = 10 minutes            WS10054 */
+
+#define MAX_UDB_RECORD_SIZE 100
+
+/*----------------------------------------------------------------
+   UDB Record Definition:
+       UDBLID      : User ID                    PS0338
+       URID        : User Record ID (xxxx)      WS2338
+       UID         : UID
+ -------------------------------------------------------------------*/
+
+typedef struct {
+ UDBLID  UDB_LID;   /* PS0338 */
+ UDBURID UDB_URID;  /* PS0339 */
+ UID     UDB_UID;
+} UDB_record;
+
+/*
+ * Static Read Only fields
+ */
+
+/* WS10054 static char UDB_Rname[44] = "UDBLOCK";                    */
+
+/*
+ * Static Read Write fields (global to the entire UDB implementation)
+ */
+
+static FILE *UDB = NULL;                        /* UDB File Handle    */
+static UDB_Modes UDB_Current_Mode = UDB_Closed; /* UDB access Mode
+                                                   Closed,
+                                                   Read  ,
+                                                   ReadWrite          */
+static int       UDB_Open_Count = 0;            /* Number of Opens
+                                                   Requested (allow
+                                                   recursive open)    */
+static UDB_record record;                       /* Curr. Record       */
+static void * lock_handle = NULL ;              /* lock handle WS10054*/
+static UDB_Codes global_rc = UDB_OK;            /*            SAS2IBMT */
+
+/*
+ * Internal Functions
+ */
+
+static UDB_Codes UDB_Release_Lock(ADMIN_PARAMS_rec_typ * admin_params);
+                                                          /* WS10054 */
+static UDB_Codes UDB_Obtain_Lock(UDB_Locks,
+                 ADMIN_PARAMS_rec_typ * admin_params);    /* WS10054 */
+static void      print_amrc(void);                        /* SAS2IBMT */
+
+
+/******************************************************************
+ * Procedure Name: UDB_Set_Mode
+ ******************************************************************
+ * Description   : Close/Open UDB for access
+ *                 Open: If closed, Obtain Locks and Open UDB.
+ *                       If opened for current mode, increase open count
+ *                       If opened for Readonly and ReadWrite is
+ *                          required, Re-Open UDB and increase Count
+ *                 Close: If Count is 1, Physically close.
+ *                        If Count is >1, Decrease Count
+ *                        If Count is <1, skip
+ *
+ * Input         : Mode         - Closed, ReadOnly, ReadWrite
+ *
+ * Output        : UDB_Open_Count   - UDB number of pending opens
+ *               : UDB_Current_Mode - UDB mode after call
+ *
+ * Return Value  : UDB_Codes    - UDB_OK, UDB_Open_Error
+ ******************************************************************/
+UDB_Codes UDB_Set_Mode(UDB_Modes mode,
+                       ADMIN_PARAMS_rec_typ * admin_params,
+                       ERR_STRUCT_rec_typ   * err)
+{
+ static char func[] = "UDB_Set_Mode";
+ int rc1 = 0;
+ int logout_done = FALSE;
+ UDB_Codes rc = UDB_OK;
+ CTSAMSG_HANDLE_rec_ptr     msgs;
+ CTSAMSG_DEST_TABLE_rec_ptr dest;
+
+ msgs = admin_params->ctsamsg_handle;
+ dest = admin_params->ctsamsg_dest;
+
+ ESA_DIAG_enter(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func);
+
+ if (CTSCRSS_set_authority( &logout_done,
+                        SET_TO_STARTED_TASK_AUTH,
+                        admin_params,
+                        err) NE ESA_OK)
+   {
+    CTSAMSG_print(ERR_INTERNAL2,msgs, NULL, dest, "UDBOPEN",func,
+          "Authority switch to STC failed", 16,__LINE__);
+    rc = ESA_FATAL;
+    goto exit;
+   };
+
+ switch(mode)
+  {
+   /*----------------------------------------------*/
+   /* UDB Close                                    */
+   /*----------------------------------------------*/
+   case UDB_Closed :
+
+    ESA_DIAG_printf(PLT_COMP_API_ACF2,DEBUG_SHOW_IMPORTANT,
+                    "UDB Close entered, Open Count is %d",
+                    UDB_Open_Count);
+
+    switch(UDB_Open_Count)
+     {
+      case 0:
+       /* File Not open, skip */
+       goto exit;
+      case 1:
+       /* Physical Close: File open once, Close it */
+       UDB_Open_Count--;
+       break;
+      default:
+       /* Logical Close: decrease count and exit */
+       UDB_Open_Count--;
+       goto exit;
+     };
+
+    /* SAS2IBMT rc1 = fclose(UDB);                                   */
+    if (fclose(UDB)) print_amrc();                        /* SAS2IBMT */
+    UDB = NULL;
+
+    UDB_Current_Mode = UDB_Closed;
+
+    UDB_Release_Lock(admin_params);                       /* WS10054 */
+    break;
+
+   /*----------------------------------------------*/
+   /* UDB Open for ReadOnly                        */
+   /*----------------------------------------------*/
+   case UDB_ReadOnly:
+
+    ESA_DIAG_printf(PLT_COMP_API_ACF2,DEBUG_SHOW_IMPORTANT,
+                    "UDB Open ReadOnly entered, Open Count is %d",
+                    UDB_Open_Count);
+
+    UDB_Open_Count++;
+
+   /*--------------------------------------------------------------*/
+   /* If UDB is Opened , Continue (ReadWrite mode support ReadOnly */
+   /*--------------------------------------------------------------*/
+    if (UDB_Current_Mode NE UDB_Closed)
+     goto exit;
+
+   /*--------------------------------------------------------------*/
+   /* Get ReadOnly Lock                                            */
+   /*--------------------------------------------------------------*/
+    rc = UDB_Obtain_Lock(UDB_ReadOnly_Lock, admin_params);  /*WS10054*/
+    if (rc NE UDB_OK)
+     {
+      UDB_Open_Count--;                 /* decrement counter IS10176 */
+      ESA_DIAG_printf(PLT_COMP_API_ACF2,DEBUG_SHOW_IMPORTANT,
+                    "UDB_Open_Count decremented to %d",   /* IS10176 */
+                    UDB_Open_Count);                      /* IS10176 */
+      rc = UDB_Read_Lock_Failed;
+      goto exit;
+     };
+
+   /*--------------------------------------------------------------*/
+   /* Open UDB for Readonly                                        */
+   /*--------------------------------------------------------------*/
+    UDB = fopen(CTSAUDB,UDB_READONLY);
+
+    if (UDB EQ NULL)
+     {
+      print_amrc();                                       /* SAS2IBMT */
+      UDB_Open_Count--;                 /* decrement counter IS10176 */
+      ESA_DIAG_printf(PLT_COMP_API_ACF2,DEBUG_SHOW_IMPORTANT,
+                    "UDB_Open_Count decremented to %d",   /* IS10176 */
+                    UDB_Open_Count);                      /* IS10176 */
+      UDB_Release_Lock(admin_params);   /* release the lock  IS10176 */
+      rc = UDB_Open_Failed;
+      UDB_Current_Mode = UDB_Closed;
+      goto exit;
+     };
+
+   /*--------------------------------------------------------------*/
+   /* Set UDB Current Mode to Readonly                             */
+   /*--------------------------------------------------------------*/
+    UDB_Current_Mode = UDB_ReadOnly;
+
+    break;
+
+   /*----------------------------------------------*/
+   /* UDB Open for ReadWrite (Update)              */
+   /*----------------------------------------------*/
+   case UDB_ReadWrite:
+
+    ESA_DIAG_printf(PLT_COMP_API_ACF2,DEBUG_SHOW_IMPORTANT,
+                    "UDB Open ReadWrite entered, Open Count is %d",
+                    UDB_Open_Count);
+
+    UDB_Open_Count++;
+
+   /*--------------------------------------------------------------*/
+   /* If UDB Current Mode is ReadOnly, Re-Open UDB                 */
+   /*--------------------------------------------------------------*/
+    switch(UDB_Current_Mode)
+     {
+      /*--------------------------------------------------------------*/
+      /* If UDB Current Mode is ReadOnly, Release Locks and Close UDB */
+      /*--------------------------------------------------------------*/
+      case UDB_ReadOnly:
+        /* SAS2IBMT fclose(UDB);                                     */
+        if (fclose(UDB)) print_amrc();                    /* SAS2IBMT */
+        UDB_Release_Lock(admin_params);                   /* WS10054 */
+        break;
+      /*--------------------------------------------------------------*/
+      /* If UDB Current Mode is ReadWrite, skip it                    */
+      /*--------------------------------------------------------------*/
+      case UDB_ReadWrite:
+        goto exit;
+      default:;
+     };
+
+   /*--------------------------------------------------------------*/
+   /* Get ReadWrite Lock                                           */
+   /*--------------------------------------------------------------*/
+    rc = UDB_Obtain_Lock(UDB_ReadWrite_Lock, admin_params); /*WS10054*/
+    if (rc NE UDB_OK)
+     {
+      UDB_Open_Count--;                 /* decrement counter IS10176 */
+      ESA_DIAG_printf(PLT_COMP_API_ACF2,DEBUG_SHOW_IMPORTANT,
+                    "UDB_Open_Count decremented to %d",   /* IS10176 */
+                    UDB_Open_Count);                      /* IS10176 */
+      rc = UDB_Update_Lock_Failed;
+      goto exit;
+     };
+
+   /*--------------------------------------------------------------*/
+   /* Open UDB for ReadWrite Processing                            */
+   /*--------------------------------------------------------------*/
+    UDB = fopen(CTSAUDB,UDB_READWRITE);
+    if (UDB EQ NULL)
+     {
+      print_amrc();                                       /* SAS2IBMT */
+      UDB_Open_Count--;                 /* decrement counter IS10176 */
+      ESA_DIAG_printf(PLT_COMP_API_ACF2,DEBUG_SHOW_IMPORTANT,
+                    "UDB_Open_Count decremented to %d",   /* IS10176 */
+                    UDB_Open_Count);                      /* IS10176 */
+      UDB_Release_Lock(admin_params);   /* release the lock  IS10176 */
+      rc = UDB_Open_Failed;
+      UDB_Current_Mode = UDB_Closed;
+      goto exit;
+     };
+
+   /*--------------------------------------------------------------*/
+   /* Set Current Mode to ReadWrite                                */
+   /*--------------------------------------------------------------*/
+    UDB_Current_Mode = UDB_ReadWrite;
+    break;
+
+   /*--------------------------------------------------------------*/
+   /* Unknown Mode Requested                                       */
+   /*--------------------------------------------------------------*/
+   default:;
+    rc = UDB_Wrong_Mode;
+  };
+
+ exit:;
+
+ if (logout_done EQ TRUE)
+    CTSCRSS_set_authority(&logout_done,
+                          RETURN_FROM_STARTED_TASK_AUTH,
+                          admin_params,
+                          err);
+
+ ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func, rc);
+
+ return rc;
+}
+/******************************************************************
+ * Procedure Name: UDB_Obtain_Lock
+ ******************************************************************
+ * Description   : Get UDB Access Lock
+ *                 ReadOnly: Obtain UDB Qname/Rname in "SHARE" mode
+ *                 ReadWrite: Obtain UDB Qname/Rname in "EXCLUSIVE" mode
+ * Input         : Lock         - ReadOnly, ReadWrite
+ *
+ * Return Value  : UDB_Codes    - UDB_OK, UDB_Obtain_Lock_Failed
+ *
+ * Special Considerations:
+ * - Uses SAS/C ENQ Macro interface and NOT the USA-API OSLOCK package
+ *   because it does not support ENQ with SHR option.
+ * - With modification WS10054, the above statement is no longer true.
+ *   We now use the USA-API OSLOCK package which now DOES support ENQ
+ *   with the SHR option.
+ * - With modification BS10076, all waiting and looping is now done
+ *   in the lock routine and all required fields, e.g., total wait
+ *   time and interval wait time, are saved in the lock header/handle
+ *   to be used by the lock routine.
+ *   These 2 values came from the following RSSPARM parameters or
+ *   (if not present in RSSPARM) from the following #define default
+ *   macro definitions:
+ *     ACF2_LOCK and ACF2_LOCK_INTERVAL - CTSBACF CMAC
+ ******************************************************************/
+static UDB_Codes UDB_Obtain_Lock(UDB_Locks lock,
+                     ADMIN_PARAMS_rec_typ * admin_params) /* WS10054 */
+{
+ static char func[] = "UDB_Obtain_Lock";
+ int       rc1, i, retries, interval;
+ UDB_Codes rc = UDB_OK;
+ /* WS10054 char      QNAME[9]="";                                   */
+ char      file_name[45];                                 /* WS10054 */
+ CTSAMSG_PARAMS_rec_typ msg_params;                       /* WS10054 */
+ char      exc_shr[] = "E";                               /* WS10054 */
+ ACF2_PARAMS_rec_typ * params_ptr = NULL;                 /* BS10076 */
+ int       acf2_lock_value;                               /* BS10076 */
+ int       acf2_lock_interval_value;                      /* BS10076 */
+
+ msg_params.ctsamsg_handle = admin_params->ctsamsg_handle;/* WS10054 */
+ msg_params.ctsamsg_dest   = admin_params->ctsamsg_dest;  /* WS10054 */
+
+ ESA_DIAG_enter(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func);
+
+ /* * * * * * * BS10076 start * * * * * * */
+ params_ptr = admin_params->apiinit_handle;
+ acf2_lock_value          = params_ptr->rssparm_ACF2_LOCK;
+ acf2_lock_interval_value = params_ptr->rssparm_ACF2_LOCK_INTERVAL;
+
+ ESA_DIAG_printf (PLT_COMP_API_ACF2, 6,
+                  "ACF2_LOCK=<%d>  ACF2_LOCK_INTERVAL=<%d>",
+                  acf2_lock_value,
+                  acf2_lock_interval_value);
+ /* * * * * * * BS10076 end * * * * * * */
+
+ /* * * * * * * * * * Start of WS10054 * * * * * * * * * */
+
+ strcpy(file_name, "CTSAUDB");
+
+ /* BS10076
+ rc = OS_CS_lock_init(file_name, 0 ,&lock_handle, NULL,              */
+ rc = OS_CS_lock_init(file_name, &lock_handle,            /* BS10076 */
+                      acf2_lock_value,                    /* BS10076 */
+                      acf2_lock_interval_value,           /* BS10076 */
+                      SCOPE_REMOTE, &msg_params);
+ if ( rc NE ESA_OK )
+    goto exit;
+
+ if (lock EQ UDB_ReadOnly_Lock)
+    strcpy(exc_shr, "S");
+ else
+    strcpy(exc_shr, "E");
+
+ /* * * * * * * * * *  End of WS10054  * * * * * * * * * */
+
+ /* WS10054 strcpy(QNAME,Global_Get_QNAME());  */
+
+ /* BS10076 delete this code - all waiting and looping is
+            being done in the lock routine and all required
+            fields are now in the lock header/handle
+ interval = Global_Retry_Wait_Lock_Time();
+ if (interval EQ 0)
+  interval = 30;
+
+ retries = Global_Total_Wait_Lock_Time() / interval;
+ if (retries EQ 0)
+  retries = 20;
+
+ for(i=0;i LT retries;i++)
+  {                                                                  */
+   /* WS10054
+   if (lock EQ UDB_ReadOnly_Lock)
+    rc1 = ENQ(QNAME,UDB_Rname,S,sizeof(UDB_Rname)-1,SYSTEMS,HAVE);
+   else
+    rc1 = ENQ(QNAME,UDB_Rname,E,sizeof(UDB_Rname)-1,SYSTEMS,HAVE);   */
+   /* BS10076
+   rc1 = OS_CS_DO_LOCK (lock_handle,LOCK_INTERVAL,        // WS10054 */
+   rc1 = OS_CS_DO_LOCK (lock_handle,                      /* BS10076 */
+                        &msg_params, exc_shr);            /* WS10054 */
+   if ( rc1 NE ESA_OK )                                   /* WS10054 */
+   {                                                      /* WS10054 */
+    rc = UDB_Obtain_Lock_Failed;                          /* WS10054 */
+    goto exit;                                            /* WS10054 */
+   }                                                      /* WS10054 */
+
+   /* WS10054
+   if (rc1 NE 0)
+    sleep(interval);
+   else
+    break;            */
+  /* BS10076 remove the 'for' loop's end bracket
+  };                                                                 */
+
+ /* WS10054
+ if (rc1 NE 0)
+ {
+   rc = UDB_Obtain_Lock_Failed;
+   goto exit;
+  };                  */
+
+ exit:;
+
+ ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func, rc);
+
+ return rc;
+}
+
+/******************************************************************
+ * Procedure Name: UDB_Release_Lock
+ ******************************************************************
+ * Description   : Relase all obtained locks
+ *
+ * Return Value  : UDB_Codes    - UDB_OK, UDB_Release_Lock_Failed
+ *
+ * Special Considerations:
+ * - Uses SAS/C DEQ Macro interface and NOT the USA-API OSLOCK package
+ * - With modification WS10054, the above statement is no longer true.
+ ******************************************************************/
+static UDB_Codes UDB_Release_Lock(ADMIN_PARAMS_rec_typ * admin_params)
+                                                          /* WS10054 */
+{
+ static char func[] = "UDB_Release_Lock";
+ int       rc1;
+ UDB_Codes rc = UDB_OK;
+ /* WS10054 char      QNAME[9]="";                                   */
+ CTSAMSG_PARAMS_rec_typ msg_params;                       /* WS10054 */
+
+ ESA_DIAG_enter(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func);
+
+ msg_params.ctsamsg_handle = admin_params->ctsamsg_handle;/* WS10054 */
+ msg_params.ctsamsg_dest   = admin_params->ctsamsg_dest;  /* WS10054 */
+
+ /* WS10054 strcpy(QNAME,Global_Get_QNAME());
+
+ rc1 = DEQ(QNAME,UDB_Rname,sizeof(UDB_Rname)-1,SYSTEMS,HAVE);
+
+ if (rc1 NE 0)
+ {
+   rc = UDB_Release_Lock_Failed;
+   goto exit;
+  };                            */
+
+ /* * * * * * * * * * Start of WS10054 * * * * * * * * * */
+
+ if ( lock_handle NE NULL ) {
+   rc1 = OS_CS_unlock (lock_handle, &msg_params);
+
+   if (rc1 NE 0)
+   {
+     rc = UDB_Release_Lock_Failed;
+     goto exit;
+   };
+
+   rc1 = OS_CS_lock_term (&lock_handle, &msg_params);
+ }
+
+ /* * * * * * * * * *  End of WS10054  * * * * * * * * * */
+
+ exit:;
+
+ ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func, rc);
+
+ return rc;
+}
+
+/******************************************************************
+ * Procedure Name: UDB_Insert
+ ******************************************************************
+ * Description   : Insert UDB Record into the Database
+ *
+ * Return Value  : UDB_Codes    - UDB_OK
+ *                                UDB_Duplicate_Key
+ *                                UDB_Insert_Failed
+ *
+ * Special Considerations:
+ * - Uses SAS/C VSAM interface function (kinsert)
+ * - In modification SAS2IBMT we removed all SAS/C functions and
+ *   replaced them with their IBM C counterparts.
+ * - The UDB package assumes record for insert is established in the
+ *   static record strcuture.
+ *
+ * See Also: UDB_Convert_to_Record, UDB_Convert_from_Record
+ ******************************************************************/
+UDB_Codes UDB_Insert(URID urid,LID lid,UID uid)           /* WS2338 */
+{
+ static char func[] = "UDB_Insert";
+ int       rc1;
+ UDB_Codes rc = UDB_OK;
+
+ ESA_DIAG_enter(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func);
+
+ /*--------------------------------------------------------------*/
+ /* Check Correct UDB Mode                                       */
+ /*--------------------------------------------------------------*/
+ if (UDB_Current_Mode NE UDB_ReadWrite)
+  {
+   rc = UDB_Wrong_Mode;
+   goto exit;
+  };
+
+ /*--------------------------------------------------------------*/
+ /* Insert Record                                                */
+ /*--------------------------------------------------------------*/
+
+ memset(&record,0X00,sizeof(record));                     /* BS3200 */
+ memset(record.UDB_LID,' ',sizeof(UDBLID));               /* PS0338 */
+
+ memcpy(record.UDB_LID,lid,strlen(lid));                  /* WS2338 */
+ memcpy(record.UDB_URID,urid,sizeof(UDBURID));            /* PS0339 */
+ strcpy(record.UDB_UID,uid);
+
+ /* SAS2IBMT The following SAS/C function was removed and was replaced
+    by its IBM C counterpart.  In case of an fwrite error, the feedback
+    code (in the print_amrc routine) will 'tell us' whether the error
+    was caused by an attempt to write a record with a duplicate key.
+ rc1 = kinsert(&record, sizeof(record), 0 , UDB);
+
+ if (rc1 NE 0)
+  {
+   if (errno EQ EDUPKEY)
+    rc = UDB_Duplicate_Key;
+   else
+    rc = UDB_Insert_Failed;
+  };                                                                 */
+
+/* * * * * * * * * * Start of SAS2IBMT * * * * * * * * * */
+
+ rc1 = fwrite(&record, 1, sizeof(record), UDB);
+
+ if (rc1 != sizeof(record))
+  {
+   print_amrc();
+   if (global_rc == UDB_Duplicate_Key) rc = UDB_Duplicate_Key;
+   else                                rc = UDB_Insert_Failed;
+   goto exit;
+  };
+/* * * * * * * * * *  End  of SAS2IBMT * * * * * * * * * */
+
+ exit:;
+
+ ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func, rc);
+
+ return rc;
+}
+
+/******************************************************************
+ * Procedure Name: UDB_Update
+ ******************************************************************
+ * Description   : Update Current UDB Record in the Database
+ *
+ * Return Value  : UDB_Codes    - UDB_OK
+ *                                UDB_Update_Failed
+ *
+ * Special Considerations:
+ * - Uses SAS/C VSAM interface function (kreplace)
+ * - In modification SAS2IBMT we removed all SAS/C functions and
+ *   replaced them with their IBM C counterparts.
+ * - The UDB package assumes record for update is established in the
+ *   static record strcuture and that VSAM is poisitioned to the record
+ *   to update.
+ *
+ * See Also: UDB_Convert_to_Record, UDB_Convert_from_Record
+ ******************************************************************/
+UDB_Codes UDB_Update(URID urid,LID lid,UID uid)           /* WS2338 */
+{
+ static char func[] = "UDB_Update";
+ int       rc1;
+ UDB_Codes rc = UDB_OK;
+
+ ESA_DIAG_enter(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func);
+
+ /*--------------------------------------------------------------*/
+ /* Check Correct UDB Mode                                       */
+ /*--------------------------------------------------------------*/
+ if (UDB_Current_Mode NE UDB_ReadWrite)
+  {
+   rc = UDB_Wrong_Mode;
+   goto exit;
+  };
+
+  memset(&record,0X00,sizeof(record));                    /* BS3200 */
+  memset(record.UDB_LID,' ',sizeof(UDBLID));              /* PS0338 */
+
+  memcpy(record.UDB_LID,lid,strlen(lid));                 /* WS2338 */
+  memcpy(record.UDB_URID,urid,sizeof(UDBURID));           /* PS0339 */
+  strcpy(record.UDB_UID,uid);
+
+ /*--------------------------------------------------------------*/
+ /* Update Record                                                */
+ /*--------------------------------------------------------------*/
+ /* SAS2IBMT The following SAS/C function was removed and was replaced
+    by its IBM C counterpart.  The fupdate function requires that
+    an flocate + fread is done before the fupdate is attempted.  I
+    found that the caller to this routine (in CTSBGUS) calls the
+    UDB_Locate and UDB_GetNext routines before calling this routine.
+    This means that we should have no problem now doing an fupdate.
+ rc1 = kreplace(&record, sizeof(record), UDB);
+
+ if (rc1 NE 0)
+  {
+    rc = UDB_Update_Failed;
+  };                                                                 */
+
+/* * * * * * * * * * Start of SAS2IBMT * * * * * * * * * */
+ rc1 = fupdate(&record, sizeof(record), UDB);
+
+ if (rc1 == 0)
+  {
+   print_amrc();
+   rc = UDB_Update_Failed;
+   goto exit;
+  };
+/* * * * * * * * * *  End  of SAS2IBMT * * * * * * * * * */
+
+ exit:;
+
+ ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func, rc);
+
+ return rc;
+}
+
+/******************************************************************
+ * Procedure Name: UDB_Delete
+ ******************************************************************
+ * Description   : Delete Current UDB Record in the Database
+ *
+ * Return Value  : UDB_Codes    - UDB_OK
+ *                                UDB_Delete_Failed
+ *
+ * Special Considerations:
+ * - Uses SAS/C VSAM interface function (kdelete)
+ * - In modification SAS2IBMT we removed all SAS/C functions and
+ *   replaced them with their IBM C counterparts.
+ * - The UDB package assumes the VSAM dataset is poisitioned for the
+ *   record to delete.
+ ******************************************************************/
+UDB_Codes UDB_Delete(void)
+{
+ static char func[] = "UDB_Delete";
+ int       rc1;
+ UDB_Codes rc = UDB_OK;
+
+ ESA_DIAG_enter(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func);
+
+ if (UDB_Current_Mode NE UDB_ReadWrite)
+  {
+   rc = UDB_Wrong_Mode;
+   goto exit;
+  };
+
+ /* SAS2IBMT The following SAS/C function was removed and was replaced
+    by its IBM C counterpart.  The fdelrec function requires that
+    an flocate + fread is done before the fdelrec is attempted.  I
+    found that the caller to this routine (in CTSBGUS) calls the
+    UDB_Locate and UDB_GetNext routines before calling this routine.
+    This means that we should have no problem now doing an fdelrec.
+ rc1 = kdelete(NULL, UDB);                                           */
+ rc1 = fdelrec(UDB);                                      /* SAS2IBMT */
+
+ if (rc1 NE 0)
+  {
+    print_amrc();                                         /* SAS2IBMT */
+    rc = UDB_Delete_Failed;
+  };
+
+ exit:;
+
+ ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func, rc);
+
+ return rc;
+}
+
+/******************************************************************
+ * Procedure Name: UDB_Locate
+ ******************************************************************
+ * Description   : Position UDB to a specific Record or the next GE
+ *                 Record.
+ *
+ * Input         : Locate Mode: Exact   - Specific record
+ *                              Generic - Great or Equal key
+ *
+ * Return Value  : UDB_Codes    - UDB_OK
+ *                                UDB_Not_Found
+ *                                UDB_Locate_Failed
+ *
+ * Special Considerations:
+ * - Uses SAS/C VSAM interface function (ksearch)
+ * - In modification SAS2IBMT we removed all SAS/C functions and
+ *   replaced them with their IBM C counterparts.
+ * - Access is done with Update/NoUpdate attribute based on UDB current
+ *   mode.
+ * - The UDB package assumes record for update is established in the
+ *   static record strcuture and that VSAM is poisitioned to the record
+ *   to update.
+ *
+ * See Also: UDB_Convert_to_Record, UDB_Convert_from_Record
+ ******************************************************************/
+UDB_Codes UDB_Locate(URID            urid,                /* WS2338 */
+                     LID             lid,
+                     UDB_Locate_Mode mode)
+{
+ static char func[] = "UDB_Locate";
+ int flags = 0;
+ int       rc1;
+ UDB_Codes rc = UDB_OK;
+
+ char locate_key[(sizeof(UDBLID)+sizeof(UDBURID))];       /* PS0339 */
+
+ ESA_DIAG_enter(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func);
+
+ memset(locate_key,0X00,sizeof(locate_key));              /* WS2338 */
+ memset(locate_key,' ',sizeof(UDBLID));                   /* PS0338 */
+ memcpy(locate_key,lid,strlen(lid));                      /* WS2338 */
+ memcpy(locate_key+sizeof(UDBLID),urid,sizeof(UDBURID));  /* PS0339 */
+ ESA_DIAG_printf(PLT_COMP_API_ACF2,DEBUG_SHOW_REGULAR,    /*SAS2IBMC*/
+                 "lid=|%s| urid=|%s| locate_key =|%s|\n", /*SAS2IBMC*/
+                 lid, urid, locate_key);                  /*SAS2IBMC*/
+
+ /*--------------------------------------------------------------*/
+ /* Establish Read Access Mode (Exact / Generic)                 */
+ /*--------------------------------------------------------------*/
+ switch(mode)
+  {
+   /* SAS2IBMT case UDB_Exact_Locate:  flags = flags | K_exact;      */
+   case UDB_Exact_Locate:   flags = __KEY_EQ;             /* SAS2IBMT */
+                            break;
+   case UDB_Generic_Locate: flags = __KEY_GE;             /* SAS2IBMT */
+                            break;
+   default:;
+                            break;
+  };
+
+ /*--------------------------------------------------------------*/
+ /* Establish Read with HOLD access (for ReadWrite UDB mode)     */
+ /*--------------------------------------------------------------*/
+ /* SAS2IBMT
+ if (UDB_Current_Mode EQ UDB_ReadOnly)
+  flags = flags | K_noupdate;                                        */
+
+ /*--------------------------------------------------------------*/
+ /* Establish Access Key                                         */
+ /*--------------------------------------------------------------*/
+ ESA_DIAG_printf(PLT_COMP_API_ACF2,DEBUG_SHOW_ALL,
+                 "Search Parms: key(%s)",
+                 locate_key);                             /* WS2338 */
+
+ /*--------------------------------------------------------------*/
+ /* Locate...                                                    */
+ /*--------------------------------------------------------------*/
+ /* WS2338 - Replaced, see below
+ rc1 = ksearch(lid, sizeof(LID)-1, flags, UDB);
+ */
+ /* SAS2IBMT The following SAS/C function was removed and was replaced
+    by its IBM C counterpart.
+ rc1 = ksearch(locate_key,
+               sizeof(locate_key),                           PS0339
+               flags,
+               UDB);                                         WS2338 */
+ rc1 = flocate(UDB, locate_key, sizeof(locate_key), flags); /*SAS2IBMT*/
+
+ /* flocate returns 0 if successful; EOF if not successful so...     */
+ if (rc1 NE 0)                                            /* SAS2IBMT */
+   {
+     print_amrc();                                        /* SAS2IBMT */
+     if (global_rc == UDB_Not_Found) rc = UDB_Not_Found;  /* SAS2IBMT */
+     else                            rc = UDB_Locate_Failed;/*SAS2IBMT*/
+     goto exit;                                           /* SAS2IBMT */
+   };
+
+ /*--------------------------------------------------------------*/
+ /* rc1 <=0 :  Error Condition: 0: Not Found, <0: Error          */
+ /*--------------------------------------------------------------*/
+ /* SAS2IBMT flocate returns a different return code so...
+ if (rc1 LE 0)
+  {
+   if (rc1 EQ 0)
+     rc = UDB_Not_Found;
+   else
+     rc = UDB_Locate_Failed;
+   goto exit;
+  };                                                                 */
+
+ exit:;
+
+ ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func, rc);
+
+ return rc;
+}
+
+/******************************************************************
+ * Procedure Name: UDB_GetNext
+ ******************************************************************
+ * Description   : Retrieve Next UDB Record from current position
+ *                 (after locate, retrieves current record)
+ * Output        : Record Type  : 'G' - Groups, 'U' - Users
+ *                 Key          : Entity Key
+ *
+ * Return Value  : UDB_Codes    - UDB_OK
+ *                                UDB_EOF
+ *                                UDB_GetNext_Failed
+ *
+ * Special Considerations:
+ * - Uses SAS/C VSAM interface function (kretrv)
+ * - In modification SAS2IBMT we removed all SAS/C functions and
+ *   replaced them with their IBM C counterparts.
+ * - The UDB package retrieves record into "record" variable. It can
+ *   be retrieved from there by the Convert_from_Record function.
+ *
+ * See Also: UDB_Convert_to_Record, UDB_Convert_from_Record
+ ******************************************************************/
+UDB_Codes UDB_GetNext(URID urid,LID lid,UID uid)          /* WS2338 */
+{
+ static char   func[] = "UDB_GetNext";
+
+ int flags = 0;
+ int       rc1;
+ UDB_Codes rc = UDB_OK;
+
+ ESA_DIAG_enter(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func);
+
+ /*--------------------------------------------------------------*/
+ /* Set Access Mode according to UDB Current Mode                */
+ /*--------------------------------------------------------------*/
+ /* SAS2IBMT
+ if (UDB_Current_Mode EQ UDB_ReadOnly)
+  flags = K_noupdate;                                                */
+
+ memset(&record,0X00,sizeof(record));
+ /*--------------------------------------------------------------*/
+ /* Retrieve Record                                              */
+ /*--------------------------------------------------------------*/
+ /* SAS2IBMT The following SAS/C function was removed and was replaced
+    by its IBM C counterpart.
+ rc1 = kretrv(&record, NULL, flags, UDB);                             */
+ rc1 = fread(&record, 1, sizeof(record), UDB);             /* SAS2IBMT */
+
+ /* BS2499, added diagnostics */
+ ESA_DIAG_printf(PLT_COMP_API_ACF2,DEBUG_SHOW_ALL,
+                 "getnext record = (%s)",
+                 &record);                            /* WS2338 */
+
+ /* fread returns >0 if successful so...                             */
+ if (rc1 LE 0)                                           /* SAS2IBMT */
+  {
+   if (feof(UDB)) rc = UDB_EOF;                          /* SAS2IBMT */
+   else if (ferror(UDB)) {                               /* SAS2IBMT */
+           print_amrc();                                 /* SAS2IBMT */
+           if (global_rc == UDB_EOF) rc = UDB_EOF;       /* SAS2IBMT */
+           else rc = UDB_GetNext_Failed;                 /* SAS2IBMT */
+        }                                                /* SAS2IBMT */
+   goto exit;                                            /* SAS2IBMT */
+  }
+
+ /*--------------------------------------------------------------*/
+ /* Check Error Condition: 0: EOF, <0: General Error             */
+ /*--------------------------------------------------------------*/
+ /* SAS2IBMT fread returns a different return code so...
+ if (rc1 LE 0)
+  {
+   if (rc1 EQ 0)
+     rc = UDB_EOF;
+   else
+     rc = UDB_GetNext_Failed;
+   goto exit;
+  }                                                                  */
+ else
+  {
+   memset(lid,0X00,sizeof(LID));                          /* PS0338 */
+   memset(urid,0X00,sizeof(URID));                        /* PS0339 */
+   memcpy(lid,record.UDB_LID,sizeof(UDBLID));             /* PS0338 */
+   Trim(lid);                                             /* WS2338 */
+   memcpy(urid,record.UDB_URID,sizeof(UDBURID));          /* PS0339 */
+   /* BS2433 strcpy(uid,record.UDB_UID); */
+   /* BS10112 memset(uid,0X00,sizeof(ACF2_UID_SIZE));  /@ BS2499 @/ */
+   memset(uid,0X00,ACF2_UID_SIZE);                     /* BS10112 */
+   strncpy(uid,record.UDB_UID, ACF2_UID_SIZE - 1);        /* BS2433 */
+  };
+
+ /* BS2499, added diagnostics */
+
+ ESA_DIAG_printf(PLT_COMP_API_ACF2,DEBUG_SHOW_ALL,
+                 "getnext exit lid=%s urid=%s uid=%s",
+                 lid,urid,uid);
+ exit:;
+
+ ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func, rc);
+
+ return rc;
+}
+
+/* WS2338 - New function */
+/******************************************************************
+ * Procedure Name: UDB_Get_Next_User
+ ******************************************************************
+ * Description   : Retrieve Next User Record from UDB (his 1st one)
+ * Output        : urid
+ *                 lid
+ *                 uid
+ *
+ * Return Value  : UDB_Codes    - UDB_OK
+ *                                UDB_EOF
+ *                                UDB_GetNext_Failed
+ *
+ * Special Considerations:
+ * - Uses SAS/C VSAM interface function (kretrv)
+ * - The UDB package retrieves record into "record" variable. It can
+ *   be retrieved from there by the Convert_from_Record function.
+ *
+ * See Also: UDB_Convert_to_Record, UDB_Convert_from_Record
+ ******************************************************************/
+UDB_Codes UDB_Get_Next_User(URID urid,LID lid,UID uid)
+{
+ static char   func[] = "UDB_Get_Next_User";
+
+ UDB_Codes rc = UDB_OK;
+
+ ESA_DIAG_enter(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func);
+
+ rc = UDB_GetNext (urid, lid, uid);
+
+ /* Loop until we reach 1st record of next user */
+ while (rc EQ UDB_OK)
+ {
+   if (strcmp (urid, "0001") EQ 0)                        /* PS0339 */
+     break;
+
+   rc = UDB_GetNext (urid, lid, uid);
+ };
+
+ ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func, rc);
+
+ return rc;
+}
+/* End of WS2338 */
+
+/* * * * * * * * * * Start of SAS2IBMT * * * * * * * * * */
+static void print_amrc() {
+   __amrc_type currErr = *__amrc; /* copy contents of __amrc     */
+                                  /* structure so that values do */
+                                  /* not get clobbered by printf */
+   char desc[25];
+   global_rc = UDB_OK;            /* clear global rc field       */
+   static char   func[] = "print_amrc";
+   ESA_DIAG_enter(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func);
+   if ((currErr.__last_op == 114)              &
+       (currErr.__code.__feedback.__rc == 8)   &
+       (currErr.__code.__feedback.__fdbk == 4))
+       {
+         global_rc = UDB_EOF;
+         ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR,
+                       func, UDB_EOF);
+         return;
+       }
+   if ((currErr.__last_op == 116)              &
+       (currErr.__code.__feedback.__rc == 8)   &
+       (currErr.__code.__feedback.__fdbk == 16))
+       {
+         global_rc = UDB_Not_Found;
+         ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR,
+                       func, UDB_Not_Found);
+         return;
+       }
+   ESA_DIAG_printf(PLT_COMP_API_ACF2, DEBUG_SHOW_IMPORTANT, /*IS10156*/
+                   "* * * VSAM Error Information * * *");
+   /* The following #defines are defined in CEE.SCEEH.H(STDIO) */
+   switch(currErr.__last_op)
+    {
+     case __VSAM_OPEN_FAIL:
+          strcpy(desc,"VSAM_OPEN_FAIL");
+          break;
+     case __VSAM_OPEN_KSDS:
+          strcpy(desc,"VSAM_OPEN_KSDS");
+          break;
+     case __VSAM_OPEN_KSDS_PATH:
+          strcpy(desc,"VSAM_OPEN_KSDS_PATH");
+          break;
+     case __VSAM_MODCB:
+          strcpy(desc,"VSAM_MODCB");
+          break;
+     case __VSAM_TESTCB:
+          strcpy(desc,"VSAM_TESTCB");
+          break;
+     case __VSAM_SHOWCB:
+          strcpy(desc,"VSAM_SHOWCB");
+          break;
+     case __VSAM_GENCB:
+          strcpy(desc,"VSAM_GENCB");
+          break;
+     case __VSAM_GET:
+          strcpy(desc,"VSAM_GET");
+          break;
+     case __VSAM_PUT:
+          strcpy(desc,"VSAM_PUT");
+          break;
+     case __VSAM_POINT:
+          strcpy(desc,"VSAM_POINT");
+          break;
+     case __VSAM_ERASE:
+          strcpy(desc,"VSAM_ERASE");
+          break;
+     case __VSAM_ENDREQ:
+          strcpy(desc,"VSAM_ENDREQ");
+          break;
+     case __VSAM_CLOSE:
+          strcpy(desc,"VSAM_CLOSE");
+          break;
+     default:
+          strcpy(desc,"not defined");
+          break;
+    };
+   ESA_DIAG_printf(PLT_COMP_API_ACF2, DEBUG_SHOW_IMPORTANT, /*IS10156*/
+       "Last VSAM function attempted = %d = %s",
+       currErr.__last_op, desc);
+   ESA_DIAG_printf(PLT_COMP_API_ACF2, DEBUG_SHOW_IMPORTANT, /*IS10156*/
+       "R15 value = %d   Reason code = %d",
+       currErr.__code.__feedback.__rc,
+       currErr.__code.__feedback.__fdbk);
+   ESA_DIAG_printf(PLT_COMP_API_ACF2, DEBUG_SHOW_IMPORTANT, /*IS10156*/
+       "RPL feedback code = %02X%02X%02X%02X",
+       currErr.__rplfdbwd[0],currErr.__rplfdbwd[1],
+       currErr.__rplfdbwd[2],currErr.__rplfdbwd[3]);
+   /* rplfdbwd is defined as 'unsigned char __rplfdbwd[4];' in     */
+   /* STDIO.  It is important that it is printed as a 4-byte hex   */
+   /* value in order to see all its 4 bytes: RPLSTAT, RPLRTNCD,    */
+   /* RPLCMPON, and RPLERRCD.                                      */
+   /* printf("RBA = %d\n", currErr.__RBA);                         */
+   if ((currErr.__last_op == 115)              &
+       (currErr.__code.__feedback.__rc == 8)   &
+       (currErr.__code.__feedback.__fdbk == 8))
+       {
+         ESA_DIAG_printf(PLT_COMP_API_ACF2, DEBUG_SHOW_IMPORTANT, /*IS10156*/
+             "* * Writing duplicate record not allowed * * ");
+         global_rc = UDB_Duplicate_Key;
+       }
+   ESA_DIAG_exit(PLT_COMP_API_ACF2, DEBUG_SHOW_REGULAR, func, global_rc);
+   return;
+}
+/* * * * * * * * * *  End  of SAS2IBMT * * * * * * * * * */

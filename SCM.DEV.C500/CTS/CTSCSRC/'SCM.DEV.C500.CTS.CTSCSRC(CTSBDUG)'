@@ -1,0 +1,597 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Delete a user group (ACF2)               *
+ *                                                             *
+ * File Name        : ctsbdug.c                                *
+ *                                                             *
+ * Author           : Yishay Yovel                             *
+ *                                                             *
+ * Creation Date    : 07/07/97                                 *
+ *                                                             *
+ * Description      : Delete ACF2 Virtual Group                *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------  -------------------------------- *
+ * BS10097  SeligT   19/11/18 ACF2 Group Aggregation Endless   *
+ *                            Loop                             *
+ * IS10178  SeligT   18/12/18 Supporting LID Anywhere in UID   *
+ * WS10079  ThomaS   29/09/20 Delete a Role or Source          *
+ * WS10084  ThomaS   13/07/23 Replace ACFRPTRX - recompile     *
+ * WS10082  MauriC   07/11/22 Recompile for new ADDINFO macros *
+ **************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+ #include   TIME
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_API
+ #include ESA_API_CODES
+
+ #include API_ADDINFO
+ #include API_AUTH
+
+ /*
+  *   MVS include files
+  */
+
+ #include MVS_OS_CLI
+ #include MVS_CODES                                       /* WS10079 */
+ #include MVS_COMP                                        /* WS10079 */
+
+ #include ACF2_CODES
+ #include ACF2
+ ASM_RTN_TYP           cts2ver;                           /* WS10079T */
+
+ static   char   component[]="DELGROUP";
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : delug                                      *
+ *                                                             *
+ * DESCRIPTION    : Delete a ACF2 user group                   *
+ *                                                             *
+ * INPUT          : ug_params - Group Name to Delete           *
+ *                  addinfo, admin, err                        *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+
+ ESA_RC CTSDelUG (UG_PARAMS_rec_typ    * ug_params,
+                  ADDINFO_rec_typ      * addinfo,
+                  ADMIN_PARAMS_rec_typ * admin_params,
+                  ERR_STRUCT_rec_typ   * err)
+ {
+
+   static char                   func[]="CTSDelUG";
+
+  /*
+   *     Variables
+   */
+
+   ESA_RC                        rc = ESA_OK;
+   GDB_Codes                     GDB_rc = GDB_OK;
+   CTSAMSG_HANDLE_rec_typ      * msgs;
+   CTSAMSG_DEST_TABLE_rec_typ  * dest;
+   char                          errmsg[128]="";
+   int                           LID_In_UID, LID_Offset;  /* BS10097 */
+   int                           LID_Length;              /* IS10178 */
+   ACF2_PARAMS_rec_typ         * params_ptr = NULL;       /* BS10097 */
+   ONE_FIELD_rec_ptr             pair = NULL;             /* WS10079 */
+   ADDINFO_rec_ptr               caddinfo = NULL;         /* WS10079 */
+   int                           GDB_open = FALSE;        /* WS10079 */
+   char                          type[20]=NULL_STRING;    /* WS10079 */
+   char                          xref[4]  = NULL_STRING;  /* WS10079 */
+   char                          parm_get[81]=NULL_STRING;/* WS10079 */
+   XREF_Cmd_Struct_typ           xref_command_struct;     /* WS10079 */
+   int                           rc_asm=0;                /* WS10079 */
+   char                          acf_version[5]="";       /* WS10079 */
+   int                           dbg_lvl=0;               /* WS10079 */
+   XBhandle_rec_typ            * xbhandle = NULL;         /* WS10079 */
+   void                        * get_xref_handle = NULL;  /* WS10079 */
+   char                          block_read  = NULL_CHAR; /* WS10079 */
+   char                          xrefname_out[19] = "";   /* WS10079 */
+   ACF2_API_Return_Codes         ACF2_rc = ACF2_OK;       /* WS10079 */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_DELUG, DEBUG_SHOW_IMPORTANT, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+
+
+   /* * * * * * * * Start WS10079 * * * * * * * */
+
+   xref_command_struct.add_command = NULL;
+   xref_command_struct.del_command = NULL;
+   xref_command_struct.rep_command = NULL;
+   xref_command_struct.ref_command = NULL;
+
+   pair = ADDINFO_search("TYPE", ACF_ADDINFO_KWD_LEN,
+                         addinfo->pair,
+                         addinfo->num_pairs);
+   if (pair NE NULL)
+    {
+       ESA_DIAG_printf(ESA_COMP_DELUG, 6,
+           "TYPE = <%.8s>",
+            pair->value);
+
+       if (strcmp(pair->value,"Group" ) EQ 0)
+          goto group_code;                 /* this is not XREF stuff */
+
+       if ( (strcmp(pair->value,"Role") NE 0)
+             AND
+            (strcmp(pair->value,"Source") NE 0)  )
+        {
+          sprintf(errmsg,
+          "Delete group = %s: "
+          "Invalid Type in addinfo: %.40s",
+          ug_params->group,
+          pair->value);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+          rc = ESA_FATAL;
+          goto exit;
+        }
+
+       ESA_DIAG_printf(ESA_COMP_DELUG, 6,
+           "Adding NAME = <%s>  TYPE = <%s>",
+            ug_params->group, pair->value);
+
+       if (strcmp(pair->value,"Role") EQ 0)
+        {
+         strcpy(type,"ROLE");
+         strcpy(xref,"ROL");
+
+        /*
+         *   Validate ACF2 version GE 16.0
+         */
+
+         if ((int)ESA_DIAG_get_debug_level(ESA_COMP_DELUG) GE 6)
+            dbg_lvl=1;
+
+         rc_asm=cts2ver(&dbg_lvl, acf_version);
+         acf_version[3]=NULL_CHAR;
+         ESA_DIAG_printf(ESA_COMP_DELUG,6,"ACF2 ver=<%s>",acf_version);
+         if (strcmp(acf_version,"160") LT 0)
+         {
+          sprintf(errmsg,
+               "Delete %s %s: ",
+               type, ug_params->group);
+          CTSAMSG_print(ACF2_MIN_VER2,
+                        msgs, NULL, dest,
+                        errmsg,
+                        "16.0","Roles",
+                        "Delete ROLE request rejected");
+          rc = ESA_FATAL;
+          goto exit;
+         }
+        }
+       else if (strcmp(pair->value,"Source") EQ 0)
+        {
+         strcpy(type,"SOURCE");
+         strcpy(xref,"SGP");
+        }
+
+
+      /*
+       *   Validate that the xref name provided is valid
+       */
+
+      rc = XREF_Validate_name(ug_params->group,
+                              ESA_COMP_DELUG,
+                              admin_params);
+      if (rc NE ESA_OK)
+       {
+       /* WS10079T
+        sprintf(errmsg,
+         "Delete %s: invalid %s name = %s",
+         type, type, ug_params->group);
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+               func, errmsg, 16, __LINE__);                  WS10079T */
+        sprintf(errmsg,                                   /* WS10079T */
+               "Delete %s %s: %s is invalid.",            /* WS10079T */
+               pair->value,                               /* WS10079T */
+               ug_params->group,ug_params->group);        /* WS10079T */
+        CTSAMSG_print(ACF2_AGGR_RCMND,                    /* WS10079T */
+                      msgs, NULL, dest,                   /* WS10079T */
+                      errmsg,                             /* WS10079T */
+                      pair->value);                       /* WS10079T */
+        rc = ESA_FATAL;
+        goto exit;
+       }
+
+      if (ADDINFO_alloc(func,1,&caddinfo,dest,msgs)
+                        NE ESA_OK)
+       {
+        sprintf(errmsg,"ADDINFO_alloc of caddinfo failed. rc=%d",rc);
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+               func, errmsg, 16, __LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+       };
+
+      /*
+       *   XREF_Commands_Create builds XREF commands for the DEL
+       *   request in xxx_command areas pointed by xref_command_struct.
+       *   We will need to free these xxx_command areas at the end.
+       */
+
+      rc = XREF_Commands_Create(
+                  xref,
+                  addinfo,
+                  ug_params->group,
+                  "DEL",
+                  NULL,
+                  NULL,
+                  &xref_command_struct,
+                  ESA_COMP_DELUG,
+                  admin_params);
+
+      ESA_DIAG_printf(ESA_COMP_DELUG, 6,
+               "XREF_Commands_Create rc = %d",rc);
+
+      if (rc NE ESA_OK)
+       {
+        sprintf(errmsg,
+               "Delete %s %s: "
+               "XREF_Commands_Create rc = %d",
+               type, ug_params->group,
+               rc);
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+            func, errmsg, 16, __LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+       }
+
+      /*
+       *   Only DEL is a valid operation for DEL request.
+       */
+
+
+      if ( ((xref_command_struct.add_command NE NULL)
+             OR
+            (xref_command_struct.rep_command NE NULL))
+             AND
+            (xref_command_struct.del_command EQ NULL)  )
+       {
+        sprintf(errmsg,
+            "Delete %s %s: "
+            "Insert must include DEL and must not include "
+            "ADD or REP",
+            type, ug_params->group);
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+            func, errmsg,
+            16, __LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+       }
+
+      xbhandle = calloc(1, sizeof(XBhandle_rec_typ));
+      if (xbhandle EQ NULL)
+       {
+          CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+          "XBhandle", sizeof(XBhandle_rec_typ));
+          rc = ESA_FATAL;
+          goto exit;
+       }
+      strcpy(xbhandle->request_type,"XREFONLY");
+      strcpy(xbhandle->xrefname,ug_params->group);
+      xbhandle->PB_type        = xref[0]; /*1st char of ROL/SGP*/
+      xbhandle->active_request = 'N';
+      xbhandle->need_rec_YN    = 'N';
+      xbhandle->sysidYN        = NULL_CHAR;
+      xbhandle->active_check   = NULL_CHAR;
+      xbhandle->active_default = NULL_CHAR;
+      xbhandle->shortest       = NULL_CHAR;
+      xbhandle->XREF_PB_handle   = NULL;
+      xbhandle->Groups_PB_handle = NULL;
+      xbhandle->bld_err        = FALSE;
+      xbhandle->bld_nf         = FALSE;
+      xbhandle->XB_err         = FALSE;
+
+      ACF2_rc = ACF2_Get_Xref(
+                    "GETTHIS",
+                    xbhandle,
+                    &get_xref_handle,
+                    'X',
+                    &block_read,
+                    ug_params->group,
+                    xrefname_out,
+                    NULL,
+                    ESA_COMP_DELUG,
+                    admin_params);
+
+      if (ACF2_rc NE ACF2_OK)
+      {
+        if (ACF2_rc EQ ACF2_Not_Found)
+        {
+          CTSAMSG_print(ACF2_XREF_NOT_FOUND,
+                  msgs, NULL, dest,
+                  (xbhandle->PB_type EQ 'R'?
+                                 "Role" : "Source"),
+                  ug_params->group);
+        }
+        else
+        {
+          sprintf(errmsg,
+             "Delete %s %s: "
+             "ACF2_Get_Xref GETTHIS rc =%d",
+             type,
+             ug_params->group,
+             ACF2_rc);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                  dest, component, func,
+                  errmsg,
+                  16, __LINE__);
+        }
+        rc = ESA_FATAL;
+        goto exit;
+      }
+
+      /**************************************************************/
+      /* Call ACF2cmd to delete the Role / RoleGroup / Source /     */
+      /* SourceGroup. This is the command:                          */
+      /* ACF2 ROL DELETE rolename ROLE                              */
+      /* or                                                         */
+      /* ACF2 SGP DELETE srcname  SOURCE                            */
+      /**************************************************************/
+
+      ESA_DIAG_printf(ESA_COMP_DELUG, 6,
+                      "Command DEL to ACF2cmd (%s)",
+                      xref_command_struct.del_command);
+      rc = ACF2cmd(func,
+                   EXECOUT_DDNAME,
+                   admin_params->admin_uname,
+                   xref_command_struct.del_command,
+                   MAX_OK_RC_0,
+                   0,
+                   &caddinfo,
+                   NULL,
+                   NULL,
+                   admin_params,
+                   CMDOUT_YES,
+                   ACF2_YES);
+
+      ESA_DIAG_printf(ESA_COMP_DELUG, 6,
+                       "ACF2cmd rc = %d", rc);
+
+      if (rc EQ ESA_FATAL)
+        {
+          sprintf(errmsg,
+                  "DELETE %s %s failed. rc=%d",
+                  type, ug_params->group, rc);
+          ESA_DIAG_printf(ESA_COMP_DELUG, 6, errmsg);
+
+          CTSAMSG_print(ACF2_CMD_FAILURE, msgs, NULL, dest,
+                  "Delete",
+                  type, ug_params->group, rc);
+          rc = ESA_FATAL;
+          goto exit;
+        };
+
+      /**************************************************************/
+      /* If the user requested that we issue the NEWXREF command,   */
+      /* call ACF2cmd to issue the NEWXREF command. This is the     */
+      /* command:                                                   */
+      /* ACF2 ROL F ACF2,NEWXREF,TYPE(ROL)                          */
+      /* or                                                         */
+      /* ACF2 SGP F ACF2,NEWXREF,TYPE(SGP)                          */
+      /* The commnad has been prepared by Xref_Commands_Create in   */
+      /*   xref_command_struct.ref_command area                     */
+      /**************************************************************/
+
+      if (xref_command_struct.ref_command NE NULL)
+      {
+         ESA_DIAG_printf(ESA_COMP_DELUG, 6,
+                         "Command REFRESH to ACF2cmd (%s)",
+                         xref_command_struct.ref_command);
+         rc = ACF2cmd(func,
+                      EXECOUT_DDNAME,
+                      admin_params->admin_uname,
+                      xref_command_struct.ref_command,
+                      MAX_OK_RC_0,
+                      0,
+                      &caddinfo,
+                      NULL,
+                      NULL,
+                      admin_params,
+                      CMDOUT_YES,
+                      ACF2_YES);
+
+      ESA_DIAG_printf(ESA_COMP_DELUG, 6,
+                       "ACF2cmd rc = %d", rc);
+
+        /*
+         *   If REFRESH command failed we don't want to fail the
+         *   transaction, just issue a warning
+         */
+
+        if (rc NE ESA_OK)      /* refresh failed?  */
+          {
+            sprintf(errmsg,
+                  "DELETE %s %s: REFRESH",
+                  type, ug_params->group);
+            CTSAMSG_print(ACF2_RESULTS_UNCERTAIN,
+               msgs, NULL, dest,
+               errmsg,rc);
+            rc = ESA_WARN;
+            goto exit;
+          };
+
+      } /* if refresh  */
+      goto exit;
+    } /* if (pair NE NULL) */
+
+   group_code:
+   pair = NULL;
+   /*----------------------------------------------------------*/
+   /* Check whether REFRESH_GDB is set to "Y".  If yes,        */
+   /* display error message and return to caller.              */
+   /*----------------------------------------------------------*/
+
+   rc = admin_params->cs_func.rssprm_get_opt_ptr(
+                                     admin_params->rss_name,
+                                     "REFRESH_GDB",
+                                     sizeof(parm_get),
+                                     parm_get,
+                                     OPT_TRUE,
+                                     OPT_TRUE);
+   if (rc EQ ESA_OK)
+   {
+      ESA_DIAG_printf(ESA_COMP_ADDUG, DEBUG_SHOW_IMPORTANT,
+                      "REFRESH_GDB = |%s|", parm_get);
+      if ( (strcmp (parm_get, "Y") EQ 0) AND
+           (Global_UDB_Active() EQ TRUE) )
+      {
+         CTSAMSG_print(ACF2_CANT_ADDGRP, msgs, NULL, dest);
+         rc = ESA_FATAL;
+         goto exit;
+      }
+   }
+
+   /* * * * * * * * End WS10079 * * * * * * * */
+   RESTORE_ENDING_BLANK(ug_params->group, ESA_COMP_DELUG);/* BS10097 */
+
+  /*
+   *   Open GDB for Update
+   */
+
+   GDB_rc = GDB_Set_Mode(GDB_ReadWrite,admin_params,err);
+   switch(GDB_rc)
+    {
+     case GDB_OK:
+      GDB_open = TRUE;                                    /* WS10079 */
+      break;
+
+     case GDB_Update_Lock_Failed:
+      sprintf(errmsg,"Unable to obtain lock on group database");
+      CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+
+     default:
+      sprintf(errmsg,"Open GDB for Update failed, rc = %d",GDB_rc);
+      CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+    };
+
+  /*
+   *   Re-Position to required Group
+   */
+
+   GDB_rc = GDB_Locate(GDB_RECORD_TYPE_GROUP,ug_params->group,
+                       GDB_Exact_Locate);
+
+   switch(GDB_rc)
+    {
+     case GDB_OK:
+      break;
+
+     case GDB_Not_Found:
+      CTSAMSG_print(ERR_NO_GROUP, msgs, NULL, dest, ug_params->group);
+      rc = ESA_FATAL;
+      goto exit;
+
+     default:
+      sprintf(errmsg,"Locate failed for Group %s (rc=%d)",
+              ug_params->group,GDB_rc);
+      CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+    };
+
+  /*
+   *   Get Record (required before delete)
+   */
+
+   GDB_rc = GDB_GetNext(GDB_RECORD_TYPE_GROUP, NULL);
+
+  /*
+   *   Delete Record
+   */
+   GDB_rc = GDB_Delete();
+
+    switch(GDB_rc)
+     {
+      case GDB_OK:
+       break;
+
+      default:
+       sprintf(errmsg,"Delete failed for Group %s (rc=%d)",
+               ug_params->group,GDB_rc);
+       CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+                errmsg, 16,__LINE__);
+       rc = ESA_FATAL;
+       goto exit;
+     };
+  /*
+   *   Finish
+   */
+
+   exit:;
+
+   if (xref_command_struct.add_command NE NULL)           /* WS10079 */
+      free(xref_command_struct.add_command);              /* WS10079 */
+                                                          /* WS10079 */
+   if (xref_command_struct.del_command NE NULL)           /* WS10079 */
+      free(xref_command_struct.del_command);              /* WS10079 */
+                                                          /* WS10079 */
+   if (xref_command_struct.rep_command NE NULL)           /* WS10079 */
+      free(xref_command_struct.rep_command);              /* WS10079 */
+                                                          /* WS10079 */
+   if (xref_command_struct.ref_command NE NULL)           /* WS10079 */
+      free(xref_command_struct.ref_command);              /* WS10079 */
+  /*
+   *   Close GDB
+   */
+   if (caddinfo NE NULL)                                  /* WS10079 */
+    ADDINFO_free(&caddinfo);                              /* WS10079 */
+   if (GDB_open EQ TRUE)                                  /* WS10079 */
+   {                                                      /* WS10079 */
+      GDB_rc = GDB_Set_Mode(GDB_Closed,admin_params,err);
+
+      if (GDB_rc NE GDB_OK)
+       {
+         sprintf(errmsg,"GDB close failed, rc = %d",GDB_rc);
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                  func, errmsg, 16,__LINE__);
+         rc = ESA_FATAL;
+       }
+      else                                                /* WS10079 */
+         GDB_open = FALSE;                                /* WS10079 */
+   }                                                      /* WS10079 */
+
+
+   term:;
+
+   ESA_DIAG_exit(ESA_COMP_DELUG, DEBUG_SHOW_IMPORTANT, func, rc);
+
+   return rc;
+
+}

@@ -1,0 +1,1928 @@
+ /**************************************************************
+ *                                                             *
+ * Title            : Add user to user group (ACF2)            *
+ *                                                             *
+ * File Name        : ctsbicn.c                                *
+ *                                                             *
+ * Author           : Yishay Yovel                             *
+ *                                                             *
+ * Creation Date    : 20/07/97                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ * In ACF2 we implement a virtual group concept. A group is    *
+ * a set of UIDMASKs representing values that should be placed *
+ * in a user's UID string to give him access rights. The UID   *
+ * masks in the group definitions sets EXACTLY the same access *
+ * rights. It is used as an alternative where it is impossible *
+ * to impose a mask on a UID string, but another one can be    *
+ * imposed.                                                    *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who      When     Description                      *
+ * -------- -------- -------- -------------------------------- *
+ * BS2306   Guy      27/10/97 added new constant for group_uid *
+ *                            and dest+msgs parms to function  *
+ * PS0321   Guy      28/10/98 Added UIDX field (MULTI VALUE)   *
+ * PS0339   Guy      26/11/98 Return connections of all user   *
+ *                            UIDs if MULTI VALUED             *
+ * PS0351   Guy      06/12/98 Support Multivalued fields       *
+ * PS0357   Guy      17/12/98 Remove internal error message    *
+ * PS0458   Michael  18/03/01 User to UG conns fix             *
+ * BS2522   Yonatan  22/04/02 when UID updated, generate       *
+ *                            an update to ESS.                *
+ * BS2556   AvnerL   14/10/02 send acf2 original error msg     *
+ * BS10097  SeligT   19/11/18 ACF2 Group Aggregation Endless   *
+ *                            Loop                             *
+ * IS10178  SeligT   18/12/18 Supporting LID Anywhere in UID   *
+ * WS10076A AvnerL   19/01/20 add admin_params 2 ACF2_Get_Group*
+ * WS10078T ThomaS   10/05/20 add LID to role or source        *
+ * BS10108T ThomaS   04/10/20 Support SYSID                    *
+ * WS10079  ThomaS   29/12/20 JPMC phase2                      *
+ * WS10079N NuritY   13/01/21 JPMC phase2                      *
+ * WS10084  ThomaS   16/07/23 ACFRPTRX replacement             *
+ * BS10134  AvnerL   18/02/24 S0C4 when Sources aggregation    *
+ * WS10082N NuritY   26/11/23 Drop interception due to hotpath *
+ * WS10090  Nurity   01/09/24 Allow uid collision              *
+ **************************************************************/
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDLIB
+ #include   STDIO
+ #include   STRING
+
+ /*
+  *   ESA include files
+  */
+
+ #include ESA_DIAG
+ #include ESA_API
+ #include ESA_API_CODES
+ #include ESA_CTSAMSG                         /* WS10078T */
+
+ #include API_ADDINFO
+ #include API_AUTH
+
+ #include MVS_OS_CLI
+ #include MVS_CODES                           /* WS10078T */
+ #include MVS_COMP                            /* WS10078T */
+
+ #include ACF2_CODES
+ #include ACF2
+ ASM_RTN_TYP           cts2ver;                         /* WS10079T */
+
+/* WS10079N - end  */
+static ESA_RC Restore_XREF_commands(
+                  char                 * type,
+                  char                 * xref_name,
+                  char                 * command_ops_to_restore,
+                  XREF_Operations_Lists_typ * include_op_lists,
+                  XREF_Operations_Lists_typ * exclude_op_lists,
+                  ESA_DIAG_COMP_typ      diag_comp,
+                  ADMIN_PARAMS_rec_typ * admin_params);
+/* WS10079N - end  */
+
+ static char component[] = "CTSBICN";
+ static int GDB_Opened = FALSE;
+
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : CTSAddUserToUG                             *
+ *                                                             *
+ * DESCRIPTION    : ADD User to UG                             *
+ *                                                             *
+ * INPUT          : u2ug_params: Connection information        *
+ *                  addinfo    : Connection ADDINFO            *
+ *                  admin,err                                  *
+ *                                                             *
+ * OUTPUT         : none                                       *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ **************************************************************/
+ ESA_RC CTSAddUserToUG (U2UG_PARAMS_rec_typ  * u2ug_params,
+                        ADDINFO_rec_typ      * addinfo,
+                        ADMIN_PARAMS_rec_typ * admin_params,
+                        ERR_STRUCT_rec_typ   * err)
+ {
+
+   static char                func[]="CTSAddUserToUG";
+
+  /*
+   *   Variables
+   */
+
+   ESA_RC                     rc = ESA_OK;
+   /* WS10082N ESA_RC                 rc_notify = ESA_OK; /@ BS2522 @/*/
+   GDB_Codes                  GDB_rc;
+   CTSAMSG_HANDLE_rec_ptr     msgs;
+   CTSAMSG_DEST_TABLE_rec_ptr dest;
+   char                       errmsg[256]="";
+   char                       temp[256]="";
+   char                       UIDs_List[9600];            /* PS0339 */
+   char                       entry_sep[2];               /* PS0351 */
+   char                       msg[81]="";                 /* PS0351 */
+   char                      *current_user_uid;           /* PS0351 */
+   UIDMASK                    User_UID;
+   UIDMASK                    temp_uid;
+   UIDMASK                    Primary_UID;                /* PS0351 */
+   UIDMASK                    Group_UID[ACF2_MAX_GRP_UIDMASKS];
+                                                          /* BS2306 */
+   int i, Group_UID_Count = 0;
+   USER_PARAMS_rec_typ        user_params;
+   ADDINFO_rec_ptr            laddinfo = NULL;
+   ADDINFO_rec_ptr            uaddinfo = NULL;
+   ONE_FIELD_rec_ptr          pair;
+   int                        ACF2_rc = ACF2_OK;
+   int                        reason_code = 0;
+   int                        conn_exists;                /* PS0351 */
+   int                        handle_multi;               /* PS0351 */
+   int show_match = FALSE, show_conflict = FALSE;
+   int                        LID_In_UID, LID_Offset;     /* BS10097 */
+   int                        LID_Length;                 /* IS10178 */
+   ACF2_PARAMS_rec_typ      * params_ptr = NULL;          /* BS10097 */
+   /* WS10079N ADDINFO_rec_ptr   iaddinfo[1] = {NULL};  * WS10078T * */
+   /* WS10079N GET_GROUP_MODE    mode;                  * WS10078T * */
+   ONE_FIELD_rec_ptr          include_pair = NULL;       /* WS10078T */
+   ONE_FIELD_rec_ptr          exclude_pair = NULL;       /* WS10078T */
+   char                       in_include = NULL_CHAR;    /* WS10078T */
+   char                       in_exclude = NULL_CHAR;    /* WS10078T */
+   ADDINFO_rec_ptr            caddinfo = NULL;           /* WS10078T */
+   char                       xref[4]  = "";             /* WS10078T */
+   char                     * ptr = NULL;                /* WS10078T */
+   XBhandle_rec_typ         * xbhandle         = NULL;   /* WS10079  */
+   void                     * get_xref_handle  = NULL;   /* WS10079  */
+   char                       block_read    = NULL_CHAR; /* WS10079  */
+   char                       xrefname_out[19] = "";     /* WS10079  */
+   XREF_Cmd_Struct_typ        xref_command_struct;       /* WS10079  */
+   XREF_Operations_Lists_typ  * include_op_lists = NULL; /* WS10079  */
+   XREF_Operations_Lists_typ  * exclude_op_lists = NULL; /* WS10079  */
+   char                  command_ops_to_restore[7] = ""; /* WS10079  */
+   char                       xreftype[8] = "";          /* WS10079  */
+   int                        rc_asm=0;                  /* WS10079  */
+   char                       acf_version[5]="";         /* WS10079  */
+   int                        dbg_lvl=0;                 /* WS10079  */
+   char          to_active_roles[]="to active roles";    /* WS10079  */
+   char          to_active_sources[]="to active sources";/* WS10079  */
+   char                     * allowed = NULL;            /* WS10079  */
+   /* WS10079
+   short                      max_num;                   /@ WS10078T @/
+   HAVE_MORE_typ              have_more;                 /@ WS10078T @/
+   short                      actual_num;                /@ WS10078T @/
+   void                     * handle = NULL;             /@ WS10078T @/
+   UG_PARAMS_rec_typ          ug_prm_in[1];              /@ WS10078T @/
+   UG_PARAMS_rec_typ          ug_prm_out[1];             /@ WS10078T @/
+   OBJ_EXISTS_typ             obj_exists[1];             /@ WS10078T @/
+   char                       cmd[100] = "";             /@ WS10078T @/
+   char                     * srch = NULL;               /@ WS10078T @/
+   ONE_FIELD_rec_ptr          refresh_pair = NULL;       /@ WS10078T @/
+   ONE_FIELD_rec_ptr          multi_pair   = NULL;       /@ BS10108T @/
+   ONE_FIELD_rec_ptr          sysid_pair   = NULL;       /@ BS10108T @/
+   short                      in_num;                    /@ WS10078T @/
+   char                       refresh = 'N';             /@ WS10078T @/
+   char                       skip_refresh = 'Y';        /@ WS10078T @/
+   ESA_RC                     ref_rc    = ESA_OK;        /@ WS10078T @/
+   ESA_RC                     roll_rc   = ESA_OK;        /@ WS10078T @/
+   char                       type = NULL_CHAR;          /@ WS10078T @/
+      WS10079 */
+
+  /*
+   *   Initialize
+   */
+
+   ESA_DIAG_enter(ESA_COMP_ADDU2UG, DEBUG_SHOW_IMPORTANT, func);
+
+   msgs = admin_params->ctsamsg_handle;
+   dest = admin_params->ctsamsg_dest;
+   params_ptr = admin_params->apiinit_handle;             /* WS10079N */
+
+   /* WS10079N  - start */
+   if (ESA_DIAG_get_debug_level(ESA_COMP_ADDU2UG) GE 6)
+   {
+      ESA_DIAG_printf(ESA_COMP_ADDU2UG, 0, "Addinfo at entry");
+      ADDINFO_dump(addinfo, 1);
+   };
+   /* WS10079N - end   */
+
+   entry_sep[0] = ADDINFO_LIST_ENTRY;                     /* PS0351 */
+   entry_sep[1] = NULL_CHAR;                              /* PS0351 */
+
+  /*  WS10079    start   */
+  xref_command_struct.add_command = NULL;
+  xref_command_struct.del_command = NULL;
+  xref_command_struct.rep_command = NULL;
+  xref_command_struct.ref_command = NULL;
+  /*  WS10079    end     */
+  /*     Start WS10078T                                            */
+  pair = ADDINFO_search("TYPE", ACF_ADDINFO_KWD_LEN,
+                        addinfo->pair,
+                        addinfo->num_pairs);
+  if (pair NE NULL)
+   {
+      ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+          "XREF TYPE = <%.8s> user = <%.8s> group = <%.8s>",
+           pair->value,u2ug_params->user,u2ug_params->group);
+
+      if (strcmp(pair->value,"Role") EQ 0)
+       {
+        /* type='R'; WS10079 */
+        strcpy(xref,"ROL");
+        /* WS10079N mode = GET_MANY_ROLES;  */
+        /* WS10079T start */
+        /*
+         *   Validate ACF2 version GE 16.0
+         */
+
+         if ((int)ESA_DIAG_get_debug_level(ESA_COMP_ADDU2UG) GE 6)
+            dbg_lvl=1;
+
+         rc_asm=cts2ver(&dbg_lvl, acf_version);
+         acf_version[3]=NULL_CHAR;
+         ESA_DIAG_printf(ESA_COMP_ADDU2UG ,6,"ACF2 ver=<%s>",
+                         acf_version);
+         if (strcmp(acf_version,"160") LT 0)
+         {
+          sprintf(errmsg,
+           "Connect user %s to %s %s: ",
+           u2ug_params->user,
+           pair->value,u2ug_params->group);               /* BS10134 */
+           /* BS10134 xreftype,u2ug_params->group);  */
+          CTSAMSG_print(ACF2_MIN_VER2,
+                        msgs, NULL, dest,
+                        errmsg,
+                        "16.0","Roles",
+                        "Connect request rejected");
+          rc = ESA_FATAL;
+          goto exit;
+         }
+        /* WS10079T end   */
+       }
+      else if (strcmp(pair->value,"Source") EQ 0)
+       {
+        /* type='S'; WS10079 */
+        strcpy(xref,"SGP");
+        /* WS10079N mode = GET_MANY_SOURCES;  */
+       }
+      else if (strcmp(pair->value,"Group" ) EQ 0)
+       {
+        /* type='G'; WS10079 */
+        goto skip_xref;
+       }
+      else
+       {
+        /* WS10079T start
+        sprintf(errmsg,"Invalid Type in addinfo: %.40s", pair->value);*/
+        sprintf(errmsg,
+         "Connect user = %s group = %s: "
+         "Invalid Type in addinfo= %.40s",
+          u2ug_params->user,u2ug_params->group,pair->value);
+        /* WS10079T end   */
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+       }
+      strcpy(xreftype,pair->value);                      /* WS10079T */
+      /*   WS100079 start         REFRESH preparation is handled
+           now by Xref_Commands_Create
+      refresh_pair = ADDINFO_search("REFRESH", ACF_ADDINFO_KWD_LEN,
+                        addinfo->pair,
+                        addinfo->num_pairs);
+      if (refresh_pair NE NULL)
+       {
+          ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+          "XREF REFRESH = <%.8s>",
+           refresh_pair->value);
+
+          if (strcmp(refresh_pair->value,"Y") EQ 0)   /@ WS10078KG @/
+              refresh = 'Y';
+          else if (strcmp(refresh_pair->value,"N") EQ 0) /@ WS10078KG @/
+              refresh = 'N';
+          else
+            {
+             sprintf(errmsg,"Invalid REFRESH attribute = <%.8s>",
+                     refresh_pair->value);
+             CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                    component,func,
+                    errmsg, 16,__LINE__);
+             rc = ESA_FATAL;
+             goto exit;
+            }
+       }
+      else
+       {
+        sprintf(errmsg,"REFRESH attribute missing");
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+       }
+          WS10079  end       */
+
+      /*  WS10079    start   */
+      /*
+       *   Validate that the xref name provided is valid
+       */
+
+      rc = XREF_Validate_name(u2ug_params->group,
+                              ESA_COMP_ADDU2UG,
+                              admin_params);
+      if (rc NE ESA_OK)
+       {
+        /* WS10079T
+        sprintf(errmsg,
+         "Connect user = %s invalid group name = %s",
+          u2ug_params->user,u2ug_params->group);
+
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+          func, errmsg, 16, __LINE__);
+          func, "xref name is not valid", 16, __LINE__);     WS10079T */
+        sprintf(errmsg,                                   /* WS10079T */
+        "Connect user %s to %s %s: %s is invalid.",       /* WS10079T */
+        u2ug_params->user,                                /* WS10079T */
+        xreftype,u2ug_params->group,u2ug_params->group);  /* WS10079T */
+        CTSAMSG_print(ACF2_AGGR_RCMND,                    /* WS10079T */
+                      msgs, NULL, dest,                   /* WS10079T */
+                      errmsg,                             /* WS10079T */
+                      "Account");                         /* WS10079T */
+        rc = ESA_FATAL;
+        goto exit;
+       }
+      /*  WS10079    end     */
+
+      /* WS10079N
+      if (ADDINFO_alloc(func,ACF2_ADDINFO,&iaddinfo[0],dest,msgs)
+                        NE ESA_OK)   */
+      if (ADDINFO_alloc(func,ACF2_ADDINFO,&laddinfo,      /* WS10079N */
+                        dest,msgs)  NE ESA_OK)            /* WS10079N */
+       {
+        /* WS10079N
+
+        sprintf(errmsg,"ADDINFO_alloc of iaddinfo failed. rc=%d",rc); */
+        sprintf(errmsg,                                   /* WS10079N */
+           "ADDINFO_alloc of iaddinfo failed. rc=%d",rc); /* WS10079N */
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+       };
+
+      rc = ADDINFO_insert(TYPE_1B,    /* change from 1A to 1B WS10079 */
+                          "IncludeList", /* becuase it multivalued now*/
+                          NULL,
+           /* WS10079N    iaddinfo[0],   */
+                          laddinfo,                       /* WS10079N */
+                          ACF_ADDINFO_KWD_LEN,
+                          ACF_ADDINFO_VAL_LEN,
+                          UNIQUE);
+
+      if (rc NE ESA_OK)
+         {
+          sprintf(errmsg,"Insert IncludeList keyword failed. rc=%d",rc);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+          rc = ESA_FATAL;
+          goto exit;
+         }
+
+      rc = ADDINFO_insert(TYPE_1B,    /* chnage from 1A to 1B WS10079 */
+                          "ExcludeList", /* becuase it multivalued now*/
+                          NULL,
+           /* WS10079N    iaddinfo[0],   */
+                          laddinfo,                       /* WS10079N */
+                          ACF_ADDINFO_KWD_LEN,
+                          ACF_ADDINFO_VAL_LEN,
+                          UNIQUE);
+
+      if (rc NE ESA_OK)
+         {
+          sprintf(errmsg,"Insert ExcludeList keyword failed. rc=%d",rc);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+          rc = ESA_FATAL;
+          goto exit;
+         }
+
+      /* WS10079  start */
+      /* We want to issue a special message if found but not active */
+      rc = ADDINFO_insert(TYPE_1A,
+                          "Active",
+                          NULL,
+                          laddinfo,
+                          ACF_ADDINFO_KWD_LEN,
+                          ACF_ADDINFO_VAL_LEN,
+                          UNIQUE);
+
+      if (rc NE ESA_OK)
+         {
+          sprintf(errmsg,"Insert active keyword failed. rc=%d",rc);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+          rc = ESA_FATAL;
+          goto exit;
+         }
+
+      xbhandle = calloc(1, sizeof(XBhandle_rec_typ));
+      if (xbhandle EQ NULL)
+       {
+          CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+          "XBhandle", sizeof(XBhandle_rec_typ));
+          rc = ESA_FATAL;
+          goto exit;
+       }
+      strcpy(xbhandle->request_type,"XREFONLY");
+      strcpy(xbhandle->xrefname,u2ug_params->group);
+      xbhandle->PB_type        = xref[0]; /* first char of ROL or SGP */
+      xbhandle->active_request = 'C';
+      xbhandle->need_rec_YN    = 'Y';
+      xbhandle->sysidYN        = NULL_CHAR;
+      xbhandle->active_check   = NULL_CHAR;
+      xbhandle->active_default = NULL_CHAR;
+      xbhandle->shortest       = NULL_CHAR;
+      xbhandle->XREF_PB_handle   = NULL;
+      xbhandle->Groups_PB_handle = NULL;
+      xbhandle->bld_err        = FALSE;
+      xbhandle->bld_nf         = FALSE;                   /* WS10079N */
+      xbhandle->XB_err         = FALSE;
+
+      /* WS10079N ACF2_Get_Xref(  */
+      ACF2_rc = ACF2_Get_Xref(                            /* WS10079N */
+                              "GETTHIS",
+                              xbhandle,
+                              &get_xref_handle,
+                              'X',
+                              &block_read,
+                              u2ug_params->group,
+                              xrefname_out,
+                              laddinfo,
+                              ESA_COMP_ADDU2UG,
+                              admin_params);
+
+      /* WS10079N
+      if ( rc EQ ACF2_Not_Found)
+         {
+           sprintf(errmsg,
+           "Connect user %s to %s %s: %s not found",
+           u2ug_params->user,
+           xreftype,u2ug_params->group,u2ug_params->group);
+           CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                   dest, component, func,
+                   errmsg,
+                   16, __LINE__);               */
+      if ( ACF2_rc EQ ACF2_Not_Found)                     /* WS10079N */
+         {                                                /* WS10079N */
+           CTSAMSG_print(ACF2_XREF_NOT_FOUND,             /* WS10079N */
+                   msgs, NULL, dest,                      /* WS10079N */
+                   (xbhandle->PB_type EQ 'R'?             /* WS10079N */
+                                      "Role" : "Source"), /* WS10079N */
+                   u2ug_params->group);                   /* WS10079N */
+           rc = ESA_FATAL;
+           goto exit;
+         }
+      /* WS10079N if ( rc NE ESA_OK)  */
+      if ( ACF2_rc NE ESA_OK)                             /* WS10079N */
+         {
+           sprintf(errmsg,
+                "Connect user %s to %s %s: "
+                "ACF2_Get_Xref rc =%d",
+                u2ug_params->user,
+                xreftype,u2ug_params->group,ACF2_rc);
+           CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                   dest, component, func,
+                   errmsg,
+                   16, __LINE__);
+           rc = ESA_FATAL;
+           goto exit;
+         }
+      /*** BS10134 start ***/
+      /* Althoiugh we did not add isIncomlete to the addinfo,   */
+      /* we may get is back if the role/source is too long.     */
+      /* If isIncomplete=Y, we do not have the whole role.      */
+      /* We will fail the request because we cannot use it for  */
+      /* validating and executing the request.                  */
+      else            /* ACF2_rc EQ ESA_OK */
+      {
+       pair = ADDINFO_search("isIncomplete",
+                ACF_ADDINFO_KWD_LEN,
+                laddinfo->pair,
+                laddinfo->num_pairs);
+       if (pair NE NULL)
+       {
+        if(pair->value[0] EQ 'Y')
+        {
+          sprintf(errmsg,
+          "Cannot connect user %s to %s %s becasue it is too long",
+                  u2ug_params->user,
+                  xreftype,u2ug_params->group);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                   dest, component, func,
+                   errmsg,
+                   16, __LINE__);
+         rc = ESA_FATAL;
+         goto exit;
+        }
+       }
+      }
+      /*** BS10134 end   ***/
+      /* item found - need to verify it is active */
+      pair = ADDINFO_search("Active",
+                          ACF_ADDINFO_KWD_LEN,
+                          laddinfo->pair,
+                          laddinfo->num_pairs);
+      if (pair EQ NULL)
+         {
+           CTSAMSG_print(ERR_INTERNAL2, msgs, NULL,
+                   dest, component, func,
+                   "active attribute not found",  /* we just added it!*/
+                   16, __LINE__);
+           rc = ESA_FATAL;
+           goto exit;
+         }
+
+      if (pair->value[0] NE 'Y')
+         {
+           sprintf(errmsg,
+           "Connect user %s to",
+           u2ug_params->user);
+
+           if (strcmp(xreftype,"Role") EQ 0)
+              allowed = to_active_roles;
+           else
+              allowed = to_active_sources;
+
+           CTSAMSG_print(ACF2_NOT_ALLOWED, msgs, NULL, dest,
+                   errmsg,       /* Connect user <user> to  */
+                   xreftype,     /* Role|Source             */
+                   u2ug_params->group, /* <xref name>       */
+                   u2ug_params->group, /* <xref name>       */
+                   "Connect",
+                   allowed);     /* to active roles|sources */
+           /*
+           CTS3964E %s %s %s is not allowed. Reason: %s is not active.
+                     %s is allowed only %s.  */
+           rc = ESA_FATAL;
+           goto exit;
+         }
+          ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+              "ACF2_Get_Xref GETTHIS for %s found %s as Active",
+              u2ug_params->group,
+              xrefname_out);
+      /* WS10079  end   */
+
+      /* WS10079  start
+      /@ BS10108T - start  @/
+      rc = ADDINFO_insert(TYPE_1A,
+                          "SYSID",
+                          NULL,
+                          iaddinfo[0],
+                          ACF_ADDINFO_KWD_LEN,
+                          ACF_ADDINFO_VAL_LEN,
+                          UNIQUE);
+
+      if (rc NE ESA_OK)
+         {
+          sprintf(errmsg,"Insert SYSID keyword failed. rc=%d",rc);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+          rc = ESA_FATAL;
+          goto exit;
+         }
+
+      rc = ADDINFO_insert(TYPE_1A,
+                          "#is#multi#rec",
+                          NULL,
+                          iaddinfo[0],
+                          ACF_ADDINFO_KWD_LEN,
+                          ACF_ADDINFO_VAL_LEN,
+                          UNIQUE);
+
+      if (rc NE ESA_OK)
+         {
+          sprintf(errmsg,
+                  "Insert #is#multi#rec keyword failed. rc=%d",rc);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+          rc = ESA_FATAL;
+          goto exit;
+         }
+      ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+          "#is#multi#rec inserted");
+      /@ BS10108T - end    @/
+         WS10079    end    */
+
+
+      if (ADDINFO_alloc(func,1,&caddinfo,dest,msgs)
+                        NE ESA_OK)
+       {
+        sprintf(errmsg,"ADDINFO_alloc of caddinfo failed. rc=%d",rc);
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+        rc = ESA_FATAL;
+        goto exit;
+       };
+
+
+      /* WS10079  start
+      strcpy((char *)ug_prm_in->group,u2ug_params->group);
+      max_num = 1;
+      in_num = 1;
+
+      rc= CTSGetUGs (mode,
+                  NULL,
+                  max_num,
+                  &actual_num,
+                  &have_more,
+                  &handle,
+                  in_num,
+                  ug_prm_in,
+                  ug_prm_out,
+                  iaddinfo,
+                  obj_exists,
+                  admin_params,
+                  err);
+
+
+      if (rc NE ESA_OK)
+        {
+          sprintf(errmsg,"Call to CTSGetUGs failed. rc=%d",rc);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+          rc = ESA_FATAL;
+         goto exit;
+        };
+
+  /@ BS10108T - start  @/
+  /@ If there are multiple roles/sources with the same name
+     (and different SYSID), we don't know which entity is the
+     correct one to add the LID to, so we fail the transaction   @/
+
+  multi_pair = ADDINFO_search("#is#multi#rec",ACF_ADDINFO_KWD_LEN,
+                        iaddinfo[0]->pair,
+                        iaddinfo[0]->num_pairs);
+
+  if (multi_pair NE NULL)
+   {
+      ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+          "#is#multi#rec=<%s>",multi_pair->value);
+      if (strcmp(multi_pair->value,"Y") EQ 0)
+       {
+          sprintf(errmsg,
+                  "ADD LID <%s> to %s <%s> rejected: "
+                  "Multiple <%s> entities exist",
+                  u2ug_params->user, pair->value, u2ug_params->group,
+                  u2ug_params->group);
+          CTSAMSG_print(WARN_INT1, msgs, NULL, dest, component,func,
+                        errmsg,16,__LINE__);
+          rc = ESA_FATAL;
+          goto exit;
+       };
+   }
+
+  sysid_pair = ADDINFO_search("SYSID",ACF_ADDINFO_KWD_LEN,
+                        iaddinfo[0]->pair,
+                        iaddinfo[0]->num_pairs);
+
+  if (sysid_pair EQ NULL)
+   {
+    CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+           func, "No SYSID attribute", 16, __LINE__);
+    rc = ESA_FATAL;
+    goto exit;
+   }
+
+
+  ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+          "SYSID=<%s>",sysid_pair->value);
+
+  if (sysid_pair->vallen EQ 0)
+   {
+    CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+           func, "No SYSID value", 16, __LINE__);
+    rc = ESA_FATAL;
+    goto exit;
+   }
+  /@ BS10108T - end    @/
+          WS10079    end    */
+
+
+  include_pair = ADDINFO_search("IncludeList",ACF_ADDINFO_KWD_LEN,
+                        laddinfo->pair,                   /* WS10079N */
+                        laddinfo->num_pairs);             /* WS10079N */
+         /* WS10079N    iaddinfo[0]->pair,
+                        iaddinfo[0]->num_pairs);  */
+
+  in_include = 'N';
+  if (include_pair NE NULL)
+   {
+      ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+          "IncludeList=<%s>",include_pair->value);
+      /* search in the list and set in_include = 'Y' if found */
+      /*   WS100079 start
+      srch = NULL;
+      ptr =NULL;
+      IS_LID_IN_LIST(u2ug_params->user,include_pair->value,srch,ptr);
+           WS10079    end    */
+
+      /*   WS100079 start  */
+      /* If the LID is already in the IncludeList, no need to add  */
+      ptr = ADDINFO_list_search(
+                    include_pair->value,
+                    u2ug_params->user,
+                    ADDINFO_LIST_ENTRY);
+      /*   WS100079 end    */
+      if (ptr NE NULL)
+       {
+        ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+                  "<%s> found in include list",u2ug_params->user);
+        in_include = 'Y';
+       }
+   }
+
+  exclude_pair = ADDINFO_search("ExcludeList",ACF_ADDINFO_KWD_LEN,
+                        laddinfo->pair,                   /* WS10079N */
+                        laddinfo->num_pairs);             /* WS10079N */
+         /* WS10079N    iaddinfo[0]->pair,
+                        iaddinfo[0]->num_pairs);  */
+
+  in_exclude = 'N';
+  if (exclude_pair NE NULL)
+   {
+      ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+          "ExcludeList=<%s>",exclude_pair->value);
+      /* search in the list and set in_exclude = 'Y' if found */
+      /*   WS100079 start
+      srch = NULL;
+      ptr =NULL;
+      IS_LID_IN_LIST(u2ug_params->user,exclude_pair->value,srch,ptr);
+           WS10079    end    */
+
+      /*   WS100079 start  */
+      /*   If the LID is in the ExcludeList we need to remove it */
+      ptr = ADDINFO_list_search(
+                    exclude_pair->value,
+                    u2ug_params->user,
+                    ADDINFO_LIST_ENTRY);
+      /*   WS100079 end     */
+      if (ptr NE NULL)
+       {
+        ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+                  "<%s> found in exclude list",u2ug_params->user);
+        in_exclude = 'Y';
+       }
+   }
+
+   /*                                                        WS10079N
+    *  If nothing to do fail or ignore according to          WS10079N
+    *  MSG_CONNGRP_ERR value.                                WS10079N
+    */                                                    /* WS10079N */
+   if ( (in_include EQ 'Y')  AND    /* If in include...      WS10079N */
+        (in_exclude EQ 'N') )       /*   and not in exclude  WS10079N */
+   {                                                      /* WS10079N */
+     if (params_ptr->rssparm_MSG_CONNGRP_ERR[0] EQ 'Y')   /* WS10079N */
+     {                                                    /* WS10079N */
+        CTSAMSG_print(ERR_ALREADY_CONNECTED,              /* WS10079N */
+                      msgs, NULL, dest,                   /* WS10079N */
+                      u2ug_params->user,                  /* WS10079N */
+                      u2ug_params->group);                /* WS10079N */
+        rc = ESA_FATAL;                                   /* WS10079N */
+     }                                                    /* WS10079N */
+     else                                                 /* WS10079N */
+       rc = ESA_OK;                                       /* WS10079N */
+                                                          /* WS10079N */
+     goto exit;                                           /* WS10079N */
+   };                                                     /* WS10079N */
+
+   if (in_include EQ 'N')     /* already in the include list? */
+    {
+      /*   WS100079 start   */
+      /*   Not in IncludeList - need to add it */
+      include_op_lists =
+              calloc(1,sizeof(XREF_Operations_Lists_typ));
+      if (include_op_lists EQ NULL)
+       {
+          CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+          "inc op list", sizeof(XREF_Operations_Lists_typ));
+          rc = ESA_FATAL;
+          goto exit;
+       }
+      include_op_lists->del_list = NULL;
+      include_op_lists->rep_list = NULL;
+      include_op_lists->add_list=
+              calloc(1,strlen(u2ug_params->user)+1);
+      if (include_op_lists->add_list EQ NULL)
+       {
+          CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+          "op_list", strlen(u2ug_params->user)+1);
+          rc = ESA_FATAL;
+          goto exit;
+       }
+       /* Xref_Commands_Create will prepare a command to add
+          the LID to the IncludeList based on what is in the
+          include_op_lists->add_list                         */
+      strcpy(include_op_lists->add_list,u2ug_params->user);
+    }
+
+   if (in_exclude EQ 'Y') /* need to remove it from excludelist? */
+    {
+      /*   Item is in ExcludeList - need to delete it from there */
+      exclude_op_lists =
+              calloc(1,sizeof(XREF_Operations_Lists_typ));
+      if (exclude_op_lists EQ NULL)
+       {
+          CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+          "exc op list", sizeof(XREF_Operations_Lists_typ));
+          rc = ESA_FATAL;
+          goto exit;
+       }
+      exclude_op_lists->add_list = NULL;
+      exclude_op_lists->rep_list = NULL;
+      exclude_op_lists->del_list=
+              calloc(1,strlen(u2ug_params->user)+1);
+      if (exclude_op_lists->del_list EQ NULL)
+       {
+          CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest,
+          "op_list", strlen(u2ug_params->user)+1);
+          rc = ESA_FATAL;
+          goto exit;
+       }
+       /* Xref_Commands_Create will prepare a command to del
+          the LID from the ExcludeList based on what is in the
+          exclude_op_lists->del_list                         */
+      strcpy(exclude_op_lists->del_list,u2ug_params->user);
+    }
+    rc = XREF_Commands_Create(
+                xref,
+                addinfo,
+                u2ug_params->group,
+                "CHA",
+                include_op_lists,
+                exclude_op_lists,
+                &xref_command_struct,
+                ESA_COMP_ADDU2UG,
+                admin_params);
+
+    ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+             "XREF_Commands_Create rc = %d",rc);
+
+
+    if (rc NE ESA_OK)
+     {
+      sprintf(errmsg,
+             "Connect user %s to %s %s: "
+             "XREF_Commands_Create rc =%d",
+             u2ug_params->user,
+             xreftype,u2ug_params->group,rc);
+      ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6, errmsg);
+
+      sprintf(errmsg,
+              "Connect user %s to",
+              u2ug_params->user);
+      CTSAMSG_print(ACF2_CMD_FAILURE, msgs, NULL, dest,
+              errmsg,
+              xreftype,u2ug_params->group,rc);
+      rc = ESA_FATAL;
+      goto exit;
+     }
+
+
+   /*
+    *   If ADD created, issue it first
+    */
+
+
+   if (xref_command_struct.add_command NE NULL)
+     {
+      /*
+       *   Now go issue the command created in
+       *   xref_command_struct.add_command area
+       */
+
+
+      ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+                      "Calling ACF2cmd with ADD command: %s",
+                       xref_command_struct.add_command);
+
+
+      rc = ACF2cmd(func,
+                    EXECOUT_DDNAME,
+                    admin_params->admin_uname,
+                    xref_command_struct.add_command,
+                    MAX_OK_RC_0,
+                    0,
+                    &caddinfo,
+                    NULL,
+                    NULL,
+                    admin_params,
+                    CMDOUT_YES,
+                    ACF2_YES);
+
+      ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+                      "ACF2cmd rc = %d", rc);
+
+      if (rc EQ ESA_FATAL)
+         {
+           sprintf(errmsg,
+                   "CHA ADD of LID %s to %s %s IncludeList "
+                   "failed with rc=%d.\n"
+                   "Command = <%.*s>",
+                   u2ug_params->user,
+                   xref,
+                   u2ug_params->group,
+                   rc,
+                   strlen(xref_command_struct.add_command),
+                   xref_command_struct.add_command);
+           ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6, errmsg);
+
+           sprintf(errmsg,
+                   "Connect user %s to",
+                   u2ug_params->user);
+           CTSAMSG_print(ACF2_CMD_FAILURE, msgs, NULL, dest,
+                   errmsg,
+                   xreftype,u2ug_params->group,rc);
+           rc = ESA_FATAL;
+           goto exit;
+         };
+      strcpy(command_ops_to_restore,"ADD");
+     }
+
+
+   /*
+    *   If DEL created, issue it
+    */
+
+   if (xref_command_struct.del_command NE NULL)
+     {
+      /*
+       *   Now go issue the command created in
+       *   xref_command_struct.del_command area
+       */
+
+       ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+                       "Calling ACF2cmd with DEL command: %s",
+                        xref_command_struct.del_command);
+
+      rc = ACF2cmd(func,
+                    EXECOUT_DDNAME,
+                    admin_params->admin_uname,
+                    xref_command_struct.del_command,
+                    MAX_OK_RC_0,
+                    0,
+                    &caddinfo,
+                    NULL,
+                    NULL,
+                    admin_params,
+                    CMDOUT_YES,
+                    ACF2_YES);
+
+      ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+                      "ACF2cmd rc = %d", rc);
+
+      if (rc EQ ESA_FATAL)
+         {
+           sprintf(errmsg,
+                   "CHA DEL of LID %s from %s %s ExcludeList "
+                   "failed with rc=%d.\n"
+                   "Command = <%.*s>",
+                   u2ug_params->user,
+                   xref,
+                   u2ug_params->group,
+                   rc,
+                   strlen(xref_command_struct.del_command),
+                   xref_command_struct.del_command);
+           ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6, errmsg);
+
+           sprintf(errmsg,
+                   "Connect user %s to",
+                   u2ug_params->user);
+           CTSAMSG_print(ACF2_CMD_FAILURE, msgs, NULL, dest,
+                   errmsg,
+                   xreftype,u2ug_params->group,rc);
+          if (command_ops_to_restore[0] EQ NULL_CHAR)
+           {
+             rc = ESA_FATAL;
+             goto exit;
+           }
+          else
+           {
+             if (strncmp(command_ops_to_restore,"ADD",3) NE 0)
+              {
+                 sprintf(errmsg,
+                   "Unexpected operation to roll back = %s. "
+                   "Expected = ADD. Roll back skipped",
+                   command_ops_to_restore);
+                   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                   component,func, errmsg, 16, __LINE__);
+                   rc = ESA_FATAL;
+                   goto exit;
+              }
+             sprintf(errmsg,
+                  "Connect user %s to",
+                  u2ug_params->user);
+             CTSAMSG_print(ACF2_ROLLING_BACK, msgs, NULL, dest,
+                  errmsg,
+                  xreftype,u2ug_params->group,
+                  strlen(xref_command_struct.add_command),
+                  xref_command_struct.add_command);
+             rc = Restore_XREF_commands(                 /* WS10079N */
+                            xref,
+                            u2ug_params->group,
+                            command_ops_to_restore,
+                            include_op_lists,
+                            exclude_op_lists,
+                            ESA_COMP_ADDU2UG,
+                            admin_params);
+             ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+                      "Restore_XREF_commands rc = %d",rc);
+
+             rc = ESA_FATAL;
+             goto exit;
+           };
+        };
+     }
+
+   /*
+    *   If REFRESH was requested then go issue the command in
+    *   xref_command_struct.ref_command area
+    */
+
+   if (xref_command_struct.ref_command NE NULL)
+    {
+      ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+                      "Calling ACF2cmd with REFRESH command: %s",
+                       xref_command_struct.ref_command);
+      rc = ACF2cmd(func,
+                 EXECOUT_DDNAME,
+                 admin_params->admin_uname,
+                 xref_command_struct.ref_command,
+                 MAX_OK_RC_0,
+                 0,
+                 &caddinfo,
+                 NULL,
+                 NULL,
+                 admin_params,
+                 CMDOUT_YES,
+                 ACF2_YES);
+
+       ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+                       "ACF2cmd rc = %d", rc);
+      /*
+       *   If REFRESH command failed we don't want to fail the
+       *   transaction, just issue a warning
+       */
+
+      if (rc NE ESA_OK)      /* refresh failed?  */
+        {
+          sprintf(errmsg,
+               "Connect user %s to %s %s: REFRESH",
+               u2ug_params->user,
+               xreftype,u2ug_params->group);
+
+          CTSAMSG_print(ACF2_RESULTS_UNCERTAIN,
+             msgs, NULL, dest,
+             errmsg,rc);
+          rc = ESA_WARN;
+          goto exit;
+        };
+    };
+
+    goto exit;                                            /* WS10079N */
+
+   }
+   /* WS10079 end */
+
+      /* call ACF2cmd to add the LID to the include list          */
+
+      /* Build the cmd:                                           */
+      /* BS10108T - start */
+      /* ACF2 ROL/SGP CHANGE Name INCLUDE(LID) ADD SYSID(sysid)   */
+      /*
+      sprintf(cmd, "ACF2 %s CHANGE %s INCLUDE(%s) ADD",
+                   xref,u2ug_params->group,u2ug_params->user);    */
+      /*  WS10079 start
+      sprintf(cmd, "ACF2 %s CHANGE %s INCLUDE(%s) ADD SYSID(%s)",
+          xref,u2ug_params->group,u2ug_params->user,sysid_pair->value);
+      /@ BS10108T - end   @/
+      ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+                      "Command to ACF2cmd (%s)",cmd);
+      rc = ACF2cmd(func,
+                   EXECOUT_DDNAME,
+                   admin_params->admin_uname,
+                   cmd,
+                   MAX_OK_RC_0,
+                   0,
+                   &caddinfo,
+                   NULL,
+                   NULL,
+                   admin_params,
+                   CMDOUT_YES,
+                   ACF2_YES);
+
+      if (rc NE ESA_OK)
+        {
+          sprintf(errmsg,
+         "ADD LID <%s> to INCLUDE of <%s> failed. Check STDMSG. rc=%d",
+          u2ug_params->user,u2ug_params->group,rc);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+          rc = ESA_FATAL;
+          goto exit;
+        };
+      skip_refresh = 'N';
+    } /@ end of adding to include list  @/
+
+   /@ The LID is in the INCLUDE list (originally or we added it)  @/
+   /@ If it is in the EXCLUDE list we have to delete it from it   @/
+
+   if (in_exclude EQ 'Y') /* need to remove it from excludelist? @/
+    {
+      /@ call ACF2cmd to del the LID from the exclude list        @/
+
+      /@ Build the cmd:                                           @/
+      /@ BS10108T - start @/
+      /@ ACF2 ROL/SGP CHANGE Name EXCLUDE(LID) DEL SYSID(sysid)   @/
+      /@
+      sprintf(cmd, "ACF2 %s CHANGE %s EXCLUDE(%s) DEL",
+                   xref,u2ug_params->group,u2ug_params->user);    @/
+
+      sprintf(cmd, "ACF2 %s CHANGE %s EXCLUDE(%s) DEL SYSID(%s)",
+       xref,u2ug_params->group,u2ug_params->user,sysid_pair->value);
+      /@ BS10108T - end   @/
+
+      ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+                      "Command to ACF2cmd (%s)",cmd);
+
+      rc = ACF2cmd(func,
+                   EXECOUT_DDNAME,
+                   admin_params->admin_uname,
+                   cmd,
+                   MAX_OK_RC_0,
+                   0,
+                   &caddinfo,
+                   NULL,
+                   NULL,
+                   admin_params,
+                   CMDOUT_YES,
+                   ACF2_YES);
+
+      if (rc NE ESA_OK)         /@ delete from exclude failed ? @/
+        {
+          skip_refresh = 'Y';
+          sprintf(errmsg,
+          "DEL LID <%s> from EXCLUDE of <%s> failed. rc=%d",
+          u2ug_params->user,u2ug_params->group,rc);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+        };
+
+      if ((rc EQ ESA_FATAL) AND (in_include EQ 'N')) /@ Roll back?    @/
+          /@ We need to roll back the add to include list             @/
+        {
+          sprintf(errmsg,
+          "Rolling back previous ADD LID <%s> to INCLUDE of <%s>",
+          u2ug_params->user,u2ug_params->group);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+
+          /@ Build the cmd:                                           @/
+          /@ BS10108T - start @/
+          /@ ACF2 ROL/SGP CHANGE Name INCLUDE(LID) DEL SYSID(sysid)   @/
+          /@
+          sprintf(cmd, "ACF2 %s CHANGE %s INCLUDE(%s) DEL",
+                       xref,u2ug_params->group,u2ug_params->user);    @/
+
+          sprintf(cmd, "ACF2 %s CHANGE %s INCLUDE(%s) DEL SYSID(%s)",
+           xref,u2ug_params->group,u2ug_params->user,sysid_pair->value);
+          /@ BS10108T - end   @/
+
+          ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+                          "Command to ACF2cmd (%s)",cmd);
+
+          roll_rc = ACF2cmd(func,
+                       EXECOUT_DDNAME,
+                       admin_params->admin_uname,
+                       cmd,
+                       MAX_OK_RC_0,
+                       0,
+                       &caddinfo,
+                       NULL,
+                       NULL,
+                       admin_params,
+                       CMDOUT_YES,
+                       ACF2_YES);
+
+          if (roll_rc NE ESA_OK)      /@ Roll back failed?  @/
+            {
+              sprintf(errmsg,
+             "Roll back failed, results uncertain. Check STDMSG. rc=%d",
+              u2ug_params->user,u2ug_params->group,roll_rc);
+              CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+                   errmsg, 16,__LINE__);
+              rc = ESA_FATAL;
+              goto exit;
+            };
+          rc = ESA_FATAL;
+          goto exit;
+        };    /@  end of roll back   @/
+
+      if ((rc NE ESA_OK) AND (rc NE ESA_FATAL)) /@ del uncertain?  @/
+          /@ Tell them we don't know what happened                 @/
+        {
+          sprintf(errmsg,
+         "DEL from EXCLUDE results uncertain. Check STDMSG. rc=%d",
+          u2ug_params->user,u2ug_params->group,roll_rc);
+          CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+          rc = ESA_FATAL;
+          goto exit;
+        }
+    }  /@ end of delete from exclude @/
+
+    if (refresh EQ 'Y' AND skip_refresh EQ 'N')
+     {
+      /@ Build the cmd:                                           @/
+      /@ ACF2 ROL F ACF2,NEWXREF,TYPE(ROL)         @/
+      /@ or                                                       @/
+      /@ ACF2 SGP F ACF2,NEWXREF,TYPE(SGP)         @/
+
+      sprintf(cmd, "ACF2 %s F ACF2,NEWXREF,TYPE(%s)",
+                   xref,xref);
+      ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+                      "Command to ACF2cmd (%s)",cmd);
+
+      ref_rc = ACF2cmd(func,
+                   EXECOUT_DDNAME,
+                   admin_params->admin_uname,
+                   cmd,
+                   MAX_OK_RC_0,
+                   0,
+                   &caddinfo,
+                   NULL,
+                   NULL,
+                   admin_params,
+                   CMDOUT_YES,
+                   ACF2_YES);
+
+      if (ref_rc NE ESA_OK)      /@ refresh failed?  @/
+        {
+          sprintf(errmsg,
+         "REFRESH results uncertain. Check STDMSG. ref_rc=%d",
+          ref_rc);
+          CTSAMSG_print(WARN_INT1, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+          rc = ESA_WARN;
+          goto exit;
+        };
+     }
+      ESA_DIAG_printf(ESA_COMP_ADDU2UG, 6,
+                      "%s connect to %s rc=%d",
+                      u2ug_params->user,u2ug_params->group,rc);
+      goto exit;
+   }
+   skip_xref:;
+  /@     End   WS10078T                                            @/
+     WS10079       */
+
+   skip_xref:;                                          /* WS10079 */
+  /*
+   *   Obtain a local addinfo buffer
+   */
+
+   if (ADDINFO_alloc(func,ACF2_ADDINFO,&laddinfo,dest,msgs) NE ESA_OK)
+    {
+      rc = ESA_FATAL;
+      goto exit;
+     };
+
+   if (ADDINFO_alloc(func,ACF2_ADDINFO,&uaddinfo,dest,msgs) NE ESA_OK)
+    {
+      rc = ESA_FATAL;
+      goto exit;
+     };
+
+
+  /*
+   *   Open Group Database for Readonly
+   */
+
+   GDB_rc = GDB_Set_Mode(GDB_ReadOnly,admin_params,err);
+
+   switch(GDB_rc)
+    {
+     case GDB_OK:
+      GDB_Opened = TRUE;
+      break;
+
+     case GDB_Update_Lock_Failed:
+      sprintf(errmsg,"Unable to obtain lock on group database");
+      CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+
+     default:
+      sprintf(errmsg,"Open GDB for Update failed, rc = %d",GDB_rc);
+      CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+    };
+
+  /*
+   *   Get Group UIDMASKs
+   */
+   ADDINFO_empty(laddinfo);
+   RESTORE_ENDING_BLANK(u2ug_params->group,
+                        ESA_COMP_ADDU2UG);                /* BS10097 */
+   rc = ACF2_Get_Group_UIDMASKS(u2ug_params->group,
+                                &Group_UID_Count,
+                                Group_UID,
+                                laddinfo,
+                                &reason_code,
+                                admin_params);            /*WS10076A*
+                                dest,                      * BS2306 *
+                                msgs);                     * BS2306 */
+
+   if (rc NE ESA_OK)
+    {
+    switch(reason_code)
+     {
+      case 4:
+        sprintf(errmsg,"No UIDMASKS field found for GROUP (%s)",
+                u2ug_params->group);
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+                 errmsg, 16,__LINE__);
+        break;
+      case 8:
+        CTSAMSG_print(ERR_NO_GROUP, msgs, NULL, dest,
+                      u2ug_params->group);
+        break;
+      default:
+        sprintf(errmsg,"Error in processing GROUP (%s)",
+                      u2ug_params->group);
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+                 errmsg, 16,__LINE__);
+     }
+     goto exit;
+   };
+
+  /*
+   *   Get User Information from ACF2
+   */
+   ADDINFO_empty(uaddinfo);
+   temp[0] = NULL_CHAR;
+   ACF2_rc = ACF2_Get_User(u2ug_params->user,
+                      ACF2_Object_is_Not_Masked,
+                      "",
+                      temp,
+                      ACF2_GetUser_Get_Fields,
+                      "",
+                      uaddinfo,
+                      ACF2_Return_Multi_UIDs,             /* PS0351 */
+                      errmsg,
+                      admin_params);                       /*bs2556*/
+
+
+   switch(ACF2_rc)
+    {
+     case ACF2_OK:
+      break;
+     case ACF2_Not_Found:
+      CTSAMSG_print(ERR_NO_USER, msgs, NULL, dest, u2ug_params->user);
+      rc = ESA_FATAL;
+      goto exit;
+     default:
+      sprintf(errmsg,"Error in processing USER (%s)",
+              u2ug_params->user);
+      CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+               errmsg, 16,__LINE__);
+      rc = ESA_FATAL;
+      goto exit;
+    };
+
+  /*
+   *   Get User UID field
+   */
+  pair = ADDINFO_search("UID", ACF_ADDINFO_KWD_LEN,
+                        uaddinfo->pair,
+                        uaddinfo->num_pairs);
+  if (pair NE NULL)
+   strcpy (User_UID,pair->value);
+  else
+  {
+     rc = ESA_FATAL;
+     sprintf(errmsg,"UID not found for USER (%s)", u2ug_params->user);
+     CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+          errmsg, 16,__LINE__);
+     goto exit;                                           /* PS0351 */
+  };
+
+  strcpy (Primary_UID, User_UID);                         /* PS0351 */
+
+  strcpy (UIDs_List, User_UID);                           /* PS0351 */
+
+  handle_multi = FALSE;                                   /* PS0351 */
+  conn_exists = FALSE;                                    /* PS0351 */
+
+  /*
+   *   PS0351 - Do we have UIDX field (multivalued) ?
+   */
+  pair = ADDINFO_search("UIDX", ACF_ADDINFO_KWD_LEN,
+                        uaddinfo->pair,
+                        uaddinfo->num_pairs);
+
+  /*------------------------------------------------------------*/
+  /* Multivalued exists - turn flag ON and print special message*/
+  /*------------------------------------------------------------*/
+  if (pair NE NULL)
+  {
+    ESA_DIAG_printf(ESA_COMP_ADDU2UG, DEBUG_SHOW_IMPORTANT,
+                    "Multivalue UIDs found for user");
+
+    handle_multi = TRUE;
+
+    strcpy (UIDs_List, pair->value);
+
+    CTSAMSG_print(ACF2_USER_UIDS_BEFORE, msgs, NULL, dest);
+  }
+  else
+    CTSAMSG_print(ACF2_USER_UID_BEFORE, msgs, NULL, dest, User_UID);
+
+  current_user_uid = strtok (UIDs_List, entry_sep);
+
+  /*------------------------------------------------------------*/
+  /* Common handling for both multivalued and non-multivalued   */
+  /*------------------------------------------------------------*/
+  while (current_user_uid NE NULL)
+  {
+    if (handle_multi)
+    {
+      sprintf (msg, "(%s)", current_user_uid);
+
+      CTSAMSG_print(ACF2_OUTPUT_LINE, msgs, NULL, dest,
+                    current_user_uid);
+
+    };
+
+    ESA_DIAG_printf(ESA_COMP_ADDU2UG, DEBUG_SHOW_IMPORTANT,
+                    "Current User UID to check is (%s)",
+                    current_user_uid);
+
+    /*----------------------------------------------------------*/
+    /* Check UIDMASKS against current User UID                  */
+    /*----------------------------------------------------------*/
+    for (i=0;(i LT Group_UID_Count) AND (NOT conn_exists);i++)
+    {
+      ESA_DIAG_printf(ESA_COMP_ADDU2UG, DEBUG_SHOW_REGULAR,
+                      "Checking GROUP (%s) UIDMASK (%s)",
+                      u2ug_params->group,
+                      Group_UID[i]);
+
+      if (ACF2_Match_Id_to_Mask(UID_Object,
+                                current_user_uid,
+                                Group_UID[i]) EQ TRUE)
+      {
+        ESA_DIAG_printf(ESA_COMP_ADDU2UG, DEBUG_SHOW_REGULAR,
+                        "Connection already exists!");
+        conn_exists = TRUE;
+        strcpy (User_UID, current_user_uid);
+      };
+    }; /* End of group UIDMASKs FOR loop */
+
+    current_user_uid = strtok (NULL, entry_sep);
+
+  }; /* End of user UIDs WHILE loop */
+
+  if (conn_exists)
+  {
+    CTSAMSG_print(ERR_ALREADY_CONNECTED, msgs, NULL, dest,
+                  u2ug_params->user, u2ug_params->group);
+    show_match = TRUE;
+    goto Dump_Group;
+  };
+
+  strcpy (User_UID, Primary_UID);
+
+  /*
+   *   Try connect a User to a single UIDMASK from the Group
+   */
+  ADDINFO_empty(laddinfo);
+
+  for (i=0;i LT Group_UID_Count; i++)
+   {
+  /*
+   *   Generate Update API ADDINFO
+   */
+    rc = Generate_UID_Update(Connect_Update,
+                             User_UID,
+                             Group_UID[i],
+                             uaddinfo,
+                             laddinfo,                    /* WS10090 */
+              /* WS10090 */  params_ptr->ALLOW_UID_COLLISION[0]);
+              /* WS10090     laddinfo);                               */
+    switch(rc)
+     {
+      case ESA_OK: break;
+      case ESA_ERR: continue;
+      default:
+        goto exit;
+      };
+
+  /*
+   *   Build CTSUpdUser parameter list
+   */
+    strcpy(user_params.user,u2ug_params->user);
+    user_params.rev_status = USER_STAT_IGNORED;
+    strcpy(user_params.passwd,BACKSLASH_STR);
+
+  /*
+   *   Indicate Update User API not to check forced disconnect
+   *   from groups
+   */
+    ADDINFO_insert(TYPE_1A,
+                   ACF2_BYPASS_DISCONNECT_CHECK,
+                   "",
+                   laddinfo,
+                   ACF_ADDINFO_KWD_LEN,
+                   ACF_ADDINFO_VAL_LEN,
+                   UNIQUE);
+
+  /*
+   *   Issue the Update User API call, This will modify the User's UID
+   *   field(s) to associate him with the group
+   */
+    rc = CTSUpdUser(&user_params,
+                    laddinfo,
+                    admin_params,
+                    err);
+
+  /*
+   *   Check Update Results
+   */
+    if (rc NE ESA_OK)
+     {
+      rc = ESA_FATAL;                                     /* PS0357 */
+      /* PS0357 - Removed
+      sprintf(errmsg,"Error in updating user (%s) for connection setup",
+              user_params.user);
+      CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+           errmsg, 16,__LINE__);
+      */
+      goto exit;
+     };
+
+    /* WS10082N start - this is not needed anymore because hotpath
+                        sends the user.
+    /@ BS2522
+     @ send an interception about the updated userid, so
+     @ its UID will be updated in ESS
+     @/
+
+    rc_notify = (admin_params->cs_func.intercept_set_ptr)
+                          (INTERCEPT_SPECIFIC,
+                           INTERCEPT_USER,
+                           NULL,
+                           u2ug_params->user,
+                           NULL);
+
+    if (rc_notify NE ESA_OK)
+      {
+        CTSAMSG_print(ACF2_NOTIFY_FAILED,msgs,NULL,dest,
+                      u2ug_params->user);
+        ESA_DIAG_printf(ESA_COMP_ADDU2UG, DEBUG_SHOW_IMPORTANT,
+         "notify Failed for user: %s rc: %d",
+         u2ug_params->user,rc_notify);
+       }
+
+    /@ BS2522 - end @/
+         end of WS10082N */
+
+    temp[0]=NULL_CHAR;
+    ADDINFO_empty(laddinfo);
+
+    strcpy (UIDs_List,"");                                /* PS0351 */
+
+    ACF2_rc = ACF2_Get_User_UID(u2ug_params->user,
+                                User_UID,
+                                temp,
+                                "",
+                                UIDs_List,                /* PS0339 */
+                                laddinfo,
+                                admin_params);            /*bs2556*/
+
+    if (ACF2_rc EQ ACF2_OK)
+    {
+      /* PS0351 - If multivalued - dump all UIDs after operation */
+      if (UIDs_List[0] NE NULL_CHAR)
+      {
+        CTSAMSG_print(ACF2_USER_UIDS_AFTER, msgs, NULL, dest);
+
+        current_user_uid = strtok (UIDs_List, entry_sep);
+
+        while (current_user_uid NE NULL)
+        {
+          sprintf (msg, "(%s)", current_user_uid);
+
+          CTSAMSG_print(ACF2_OUTPUT_LINE, msgs, NULL, dest,
+                        current_user_uid);
+
+          current_user_uid = strtok (NULL, entry_sep);
+        };
+      }         /* End of PS0351 */
+      else
+        CTSAMSG_print(ACF2_USER_UID_AFTER, msgs, NULL, dest,
+                      User_UID);
+    };
+
+    goto exit; /* Connect Completed */
+   };
+
+   Connect_Failed:
+
+   CTSAMSG_print(ACF2_NO_CONNECT, msgs, NULL, dest,
+                 u2ug_params->user, u2ug_params->group);
+
+   show_conflict = TRUE;
+
+   Dump_Group:
+
+   /* strcpy(temp_uid,User_UID);  */                      /* PS0458 */
+   memset(temp_uid,0X00,sizeof(temp_uid));                /* PS0458 */
+   memset(temp_uid,'*',sizeof(temp_uid)-1);               /* PS0458 */
+   memcpy(temp_uid,User_UID,strlen(User_UID));            /* PS0458 */
+
+   while(strpbrk(temp_uid," ") NE NULL)
+    *strpbrk(temp_uid," ") = '*';
+
+   for(i=0;i LT Group_UID_Count;i++)
+    {
+    if (ACF2_Match_Id_to_Mask(UID_Object,temp_uid,Group_UID[i]) EQ TRUE)
+      if (show_match EQ TRUE)
+       CTSAMSG_print(ACF2_USER_GROUP_MATCH, msgs, NULL, dest,
+        u2ug_params->user,User_UID,u2ug_params->group,i+1,Group_UID[i]);
+      else;
+     else
+      if (show_conflict EQ TRUE)
+       CTSAMSG_print(ACF2_USER_GROUP_CONFLICT, msgs, NULL, dest,
+        u2ug_params->user,User_UID,u2ug_params->group,i+1,Group_UID[i]);
+    };
+
+   rc = ESA_FATAL;
+
+  /*
+   *   Finish
+   */
+
+   exit:;
+   /*  WS10079
+   if (handle NE NULL)                                  /@ WS10078T @/
+      free(handle);           WS10079 */                /* WS10078T */
+   /* WS10079N if (iaddinfo[0] NE NULL)              /@ WS10078T @/
+             ADDINFO_free(&iaddinfo[0]);             /@ WS10078T @/  */
+   if (caddinfo NE NULL)                                /* WS10078T */
+    ADDINFO_free(&caddinfo);                            /* WS10078T */
+   if (laddinfo NE NULL)
+    ADDINFO_free(&laddinfo);
+   if (uaddinfo NE NULL)
+    ADDINFO_free(&uaddinfo);
+   /*  WS10079  start */
+   if (get_xref_handle NE NULL)
+      ACF2_Get_Xref(
+                    "TERM",
+                    xbhandle,
+                    &get_xref_handle,
+                    NULL_CHAR,
+                    NULL,
+                    NULL,
+                    NULL,
+                    NULL,
+                    ESA_COMP_ADDU2UG,
+                    admin_params);
+   if (xbhandle NE NULL)
+       free(xbhandle);
+   if (include_op_lists NE NULL)
+   {
+      if (include_op_lists->del_list NE NULL)
+         free(include_op_lists->del_list);
+      if (include_op_lists->rep_list NE NULL)
+         free(include_op_lists->rep_list);
+      if (include_op_lists->add_list NE NULL)
+         free(include_op_lists->add_list);
+      free(include_op_lists);
+   }
+   if (exclude_op_lists NE NULL)
+   {
+      if (exclude_op_lists->del_list NE NULL)
+         free(exclude_op_lists->del_list);
+      if (exclude_op_lists->rep_list NE NULL)
+         free(exclude_op_lists->rep_list);
+      if (exclude_op_lists->add_list NE NULL)
+         free(exclude_op_lists->add_list);
+      free(exclude_op_lists);
+   }
+   if (xref_command_struct.add_command NE NULL)
+      free(xref_command_struct.add_command);
+   if (xref_command_struct.del_command NE NULL)
+      free(xref_command_struct.del_command);
+   if (xref_command_struct.rep_command NE NULL)
+      free(xref_command_struct.rep_command);
+   if (xref_command_struct.ref_command NE NULL)
+      free(xref_command_struct.ref_command);
+   /*  WS10079  end   */
+
+   if (GDB_Opened EQ TRUE)
+    {
+     GDB_Set_Mode(GDB_Closed,admin_params,err);
+     GDB_Opened = FALSE;
+    };
+
+   ESA_DIAG_exit(ESA_COMP_ADDU2UG, DEBUG_SHOW_IMPORTANT, func, rc);
+
+   return rc;
+
+}
+
+ /* WS10079N - start */
+ /**************************************************************
+ *                                                             *
+ * PROCEDURE NAME : Restore_XREF_commands                      *
+ *                                                             *
+ * DESCRIPTION    : Restore commands that failed               *
+ *                                                             *
+ * INPUT            type                ROL/SGP           (I)  *
+ *                  xref_name                             (I)  *
+ *                  command_ops_to_restore                (I)  *
+ *                                   - list of 3 char ops      *
+ *                                     (ADD and/or DEL)   (I)  *
+ *                                     to be restored     (I)  *
+ *                  include_op_lists - pointer to existing     *
+ *                                      op lists          (I)  *
+ *                  exclude_op_lists - pointer to existing     *
+ *                                      op lists          (I)  *
+ *                  diag_comp                             (I)  *
+ *                  admain_params                         (I)  *
+ *                                                             *
+ * OUTPUT         :                                            *
+ *                                                             *
+ * RETURN VALUE   : ESA_RC                                     *
+ *                                                             *
+ * WS10079N:                                                   *
+ * =========                                                   *
+ * This code in this routine was moved from                    *
+ * XREF_Commands_Restore (which resides in CTSBSRV) in order   *
+ * to save the need to add CTSBCMD (for Acf2Cmd) to the        *
+ * LONKCARDs of CTSCONI nd CTSCOFI. Both programs have         *
+ * CTSBSRV in their LINKCARD so adding a code that calls       *
+ * ACf2Cmd requires changing their LINKCARDs. To save this     *
+ * need, XREF_COmmands_Restore was changed to prepare the      *
+ * commands and its callers will issue them.                   *
+ *                                                             *
+ **************************************************************/
+
+static ESA_RC Restore_XREF_commands(
+                  char                 * type,
+                  char                 * xref_name,
+                  char                 * command_ops_to_restore,
+                  XREF_Operations_Lists_typ * include_op_lists,
+                  XREF_Operations_Lists_typ * exclude_op_lists,
+                  ESA_DIAG_COMP_typ      diag_comp,
+                  ADMIN_PARAMS_rec_typ * admin_params)
+{
+
+ static char    func[]="Restore_XREF_commands";
+
+/*
+ *     Variables
+ */
+
+ ESA_RC                      rc                  = ESA_OK;
+ int                         i                   = 0;
+ char                        op[4]               = "";
+ char                        rst[4]              = "";
+ char                        errmsg[125]         = "";
+ char                      * pos                 = NULL;
+ char                      * cmd                 = NULL;
+ XREF_Cmd_Struct_typ         xref_command_struct;
+ ADDINFO_rec_ptr             caddinfo            = NULL;
+ CTSAMSG_HANDLE_rec_ptr      msgs;
+ CTSAMSG_DEST_TABLE_rec_ptr  dest;
+
+ msgs = admin_params->ctsamsg_handle;
+ dest = admin_params->ctsamsg_dest;
+
+ ESA_DIAG_enter(diag_comp, 1, func);
+
+/*
+ *     Alocate an empty ADDINFO fro ACF2cmd
+ */
+
+ if (ADDINFO_alloc(func,1,&caddinfo,dest,msgs) NE ESA_OK)
+ {
+   sprintf(errmsg,"ADDINFO_alloc of caddinfo failed. rc=%d",rc);
+   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,func,
+                 errmsg, 16,__LINE__);
+   rc = ESA_FATAL;
+   goto exit;
+ };
+
+ /*
+  *    Prepare the commands
+  */
+ rc = XREF_Commands_Restore(
+                type,
+                xref_name,
+                command_ops_to_restore,
+                include_op_lists,
+                exclude_op_lists,
+                &xref_command_struct,
+                diag_comp,
+                admin_params);
+ if (rc NE ESA_OK)      /* restore failed?  */
+ {
+   sprintf(errmsg,
+           "Prepare roll back commands (XREF_Commands_Restore) rc=%d "
+           "Roll back will not be performed.",
+           rc);
+   CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest, component,
+                func, errmsg, 16,__LINE__);
+   rc = ESA_FATAL;
+   goto exit;
+ };
+
+ /*
+  *  Execute the commands
+  */
+ for (i = strlen(command_ops_to_restore) / 3; i GE 1; i--)
+ {
+   pos = command_ops_to_restore + (i-1)*3;
+   if (strncmp(pos,"ADD",3) EQ 0)
+      {
+       cmd = xref_command_struct.del_command;
+       strcpy(op,"ADD");
+       strcpy(rst,"DEL");
+      }
+   else
+   if (strncmp(pos,"DEL",3) EQ 0)
+      {
+       cmd = xref_command_struct.add_command;
+       strcpy(op,"DEL");
+       strcpy(rst,"ADD");
+      }
+
+   ESA_DIAG_printf(diag_comp, 6,
+                  "Calling ACF2cmd with %s to restore %s",
+                  rst,op);
+
+   rc = ACF2cmd(func,
+           EXECOUT_DDNAME,
+           admin_params->admin_uname,
+           cmd,
+           MAX_OK_RC_0,
+           0,
+           &caddinfo,
+           NULL,
+           NULL,
+           admin_params,
+           CMDOUT_YES,
+           ACF2_YES);
+
+   if (rc NE ESA_OK)      /* Roll back failed?  */
+     {
+       CTSAMSG_print(ACF2_RESULTS_UNCERTAIN,
+           msgs, NULL, dest,
+           "Roll back",rc);
+       rc = ESA_FATAL;
+       goto exit;
+     };
+  }
+
+ exit:
+
+  if (caddinfo NE NULL)
+    ADDINFO_free(&caddinfo);
+
+  if (xref_command_struct.add_command NE NULL)
+    free(xref_command_struct.add_command);
+
+  if (xref_command_struct.del_command NE NULL)
+    free(xref_command_struct.del_command);
+
+  if (xref_command_struct.rep_command NE NULL)
+    free(xref_command_struct.rep_command);
+
+  if (xref_command_struct.ref_command NE NULL)
+    free(xref_command_struct.ref_command);
+
+  ESA_DIAG_exit(diag_comp, 1, func, rc);
+  return rc;
+
+}
+/* WS10079N - end */
