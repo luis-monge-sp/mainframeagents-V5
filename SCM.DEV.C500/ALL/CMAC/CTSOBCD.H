@@ -1,0 +1,109 @@
+/**************************************************************
+*                                                             *
+*  <!><!> ATTENTION <!><!>                                    *
+*  =-=-=-=-=-=-=-=-=-=-=-=                                    *
+*                                                             *
+*  When updating this member, do not forget to update         *
+*  CTSBCOD in CTS.CMAC as well.                               *
+*                                                             *
+*                                                             *
+**************************************************************/
+/**************************************************************
+*                                                             *
+* Title            : ACF2 api message ids definitions         *
+*                                                             *
+* File Name        : ctsobcd.h                                *
+*                                                             *
+* Author           : Yishay Yovel                             *
+*                                                             *
+* Creation Date    : 25/05/1997                               *
+*                                                             *
+* Description      :                                          *
+*                                                             *
+* Assumptions and                                             *
+*   Considerations :                                          *
+*                                                             *
+**************************************************************/
+
+/**************************************************************
+* Mod.Id   Who      When     Description                      *
+* -------- -------- -------  -------------------------------- *
+* IS10004  EliM.    27/03/07 Count load resources             *
+* IS10005  AvnerL   08/05/07 Support RU_LOCKED & RU_SUSPENDED *
+* IS10088  NuritY   03/06/13 UID mask > UID max length...     *
+*                            ...(S0C4)  (BS10030)             *
+* IS10119  AvnerL   17/03/14 Support ACCREL# in ACCVT.        *
+* IS10122  NuritY   16/06/14 Ignore ROLESET rules.            *
+* WS10052  AvnerL   31/01/16 Support ACF2 R16 & fix bug in MSG*
+* sasc     NuritY   24/08/16 Copied from CTSBCOD              *
+* WS10075  SeligT   07/11/19 Add message numbers CTS3890E,    *
+*                            CTS3891I, CTS3892E, and CTS3893W *
+* WS10078N NuritY   05/04/20 Support XREF records.            *
+**************************************************************/
+
+#ifndef  ACF2CODE_H_included
+#define  ACF2CODE_H_included          1
+
+#define ACF2_OUTPUT_LINE              "CTS3816I"
+#define ACF2_OUTPUT_ERR               "CTS3830E"
+#define ACF2_USER_UIDS_BEFORE         "CTS3831I"
+#define ACF2_USER_UIDS_AFTER          "CTS3832I"
+#define ACF2_ALL_UIDMASKS             "CTS3851E"
+#define ACF2_NO_UIDMASKS              "CTS3852E"
+#define ACF2_UG_CORRELLATE            "CTS3853E"
+#define ACF2_NO_CONNECT               "CTS3854E"
+#define ACF2_USER_GROUP_MATCH         "CTS3855I"
+#define ACF2_USER_GROUP_CONFLICT      "CTS3856I"
+#define ACF2_USER_UID_BEFORE          "CTS3857I"
+#define ACF2_USER_UID_AFTER           "CTS3858I"
+#define ACF2_FORCE_DISCONNECT         "CTS3859E"
+#define ACF2_LID_NOT_IN_UID           "CTS3860E"
+#define ACF2_USER_NAME_TOO_LONG       "CTS3861E"
+#define ACF2_INVALID_USER_NAME        "CTS3862E"
+#define ACF2_INVALID_ACE_TYPE         "CTS3863E"
+#define ACF2_UNTIL_DATE_PASSED        "CTS3864E"
+#define ACF2_RESMODEL_NOT_FOUND       "CTS3865E"
+#define ACF2_NO_RESTYPE_PREFIX        "CTS3866E"
+#define ACF2_LOADING_NEXTKEYS         "CTS3867I"
+#define ACF2_OBTAINED_NEXTKEY         "CTS3868I"
+#define ACF2_IGNORING_NEXTKEY         "CTS3869I"
+#define ACF2_NEXTKEY_NOT_FOUND        "CTS3870W"
+#define ACF2_SCANNING_RULESET         "CTS3871I"
+#define ACF2_NO_FULL_MASK             "CTS3872E"
+#define ACF2_MVF_PARTIAL_MASK         "CTS3873E"
+#define ACF2_CANNOT_DEL_VIRTUAL_RES   "CTS3874E"
+#define ACF2_RESMASK_REQUIRED         "CTS3875E"
+#define ACF2_RULESET_IS_NOSORT        "CTS3876E"
+#define ACF2_SELECTED_RULESET         "CTS3877I"
+#define ACF2_JUMP_TO_NEXTKEY          "CTS3878I"
+#define ACF2_ACCESS_FULLY_PREVENTED   "CTS3879W"
+#define ACF2_ARI_STARTING             "CTS3880I"
+#define ACF2_ARI_UNSUPPORTED_KEYWORD  "CTS3881E"
+#define ACF2_MAX_ALLOWED_KEYS_EXCEED  "CTS3882E"
+#define ACF2_NO_MATCHING_KEY          "CTS3883E"
+#define ACF2_ARI_ENDED                "CTS3884I"
+#define ACF2_ARI_FAILED               "CTS3885E"
+#define ACF2_NEXTKEY_NAME             "CTS3886I"
+#define ACF2_NEXTKEYS_LOOP            "CTS3887E"
+#define ACF2_RES_ROLESET_IGNORED      "CTS3888W"          /* IS10122 */
+#define ACF2_PSWD_REQUIRED            "CTS3889E"         /* IS10147A */
+#define ACF2_CANT_ADDGRP              "CTS3890E"          /* WS10075 */
+#define ACF2_NO_PERMISSION            "CTS3891I"          /* WS10075 */
+#define ACF2_GET_LIDPERM_FAILED       "CTS3892E"          /* WS10075 */
+#define ACF2_MISSING_PERM             "CTS3893W"          /* WS10075 */
+#define ACF2_XSGP_INCOMPLETE          "CTS3894W"          /* WS10078N */
+#define ACF2_VERSION_ERR              "CTS3940E"
+#define ACF2_NOT_ACTIVE               "CTS3941E"
+#define ACF2_DOWN                     "CTS3942E"
+#define INVALID_RSS_VER               "CTS3943E"
+#define ACF2_NOTIFY_FAILED            "CTS3944E"
+#define ACF2_VERIFY_PWD               "CTS3945I"
+#define ACF2_COUNT_RESOURCE           "CTS3946I"           /*IS10004*/
+#define DISREGARD_RU_SUSPENDED        "CTS3947W"           /*IS10005*/
+#define UIDMASK_GT_UIDLEN             "CTS3948E"           /*IS10088*/
+/*#define ACF2_NEW_VER                "CTS3949E"            *IS10119*/
+#define ACF2_NEW_VER                  "CTS3949W"           /*WS10052*/
+#define ACF2_MIN_VER                  "CTS3950W"           /*WS10078T*/
+#define PRE_REQ_ATTRIBUTE             "CTS3951W"           /*WS10078T*/
+
+#endif  /* ACF2CODE_included */

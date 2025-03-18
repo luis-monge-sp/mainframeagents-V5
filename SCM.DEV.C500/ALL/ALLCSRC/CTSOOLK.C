@@ -1,0 +1,888 @@
+/**************************************************************
+*                                                             *
+*  <!><!> ATTENTION <!><!>                                    *
+*  =-=-=-=-=-=-=-=-=-=-=-=                                    *
+*                                                             *
+*  When updating this member, do not forget to update         *
+*  CTSCOLK in CTS.CSRC as well.                               *
+*                                                             *
+*                                                             *
+**************************************************************/
+ /**************************************************************
+ *                                                             *
+ * Title            : OS lock functions                        *
+ *                                                             *
+ * File Name        : ctscolk.c                                *
+ *                                                             *
+ * Author           : Alexander Shvartsman                     *
+ *                                                             *
+ * Creation Date    : 20/07/94                                 *
+ *                                                             *
+ * Description      :                                          *
+ *                                                             *
+ * Assumptions and                                             *
+ *   Considerations :                                          *
+ *                                                             *
+ **************************************************************/
+
+ /**************************************************************
+ * Mod.Id   Who    When      Description                       *
+ * -------- ------ --------  --------------------------------- *
+ * SAS2IBMT SeligT 12/07/16  SAS/C to IBM C Conversion Project *
+ * WS10054  SeligT 04/08/16  Add ENQ/DEQ SYSTEMS RNL Parameter *
+ * SAS2IBMN NuritY 09/10/16  SAS/C to IBM C Conversion Project:*
+ *                           Replace osddinfo with ctsaddi     *
+ *     "      "    23/01/17  Replace sleep with ctsaslp.       *
+ * SAS2IBMA AvnerL 07/12/16  Set CC includes per IS0060.       *
+ * BS10076  SeligT 11/12/17  Organize Connector Locking        *
+ *                           Functions and Structures          *
+ * BS10082  SeligT 06/03/18  Potential Lock Problem When Many  *
+ *                           Many Records Are Read/Written     *
+ *                           Simultaneously                    *
+ * IS10174  NuritY 01/08/18  Call to ctsaddi incorrect.        *
+ * WS10082  MauriC 24/11/22  Drop CTSOADI and recompile        *
+ **************************************************************/
+
+ #include   <globs.h>
+
+ /*
+  *   Standard include files
+  */
+
+ #include   STDIO
+ #include   STDLIB
+ #include   STRING
+ #include   TIME
+ /* SAS2IBMT #include  LCLIB                                         */
+ /* SAS2IBMT #include  OS                                            */
+
+ /*
+  *   ESA include files
+  */
+
+ #include   ESA_API
+ #include   ESA_CS_OS
+ #include   ESA_DIAG
+ #include   ESA_CTSAMSG
+ #include   ESA_API_CODES
+
+ /*
+  *   MVS include files
+  */
+ /* IS0060 - do not use USA-API H files
+ #include   MVS_OS_MVS
+ #include   MVS_CODES
+ */
+ /* IS0060 - Use CC / ALL H files */
+ #include   MVS_OSC_MVS
+ #include   MVS_C_CODES
+ /* IS0060 - end  */
+
+ /*
+  *   RACF include files
+  */
+
+ /* #include   RACF_CODES
+ #include   API_ADDINFO              IS0060 */
+ #include   RACF_C_CODES          /* IS0060 */
+ /* WS10082 #include   API_C_ADDINFO IS0060  CTSOADI is obsolete */
+ /*
+  *   Defaults
+  */
+
+ #define    QNAME    "CTSA    "    /* default qname if no ioaparm */
+ #define    EXCSHR   "E"           /* default = E (Exc)      WS10054 */
+ #define    ENQRNL   "Y"           /* default = RNL=YES      WS10054 */
+ /* BS10076 The following is removed because now each caller decides
+            for themselves what this value is.  That value is passed
+            to the OS_CS_lock_init routine and will be saved in the
+            lock header/handle to be used when we actually get the
+            lock in the OS_CS_DO_LOCK routine.
+ #define    OS_LOCK_INTERVAL  1000 // used to be 3000        WS10054 */
+ #define    RNAME_DIAG_LEN    44   /* used to be 20          WS10054 */
+
+ static     char  component[]="OSCSLCK";
+ static     char  err_desc[] ="Invalid handle";
+ static     char  rname_diag[RNAME_DIAG_LEN+1];
+ static     char  *rname_diag_ptr;
+
+ /* SAS2IBMN - start */
+ /*
+  *   Assembler module. get dsname for a ddname.
+  */
+/* IS10174 extern  int ctsaddi();   */
+extern  int ctsaslp();
+ /* SAS2IBMN - end */
+
+ /*
+  *   Assembler module. get QNAME for ENQ/DEQ service
+  */
+
+ /* SAS2IBMT prototype changed for IBM C
+ extern ESA_RC ctsagtq(int         *debug_level,
+                       char        *qname,
+                       char        *rnl,                  // WS10054 //
+                       int         *reason_code);                    */
+ extern ESA_RC ctsagtq();                                 /* SAS2IBMT */
+
+ /*
+  *   Assembler module. ENQ/DEQ service
+  */
+
+ /* SAS2IBMT prototype changed for IBM C
+ extern ESA_RC ctsaenq(int         *debug_level,
+                       char        *op_code,
+                       char        *qname,
+                       char        *rname,
+                       char        *ddname,
+                       char        *excshr,               // WS10054 //
+                       char        *rnl,                  // WS10054 //
+                       int         *reserve,
+                       int         *reason_code,
+                       int         *resource_scope);                 */
+ extern ESA_RC ctsaenq();                                 /* SAS2IBMT */
+
+
+
+/****************************************************
+ * Procedure Name: OS_CS_wait
+ * Description   : wait
+ *
+ * Input         : miliseconds (0.001 seconds)
+ *
+ * Return Value  : ESA_OK     upon success
+ *                 ESA_FATAL  on any fail situation
+ * Comments      :
+ *
+ * Scope         :
+ ****************************************************/
+
+ ESA_RC OS_CS_wait (int        mseconds)
+  {
+
+ /*
+  *   Variables
+  */
+    ESA_RC rc=ESA_OK ;
+    static char func[]="OS_CS_wait";
+    /* SAS2IBMN double sec;       */
+    int    sec;                                          /* SAS2IBMN */
+    int    debug_level;                                  /* SAS2IBMN */
+    char   time_type = 'H';    /* H(undredths of seconds)   SAS2IBMN */
+
+  /*
+   *    Initialization
+   */
+
+
+    ESA_DIAG_enter(ESA_COMP_OS_WAIT,1, func);
+
+    /* SAS2IBMN - start */
+    /*
+    sec = mseconds / 1000;
+     * SAS2IBMT sleepd(sec) ;                   * Suspend execution *
+    sleep(sec) ;                     * Suspend execution   SAS2IBMT *
+    */
+
+    debug_level = ESA_DIAG_get_debug_level(ESA_COMP_OS_WAIT);
+    if (debug_level NE 0)
+      debug_level = 1;
+
+    sec = mseconds / 10;
+    (*(ASM_RTN_TYP *)&ctsaslp)(&sec, &time_type, &debug_level);
+    /* SAS2IBMN - end   */
+
+    ESA_DIAG_exit(ESA_COMP_OS_WAIT,1, func, rc );
+
+    return rc ;
+
+  }
+
+/****************************************************
+ * Procedure Name: OS_CS_lock
+ * Description   : lock files
+ *
+ * Input         : - handle from lock_init
+ *                 - wait time  How many seconds to try before
+ *                   giving up.
+ *                   Polling interval is platform-dependent
+ *                   defined by OS_LOCK_INTERVAL (seconds)
+ *                 - CTSAMSG stuff
+ *
+ * output        :
+ *
+ * Return Value  : ESA_OK     upon success
+ *                 ESA_LOCKED if the file is locked by other
+ *                            process
+ *                 ESA_FATAL  on any other fail situation
+ *
+ * Comments      : With modification WS10054, this routine was
+ *                 basically moved to a new routine called
+ *                 OS_CS_DO_LOCK.  This routine calls the new
+ *                 OS_CS_DO_LOCK routine with the same parameters but
+ *                 with one added parameter: the new "E" (exclusive)
+ *                 parameter. In all existing calls, the ENQ being done
+ *                 is an exclusive ENQ.  However, in 2 modules, CTSBGDB
+ *                 and CTSBUDB, with modification WS10054, the new
+ *                 OS_CS_DO_LOCK routine will be called directly with
+ *                 either "E" (exclusive) or "S" (shared). (The reason
+ *                 we are doing this with a new routine is so that we do
+ *                 not have to change all current callers of the
+ *                 existing OS_CS_lock routine. They will all remain
+ *                 unchanged.  The only modules which will call the
+ *                 new OS_CS_DO_LOCK routine directly are CTSBGDB and
+ *                 CTSBUDB - sometimes with "E" and sometimes with "S".)
+ *
+ *                 With modification BS10076, we get the wait time
+ *                 value from the lock header/handle so it is removed
+ *                 from the parameter list.
+ *
+ * Scope         :
+ ****************************************************/
+
+ ESA_RC OS_CS_lock (void                    * handle,
+                    /* BS10076 int            wait_sec, */
+                    CTSAMSG_PARAMS_rec_typ  * msg_params)
+
+  {
+
+ /*
+  *   Variables
+  */
+    ESA_RC rc=ESA_OK ;
+    static char func[]="OS_CS_lock";
+    char exc_shr[] = "E";                                 /* WS10054 */
+
+    ESA_DIAG_enter(ESA_COMP_OS_LOCK,1, func);
+
+    /* BS10076
+    rc=OS_CS_DO_LOCK(handle, wait_sec, msg_params, exc_shr);//WS10054*/
+    rc=OS_CS_DO_LOCK(handle, msg_params, exc_shr);        /* BS10076 */
+
+    ESA_DIAG_exit(ESA_COMP_OS_LOCK,1, func, rc );
+
+    return rc ;
+
+  }
+
+/****************************************************
+ * Procedure Name: OS_CS_DO_LOCK
+ * Description   : lock files
+ *
+ * Input         : - handle from lock_init
+ *                 - wait time  How many seconds to try before
+ *                   giving up.
+ *                   Polling interval is platform-dependent
+ *                   defined by OS_LOCK_INTERVAL (seconds)
+ *                 - CTSAMSG stuff
+ *
+ * output        :
+ *
+ * Return Value  : ESA_OK     upon success
+ *                 ESA_LOCKED if the file is locked by other
+ *                            process
+ *                 ESA_FATAL  on any other fail situation
+ *
+ * Comments      : See comments in the OS_CS_lock routine above.
+ *                 It explains the WS10054 modification.
+ *
+ *                 With modification BS10076, we get the wait time
+ *                 value from the lock header/handle so it is removed
+ *                 from the parameter list.
+ *
+ * Scope         :
+ ****************************************************/
+
+ ESA_RC OS_CS_DO_LOCK (void                    * handle,
+                       /* BS10076 int            wait_sec, */
+                       CTSAMSG_PARAMS_rec_typ  * msg_params,
+                       char                    * exc_shr) /* WS10054 */
+
+  {
+
+ /*
+  *   Variables
+  */
+    ESA_RC rc=ESA_OK ;
+    CTSAMSG_HANDLE_rec_ptr msgs;
+    CTSAMSG_DEST_TABLE_rec_ptr dest;
+    OS_LOCK_HEADER_ptr header;
+    int  debug_level=0;
+    int  reason_code;
+    time_t before, after ;
+    static char func[]="OS_CS_DO_LOCK";
+
+  /*
+   *    Initialization
+   */
+
+    ESA_DIAG_enter(ESA_COMP_OS_LOCK,1, func);
+
+    msgs   = msg_params->ctsamsg_handle;
+    dest   = msg_params->ctsamsg_dest;
+
+    if ( handle EQ NULL ) {
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                       component,func,err_desc,16,__LINE__);
+         rc=ESA_FATAL;
+         goto exit;
+    }
+    else {
+       header = (OS_LOCK_HEADER_ptr) handle ;
+
+      /*
+       *   Eye catcher checking
+       */
+
+       if ( memcmp(header->eyecatcher,
+                   LOCK_EYECATCHER , 4 ) NE 0 ) {
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                       component,func,err_desc,16,__LINE__);
+         rc=ESA_FATAL;
+         goto exit;
+       }
+    }
+
+    debug_level = ESA_DIAG_get_debug_level(ESA_COMP_OS_LOCK);
+
+    memcpy(rname_diag, header->res_name,RNAME_DIAG_LEN);
+    rname_diag[RNAME_DIAG_LEN]=NULL_CHAR;
+    rname_diag_ptr=strchr(rname_diag,BLANK);
+    if ( rname_diag_ptr NE NULL )
+       *rname_diag_ptr = NULL_CHAR ;
+
+    ESA_DIAG_printf(ESA_COMP_OS_LOCK,2,
+             /* BS10076 Added the interval time to this diag message
+             "QNAME=(%d)%s RNAME=(%d)%s EXC_SHR=%s RNL=%s wait %d sec ", */
+             "QNAME=(%d)%s RNAME=(%d)%s EXC_SHR=%s RNL=%s wait %d / %d",
+                    strlen(header->q_name),
+                    header->q_name,
+                    strlen(header->res_name),
+                    rname_diag,
+                    exc_shr, header->rnl,                 /* WS10054 */
+                    /* BS10076 wait_sec);                            */
+                    header->total_wait_lock,              /* BS10076 */
+                    header->interval_wait_lock);          /* BS10076 */
+
+    time(&before);      /* Obtain date/time value  */
+
+    do { /* ENQ service loop */
+
+    /*
+     *    Invoke ENQ service
+     */
+
+    /* SAS2IBMT
+    rc=ctsaenq(&debug_level,             // debug level           */
+    rc=(*(ASM_RTN_TYP *)&ctsaenq)(&debug_level,        /* SAS2IBMT */
+             "ENQ",                      /* request ENQ service   */
+             header->q_name,             /* qname                 */
+             header->res_name,           /* rname (ddn or dsn)    */
+             header->res_ddname,         /* ddname (if rname=dsn) */
+             exc_shr,                    /* exc or shr    WS10054 */
+             header->rnl,                /* rnl=y/n parm  WS10054 */
+             &(header->reserve_flag),    /* reserve flag          */
+             &reason_code,               /* reason code           */
+             &(header->resource_scope)); /* resource scope        */
+
+    /*
+     *    rc=0   -  ENQ request done successfuly
+     *    rc=8   -  problem with ENQ service
+     *              reason=4   The resource is not immediately
+     *                         available.
+     *              reason=8   A previous request for control
+     *                         of the same resource has been made
+     *                         for the same task.The task has
+     *                         control of the resource.
+     *              reason=14  A previous request for control
+     *                         of the same resource has been made
+     *                         for the same task.The task does not
+     *                         have control of the resource.
+     *
+     *              reason=18  Environment error. The limit for the
+     *                         number of concurrent resource requests
+     *                         has been reached. The task does not
+     *                         have control of the resource.
+     */
+
+    if (  ( (rc EQ 8) AND (reason_code EQ 8) )  OR (rc EQ 0)  )
+      {
+         rc=ESA_OK ;
+         /* BS10076 wait_sec=0;                                      */
+         /* BS10082 Delete these 2 instructions. Do not clear the
+                    total_wait_lock field. Just leave loop.
+         header->total_wait_lock = 0;                     // BS10076 //
+         time(&after);                    // Obtain date/time value  */
+         break;                    /* leave loop immediately BS10082 */
+      }
+    else if (  ( rc EQ 8 )                                AND
+               ( (reason_code EQ 4) OR ( reason_code EQ 14 ) )  )
+      {
+         /* BS10076 OS_CS_wait(OS_LOCK_INTERVAL);                    */
+         OS_CS_wait(header->interval_wait_lock);          /* BS10076 */
+         time(&after);  /* Obtain date/time value  */
+         rc=ESA_LOCKED;
+         ESA_DIAG_printf(ESA_COMP_OS_LOCK,2,              /* WS10054 */
+             "ENQ attempt returned with rc=8 reason=4 or 14");
+      }
+    else
+      {
+         CTSAMSG_print(OS_CS_LOCK_FAILED, msgs, NULL, dest,
+                       header->q_name, rname_diag);
+         CTSAMSG_print(OS_CS_ENQ_ERR, msgs, NULL, dest,rc,reason_code);
+         /* BS10076 OS_CS_wait(OS_LOCK_INTERVAL);                    */
+         OS_CS_wait(header->interval_wait_lock);          /* BS10076 */
+         rc=ESA_LOCKED;
+         time(&after);  /* Obtain date/time value  */
+      }
+
+    /* BS10076 } while ( difftime(after,before) LT wait_sec ) ;      */
+    } while (difftime(after,before) LT header->total_wait_lock);/*BS10076*/
+
+   exit :;
+    if ( rc NE ESA_FATAL ) {
+      if ( rc EQ ESA_OK )
+         header->enq_done = 1;   /* ENQ service done successfully */
+      else
+         header->enq_done = 0;   /* ENQ service not done          */
+    }
+
+    if ( rc  EQ  ESA_LOCKED )
+       CTSAMSG_print(OS_CS_RES_NOT_AVAILABLE,
+                     msgs, NULL, dest,rname_diag);
+
+    ESA_DIAG_exit(ESA_COMP_OS_LOCK,1, func, rc );
+
+    return rc ;
+
+  }
+
+
+/****************************************************
+ * Procedure Name: OS_CS_unlock
+ * Description   : unlock files
+ *
+ * Input         : file name
+ *                 handle
+ *                 CTSAMSG stuff
+ *
+ * output        : handle
+ *                 CTSAMSG error structure
+ *
+ * Return Value  : ESA_OK     upon success
+ *                 ESA_FATAL  on any other fail situation
+ *
+ * Comments      : please free the handle
+ *
+ * Scope         :
+ ****************************************************/
+
+ ESA_RC OS_CS_unlock (void                   * handle,
+                      CTSAMSG_PARAMS_rec_typ * msg_params)
+
+  {
+
+ /*
+  *   Variables
+  */
+    ESA_RC rc=ESA_OK ;
+    CTSAMSG_HANDLE_rec_ptr msgs;
+    CTSAMSG_DEST_TABLE_rec_ptr dest;
+    OS_LOCK_HEADER_ptr header;
+    int  debug_level=0;
+    int  reason_code;
+    static char func[]="OS_CS_unlock";
+
+  /*
+   *    Initialization
+   */
+
+    ESA_DIAG_enter(ESA_COMP_OS_UNLOCK,1, func);
+
+    msgs = msg_params->ctsamsg_handle;
+    dest = msg_params->ctsamsg_dest;
+
+    if ( handle EQ NULL ) {
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                       component,func,err_desc,16,__LINE__);
+         rc=ESA_FATAL;
+         goto exit;
+    }
+    else {
+
+      /*
+       *   Eye catcher checking
+       */
+
+       header = (OS_LOCK_HEADER_ptr) handle ;
+       if ( memcmp(header->eyecatcher,
+                   LOCK_EYECATCHER , 4 ) NE 0 ) {
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                       component,func,err_desc,16,__LINE__);
+         rc=ESA_FATAL;
+         goto exit;
+       }
+    }
+
+    memcpy(rname_diag, header->res_name,RNAME_DIAG_LEN);
+    rname_diag[RNAME_DIAG_LEN]=NULL_CHAR;
+    rname_diag_ptr=strchr(rname_diag,BLANK);
+    if ( rname_diag_ptr NE NULL )
+       *rname_diag_ptr = NULL_CHAR ;
+
+   /*
+    *       ENQ service not performed
+    */
+
+    if (  header->enq_done EQ 0 ) {
+       rc = ESA_ERR;
+       CTSAMSG_print(OS_CS_RES_NO_LOCKED, msgs, NULL, dest, rname_diag);
+       goto exit ;
+    }
+
+    debug_level = ESA_DIAG_get_debug_level(ESA_COMP_OS_UNLOCK);
+    ESA_DIAG_printf(ESA_COMP_OS_UNLOCK,2,
+                    "QNAME=(%d)%s RNAME=(%d)%s RNL=%s",   /* WS10054 */
+                    strlen(header->q_name),
+                    header->q_name,
+                    strlen(header->res_name),
+                    rname_diag,
+                    header->rnl);                         /* WS10054 */
+
+    /*
+     *    Invoke DEQ service
+     */
+
+    /* SAS2IBMT
+    rc=ctsaenq(&debug_level,             // debug level           */
+    rc=(*(ASM_RTN_TYP *)&ctsaenq)(&debug_level,        /* SAS2IBMT */
+             "DEQ",                      /* request DEQ service   */
+             header->q_name,             /* qname                 */
+             header->res_name,           /* rname (ddn or dsn)    */
+             header->res_ddname,         /* ddname (if rname=dsn) */
+             NULL,                       /* placeholder   WS10054 */
+             header->rnl,                /* rnl=y/n parm  WS10054 */
+             &(header->reserve_flag),    /* reserve flag          */
+             &reason_code,               /* reason code           */
+             &(header->resource_scope)); /* resource scope        */
+
+    /*
+     *    rc=0   -  DEQ request done successfuly
+     *    rc=12  -  problem with DEQ service
+     *              reason=4   The resource has been requested
+     *                         for the task,but the task has not
+     *                         been assigned control of it.
+     *              reason=8   Control of the resource has not
+     *                         been requested by the active task,
+     *                         or the resource has already been
+     *                         released.
+     */
+
+    if  ( rc EQ 12 )
+      {
+         CTSAMSG_print(OS_CS_UNLOCK_FAILED, msgs, NULL, dest,
+                       header->q_name, rname_diag);
+         CTSAMSG_print(OS_CS_DEQ_ERR, msgs, NULL, dest,rc,reason_code);
+         rc=ESA_FATAL;
+      }
+
+   exit :;
+    if ( rc EQ ESA_OK )
+        header->enq_done = 0;   /* ENQ service not done */
+
+    ESA_DIAG_exit(ESA_COMP_OS_UNLOCK,1, func, rc );
+
+    return rc ;
+
+  }
+
+/****************************************************
+ * Procedure Name: OS_CS_lock_init
+ * Description   : lock resource init function
+ *
+ * Input         : Resource name
+ *                 Resource type (LOCK_FILE or die!)
+ *
+ *                 File handle - reserved for future use
+ *                 CTSAMSG stuff
+ *
+ * output        : Pointer to handle (as in ESAAPI handles)
+ *
+ * Return Value  : ESA_OK     upon success
+ *                 ESA_LOCKED if the file is locked by other
+ *                            process
+ *                 ESA_FATAL  on any other fail situation
+ * Comments      : With modification BS10076, we now pass the total
+ *                 wait time and the interval wait time to this
+ *                 routine. These 2 values will be saved in the lock
+ *                 header/handle to be used when we actually get the
+ *                 lock in the OS_CS_DO_LOCK routine.
+ *                 These 2 values came from the following RSSPARM
+ *                 parameters or (if not present in RSSPARM) from the
+ *                 following #define default macro definitions:
+ *                 WAIT_QUEUE and WAIT_QUEUE_INTERVAL - ESAQUE CMAC -
+ *                              when file is a QUEUE-related file
+ *                 ACF2_LOCK and ACF2_LOCK_INTERVAL - CTSBACF CMAC -
+ *                              when file is an ACF2 (GDB and UDB) file
+ *                 WAIT_LOCK and WAIT_LOCK_INTERVAL - PLATFORM CMAC -
+ *                              when file is a general file
+ *                 Also, these 2 parameters, res_typ and file_handle,
+ *                 are not used in this routine so they were removed
+ *                 from the calling sequence.
+ *
+ * Scope         :
+ ****************************************************/
+
+ ESA_RC OS_CS_lock_init (RESOURCE_typ             res_name,
+                         /* BS10076 LOCK_RES_TYP_typ res_typ, */
+                         void                  ** handle,
+                         /* BS10076 FILE        * file_handle, */
+                         int                      total,   /* BS10076 */
+                         int                      interval,/* BS10076 */
+                         LOCK_SCOPE_typ           lock_scope,
+                         CTSAMSG_PARAMS_rec_typ * msg_params)
+
+ {
+
+ /*
+  *   Variables
+  */
+
+ static char func[]="OS_CS_lock_init";
+ static int  get_qname=1;       /* get qname parameter */
+ static char qname[10];
+ static char rnl[2];                                      /* WS10054 */
+
+ CTSAMSG_HANDLE_rec_ptr     msgs;
+ CTSAMSG_DEST_TABLE_rec_ptr dest;
+ ESA_RC                     rc = ESA_OK;
+ OS_LOCK_HEADER_ptr         lock_ptr;
+ int                        debug_level,reason_code;
+
+ /* IS10174 int    dd_rc = 0 ;    */
+ ESA_RC dd_rc = 0 ;                                      /* IS10174 */
+ char   ds_name[45] = NULL_STRING;
+ /* IS10174 int    dsname_len  = 0;                     * SAS2IBMN * */
+
+ /*
+  *    Initialization
+  */
+
+ ESA_DIAG_enter(ESA_COMP_OS_LOCK_I,1, func );
+
+ msgs = msg_params->ctsamsg_handle;
+ dest = msg_params->ctsamsg_dest;
+
+ /*
+  *   Check resource length. Must be LE 256 byte .
+  *   According the ENQ/DEQ service requirenment
+  */
+
+ if ( strlen(res_name) GT 256 ) {
+    CTSAMSG_print(OS_CS_INV_RES_LEN, msgs, NULL, dest, res_name);
+    rc=ESA_FATAL ;
+    goto exit ;
+ }
+
+ /*
+  *   Obtain handle
+  */
+
+ *handle = NULL ;
+ *handle = malloc( sizeof(OS_LOCK_HEADER_typ) );
+ if ( *handle EQ NULL ) {
+    CTSAMSG_print(ERR_MALLOC, msgs, NULL, dest, "LOCK_HANDLE",
+                  sizeof(OS_LOCK_HEADER_typ) );
+    rc = ESA_FATAL ;
+    goto exit ;
+ }
+
+ lock_ptr = *handle;
+ memcpy(lock_ptr->eyecatcher, LOCK_EYECATCHER , 4 );
+
+ debug_level = ESA_DIAG_get_debug_level(ESA_COMP_OS_LOCK_I);
+
+ if ( get_qname ) {
+      get_qname=0;
+      /* SAS2IBMT
+      rc = ctsagtq(&debug_level, qname, rnl, &reason_code); //WS10054*/
+      rc = (*(ASM_RTN_TYP *)&ctsagtq)(&debug_level, qname,
+                                      rnl, &reason_code); /* SAS2IBMT */
+
+      qname[8]=NULL_CHAR;
+      rnl[1]=NULL_CHAR;                                   /* WS10054 */
+      ESA_DIAG_printf(ESA_COMP_OS_LOCK_I,1,
+                      "Get QNAME=%s RNL=%s rc=%d",        /* WS10054 */
+                      qname, rnl, reason_code );          /* WS10054 */
+
+      if ( rc NE 0) {
+         CTSAMSG_print(OS_CS_INV_GET_QNAME, msgs, NULL, dest,
+                       reason_code, QNAME );
+         memcpy( qname , QNAME , 8 );
+         qname[8]=NULL_CHAR;
+         memcpy( rnl , ENQRNL , 1 );                      /* WS10054 */
+         rnl[1]=NULL_CHAR;                                /* WS10054 */
+         rc = ESA_OK;
+      }
+ }    /* first entry - get QNAME from IOA parameters load table*/
+
+ memcpy( lock_ptr->q_name, qname , 8 );
+ memcpy( lock_ptr->rnl, rnl , 1 );                        /* WS10054 */
+
+ /*
+  *   Initialize header's variables
+  */
+
+  memset( lock_ptr->res_name, BLANK, MAX_RSS_RESOURCE_NAME_LEN);
+  memcpy( lock_ptr->res_name, res_name, strlen(res_name) );
+  lock_ptr->enq_done = 0;
+
+  memset( lock_ptr->res_ddname, BLANK, 8);     /* dc141295 */
+  lock_ptr->res_ddname[8] = NULL_CHAR;          /* dc141295 */
+  lock_ptr->reserve_flag = 0;                  /* dc141295 */
+
+  if ( lock_scope EQ SCOPE_REMOTE )
+     lock_ptr->resource_scope = 0;
+  else
+     lock_ptr->resource_scope = 4;
+
+  lock_ptr->res_name[MAX_RSS_RESOURCE_NAME_LEN]=NULL_CHAR;
+  lock_ptr->q_name[8]=NULL_CHAR;
+  lock_ptr->rnl[1]=NULL_CHAR;                             /* WS10054 */
+  lock_ptr->total_wait_lock = total;                      /* BS10076 */
+  lock_ptr->interval_wait_lock = interval;                /* BS10076 */
+
+  /*
+   *    if ddname was passed , convert the ddname to dsname
+   *    and use it for the lock instead of the ddname.
+   */
+
+
+  if (strlen(res_name) LE 8) {
+     /* SAS2IBMN
+     dd_rc = osddinfo(res_name, ds_name, NULL, NULL , NULL, NULL ); */
+     /* SAS2IBMT
+     dd_rc = ctsaddi(res_name, ds_name, &dsname_len,       // SAS2IBMN */
+     /* IS10174
+     dd_rc = (*(ASM_RTN_TYP *)&ctsaddi)(res_name, ds_name,  * SAS2IBMN *
+           &dsname_len, NULL, NULL, &debug_level);  * SAS2IBMN SAS2IBMT *
+     ds_name[dsname_len] = NULL_CHAR;                     * SAS2IBMN *
+     */
+     dd_rc = OS_MVS_ddinfo(res_name, ds_name, TRUE,       /* IS10174 */
+                           dest, msgs, 0);                /* IS10174 */
+     ESA_DIAG_printf(ESA_COMP_OS_LOCK, 1,
+                     "ddinfo rc=%s, dd=%s ds=%s",         /* IS10174 */
+                     ESA_rc2str(dd_rc), res_name, ds_name);/*IS10174 */
+     /* IS10174 if (dd_rc EQ 0) {   */
+     if (dd_rc EQ ESA_OK) {                               /* IS10174 */
+        strcpy( lock_ptr->res_ddname, res_name);       /* dc141295 */
+        lock_ptr->res_ddname[strlen(res_name)]= BLANK; /* dc141295 */
+        memcpy( lock_ptr->res_name, ds_name, strlen(ds_name) );
+     }
+  }
+
+  /*
+   *    Delete trialing blanks for diag and messages
+   */
+
+  memcpy(rname_diag, lock_ptr->res_name, RNAME_DIAG_LEN);
+  rname_diag[RNAME_DIAG_LEN]=NULL_CHAR;
+  rname_diag_ptr=strchr(rname_diag,BLANK);
+  if ( rname_diag_ptr NE NULL )
+     *rname_diag_ptr = NULL_CHAR ;
+
+  ESA_DIAG_printf(ESA_COMP_OS_LOCK_I,1,
+      "qname=%s rname=%s rnl=%s, dd=%s reserve=%d scope=%d(%d)",
+                  lock_ptr->q_name, rname_diag ,
+                  lock_ptr->rnl,                          /* WS10054 */
+                  lock_ptr->res_ddname,
+                  lock_ptr->reserve_flag,
+                  lock_scope, lock_ptr->resource_scope);
+  ESA_DIAG_printf(ESA_COMP_OS_LOCK_I, 1,                  /* BS10076 */
+      "total_time (sec)=%d interval_time (millisec)=%d",  /* BS10076 */
+                  lock_ptr->total_wait_lock,              /* BS10076 */
+                  lock_ptr->interval_wait_lock);          /* BS10076 */
+
+  ESA_DIAG_exit(ESA_COMP_OS_LOCK_I,1, func, rc );
+
+  exit : ;
+
+  return rc;
+
+}
+
+/****************************************************
+ * Procedure Name: OS_CS_lock_term
+ * Description   : cleanup after last lock
+ *
+ * Input         : CTSAMSG stuff
+ *
+ * Input/output  : Handle for the unlock function
+ *
+ * Return Value  : ESA_OK     upon success
+ *                 ESA_FATAL  on any other fail situation
+ *
+ ****************************************************/
+
+extern ESA_RC OS_CS_lock_term (void                  ** handle,
+                               CTSAMSG_PARAMS_rec_typ * msg_params)
+{
+
+
+   /*
+    *   Variables
+    */
+
+    ESA_RC rc=ESA_OK;
+    CTSAMSG_HANDLE_rec_ptr msgs;
+    CTSAMSG_DEST_TABLE_rec_ptr dest;
+    OS_LOCK_HEADER_ptr lock_ptr;
+    static char func[]="OS_CS_lock_trm";
+
+   /*
+    *    Initialization
+    */
+
+    ESA_DIAG_enter(ESA_COMP_OS_LOCK_T,1, func);
+
+    msgs = msg_params->ctsamsg_handle;
+    dest = msg_params->ctsamsg_dest;
+
+   /*
+    *   Entered Handle EQ NULL
+    */
+
+    if ( *handle EQ NULL ) {
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                      component,func,err_desc,16,__LINE__);
+        rc = ESA_FATAL ;
+        goto exit;
+    }
+
+   /*
+    *   Eye catcher checking
+    */
+
+    lock_ptr = (OS_LOCK_HEADER_ptr) (*handle) ;
+    if ( memcmp(lock_ptr->eyecatcher,
+                LOCK_EYECATCHER , 4 ) NE 0 ) {
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                       component,func,err_desc,16,__LINE__);
+         rc=ESA_FATAL;
+         goto exit;
+    }
+
+   /*
+    *   Free handle
+    */
+
+    free(*handle) ;
+    *handle = NULL ;
+
+   exit:;
+
+    ESA_DIAG_exit(ESA_COMP_OS_LOCK_T,1, func, rc );
+
+    return rc;
+  }
+
