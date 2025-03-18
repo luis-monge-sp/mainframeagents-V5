@@ -1,0 +1,480 @@
+/**********************************************************************
+*
+* C Source: ctsprc.c
+* Description: Create/Rebuild proc. table (RSSOFLI)
+* %created_by: ihoffma %
+* %date_created: Thu Nov 20 11:28:27 2003 %
+*
+**********************************************************************/
+/********************************************************************
+* Mod.ID  Who            When         Description
+* ===================================================================
+* IMH001  Ian H.   17/10/03     Add support for CheckAndPrintVersion
+* IMH002  Ian H.   16/11/03     Thread-safe code (ERRNO)
+* MHD003  monika   17/04/08     Fixed for the QAP QM001553440
+* SAS2IBMT SeligT  30/06/16     SAS/C to IBM C Conversion Project
+********************************************************************/
+ 
+#define THIS_IS_MAIN
+ 
+#include   "globs.h"
+ 
+#include   ERRNO
+#include   ESA_INIT
+#include   ESA_CS_SINFO
+#include   ESA_PROC
+#include   ESA_RSS
+#include   ESA_CS_OS
+#include   ESA_OS_PROC
+#include   ESA_OS_CONSOLE
+#include   ESA_RSSF
+#include   ESA_VER
+ 
+    SCCSID("@(#) ctsprc.c \
+$Revision:   1.13  $\
+$Date:   Nov 11 1999 19:19:56  $\
+$Author:   leonid_s  $")
+ 
+ 
+static ESA_RC chk_restart_fld (int  * kk,
+                               char * rsstbl_row_ptr)
+{
+  char                  fn[]="chk_restart_fld";
+  RSS_typ               rss_name;
+  ESA_RC                rc= ESA_OK, OfliInerval_rc= ESA_OK;
+  TIME_typ              cur_time,next_time,strt_time,OfliInterval="";
+  DATE_typ              cur_date,  next_date, strt_date;
+  RSSTBL_rec_typ      * rsstbl;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON, fn);
+ 
+  memcpy ((char *)rss_name, rsstbl_row_ptr, sizeof(RSS_typ));
+  strtok (rss_name, " ");
+  CS_get_cur_time (cur_date,
+                   cur_time);
+  ESA_DIAG_printf (ESA_COMP_ACSPROC, 6, "Current time=%.6s date=%.8s.",
+                   cur_time, cur_date);
+  memcpy (next_time, cur_time, TIME_LEN);
+  memcpy (next_date, cur_date, DATE_LEN);
+  next_time[TIME_LEN]= '\0';
+  next_date[DATE_LEN]= '\0';
+ 
+  OfliInerval_rc=rssprm_get_opt (rss_name,
+                                 OFLI_INTERVAL,
+         			             TIME_LEN, OfliInterval,
+		    		             OPT_TRUE, OPT_FALSE);
+  ESA_DIAG_printf (ESA_COMP_ACSPROC, 6,
+        "rss=%s Ofli: Interval=%s rc=%d.",
+         rss_name, OfliInterval, (int)OfliInerval_rc);
+  rc= set_next_time (rss_name,
+                    (OfliInerval_rc EQ ESA_OK) ? OfliInterval : NULL,
+                     next_date, next_time);
+  ESA_DIAG_printf (ESA_COMP_ACSPROC, 6,
+          "Next time=%.6s date=%.8s.",
+          next_time,
+          next_date);
+  rsstbl= (RSSTBL_rec_typ *)rsstbl_row_ptr;
+  memcpy (strt_time, rsstbl->intercept_next_time, TIME_LEN);
+  memcpy (strt_date, rsstbl->intercept_next_date, DATE_LEN);
+  strt_time[TIME_LEN]= '\0';
+  strt_date[DATE_LEN]= '\0';
+  ESA_DIAG_printf (ESA_COMP_ACSPROC, 6,
+          "Start interceptor time=%.6s date=%.8s.",
+          strt_time,
+          strt_date);
+ 
+  if (memcmp (next_date, strt_date, DATE_LEN) GT 0)
+     goto cleanup;
+  if (
+        (memcmp (next_date, strt_date, DATE_LEN) EQ 0)
+       AND
+        (memcmp (next_time, strt_time, TIME_LEN) GT 0)
+     )
+     goto cleanup;
+  (*kk)++;
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSCHED, 6,
+     "Need change Offline interceptor start time for rss=%s.",
+     rss_name);
+  memcpy (rsstbl->intercept_next_time, next_time, TIME_LEN);
+  memcpy (rsstbl->intercept_next_date, next_date, DATE_LEN);
+ 
+  CTSAMSG_print (MSG_CTSPRC_ACT_TIME_CHG,
+                 envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                 envir_ptr->msg_admin_param.ctsamsg_dest,
+                 CG_name (envir_ptr->p_main_name),
+                 rss_name);
+ 
+cleanup:
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON, fn, rc);
+  return (rc);
+}
+ 
+/**************************************************************
+ * Procedure Name   : prc_tbl_reinst
+ *
+ * Description      : Add new rss rows in 'proc_table'
+ *                        according to rss rows from 'rssprm_tbl'
+ * Return Value     : ESA_RC
+ *                                                             *
+ **************************************************************/
+ 
+static ESA_RC prc_tbl_reinst (char * rss_in,
+                              char * host_in)
+{
+  char                    fn[]="prc_tbl_reinst";
+  RSS_typ                 rss, rss_tbl, rss_type;
+  ESA_RC                  rc= ESA_OK;
+  RSSTBL_rec_typ          rsstbl_row, * rsstbl = NULL;
+  int                     rsstbl_num= 0, from_row_num= -1;
+  int                     ii, rss_num_after_load= 0;
+  int                     sw_rss, sw_host, jj, kk;
+  TIME_typ                cur_time;
+  DATE_typ                cur_date;
+  ENVIRONMENT_rec_typ   * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON, fn);
+ 
+  rc= tbl_load (&rsstbl, &rsstbl_num);
+ 
+  for (ii= 0, jj= 0; ii + jj LT rsstbl_num; ii++)
+  {
+     CLEAR (rss_tbl);
+     memcpy ((char *)rss_tbl, (char *)(rsstbl+ (ii - jj)),
+             sizeof (RSS_typ));
+     strtok (rss_tbl, " ");
+     rc= rssprm_get (rss_tbl, RSS_TYPE, RSS_NAME_LEN, rss_type);
+     if (rc EQ ESA_OK)
+        continue;
+     memcpy ((char *)(rsstbl+ (ii - jj)),
+             (char *)(rsstbl+ (rsstbl_num -1 -jj)),
+             sizeof (RSSTBL_rec_typ));
+     jj++;
+  }
+ 
+  if (jj NE 0)
+  {
+    rc= tbl_rebuild (rsstbl, rsstbl_num- jj);
+    if (rc EQ ESA_OK)
+    {
+       CSA_free ((char **)&rsstbl);
+       rsstbl = NULL;
+       rc= tbl_load (&rsstbl, &rsstbl_num);
+    }
+    if (rc NE ESA_OK AND rc NE ESA_KEY_NOT_FOUND)
+       goto cleanup;
+  }
+  if (jj NE 0)
+      CTSAMSG_print (MSG_CTSPRC_DEL_REC,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     CG_name (envir_ptr->p_main_name),
+                     jj);
+ 
+  for (rss_num_after_load= rsstbl_num, from_row_num= -1, kk= 0;
+       rc EQ ESA_OK;)
+  {
+    CLEAR (rss);
+    rc= rssprm_next_rss (rss, rss_type, &from_row_num);
+    if (rc EQ ESA_OK)
+    {
+      for (ii= 0; ii LT rsstbl_num; ii++)
+      {
+        CLEAR (rss_tbl);
+        memcpy ((char *)rss_tbl,
+                (char *)(rsstbl+ ii), sizeof (RSS_typ));
+        strtok (rss_tbl, " ");
+        if (My_stricmp (rss_tbl, rss) EQ 0)
+           break;
+      }
+      if (ii LT rsstbl_num)
+      {
+         rc= chk_restart_fld (&kk, (char *)(rsstbl+ ii));
+         if (rc NE ESA_OK)
+            goto cleanup;
+         continue;
+      }
+      if (rss_num_after_load EQ 0)
+         rc= CSA_alloc ((char **)&rsstbl, STRUC_RSSTBL,
+                         sizeof (RSSTBL_rec_typ),
+                         1, fn, "RSSTBL (OFLI) table");
+      else
+         rc= CSA_realloc ((char **)&rsstbl, STRUC_RSSTBL,
+                          sizeof (RSSTBL_rec_typ),
+                          rss_num_after_load + 1);
+      if (rc NE ESA_OK)
+      {
+         CTSAMSG_print (ERR_CS_MALLOC,
+                     envir_ptr->ctsamsg_handle, NULL,
+                     envir_ptr->ctsamsg_dest,
+                     "RSSOFLI_TBL",
+                    (int)((rss_num_after_load + 1)*
+                          sizeof (RSSTBL_rec_typ)),
+                     fn);
+          rc = ESA_ERR;
+           goto cleanup;
+      }
+      CS_get_cur_time (cur_date, cur_time);
+      memset ((char *)(&rsstbl_row), ' ', sizeof(RSSTBL_rec_typ));
+      memcpy ((char *)rsstbl_row.rss, (char *)rss, strlen(rss));
+      memcpy ((char *)rsstbl_row.intercept_next_date, (char *)cur_date,
+              DATE_LEN);
+      memcpy ((char *)rsstbl_row.intercept_next_time, (char *)cur_time,
+              TIME_LEN);
+      memcpy ((char *)rsstbl_row.intercept_end_date, (char *)cur_date,
+              DATE_LEN);
+      memcpy ((char *)rsstbl_row.intercept_end_time, (char *)cur_time,
+              TIME_LEN);
+      memcpy ((char *)rsstbl_row.sync_start_date, (char *)cur_date,
+              DATE_LEN);
+      memcpy ((char *)rsstbl_row.sync_start_time, (char *)cur_time,
+              TIME_LEN);
+      memset ((char *)rsstbl_row.intercept_till_date, '0', DATE_LEN);
+      memset ((char *)rsstbl_row.intercept_till_time, '0', TIME_LEN);
+      memset ((char *)rsstbl_row.log_last_update_date, '0', DATE_LEN);
+      memset ((char *)rsstbl_row.log_last_update_time, '0', TIME_LEN);
+      memset ((char *)rsstbl_row.log_last_recnum, '0',
+              MAX_FIGURES_IN_LONG_INT);
+ 
+      memcpy ((char *)rsstbl_row.host, (char *)envir_ptr->host_name,
+              strlen(envir_ptr->host_name));
+      rsstbl_row.dwnld_sync_method = '4';
+      rsstbl_row.end_row= '\n';
+      rsstbl_row.end_string= '\0';
+      memcpy ((char *)(rsstbl+ rss_num_after_load),
+              (char *)(&rsstbl_row), sizeof(RSSTBL_rec_typ));
+      rss_num_after_load++;
+      ESA_DIAG_printf (ESA_COMP_ACSPROC, DIAG_COMMON+ 1,
+       "Added row %s",rsstbl_row.rss);
+    }
+  }
+  rc = ESA_OK;
+ 
+  if (rss_in NE NULL)
+  {
+    for (sw_rss = 0, sw_host = 0, ii= 0;
+ 
+         /* Amir added '()' in next line */
+         (ii LT rss_num_after_load) AND (sw_host EQ 0) ;
+ 
+         ii++)
+    {
+      memcpy ((char *)(&rsstbl_row), (char *)(rsstbl+ ii),
+              sizeof(RSSTBL_rec_typ));
+      strtok (rsstbl_row.host, " ");
+      strtok (rsstbl_row.host, "\n");
+      strtok (rsstbl_row.rss, " ");
+      if (My_stricmp (rsstbl_row.rss, rss_in) EQ 0)
+      {
+         if (sw_rss EQ 0)
+         {
+            sw_rss = 1;
+            jj = ii;
+         }
+         if (strcmp (rsstbl_row.host, host_in) EQ 0)
+            sw_host = 1;
+      }
+    }
+    if (sw_rss EQ 0)
+    {
+          rc = ESA_ERR;
+          CTSAMSG_print (MSG_CTSPRC_HOST_ERR,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     rss_in, envir_ptr->file_rssofli, fn);
+         goto cleanup;
+    }
+    if (sw_host NE 0)
+    {
+          rc = ESA_ERR;
+          CTSAMSG_print (MSG_CTSPRC_HOST_ERR,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     CG_name (envir_ptr->p_main_name),
+                     rss_in, host_in);
+          goto cleanup;
+    }
+ 
+    rc= CSA_realloc ((char **)&rsstbl, STRUC_RSSTBL,
+                     sizeof (RSSTBL_rec_typ),
+                     rss_num_after_load + 1);
+    if (rc NE ESA_OK)
+    {
+          rc = ESA_ERR;
+         CTSAMSG_print (ERR_CS_MALLOC,
+                     envir_ptr->ctsamsg_handle, NULL,
+                     envir_ptr->ctsamsg_dest,
+                     "RSSOFLI_TBL",
+                    (int)((rss_num_after_load + 1)*
+                          sizeof (RSSTBL_rec_typ)),
+                     fn);
+          goto cleanup;
+    }
+    memcpy ((char *)(&rsstbl_row), (char *)(rsstbl+ jj),
+            sizeof(RSSTBL_rec_typ));
+    memset ((char *)rsstbl_row.host, ' ', HOST_NAME_LENGTH);
+    memcpy ((char *)rsstbl_row.host, (char *)host_in, strlen(host_in));
+    rsstbl_row.dwnld_sync_method = '4';
+    rsstbl_row.end_row = '\n';
+    rsstbl_row.end_string = '\0';
+    memcpy ((char *)(rsstbl + rss_num_after_load),
+            (char *)(&rsstbl_row),
+            sizeof(RSSTBL_rec_typ));
+    rss_num_after_load++;
+  }
+ 
+  if (
+        (rss_num_after_load GT rsstbl_num)
+       OR
+        (kk GT 0)
+     )
+  {
+     if (rss_num_after_load GT rsstbl_num)
+        CTSAMSG_print (MSG_CTSPRC_NEW_REC,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     CG_name (envir_ptr->p_main_name),
+                     rss_num_after_load - rsstbl_num );
+    rsstbl_num = rss_num_after_load;
+    rc= tbl_rebuild (rsstbl, rsstbl_num);
+  }
+  cleanup:
+  if (rsstbl NE NULL)
+  {
+     CSA_free ((char **)&rsstbl);
+     rsstbl = NULL;
+  }
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON, fn, rc);
+ 
+  return(rc);
+ 
+} /* prc_tbl_reinst */
+ 
+/**************************************************************
+ * Procedure Name   : main
+ *
+ * Description      : Add new rss rows in 'proc_table'
+ *                        according to rss rows from 'rssprm_tbl'
+ * Return Value     : ESA_RC
+ *                                                             *
+ **************************************************************/
+ 
+int main (int argc, char **argv)
+{
+  char                    fn[]="ctsprc";
+  char                    failmsg [512];
+  ESA_RC                  rc= ESA_OK;
+  int                     seconds;
+  char                    wait_seconds[RSSPRM_VALUE_LEN+ 1];
+  FILE                  * rsstbl_file;
+/* MHD003 */
+  char                    skip_rec[3];
+  char                  * rss = NULL, * host = NULL;
+  ENVIRONMENT_rec_typ   * envir_ptr;
+  char                    ddn_with[12]="";                /* SAS2IBMT */
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON, fn);
+ 
+  rc= CG_prolog (ESA_ACSPRC_PROC, argc, argv);
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  if (rc NE ESA_OK) {
+    sprintf (failmsg, PROLOG_PROC_INIT_ERROR,
+             CG_name (envir_ptr->p_main_name),
+             ESA_rc2str(rc));
+    fprintf (stderr,failmsg);
+    OS_CONSOLE_print (failmsg,
+                      OS_CONS_ROLLABLE_YES,
+                      OS_CONS_SEV_ERROR);
+ 
+    goto exit_point;
+  }
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON, fn);
+ 
+  envir_ptr->msg_dest->dests[CTSAMSG_DEST_CNSL].active= FLAG_YES;
+ 
+/* IMH001 start */
+ 
+   rc = CheckAndPrintVersion (argc, argv);
+   if (rc EQ ESA_OK)
+       goto exit_point;
+ 
+    rc = ESA_OK;
+/* IMH001 end */
+ 
+  if (argc GT 1 AND argc LT 3) {
+      rc = ESA_ERR;
+      CTSAMSG_print (MSG_CTSPRC_PRM_ERR,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                      CG_name (envir_ptr->p_main_name));
+ 
+    goto exit_point;
+  }
+  if (argc GT 1)
+  {
+     rss = argv[1];
+     host = argv[2];
+  }
+ 
+  CLEAR (wait_seconds);
+  rc= envir_ptr->msg_admin_param.cs_func.rssprm_get_ptr (
+                     envir_ptr->all_rss,
+                     WAIT_LOCK, 10, wait_seconds);
+ 
+  if (rc NE ESA_OK)
+    goto exit_point;
+ 
+  seconds= atoi (wait_seconds);
+ 
+  strcpy(ddn_with,"DD:");                                 /* SAS2IBMT */
+  strcat(ddn_with, envir_ptr->file_rssofli);              /* SAS2IBMT */
+ 
+  /* SAS2IBMT rsstbl_file = fopen(envir_ptr->file_rssofli, "r");     */
+  rsstbl_file = fopen(ddn_with, "r");                     /* SAS2IBMT */
+  if (rsstbl_file EQ NULL) {
+    /* SAS2IBMT rsstbl_file = fopen(envir_ptr->file_rssofli, "w");   */
+    rsstbl_file = fopen(ddn_with, "w,recfm=*");           /* SAS2IBMT */
+    if (rsstbl_file EQ NULL) {
+      CTSAMSG_print (ERR_FILE,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     "OPEN ", "Proc. table:",
+                     envir_ptr->file_rssofli, strerror(errno));
+      rc= ESA_FATAL;
+      goto exit_point;
+    }
+    memset(skip_rec,0,sizeof(skip_rec));
+    strcpy (skip_rec, SKIP_RECORD);
+    if (fputs(skip_rec, rsstbl_file) EQ EOF) {
+      CTSAMSG_print (ERR_IO,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     "WRITE (fputs) in TBL_LOAD",
+                     envir_ptr->file_rssofli, strerror(errno));
+      rc= ESA_ERR;
+      goto exit_point;
+    }
+  }
+  fclose (rsstbl_file);
+ 
+  rc= prc_tbl_reinst(rss, host);
+ 
+ exit_point:
+  envir_ptr->msg_dest->dests[CTSAMSG_DEST_CNSL].active= FLAG_NO;
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON, fn, rc);
+  CG_epilog (rc , 0);
+ 
+  return (rc EQ ESA_OK) ? PLAT_OK_STAT : PLAT_FAIL_STAT;
+ 
+} /* main */
+ 

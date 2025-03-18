@@ -1,0 +1,3093 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: esaofio.c %
+ * Created on      : %date_created: Sun Feb 01 17:24:52 2004 %
+ * Current Version : %version: 3 %
+ * Last Modified on: %date_modified: Sun Feb 01 17:24:52 2004 %
+ * Created by      : %created_by: ihoffma %
+ * Last Modified by: %derived_by: ihoffma %
+ */
+ 
+/********************************************************************
+ * Mod.ID  Who      When         Description
+ * =============================================
+ * IMH001  Ian H.   27-May-2003  BSAN101877 - Offline interceptor
+ *                               should not insert lines with
+ *                               NULL object to the img file
+ * IMH002  Ian H.   19-Nov-2003  WSAN101432 Thread-safe code (errno)
+ * AL001   Avner L. 01-Feb-2004  ISAN000952 Missing diag_exit in qsort
+ * BSAN102349   Nmore    25-Jan-05  Adding RSSPARAM to ignore uppercase conversion
+ * AV001   Ajay V   20-Jan-2009  Skip the invalid records from OFLI image files
+ * 502839  AvnerL   25-Jun-2009  MF updates for 3.3.00
+ * SAS2IBMN NuritY  10/10/16     SAS/C to IBM C Conversion:
+ *                               1. Replace calls to access() with
+ *                                  fopen(), fget() and fclose().
+ *                               2. remove() does not have to be handled
+ *                                  because it deletes the file.
+ *                               3. Replcae #if DEBUG with decision
+ *                                  upon debug level.
+ * SAS2IBMT SeligT  13/11/16     SAS/C to IBM C Conversion Project
+ *******************************************************************/
+ 
+#include "globs.h"
+ 
+/*
+ *   Standard header files
+ */
+ 
+#include ERRNO
+#include STRING
+#include STDIO
+#include STDLIB
+#include FCNTL
+#include CTYPE     /* BSAN100840 */
+ 
+/*
+ *   Common code header files
+ */
+ 
+#include ESA_API
+#include ESA_DIAG
+#include ESA_API_CODES
+#include ESA_CHKSUM
+ 
+/*
+ *   Offline header files
+ */
+ 
+#include ESA_ESAOFLI
+#include ESA_ESAOFIO
+#include ESA_OS_OFLI
+ 
+static char db_component[] = "OFFLINE INTERCEPTOR I/O";
+ 
+void AboutOsFileDB (char                       * os_file,
+                    char                       * cmp_file,
+                    CTSAMSG_DEST_TABLE_rec_typ * dest,
+                    CTSAMSG_HANDLE_rec_typ     * msgs);
+ 
+ESA_RC CopyDB(int                            db_type,
+                     char                          *file_from,
+                     char                          *file_to,
+                     CTSAMSG_DEST_TABLE_rec_typ    *dest,
+                     CTSAMSG_HANDLE_rec_typ        *msgs);
+ 
+#define REALLOC_RECORD_PTRS(p_area, i, cnt)              \
+     if ( (i) GE (cnt) ) {                               \
+        (cnt) += MAX_EXPECTED_RECORDS;                   \
+        (p_area) = (char **) realloc((void *)(p_area),   \
+                   sizeof(char *) * (cnt));              \
+        if ( !(p_area) ) {                               \
+            CTSAMSG_print (ERR_MALLOC, msgs, NULL, dest, \
+                           "sort ptrs", (cnt));          \
+            rc = ESA_FATAL;                              \
+            goto exit;                                   \
+        }                                                \
+      }
+ 
+#define  SET_PTR_TO_NULL(i,db_ptrs,db_rec_cnt,wrk_ptrs,rmv_cntr)     \
+   {                                                                 \
+      if ( (i) NE (db_rec_cnt)-1 )  {                                \
+        memcpy( &(wrk_ptrs)[0], &(db_ptrs)[(i)+1], sizeof(char *) *  \
+                ((db_rec_cnt) - (i) -1));                            \
+        memcpy( &(db_ptrs)[(i)], &(wrk_ptrs)[0], sizeof(char *) *    \
+                ((db_rec_cnt) - (i) -1));                            \
+      }                                                              \
+      (db_ptrs)[(db_rec_cnt)-(rmv_cntr)] = NULL;                     \
+   }
+ 
+#define  ADD_NEW_PTR(i, db_ptrs, rec_cnt, wrk_ptrs)                 \
+   {                                                                \
+      memcpy( &(wrk_ptrs)[(i)+1], &(db_ptrs)[(i)], sizeof(char *) * \
+              ((rec_cnt) - (i)));                                   \
+      memcpy( &(db_ptrs)[(i)], &(wrk_ptrs)[(i)], sizeof(char *) *   \
+              ((rec_cnt)+1 - (i)));                                 \
+   }
+ 
+static ESA_RC  db_sort_rc;
+ 
+/* for MVS */
+/* ==============  my_qsort  ================================ */
+ 
+#include <stdlib.h>
+ 
+typedef int     cmp_t (const void *, const void *);
+static  char  * med3 (char *, char *, char *, cmp_t *);
+static  void    swapfunc (char *, char *, int, int);
+static  void    my_qsort(void *a, size_t n, size_t es, cmp_t *cmp);
+ 
+#define min(a, b) (a) < (b) ? a : b
+ 
+/*
+ * Qsort routine from Bentley & McIlroy's "Engineering a Sort Function".
+ */
+#define swapcode(TYPE, parmi, parmj, n) {   \
+ long i = (n) / sizeof (TYPE);    \
+ register TYPE *pi = (TYPE *) (parmi);   \
+ register TYPE *pj = (TYPE *) (parmj);   \
+ do {       \
+  register TYPE t = *pi;  \
+  *pi++ = *pj;    \
+  *pj++ = t;    \
+        } while (--i > 0);    \
+}
+ 
+#define SWAPINIT(a, es) swaptype = ((char *)a - \
+ (char *)0) % sizeof(long) || \
+ es % sizeof(long) ? 2 : es == sizeof(long)? 0 : 1;
+ 
+static void
+swapfunc(a, b, n, swaptype)
+ char *a, *b;
+ int n, swaptype;
+{
+ if(swaptype <= 1)
+  swapcode(long, a, b, n)
+ else
+  swapcode(char, a, b, n)
+}
+ 
+#define swap(a, b)     \
+ if (swaptype == 0) {    \
+  long t = *(long *)(a);   \
+  *(long *)(a) = *(long *)(b);  \
+  *(long *)(b) = t;   \
+ } else      \
+  swapfunc(a, b, es, swaptype)
+ 
+#define vecswap(a, b, n)  if ((n) > 0) swapfunc(a, b, n, swaptype)
+ 
+static char *
+med3(a, b, c, cmp)
+ char *a, *b, *c;
+ cmp_t *cmp;
+{
+ return cmp(a, b) < 0 ?
+        (cmp(b, c) < 0 ? b : (cmp(a, c) < 0 ? c : a ))
+              :(cmp(b, c) > 0 ? b : (cmp(a, c) < 0 ? a : c ));
+}
+ 
+static void
+my_qsort(void *a, size_t n, size_t es, cmp_t *cmp)
+{
+ char *pa, *pb, *pc, *pd, *pl, *pm, *pn;
+ int d, r, swaptype, swap_cnt;
+ char   func[]="my_qsort";
+ 
+ ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+loop: SWAPINIT(a, es);
+ swap_cnt = 0;
+ if (n < 7) {
+  for (pm = (char *)a + es; pm < (char *)a + n * es; pm += es)
+   for (pl = pm; pl > (char *)a && cmp(pl - es, pl) > 0;
+        pl -= es)
+    swap(pl, pl - es);
+    goto exit;                        /* AL001 */
+ }
+ pm = (char *)a + (n / 2) * es;
+ if (n > 7) {
+  pl = a;
+  pn = (char *)a + (n - 1) * es;
+  if (n > 40) {
+   d = (n / 8) * es;
+   pl = med3(pl, pl + d, pl + 2 * d, cmp);
+   pm = med3(pm - d, pm, pm + d, cmp);
+   pn = med3(pn - 2 * d, pn - d, pn, cmp);
+  }
+  pm = med3(pl, pm, pn, cmp);
+ }
+ swap(a, pm);
+ pa = pb = (char *)a + es;
+ 
+ pc = pd = (char *)a + (n - 1) * es;
+ for (;;) {
+  while (pb <= pc && (r = cmp(pb, a)) <= 0) {
+   if (r == 0) {
+    swap_cnt = 1;
+    swap(pa, pb);
+    pa += es;
+   }
+   pb += es;
+  }
+  while (pb <= pc && (r = cmp(pc, a)) >= 0) {
+   if (r == 0) {
+    swap_cnt = 1;
+    swap(pc, pd);
+    pd -= es;
+   }
+   pc -= es;
+  }
+  if (pb > pc)
+   break;
+  swap(pb, pc);
+  swap_cnt = 1;
+  pb += es;
+  pc -= es;
+ }
+ if (swap_cnt == 0) {  /* Switch to insertion sort */
+  for (pm = (char *)a + es; pm < (char *)a + n * es; pm += es)
+   for (pl = pm; pl > (char *)a && cmp(pl - es, pl) > 0;
+        pl -= es)
+    swap(pl, pl - es);
+   goto exit;                              /* AL001 */
+ 
+  }
+ 
+ pn = (char *)a + n * es;
+ r = min(pa - (char *)a, pb - pa);
+ vecswap(a, pb - r, r);
+ r = min(pd - pc, pn - pd - es);
+ vecswap(pb, pn - r, r);
+ if ((r = pb - pa) > es)
+  my_qsort(a, r / es, es, cmp);
+ if ((r = pd - pc) > es) {
+  /* Iterate rather than recurse to save stack space */
+  a = pn - r;
+  n = r / es;
+  goto loop;
+ }
+/*  my_qsort(pn - r, r / es, es, cmp);*/
+ 
+exit:                                      /* AL001 */
+ 
+  ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, ESA_RC_VOID);
+  return;
+}
+/* =================  my_qsort  ============================= */
+ /* MVS */
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : PutDBRecord                               *
+*                                                             *
+* DESCRIPTION     : Put DB record                             *
+*                                                             *
+* INPUT           : file_ptr  - ptr to db FILE                *
+*                   rec_ptr   - ptr to record                 *
+*                   db_file   - ptr to file name              *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+static ESA_RC PutDBRecord (FILE                       * file_ptr,
+                           char                       * rec_ptr,
+                           char                       * db_file,
+                           CTSAMSG_DEST_TABLE_rec_typ * dest,
+                           CTSAMSG_HANDLE_rec_typ     * msgs)
+{
+   ESA_RC rc = ESA_OK;
+   char   func[]="PutDBRecord";
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func);
+   fputs ( rec_ptr, file_ptr);
+       if ( ferror(file_ptr) )  {
+           CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                         "fputs", db_file, strerror(errno) );
+           ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                         "file %s/%s error %d/%s",
+                          db_file, "fputs", errno,
+                          strerror(errno));
+           rc = ESA_FATAL;
+       }
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func, rc);
+   return rc;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : WriteSortedDB                             *
+*                                                             *
+* DESCRIPTION     : Write result DB according ptrs to records *
+*                                                             *
+* INPUT           : dbfile_ptr  - ptr to FILE structure       *
+*                   db_file     - ptr to file name            *
+*                   db_ptrs     - ptrs to db records          *
+*                   records_cnt - ptrs number                 *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+static ESA_RC WriteSortedDB(FILE                          * dbfile_ptr,
+                            char                          * db_file,
+                            char                         ** db_ptrs,
+                            unsigned int                    records_cnt,
+                            CTSAMSG_DEST_TABLE_rec_typ    * dest,
+                            CTSAMSG_HANDLE_rec_typ        * msgs)
+{
+ 
+   static char   func[] = "WriteSortedDB";
+   ESA_RC        rc = ESA_OK;
+   unsigned int  i  = 0;
+   char         *w1;
+ 
+   OFFLINE_INTERCEPT_DB_RECORD_rec_typ  db_record;
+ 
+   /*
+    *  Initialize
+    */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   /* printf("writedb rec_cnt=%d\n", records_cnt); */
+ 
+   for (i=0; i LT records_cnt; i++) {
+       w1 = db_ptrs[i];
+ 
+       /* printf("writedb rec %d/%X\n", i, w1);  */
+ 
+       if (w1) {     /* Record that was deleted  -> ptr=NULL */
+         strcpy( (char *)&db_record, w1);
+         if ( !strchr((char *)&db_record,'\n') )
+           strcat( (char *)&db_record, "\n");
+ 
+         rc = PutDBRecord(dbfile_ptr, (char *)&db_record,
+                          db_file, dest, msgs);
+         if (rc NE ESA_OK)
+            goto exit;
+       }
+   }
+ 
+  exit :;
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+   return rc;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : BuildSortInfo                             *
+*                                                             *
+* DESCRIPTION     : Build records ptrs for qsort              *
+*                                                             *
+* INPUT           : db_records  - ptr to db compressed area   *
+*                                                             *
+* OUTPUT          : db_ptrs     - allocated ptrs list         *
+*                   records_cnt - ptrs number                 *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC BuildSortInfo(char                          * db_records,
+                     char                        *** db_ptrs,
+                     int                           * records_cnt       ,
+                     CTSAMSG_DEST_TABLE_rec_typ    * dest,
+                     CTSAMSG_HANDLE_rec_typ        * msgs)
+{
+ 
+   static       char  func[] = "BuildSortInfo";
+   ESA_RC       rc       = ESA_OK;
+   void         *strtok_handle = NULL;
+   char         **p_area = NULL;
+   int          i        = 0;
+   char         *token;
+   int          cnt = MAX_EXPECTED_RECORDS;
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   p_area = (char **) malloc(cnt * sizeof(char *));
+   if ( !p_area ) {
+      CTSAMSG_print (ERR_MALLOC, msgs, NULL, dest,
+                     "sort ptrs", cnt);
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   token = my_strtok(db_records, "\n", &strtok_handle);
+   while ( token ) {
+     p_area[i] = token;
+     i++;
+ 
+     REALLOC_RECORD_PTRS(p_area, i, cnt)
+     token = my_strtok(NULL, "\n", &strtok_handle);
+   }
+ 
+   exit :;
+ 
+   *records_cnt = i;
+   *db_ptrs     = p_area;
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+   return rc;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetDBFileSize                             *
+*                                                             *
+* DESCRIPTION     : Obtain file size                          *
+*                                                             *
+* INPUT           : dbfile_ptr   - ptr to FILE structure      *
+*                   db_file      - ptr to file name           *
+*                                                             *
+* OUTPUT          : file_amount                               *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+static ESA_RC GetDBFileSize(char                          * db_file,
+                            unsigned long                 * file_amount,
+                            CTSAMSG_DEST_TABLE_rec_typ    * dest,
+                            CTSAMSG_HANDLE_rec_typ        * msgs)
+{
+    ESA_RC                          rc = ESA_OK;
+    FILE                          * dbfile_ptr;
+/* for MVS */
+    OFFLINE_INTERCEPT_DB_RECORD_rec_typ   db_rec;
+ /* MVS */
+    char                            ddn_with[50]="";      /* SAS2IBMT */
+    char func[]="GetDBFileSize";
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func);
+    *file_amount = 0;
+ 
+    dbfile_ptr = NULL;
+ 
+    /* strcpy(ddn_with,"DD:");                               SAS2IBMT */
+    /* strcat(ddn_with, db_file);                            SAS2IBMT */
+    /* strcpy(ddn_with,"//'");                               SAS2IBMT */
+    /* strcat(ddn_with, db_file);                            SAS2IBMT */
+    /* strcat(ddn_with,"'");                                 SAS2IBMT */
+    /* ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+        "ESAOFIO: About to fopen %s", db_file);              SAS2IBMT */
+ 
+    dbfile_ptr = fopen(db_file , "r");
+ 
+    if ( !dbfile_ptr ) {
+      CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                    "fopen", db_file, strerror(errno) );
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "file %s/%s error %d/%s",
+                      db_file, "fopen", errno,
+                      strerror(errno));
+      rc = ESA_FATAL;
+      goto exit;
+    }
+ 
+/* for MVS */
+   while (fgets( (char *)&db_rec,
+          sizeof(OFFLINE_INTERCEPT_DB_RECORD_rec_typ),
+          dbfile_ptr) )        {
+    strcat( (char *)&db_rec, "\n");
+    *file_amount  +=  strlen( (char *)&db_rec);
+ 
+   }
+ /* MVS */
+ 
+   exit :;
+ 
+     ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 11,
+                   "db_file=%s file_amount=%d",
+                   db_file, *file_amount);
+ 
+     if ( dbfile_ptr )
+       fclose ( dbfile_ptr );
+     ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func, rc);
+     return rc;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : CompressDBRecord                          *
+*                                                             *
+* DESCRIPTION     : Compress DB record                        *
+*                                                             *
+* INPUT           : db_record                                 *
+*                                                             *
+* OUTPUT          : db_record                                 *
+*                                                             *
+* RETURN VALUE    : record len                                *
+*                                                             *
+**************************************************************/
+ 
+static int CompressDBRecord (
+    OFFLINE_INTERCEPT_DB_RECORD_rec_typ * db_record)
+{
+   char  tmp[sizeof(OFFLINE_INTERCEPT_DB_RECORD_rec_typ)];  /*as2406*/
+   char  *record;
+   int   len;
+   char func[]="CompressDBRecord";
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func);
+ 
+  /*
+   *   Object #1
+   */
+ 
+   /* as2406 record  = (char *)db_record;  */
+   record = tmp;                         /* as2406 */
+   strcpy( record, db_record->obj1);     /* as2406 */
+ 
+   record += strlen(db_record->obj1);
+   len     = (int)strlen(db_record->obj1);
+   *record = DB_FIELDS_SEPARATOR_CHAR;
+   record++;
+   len++;
+ 
+  /*
+   *   Object #2
+   */
+ 
+   strcpy( record, db_record->obj2);
+   record += strlen(db_record->obj2);
+   len    += strlen(db_record->obj2);
+   if (strlen(db_record->obj2) EQ 0) {
+      *record = ' ';
+      record++;
+      len++;
+   }
+   *record = DB_FIELDS_SEPARATOR_CHAR;
+   record++;
+   len++;
+ 
+  /*
+   *   Check Sum
+   */
+ 
+   memcpy( record, db_record->CheckSum, sizeof(db_record->CheckSum));
+   len    += sizeof(db_record->CheckSum);
+   record += sizeof(db_record->CheckSum);
+   *record = DB_FIELDS_SEPARATOR_CHAR;
+   record++;
+   len++;
+   *record = '\n';
+   len++;
+   record++;
+   *record = '\0';
+ 
+   strcpy( (char *)db_record, tmp);    /* as2406 */
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func, ESA_RC_VOID);
+   return len;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : UncompressDBRecord                        *
+*                                                             *
+* DESCRIPTION     : Uncompress DB record                      *
+*                                                             *
+* INPUT           : db_record                                 *
+*                                                             *
+* OUTPUT          : db_record                                 *
+*                                                             *
+* RETURN VALUE    : none                                      *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC UncompressDBRecord(
+                      OFFLINE_INTERCEPT_DB_RECORD_rec_typ * db_record)
+{
+   char                                *record;
+   void                                *strtok_handle = NULL;
+   char                                *token;
+   OFFLINE_INTERCEPT_DB_RECORD_rec_typ  db_rec;
+   ESA_RC                              rc = ESA_FATAL;
+   char func[]="UncompressDBRecord";
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func);
+ 
+  /*
+   *   Object #1
+   */
+ 
+   record  = (char *)db_record;
+   token   = my_strtok( record, DB_FIELDS_SEPARATOR_STR,
+                        &strtok_handle);
+   if ( !token ) /* Invalid record structure */
+     goto exit;
+   memset( (char *)&db_rec.obj1, ' ', sizeof(db_rec.obj1) );
+   strcpy( (char *)&db_rec.obj1, token);
+ 
+  /*
+   *   Object #2
+   */
+ 
+   token   = my_strtok( NULL, DB_FIELDS_SEPARATOR_STR, &strtok_handle);
+   if ( !token ) /* Invalid record structure */
+     goto exit;
+   memset( (char *)&db_rec.obj2, ' ', sizeof(db_rec.obj2) );
+   strcpy( (char *)&db_rec.obj2, token);
+ 
+  /*
+   *   Check Sum
+   */
+ 
+   token   = my_strtok( NULL, DB_FIELDS_SEPARATOR_STR, &strtok_handle);
+   if ( !token ) /* Invalid record structure */
+     goto exit;
+   memcpy( (char *)&db_rec.CheckSum, token, sizeof(db_rec.CheckSum));
+ 
+   db_rec.ess_flag = ' ';
+   db_rec.eol      = '\n';   /* NEW_LINE; */
+ 
+   memcpy( (char *)db_record, (char *)&db_rec,
+           sizeof(OFFLINE_INTERCEPT_DB_RECORD_rec_typ) );
+   rc = ESA_OK;
+ 
+  exit :;
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func, rc);
+   return rc;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : DB2Memory                                 *
+*                                                             *
+* DESCRIPTION     : Read DB into the memory                   *
+*                                                             *
+* INPUT           : db_file    - file path                    *
+*                                                             *
+* OUTPUT          : db_records - ptr to allocated area        *
+*                                with ptrs to records         *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC DB2Memory(char                          * db_file,
+                 char                         ** db_records,
+                 int                           * sorted,
+                 CTSAMSG_DEST_TABLE_rec_typ    * dest,
+                 CTSAMSG_HANDLE_rec_typ        * msgs)
+{
+#define DBK_LEN (MAX_RSS_USER_NAME_LEN+1+MAX_RSS_USER_NAME_LEN+1)
+ 
+   ESA_RC        rc = ESA_OK;
+   int           len = 0;
+   unsigned long file_amount;
+   FILE         *fptr = NULL;
+   char         *db_rec = NULL;
+   static        char func[]="DB2Memory";
+   char          db_key [DBK_LEN];
+   char          db_keym[DBK_LEN] = "";
+   USER_typ      db_user;
+   UG_typ        db_group;
+   char          err_str[1024];
+   char          ddn_with[50]="";                         /* SAS2IBMT */
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func);
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, "db_file=%s",db_file);
+ 
+    *sorted = 1;
+ 
+    rc = OfflineIntrcptrDBAccess( OFLI_USER_DB,
+                                  db_file, 0, dest, msgs );
+    if ( rc NE ESA_OK ) {   /* DB file does not exist */
+       rc = ESA_OK;
+       goto exit;
+    }
+ 
+   /*
+    *  Get file size ( in bytes )
+    */
+ 
+    rc = GetDBFileSize(db_file, &file_amount, dest, msgs);
+    if ( rc NE ESA_OK ) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 11,
+                    "file amount=%d bytes", file_amount);
+ 
+    if ( file_amount EQ 0 ) { /* file is empty */
+       goto exit;
+    }
+ 
+    /***   Open DB   ***/
+ 
+    /* strcpy(ddn_with,"DD:");                               SAS2IBMT */
+    /* strcat(ddn_with, db_file);                            SAS2IBMT */
+    /* strcpy(ddn_with,"//'");                               SAS2IBMT */
+    /* strcat(ddn_with, db_file);                            SAS2IBMT */
+    /* strcat(ddn_with,"'");                                 SAS2IBMT */
+    /* ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+        "ESAOFIO: About to fopen %s", db_file);              SAS2IBMT */
+ 
+    fptr = fopen(db_file , "r");
+ 
+    /**  Errors handling  **/
+ 
+    if ( !fptr ) {
+      CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                    "fopen", db_file, strerror(errno) );
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "file %s/%s error %d/%s",
+                      db_file, "fopen", errno,
+                      strerror(errno));
+      rc = ESA_FATAL;
+      goto exit;
+    }
+ 
+    /**  Allocate buffer for all db records   **/
+ 
+    db_rec = (char *) malloc(file_amount +
+        sizeof(OFFLINE_INTERCEPT_DB_RECORD_rec_typ) );  /*  + 10); */
+    if ( !db_rec ) {
+      CTSAMSG_print (ERR_MALLOC, msgs, NULL, dest,
+                     "db_file", file_amount);
+      rc = ESA_FATAL;
+      goto exit;
+    }
+ 
+    *db_records = db_rec;
+ 
+    /**  Read DB  **/
+ 
+    while (fgets( (char *)db_rec,
+                 sizeof(OFFLINE_INTERCEPT_DB_RECORD_rec_typ), fptr) ) {
+ 
+     /** Error handling  **/
+ 
+     if ( ferror(fptr) )  {
+        CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                      "fgets", db_file, strerror(errno) );
+        ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                        "file %s/%s error %d/%s",
+                        db_file, "fgets", errno,
+                        strerror(errno));
+        rc = ESA_FATAL;
+     }
+ 
+/* for MVS */
+    strcat(db_rec, "\n");
+ /* MVS */
+ 
+    rc = BuildKeyFromDBfile(db_rec, db_key, db_user, db_group);
+    if (rc NE ESA_OK) {
+      rc = ESA_OK;									/*AV001*/
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 11,
+                      "corrupted record=%d/%s",
+                      strlen(db_rec), db_rec);
+      CTSAMSG_print (MSG_OFLI_FILE_CORRUPTED, msgs, NULL, dest,
+                     db_file);
+	  sprintf(err_str, "skipping corrupted record=%d/%s", strlen(db_rec), db_rec);	/*AV001*/
+      CTSAMSG_print (ERR_UL_STRING, msgs, NULL, dest, err_str);						/*AV001*/
+  	  *db_rec = '\0';								/*AV001*/
+      /*goto exit;*/
+	  continue;										/*AV001*/
+    }
+ 
+    if ( (int)strlen(db_keym) EQ 0 )
+      strcpy(db_keym, db_key);
+    else if ( *sorted ) {      /* Check if file sorted */
+       if ( strcmp(db_keym, db_key) GT 0 )
+         *sorted = 0;          /* File not sorted      */
+       strcpy(db_keym, db_key);
+    }
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 11, "LOOP1: len=%d",
+                    strlen(db_rec));
+ 
+    len    += strlen(db_rec);
+    db_rec += strlen(db_rec);
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 11, "LOOP1: left=%d",
+                    file_amount - len);
+   }
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 11, "len/amount=%d,%d",
+                   len, file_amount);
+ 
+   exit :;
+ 
+   if ( fptr )
+      fclose( fptr);
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func, rc);
+ 
+   return rc;
+}
+/**************************************************************
+*                                                             *
+* Subroutine name : OSFile2Memory                             *
+*                                                             *
+* DESCRIPTION     : Read DB into the memory and build ptrs    *
+*                   for sort                                  *
+*                                                             *
+* INPUT           : db_file  - file path                      *
+*                                                             *
+* OUTPUT          : db_records - ptr to allocated area        *
+*                                with compressed info         *
+*                 : db_ptrs    - ptr to allocated area        *
+*                                with ptrs to records         *
+*                   records_cnt- records number               *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC OSFile2Memory(char                         * os_file,
+                     char                        ** db_records,
+                     char                       *** db_ptrs,
+                     int                          * records_cnt,
+                     CTSAMSG_DEST_TABLE_rec_typ   * dest,
+                     CTSAMSG_HANDLE_rec_typ       * msgs)
+{
+#define OSK_LEN (MAX_RSS_USER_NAME_LEN + 1 + MAX_RSS_USER_NAME_LEN + 1)
+ 
+   ESA_RC            rc = ESA_OK;
+   int               len = 0;
+   unsigned long     file_amount;
+   FILE             *fptr    = NULL;
+   char             *db_rec  = NULL;
+   char            **p_area  = NULL;
+   int               i       = 0;
+   int               cnt = MAX_EXPECTED_RECORDS;
+   char              os_key[OSK_LEN];
+   USER_typ          os_user;
+   UG_typ            os_group;
+   char              os_action;
+   char             *os_rec_ptr;
+   static            char func[]="OSFile2Memory";
+   char          err_str[1024];
+   char              ddn_with[50]="";                     /* SAS2IBMT */
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, "os_file=%s",os_file);
+ 
+    p_area = (char **) malloc(cnt * sizeof(char *));
+    if ( !p_area ) {
+       CTSAMSG_print (ERR_MALLOC, msgs, NULL, dest,
+                      "sort ptrs", cnt);
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+   /*
+    *  Get file size ( in bytes )
+    */
+ 
+    rc = GetDBFileSize(os_file, &file_amount, dest, msgs);
+    if ( rc NE ESA_OK ) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 13,
+                    "file amount=%d bytes", file_amount);
+ 
+    if ( file_amount EQ 0 ) { /* file is empty */
+      goto exit;
+    }
+ 
+    /**   Open DB  **/
+ 
+    /* strcpy(ddn_with,"DD:");                               SAS2IBMT */
+    /* strcat(ddn_with, os_file);                            SAS2IBMT */
+    /* strcpy(ddn_with,"//'");                               SAS2IBMT */
+    /* strcat(ddn_with, os_file);                            SAS2IBMT */
+    /* strcat(ddn_with,"'");                                 SAS2IBMT */
+    /* ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+        "ESAOFIO: About to fopen %s", os_file);              SAS2IBMT */
+ 
+    fptr = fopen(os_file , "r");
+ 
+    /**  Errors handling  **/
+ 
+    if ( !fptr ) {
+      CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                    "fopen", os_file, strerror(errno) );
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "file %s/%s error %d/%s",
+                      os_file, "fopen", errno,
+                      strerror(errno));
+      rc = ESA_FATAL;
+      goto exit;
+    }
+   /*
+    *  Allocate buffer for all db records
+    */
+ 
+   db_rec = (char *) malloc(file_amount +
+            sizeof(OFFLINE_INTERCEPT_DB_RECORD_rec_typ) ); /* + 10); */
+   if ( !db_records ) {
+      CTSAMSG_print (ERR_MALLOC, msgs, NULL, dest,
+                     "os_file", file_amount);
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   *db_records = db_rec;
+ 
+   /**  Read DB  **/
+ 
+   while (fgets ( (char *)db_rec,
+             sizeof(OFFLINE_INTERCEPT_DB_RECORD_rec_typ), fptr ) ) {
+ 
+     /** Error handling  **/
+ 
+     if ( ferror(fptr) )  {
+        CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                      "fgets", os_file, strerror(errno) );
+        ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                        "file %s/%s error %d/%s",
+                        os_file, "fgets", errno,
+                        strerror(errno));
+        rc = ESA_FATAL;
+     }
+ 
+/* for MVS */
+     strcat(db_rec, "\n");
+ /* MVS */
+ 
+     /**  Save ptr of record **/
+ 
+     ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 11, "LOOP2: len=%d",
+                     strlen(db_rec));
+     len += strlen (db_rec);
+ 
+     rc = BuildKeyFromOSfile(db_rec, os_key, os_user, os_group,
+                             &os_action, &os_rec_ptr);
+     if (rc NE ESA_OK) {
+      rc = ESA_OK;
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 11,
+                      "corrupted record=%d/%s",
+                      strlen(db_rec), db_rec);
+      CTSAMSG_print (MSG_OFLI_FILE_CORRUPTED, msgs, NULL, dest,
+                     os_file);
+	  sprintf(err_str, "skipping corrupted record=%d/%s", strlen(db_rec), db_rec);	/*AV001*/
+	  CTSAMSG_print (ERR_UL_STRING, msgs, NULL, dest, err_str);						/*AV001*/
+      /*goto exit;*/
+	  continue;
+     }
+ 
+     p_area[i] = db_rec;
+     i++;
+     REALLOC_RECORD_PTRS(p_area, i, cnt)
+     db_rec += strlen(db_rec) - 1;
+     *(db_rec) = '\0';   /* End of record. Erase \n symbol  */
+     db_rec++;
+ 
+     ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 11, "LOOP2: left=%d",
+                     file_amount - len);
+   }
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 11, "len/amount=%d,%d",
+                   len, file_amount);
+ 
+   exit :;
+ 
+   *records_cnt = i;
+   *db_ptrs     = p_area;
+ 
+   if ( fptr )
+      fclose( fptr);
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+   return rc;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : OfflineIntrcptrDBOpen                     *
+*                                                             *
+* DESCRIPTION     : Open DB                                   *
+*                                                             *
+* INPUT           : io_handle                                 *
+*                   db type                                   *
+*                   file                                      *
+*                   open_mode                                 *
+*                   dest                                      *
+*                   msgs                                      *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC OfflineIntrcptrDBOpen(void                         ** io_handle,
+                             int                             db_type,
+                             char                          * db_file,
+                             int                             open_mode,
+                             CTSAMSG_DEST_TABLE_rec_typ    * dest,
+                             CTSAMSG_HANDLE_rec_typ        * msgs)
+{
+   static       char  func[] = "OfflineIntrcptrDBOpen";
+   ESA_RC       rc = ESA_OK;
+   char         errmsg[100];
+   FILE        *dbfile_ptr = NULL;
+   char         ddn_with[50]="";                          /* SAS2IBMT */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,13,"db_type=%d open_mode=%d",
+                   db_type, open_mode);
+ 
+  /*
+   *   Open db file
+   */
+ 
+   /* strcpy(ddn_with,"DD:");                   if ddname    SAS2IBMT */
+   /* strcat(ddn_with, db_file);                if ddname    SAS2IBMT */
+   /* strcpy(ddn_with,"//'");                   if dsname    SAS2IBMT */
+   /* strcat(ddn_with, db_file);                if dsname    SAS2IBMT */
+   /* strcat(ddn_with,"'");                     if dsname    SAS2IBMT */
+   /* ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+       "ESAOFIO: About to fopen %s", db_file);               SAS2IBMT */
+ 
+   switch ( open_mode ) {
+     case  OPEN_FOR_WRITE:
+         /* SAS2IBMT dbfile_ptr = fopen(db_file , "w");              */
+         dbfile_ptr = fopen(db_file,   "w,recfm=*");      /* SAS2IBMT */
+         break;
+     case  OPEN_FOR_READ:
+         /* SAS2IBMT dbfile_ptr = fopen(db_file , "r");              */
+         dbfile_ptr = fopen(db_file,   "r");              /* SAS2IBMT */
+         break;
+     case  OPEN_FOR_READ_WRITE:
+         /* SAS2IBMT dbfile_ptr = fopen(db_file , "r+");             */
+         dbfile_ptr = fopen(db_file,   "r+");             /* SAS2IBMT */
+         break;
+     case  OPEN_FOR_APPEND:
+         /* SAS2IBMT dbfile_ptr = fopen(db_file , "a");              */
+         dbfile_ptr = fopen(db_file,   "a,recfm=*");      /* SAS2IBMT */
+         break;
+     default :
+         sprintf( errmsg, "Invalid open mode=%d", open_mode);
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                       db_component, func, errmsg, 16, __LINE__);
+         rc = ESA_FATAL;
+         goto exit;
+   }
+ 
+   /*
+    *  Check open operation
+    */
+ 
+ 
+   if ( !dbfile_ptr ) {
+      CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                    "fopen", db_file, strerror(errno) );
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "file %s/%s error %d/%s",
+                      db_file, "fopen", errno,
+                      strerror(errno));
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   exit :;
+ 
+   *io_handle = dbfile_ptr;
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+   return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : OfflineIntrcptrDBClose                    *
+*                                                             *
+* DESCRIPTION     : Open DB                                   *
+*                                                             *
+* INPUT           : io_handle                                 *
+*                   db type                                   *
+*                   file                                      *
+*                   dest                                      *
+*                   msgs                                      *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC OfflineIntrcptrDBClose(void                         ** io_handle,
+                              int                             db_type,
+                              char                          * db_file,
+                              CTSAMSG_DEST_TABLE_rec_typ    * dest,
+                              CTSAMSG_HANDLE_rec_typ        * msgs)
+ 
+{
+   static       char  func[] = "OfflineIntrcptrDBClose";
+   ESA_RC       rc = ESA_OK;
+   FILE        *dbfile_ptr = NULL;
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 13, "db_type=%d", db_type);
+ 
+  /*
+   *   Close db file
+   */
+ 
+   dbfile_ptr = (FILE *)(*io_handle);
+ 
+   if ( dbfile_ptr )
+      fclose( dbfile_ptr);
+ 
+   *io_handle = NULL;
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+   return rc;
+ 
+}
+ 
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : OfflineIntrcptrDBWrite                    *
+*                                                             *
+* DESCRIPTION     : Write DB record                           *
+*                                                             *
+* INPUT           : io_handle                                 *
+*                   db type                                   *
+*                   file                                      *
+*                   dest                                      *
+*                   msgs                                      *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC OfflineIntrcptrDBWrite(
+        void                                * io_handle,
+        int                                   db_type,
+        char                                * db_file,
+        OFFLINE_INTERCEPT_DB_RECORD_rec_typ * db_record,
+        CTSAMSG_DEST_TABLE_rec_typ          * dest,
+        CTSAMSG_HANDLE_rec_typ              * msgs)
+{
+   static       char  func[] = "OfflineIntrcptrDBWrite";
+   ESA_RC       rc = ESA_OK;
+   int          rec_len;
+   FILE        *dbfile_ptr = NULL;
+   int          ignoreThisRecord = 0;
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 13, "db_type=%d", db_type);
+ 
+/* IMH001 start */
+   if (db_type EQ OFLI_CONNECTION_DB)
+   {
+       /* for connections, both object1 and object2 should be populated */
+       if ((strlen(db_record->obj1) EQ 0) OR (strlen(db_record->obj2) EQ 0))
+           ignoreThisRecord = 1;
+   }
+   else   /* User/UG/OE  - obj1 should be populated */
+   {
+       if (strlen(db_record->obj1) EQ 0)
+           ignoreThisRecord = 1;
+   }
+ 
+   if (ignoreThisRecord)
+   {
+       ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+                       "Received record is empty - ignored. (db_type=%d)", db_type);
+       goto cleanup;
+   }
+ 
+/* IMH001 end */
+ 
+  /*
+   *   Write db record
+   */
+ 
+   dbfile_ptr = (FILE *)io_handle;
+ 
+   rec_len = CompressDBRecord(db_record);
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,13, "record len=%d", rec_len);
+ 
+   rc = PutDBRecord(dbfile_ptr, (char *)db_record,
+                    db_file, dest, msgs);
+ 
+cleanup:
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+   return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : OfflineIntrcptrDBRead                     *
+*                                                             *
+* DESCRIPTION     : Read DB record                            *
+*                                                             *
+* INPUT           : io_handle                                 *
+*                   db type                                   *
+*                   file                                      *
+*                   dest                                      *
+*                   msgs                                      *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC OfflineIntrcptrDBRead(
+                 void                                * io_handle,
+                 int                                   db_type,
+                 char                                * db_file,
+                 OFFLINE_INTERCEPT_DB_RECORD_rec_typ * db_record,
+                 CTSAMSG_DEST_TABLE_rec_typ          * dest,
+                 CTSAMSG_HANDLE_rec_typ              * msgs,
+                 OFFLINE_INTERCEPT_STUFF_rec_typ    *offl_params)
+{
+   static       char  func[] = "OfflineIntrcptrDBRead";
+   ESA_RC       rc = ESA_OK;
+   char        *wptr;         /* BSAN100840 */
+   FILE        *dbfile_ptr = NULL;
+   char		   err_str[1024];
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func);
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,13, "db_type=%d", db_type);
+ 
+   wptr = (char *)db_record->obj1;  /* BSAN100840 */
+ 
+  /*
+   *   Read db record
+   */
+ 
+   dbfile_ptr = (FILE *)io_handle;
+   while (1) { /* AV001 */
+ 
+   fgets ( (char *)db_record,
+           sizeof(OFFLINE_INTERCEPT_DB_RECORD_rec_typ),
+           dbfile_ptr);
+ 
+   if ( feof(dbfile_ptr ) ) {
+      rc = ESA_EOF;
+      goto exit;
+   }
+ 
+   if ( ferror(dbfile_ptr) )  {
+      CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                    "fgets", db_file, strerror(errno) );
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "file %s/%s error %d/%s",
+                      db_file, "fgets", errno,
+                      strerror(errno));
+      rc = ESA_FATAL;
+      break; /* AV001 */
+   }
+ 
+   rc = UncompressDBRecord(db_record);
+      if (rc NE ESA_OK) /* AV001 */
+   {
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 11,
+                      "corrupted record=%d/%s",
+                      strlen((char const *) db_record), (char const *) db_record); /*502839*/
+ 
+	  sprintf(err_str, "skipping corrupted record=%d/%s", strlen((char const *) db_record), (char const *) db_record); /*502839*/
+ 
+      CTSAMSG_print (MSG_OFLI_FILE_CORRUPTED, msgs, NULL, dest,
+                     db_file);
+ 
+      CTSAMSG_print (ERR_UL_STRING, msgs, NULL, dest, err_str);
+ 
+      continue;
+   }
+ 
+	break;
+ 
+	} /* AV001 */
+ 
+ 
+   /*BSAN102349 [Nmore, 24/01/2006]*/
+ 
+   if(offl_params->respect_rss_case == 'N')
+   {
+ 
+       ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 11,
+           "--RSS %s - converting the RSS Name to upper case",wptr);
+ 
+         /*
+           * BSAN100840 . Uppercase the RSS name
+         */
+ 
+       if (db_type EQ OFLI_RSS_DB) {            /* BSAN100840 */
+         for (; *wptr; wptr++) {                /* BSAN100840 */
+           *wptr = (char)toupper(*wptr);        /* BSAN100840 */
+         }                                      /* BSAN100840 */
+       }                                        /* BSAN100840 */
+   }
+   exit :;
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func, rc);
+ 
+   return rc;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : db_sort_compare                           *
+*                                                             *
+* DESCRIPTION     : Sort DB records(compare function)         *
+*                   Invoked by qsort                          *
+*                                                             *
+* INPUT           : element1 - ptr to record                  *
+*                   element2 - ptr to record                  *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : 0, <0, >0                                 *
+*                                                             *
+**************************************************************/
+ 
+static int db_sort_compare (const void * element1,
+                            const void * element2)
+{
+#define DBK1_LEN (MAX_RSS_USER_NAME_LEN + 1 + MAX_RSS_USER_NAME_LEN + 1)
+ USER_typ db_user;
+ UG_typ   db_group;
+ char   ** e1, ** e2;
+ char     db_key1 [DBK1_LEN];
+ char     db_key2 [DBK1_LEN];
+ 
+ memcpy ((char *)&e1, (char *)&element1, sizeof (e1));
+ memcpy ((char *)&e2, (char *)&element2, sizeof (e2));
+ 
+ db_sort_rc = BuildKeyFromDBfile ((const char *)(*e1),
+                                  db_key1, db_user, db_group);
+ db_sort_rc = BuildKeyFromDBfile ((const char *)(*e2),
+                                  db_key2, db_user, db_group);
+ 
+ return strcmp (db_key1, db_key2);
+ 
+} /* db_sort_compare */
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : db_search_compare                         *
+*                                                             *
+* DESCRIPTION     : bsearch DB records(compare function)      *
+*                                                             *
+* INPUT           : os_key  - ptr to key from ps file         *
+*                   record  - ptr to record                   *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : 0, <0, >0                                 *
+*                                                             *
+**************************************************************/
+ 
+int db_search_compare (const void * os_key,
+                       const void * record)
+{
+#define DBKL (MAX_RSS_USER_NAME_LEN + 1 + MAX_RSS_USER_NAME_LEN + 1)
+ int       compare;
+ USER_typ  db_user;
+ UG_typ    db_group;
+ char      db_key [DBKL];
+ char   ** rx;
+ char   ** ro;
+ /* 502839 char func[]="BuildKeyFromOSfile"; no ref*/
+ 
+/* commented the DIAG for offli performance*/
+ /*ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);*/
+ if (NOT record) {  /* Record removed */
+   compare = -1;
+   goto exit;
+ }
+ 
+ memcpy ((char *)&rx, (char *)&record, sizeof (rx));
+ memcpy ((char *)&ro, (char *)&os_key, sizeof (ro));
+ 
+ db_sort_rc = BuildKeyFromDBfile ((const char *)(*rx),
+                                  db_key, db_user, db_group);
+ compare = strcmp ((const char *)(*ro), db_key);
+ 
+ exit:;
+   /*ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, ESA_RC_VOID);*/
+   return compare;
+} /* db_search_compare */
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : BuildKeyFromOSfile                        *
+*                                                             *
+* DESCRIPTION     : Build key for sort                        *
+*                                                             *
+* INPUT           : record            - ptr to record         *
+*                   compressed_record - ptr to record in      *
+*                                       compressed form       *
+*                                                             *
+* OUTPUT          : key       - ptr to concatenated           *
+*                               (user || group ) key          *
+*                   user      - ptr to user                   *
+*                   group     - ptr to group                  *
+*                   os_action - ptr to os_action field        *
+*                   os_rec_ptr- ptr to os file record         *
+*                               ( in DB compressed form )     *
+*                                                             *
+* RETURN VALUE    : none                                      *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC BuildKeyFromOSfile(char        * record,
+                          char        * key,
+                          USER_typ      user,
+                          UG_typ        group,
+                          char        * os_action,
+                          char       ** os_rec_ptr)
+{
+   ESA_RC rc = ESA_FATAL;
+   char   *token;
+   void   *strtok_handle;
+   char   os_key[MAX_RSS_USER_NAME_LEN + 1 + MAX_RSS_USER_NAME_LEN + 1];
+   char   *os_key_ptr = os_key;
+   OFFLINE_INTERCEPT_DB_RECORD_rec_typ  os_record;
+   char func[]="BuildKeyFromOSfile";
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func);
+ 
+  /*
+   *    Clean output strings
+   */
+ 
+   memset( os_key, ' ', sizeof(os_key) );
+   os_key[sizeof(os_key)-1] = NULL_CHAR;
+   strcpy(user, "");
+   strcpy(group,"");
+   *os_action  = *record;  /* Action                 */
+   *os_rec_ptr = record+2; /* Record addr in form DB */
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                   "os_key:max len=%d record=%x/%d/%s os_key_ptr=%x",
+                   sizeof(os_key), record, strlen(record), record,
+                   os_key_ptr);
+ 
+   strcpy( (char *)&os_record, record);
+ 
+  /*
+   *    Action
+   */
+ 
+   token   = my_strtok((char *)&os_record,
+                       DB_FIELDS_SEPARATOR_STR, &strtok_handle);
+   if ( !token ) /* Invalid record structure */
+     goto exit;
+ 
+ 
+  /*
+   *    Get object ( user )
+   */
+ 
+   token   = my_strtok(NULL, DB_FIELDS_SEPARATOR_STR, &strtok_handle);
+   if ( !token ) /* Invalid record structure */
+     goto exit;
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                   "os_key1:%d/%s os_key_ptr=%x",
+                   strlen(token), token, os_key_ptr);
+ 
+   memcpy(os_key_ptr, token, strlen(token) );
+   os_key_ptr += MAX_RSS_USER_NAME_LEN;
+   if (user)
+      strcpy(user,token);
+ 
+  /*
+   *    Get object ( group )
+   */
+ 
+   token   = my_strtok(NULL, DB_FIELDS_SEPARATOR_STR, &strtok_handle);
+   if ( !token ) /* Invalid record structure */
+     goto exit;
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                   "os_key2:%d/%s os_key_ptr=%x",
+                   strlen(token), token, os_key_ptr);
+ 
+   memcpy(os_key_ptr, token, strlen(token) );
+   os_key_ptr += MAX_RSS_USER_NAME_LEN;
+   if (group)
+      strcpy(group,token);
+ 
+   *os_key_ptr = NULL_CHAR;
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, "os_key:%d/%s",
+                   strlen(os_key), os_key);
+ 
+   rc = ESA_OK;
+ 
+   exit :;
+     strcpy( key, os_key);
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func, rc);
+   return rc;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : BuildKeyFromDBfile                        *
+*                                                             *
+* DESCRIPTION     : Build key for sort                        *
+*                                                             *
+* INPUT           : record   - ptr to DB record               *
+*                              (compressed form)              *
+*                                                             *
+* OUTPUT          : key      - ptr to concatenated key        *
+*                              (user || group)                *
+*                   user     - ptr to user                    *
+*                   group    - ptr to group                   *
+*                                                             *
+* RETURN VALUE    : none                                      *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC BuildKeyFromDBfile (const char * record,
+                           char       * key,
+                           USER_typ     user,
+                           UG_typ       group)
+{
+   ESA_RC rc=ESA_FATAL;
+   char   *token;
+   void   *strtok_handle;
+   char   db_key[MAX_RSS_USER_NAME_LEN + 1 + MAX_RSS_USER_NAME_LEN + 1];
+   char  *db_key_ptr = db_key;
+   OFFLINE_INTERCEPT_DB_RECORD_rec_typ  db_record;
+   /* 502839 char func[]="BuildKeyFromDBfile"; no ref*/
+ 
+   /* commented for the offline performance*/
+  /* ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func);*/
+ 
+   strcpy( (char *)&db_record, record);
+ 
+  /*
+   *    Clean output strings
+   */
+ 
+   memset( db_key, ' ', sizeof(db_key) );
+   db_key[sizeof(db_key)-1] = NULL_CHAR;
+   strcpy(user, "");
+   strcpy(group,"");
+ 
+  /*
+   *    Get object ( user )
+   */
+ 
+   token   = my_strtok((char *)&db_record,
+                       DB_FIELDS_SEPARATOR_STR, &strtok_handle);
+   if ( !token ) /* Invalid record structure */
+     goto exit;
+ 
+   memcpy(db_key_ptr, token, strlen(token) );
+   db_key_ptr += MAX_RSS_USER_NAME_LEN;
+   if (user)
+      strcpy(user,token);
+ 
+  /*
+   *    Get object ( group )
+   */
+ 
+   token   = my_strtok(NULL, DB_FIELDS_SEPARATOR_STR, &strtok_handle);
+   if ( !token ) /* Invalid record structure */
+     goto exit;
+ 
+   memcpy(db_key_ptr, token, strlen(token) );
+   db_key_ptr += MAX_RSS_USER_NAME_LEN;
+   if (group)
+      strcpy(group,token);
+ 
+   *db_key_ptr = NULL_CHAR;
+   rc = ESA_OK;
+ 
+   exit :;
+     strcpy(key, db_key);
+     /*ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func, rc);*/
+     return rc;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : OfflineIntrcptrDBSort                     *
+*                                                             *
+* DESCRIPTION     : Sort DB records                           *
+*                                                             *
+* INPUT           : db type                                   *
+*                   file                                      *
+*                   open_mode                                 *
+*                   dest                                      *
+*                   msgs                                      *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC OfflineIntrcptrDBSort (int                          db_type,
+                              char                       * db_file,
+                              CTSAMSG_DEST_TABLE_rec_typ * dest,
+                              CTSAMSG_HANDLE_rec_typ     * msgs)
+{
+   static        char  func[] = "OfflineIntrcptrDBSort";
+   ESA_RC        rc = ESA_OK;
+   int           records_cnt;
+   int           sorted;
+   int           kk;                  /* ps0381 */
+   char          dbkey1[1024];        /* ps0381 */
+   USER_typ      dbuser1;             /* ps0381 */
+   UG_typ        dbgroup1;            /* ps0381 */
+   char          dbkey2[1024];        /* ps0381 */
+   USER_typ      dbuser2;             /* ps0381 */
+   UG_typ        dbgroup2;            /* ps0381 */
+   char         *db_record;           /* ps0381 */
+   char          *db_records = NULL;
+   char         **db_ptrs    = NULL;
+   FILE          *dbfile_ptr = NULL;
+   char          ddn_with[50]="";                         /* SAS2IBMT */
+ 
+   /*
+    *  Initialize
+    */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,13, "db_type=%d", db_type);
+ 
+   rc = DB2Memory(db_file, &db_records, &sorted, dest, msgs );
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   if ( !db_records )  /* file empty */
+      goto exit;
+ 
+   /**   Sort   **/
+ 
+   rc = BuildSortInfo(db_records, &db_ptrs, &records_cnt, dest, msgs);
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   db_sort_rc = ESA_OK;
+ 
+   if ( NOT sorted ) {
+/* for MVS */
+      my_qsort( (char *)db_ptrs, records_cnt, sizeof(char *),
+             &db_sort_compare);
+ /* MVS */
+      if (db_sort_rc NE ESA_OK) {
+         rc = ESA_FATAL;
+         CTSAMSG_print (MSG_OFLI_FILE_CORRUPTED, msgs, NULL, dest,
+                        db_file);
+         goto exit;
+      }
+   }
+ 
+   /* ps0381. Check Duplicate records */
+   strcpy(dbkey1,   "");
+   strcpy(dbuser1,  "");
+   strcpy(dbgroup1, "");
+ 
+   strcpy(dbkey2,   "");
+   strcpy(dbuser2,  "");
+   strcpy(dbgroup2, "");
+ 
+   db_record = db_ptrs[0 ];
+   BuildKeyFromDBfile(db_record, dbkey1, dbuser1, dbgroup1);
+ 
+   for (kk=1; kk LT records_cnt; kk++) {
+      db_record = db_ptrs[kk];
+      BuildKeyFromDBfile(db_record, dbkey2, dbuser2, dbgroup2);
+      if ( (strcmp(dbuser1, dbuser2) EQ 0)  AND
+           (strcmp(dbgroup1, dbgroup2) EQ 0)  )  {
+        db_ptrs[kk]= NULL;
+      }
+      else {
+        strcpy(dbkey1,   dbkey2);
+        strcpy(dbuser1,  dbuser2);
+        strcpy(dbgroup1, dbgroup2);
+      }
+   }
+ 
+   /**  Open DB ( for write )  **/
+ 
+   /* strcpy(ddn_with,"DD:");                                SAS2IBMT */
+   /* strcat(ddn_with, db_file);                             SAS2IBMT */
+   /* strcpy(ddn_with,"//'");                                SAS2IBMT */
+   /* strcat(ddn_with, db_file);                             SAS2IBMT */
+   /* strcat(ddn_with,"'");                                  SAS2IBMT */
+   /* ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+       "ESAOFIO: About to fopen %s", db_file);               SAS2IBMT */
+ 
+   dbfile_ptr = fopen(db_file , "w,recfm=*");
+ 
+   /** Errors handling  **/
+ 
+   if ( !dbfile_ptr ) {
+      CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                    "fopen", db_file, strerror(errno) );
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "file %s/%s error %d/%s",
+                      db_file, "fopen", errno,
+                      strerror(errno));
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   /**  Write result  **/
+ 
+   rc = WriteSortedDB(dbfile_ptr, db_file,
+                      db_ptrs, records_cnt, dest, msgs );
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   exit :;
+ 
+   if ( dbfile_ptr )
+      fclose( dbfile_ptr);
+ 
+   if ( db_records )
+      free( db_records );
+ 
+   if ( db_ptrs )
+      free( db_ptrs );
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+   return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : OfflineIntrcptrDBRename                   *
+*                                                             *
+* DESCRIPTION     : Delete old file, rename new to old        *
+*                                                             *
+* INPUT           : old_file                                  *
+*                   new_file                                  *
+*                   work_file                                 *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC OfflineIntrcptrDBRename(char                       * old_file,
+                               char                       * new_file,
+                               char                       * work_file,
+                               int                          db_type,
+                               CTSAMSG_DEST_TABLE_rec_typ * dest,
+                               CTSAMSG_HANDLE_rec_typ     * msgs)
+ 
+{
+   ESA_RC        rc = ESA_OK;
+   static        char func[]="OfflineIntrcptrDBRename";
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                    "Old file=%s New file=%s Work file=%s",
+                    old_file, new_file, work_file);
+ 
+    /*
+     * Delete work file
+     */
+ 
+       OS_OFLI_RemoveDB(work_file);
+ 
+    /*
+     *  Delete old file and Rename new file
+     */
+ 
+     RenameDB(new_file, old_file, dest, msgs);
+ 
+     ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+     return rc;
+ 
+}
+ 
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : OfflineIntrcptrDBRecCnt                   *
+*                                                             *
+* DESCRIPTION     : Calculate records count                   *
+*                                                             *
+* INPUT           : db_type                                   *
+*                   db_file                                   *
+*                                                             *
+* OUTPUT          : total_records                             *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ESA_RC OfflineIntrcptrDBRecCnt(int                             db_type,
+                               char                          * db_file,
+                               int                           * records,
+                               CTSAMSG_DEST_TABLE_rec_typ    * dest,
+                               CTSAMSG_HANDLE_rec_typ        * msgs)
+{
+   ESA_RC        rc = ESA_OK;
+   void         *strtok_handle = NULL;
+   int           sorted;
+   int           i=0;
+   char         *token;
+   char         *db_records = NULL;
+   static        char func[]="OfflineIntrcptrDBRecCnt";
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func);
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,"db_file=%s",db_file);
+ 
+    *records = 0;
+ 
+    rc = DB2Memory(db_file, &db_records, &sorted, dest, msgs );
+    if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+    }
+ 
+   if ( !db_records )
+      goto exit;
+ 
+   token = my_strtok(db_records, "\n", &strtok_handle);
+   while ( token ) {
+     i++;
+     token = my_strtok(NULL, "\n", &strtok_handle);
+   }
+ 
+   exit :;
+ 
+   *records = i;
+   if ( db_records )
+      free( db_records );
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func, rc);
+ 
+    return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : RemoveMassDBRecords                       *
+*                                                             *
+* DESCRIPTION     : Remove Records from DB ( ptrs )           *
+*                                                             *
+* INPUT           : db_ptrs   -   area of db records ptrs     *
+*                   db_rec_cnt-   ptr to records counter      *
+*                   wrk_ptrs  -   work area                   *
+*                   user      -   user for remove             *
+*                   group     -   group for remove            *
+*                   os_key    -   concatenated(user || grpoup)*
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+static ESA_RC RemoveMassDBRecords (
+        int                             db_type,
+        char                          * db_file,
+        char                         ** db_ptrs,
+        int                           * db_rec_cnt,
+        char                         ** wrk_ptrs,
+        USER_typ                        user,
+        UG_typ                          group,
+        char                          * os_key,
+        CTSAMSG_DEST_TABLE_rec_typ    * dest,
+        CTSAMSG_HANDLE_rec_typ        * msgs)
+ 
+{
+#define DBKLM (MAX_RSS_USER_NAME_LEN + 1 + MAX_RSS_USER_NAME_LEN + 1)
+ 
+   static    char func[]="RemoveMassDBRecords";
+   ESA_RC    rc = ESA_OK;
+   int       i;
+   int       removed_cntr=0;
+   char      db_key[DBKLM];
+   USER_typ  db_user;
+   UG_typ    db_group;
+ 
+   /*
+    *   Initialize
+    */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                   "db file rec cntr=%d", db_rec_cnt);
+ 
+  /*
+   *   Remove whole info by user or by group
+   *   information in form ( user, "*" ) OR ( "*", group )
+   */
+ 
+   i=0;
+   while ( (i LT *db_rec_cnt) AND db_ptrs[i] ) {
+        rc = BuildKeyFromDBfile(db_ptrs[i], db_key, db_user, db_group);
+        if (rc NE ESA_OK) {
+          rc = ESA_FATAL;
+          CTSAMSG_print (MSG_OFLI_FILE_CORRUPTED, msgs, NULL, dest,
+                         db_file);
+          goto exit;
+        }
+ 
+        if ( (int)strlen(user) GT 0) {
+           if ( !strcmp(user, db_user ) ) {
+              removed_cntr++;
+              SET_PTR_TO_NULL(i,db_ptrs,*db_rec_cnt,wrk_ptrs,
+                              removed_cntr)
+              continue;
+           }
+        }
+        else if ( (int)strlen(group) GT 0) {
+           if ( !strcmp(group, db_group ) ) {
+              removed_cntr++;
+              SET_PTR_TO_NULL(i,db_ptrs,*db_rec_cnt,wrk_ptrs,
+                              removed_cntr)
+              continue;
+           }
+        }
+        i++;
+   }
+ 
+   *db_rec_cnt -= removed_cntr;
+   exit :;
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+   return rc;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : RemoveDBRecords                           *
+*                                                             *
+* DESCRIPTION     : Remove Records from DB ( ptrs )           *
+*                                                             *
+* INPUT           : db_ptrs   -   area of db records ptrs     *
+*                   db_rec_cnt-   ptr to records counter      *
+*                   wrk_ptrs  -   work area                   *
+*                   user      -   user for remove             *
+*                   group     -   group for remove            *
+*                   os_key    -   concatenated(user || grpoup)*
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+static ESA_RC RemoveDBRecords(int                            db_type,
+                              char                         * db_file,
+                              char                        ** db_ptrs,
+                              int                          * db_rec_cnt,
+                              char                        ** wrk_ptrs,
+                              USER_typ                       user,
+                              UG_typ                         group,
+                              char                         * os_key,
+                              CTSAMSG_DEST_TABLE_rec_typ   * dest,
+                              CTSAMSG_HANDLE_rec_typ       * msgs)
+ 
+{
+   static    char func[]="RemoveDBRecords";
+   ESA_RC    rc = ESA_OK;
+   int       i;
+   char    * foundb;
+   char   ** found;
+ 
+   /*
+    *   Initialize
+    */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                   "db file rec cntr=%d", *db_rec_cnt);
+ 
+  /*
+   *  Remove single DB records ( user, group, connection )
+   */
+ 
+   db_sort_rc = ESA_OK;
+   foundb = bsearch( &os_key, db_ptrs, *db_rec_cnt,
+                     sizeof(char *), db_search_compare);
+   if (db_sort_rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      CTSAMSG_print (MSG_OFLI_FILE_CORRUPTED, msgs, NULL, dest,
+                     db_file);
+      goto exit;
+   }
+ 
+   /* Avoid casting */
+ 
+   memcpy ((char *)&found, (char *)&foundb, sizeof (found));
+ 
+   if (found) {
+      i = found - db_ptrs;
+ 
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,"1.found=(%d)%x/%s",
+                      i, found, os_key);
+ 
+      SET_PTR_TO_NULL(i, db_ptrs, *db_rec_cnt, wrk_ptrs,1)
+      *db_rec_cnt -= 1;
+   }
+ 
+  exit :;
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+   return rc;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : UpdateDBRecords                           *
+*                                                             *
+* DESCRIPTION     : Update Records                            *
+*                                                             *
+* INPUT           : db parameters                             *
+*                   os file parameters                        *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+static ESA_RC UpdateDBRecords(int                            db_type,
+                              char                         * db_file,
+                              char                        ** db_ptrs,
+                              int                          * db_rec_cnt,
+                              char                         * os_rec,
+                              char                        ** wrk_ptrs,
+                              char                         * os_key,
+                              CTSAMSG_DEST_TABLE_rec_typ   * dest,
+                              CTSAMSG_HANDLE_rec_typ       * msgs)
+{
+   static     char func[]="UpdateDBRecords";
+   ESA_RC     rc = ESA_OK;
+   int        i;
+   int        rec_cntr;
+   int        os_record_done;
+   int        compare;
+   char     * wptr;
+   char     * foundb;
+   char    ** found;
+ 
+   /*
+    *   Initialize
+    */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                   "db file rec cntr=%d key=%s", *db_rec_cnt, os_key);
+ 
+   rec_cntr = *db_rec_cnt;
+ 
+  /*
+   *  If bsearch found records -> update it
+   *  Change record ptr to this record to ptr from os file record ptr
+   */
+ 
+   db_sort_rc = ESA_OK;
+   foundb = bsearch( &os_key, db_ptrs, rec_cntr,
+                     sizeof(char *), db_search_compare);
+   if (db_sort_rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      CTSAMSG_print (MSG_OFLI_FILE_CORRUPTED, msgs, NULL, dest,
+                     db_file);
+      goto exit;
+   }
+ 
+   /* Avoid casting */
+ 
+   memcpy ((char *)&found, (char *)&foundb, sizeof (found));
+ 
+   if (found) {
+      i = found - db_ptrs;
+      db_ptrs[i] = os_rec;
+ 
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,"1.found=(%d)%x-%x/%s",
+                      i, found, os_rec, os_rec);
+ 
+      goto exit;
+   }
+ 
+   os_record_done = 0;
+ 
+  /*
+   *  bsearch not found records -> add it
+   */
+ 
+   for (i=0; i LT rec_cntr; i++) {
+      wptr = db_ptrs[i];
+      if ( !wptr )   /* Record removed */
+        continue;
+ 
+        db_sort_rc = ESA_OK;
+        compare  = db_search_compare(&os_key, &wptr);
+        if (db_sort_rc NE ESA_OK) {
+          rc = ESA_FATAL;
+          CTSAMSG_print (MSG_OFLI_FILE_CORRUPTED, msgs, NULL, dest,
+                         db_file);
+          goto exit;
+        }
+ 
+        if (compare EQ 0) {
+            ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+     "Why bsearch not found this record? Updated Record OLD=%s NEW=%s",
+                              db_ptrs[i], os_rec);
+             db_ptrs[i] = os_rec;
+             os_record_done = 1;
+             break;
+        }  /* compare EQ 0 */
+        else if (compare LT 0) {
+           ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                           "2.found=(%d)%x-%x/%s",
+                           i, wptr, os_rec, os_rec);
+ 
+           wrk_ptrs[i] = os_rec;
+           ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                           "Added Record %s", wptr);
+           ADD_NEW_PTR(i, db_ptrs, rec_cntr, wrk_ptrs)
+               (*db_rec_cnt)++;
+           os_record_done = 1;
+           break;
+        }  /* compare LT 0 */
+   }  /* for db_records */
+ 
+  /*
+   *  End-of-loop,
+   */
+ 
+   if ( !os_record_done )  {  /* Add Record to the end of db_ptrs */
+ 
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "3.not found.Added=(%d)NULL-%x/%s",
+                      *db_rec_cnt, os_rec, os_rec);
+ 
+      db_ptrs[*db_rec_cnt] = os_rec;
+      (*db_rec_cnt)++;
+   }
+ 
+   exit :;
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+   return rc;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : UpdateDB                                  *
+*                                                             *
+* DESCRIPTION     : Update Initial DB                         *
+*                                                             *
+* INPUT           : db_ptrs      - area with ptrs to DB records
+*                   db_rec_cnt   - DB records number          *
+*                 : os_ptrs      - area with ptrs to OS records
+*                   os_rec_cnt   - OS records number          *
+*                   wr_ptrs      - work area                  *
+*                                                             *
+* OUTPUT          : res_rec_cnt  - result records number      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+static ESA_RC UpdateDB(int                               db_type,
+                       char                            * db_file,
+                       char                            * os_file,
+                       char                           ** db_ptrs,
+                       int                               db_rec_cnt,
+                       char                           ** os_ptrs,
+                       int                               os_rec_cnt,
+                       char                           ** wrk_ptrs,
+                       int                             * res_rec_cnt,
+                       CTSAMSG_DEST_TABLE_rec_typ      * dest,
+                       CTSAMSG_HANDLE_rec_typ          * msgs)
+ 
+{
+#define OSKL (MAX_RSS_USER_NAME_LEN + 1 + MAX_RSS_USER_NAME_LEN + 1)
+ 
+   static    char func[]="UpdateDB";
+   ESA_RC    rc = ESA_OK;
+   int       i;
+   char     *wptr;
+   char      os_action;
+   char     *os_rec_ptr;
+   USER_typ  os_user;
+   UG_typ    os_group;
+   char      os_key[OSKL];
+ 
+   int       idebug;
+   char      *wdb;
+ 
+   /*
+    *   Initialize
+    */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+ 
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                   "db file rec cntr=%d os file rec cntr=%d",
+                    db_rec_cnt, os_rec_cnt);
+ 
+ 
+ 
+   for (i=0; i LT os_rec_cnt; i++) {     /* merge loop( os_file) */
+ 
+     os_user[0]     = NULL_CHAR;
+     os_group[0]    = NULL_CHAR;
+ 
+     wptr = os_ptrs[i];
+     rc = BuildKeyFromOSfile(wptr, os_key, os_user, os_group,
+                             &os_action, &os_rec_ptr);
+ 
+     if ( rc NE ESA_OK) {
+        rc = ESA_FATAL;
+        CTSAMSG_print (MSG_OFLI_FILE_CORRUPTED, msgs, NULL, dest,
+                       os_file);
+        goto exit;
+     }
+ 
+     if ( !strcmp(os_user, DB_REMOVE_MASS_STR) ) {
+        os_user[0] = NULL_CHAR;
+        rc = RemoveMassDBRecords( db_type, db_file,
+                            db_ptrs, &db_rec_cnt, wrk_ptrs,
+                            os_user, os_group, os_key, dest, msgs);
+            }
+     else if ( !strcmp(os_group, DB_REMOVE_MASS_STR) ) {
+         os_group[0] = NULL_CHAR;
+         rc = RemoveMassDBRecords( db_type, db_file,
+                             db_ptrs, &db_rec_cnt, wrk_ptrs,
+                             os_user, os_group, os_key, dest, msgs);
+            }
+     else if ( os_action EQ OBJECT_DELETED ) {
+        rc = RemoveDBRecords( db_type, db_file,
+                              db_ptrs, &db_rec_cnt, wrk_ptrs,
+                              os_user, os_group, os_key, dest, msgs);
+ 
+        ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                        ">>AFTER REMOVE:db_records=%d", db_rec_cnt);
+        for (idebug=0; idebug LT db_rec_cnt; idebug++) {
+           wdb = db_ptrs[idebug];
+           ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,60, "%d.%x-%s",
+                           idebug, wdb, wdb);
+        }
+     }
+     else {
+        rc = UpdateDBRecords( db_type, db_file,
+                              db_ptrs, &db_rec_cnt, os_rec_ptr,
+                              wrk_ptrs, os_key, dest, msgs);
+        ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                        ">>AFTER Update:db_records=%d", db_rec_cnt);
+        for (idebug=0; idebug LT db_rec_cnt; idebug++) {
+           wdb = db_ptrs[idebug];
+           ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,60, "%d.%x-%s",
+                           idebug, wdb, wdb);
+        }
+     }
+ 
+     if (rc NE ESA_OK)
+       goto exit;
+   }     /* for os_records */
+ 
+   *res_rec_cnt = db_rec_cnt;
+ 
+   exit :;
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT,DIAG_COMMON, func, rc);
+ 
+   return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : UpdateInitDB                              *
+*                                                             *
+* DESCRIPTION     : Update Initial DB                         *
+*                                                             *
+* INPUT           : init file                                 *
+*                   os file                                   *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC UpdateInitDB(int                               db_type,
+                    char                            * init_file,
+                    char                            * os_file,
+                    char                            * cmp_file,
+                    CTSAMSG_DEST_TABLE_rec_typ      * dest,
+                    CTSAMSG_HANDLE_rec_typ          * msgs)
+{
+ 
+   ESA_RC    rc = ESA_OK, rc_lock= ESA_ERR, rc_rename= ESA_ERR, rc_access= ESA_ERR;
+   static    char func[] = "UpdateInitDB";
+   int       sorted;
+   int       issue_msg   = 0;
+   int       os_rec_cnt  = 0;
+   int       db_rec_cnt  = 0;
+   int       res_rec_cnt = 0;
+   int       new_db_size = 0;
+   char     *os_records  = NULL;
+   char     **os_ptrs    = NULL;
+   char     *db_records  = NULL;
+   char     **db_ptrs    = NULL;
+   char     **wrk_ptrs   = NULL;
+   FILE     *dbfile_ptr  = NULL;
+   /*502839 int       idebug; no ref*/
+   /*502839 char     *wdb; no ref*/
+   int       idebug;                                       /* SAS2IBMN */
+   char     *wdb;                                          /* SAS2IBMN */
+   char     ddn_with[50]="";                              /* SAS2IBMT */
+ 
+   /*
+    *   Initialize
+    */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                   "Init file=%s os file=%s", init_file, os_file);
+ 
+  /*
+   *   Get OSOFLI file
+   */
+ 
+   rc_access= OfflineIntrcptrDBAccess( OFLI_OS_FILE,
+                                 os_file, issue_msg , dest, msgs );
+   if (rc_access NE ESA_OK ) {   /* OS file does not exist */
+      rc = ESA_OK;
+      goto exit;
+   }
+ 
+   rc_lock= CSA_lock (os_file, func, SCOPE_LOCAL);
+   if (rc_lock NE ESA_OK)
+   {
+      rc= rc_lock;
+      goto exit;
+   }
+   rc_rename= RenameDB (os_file, cmp_file, dest, msgs);
+   if (rc_lock EQ ESA_OK)
+      CSA_unlock (os_file, func);
+   if (rc_rename NE ESA_OK)
+   {
+	   rc= rc_rename;
+	   goto exit;
+   }
+ 
+   rc = OSFile2Memory(cmp_file, &os_records, &os_ptrs, &os_rec_cnt,
+                      dest, msgs );
+ 
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   if ( !os_records )  /* OSOFLI file changes is empty */
+      goto exit;
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, ">>os_records=%d",
+                   os_rec_cnt);
+ 
+/* SAS2IBMN #ifdef DEBUG */
+ 
+   if (ESA_DIAG_get_debug_level(ESA_COMP_RSS_INTERCEPT) GE 15)
+                                                          /* SAS2IBMN */
+   {                                                      /* SAS2IBMN */
+     for (idebug=0; idebug LT os_rec_cnt; idebug++) {
+        wdb = os_ptrs[idebug];
+        ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, "%d.%x-%s",
+                        idebug, wdb, wdb);
+     }
+   }                                                      /* SAS2IBMN */
+/* SAS2IBMN #endif       */
+ 
+   /**   Get DB file   **/
+ 
+   rc = DB2Memory(init_file, &db_records, &sorted, dest, msgs );
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   if ( db_records ) {
+     rc = BuildSortInfo(db_records, &db_ptrs, &db_rec_cnt, dest, msgs);
+     if ( rc NE ESA_OK ) {
+        rc = ESA_FATAL;
+        goto exit;
+     }
+   }
+   else {
+            rc = ESA_OK;
+            goto exit;
+   }
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, ">>db_records=%d",
+                   db_rec_cnt);
+/* SAS2IBMN #ifdef DEBUG     */
+   if (ESA_DIAG_get_debug_level(ESA_COMP_RSS_INTERCEPT) GE 15)
+                                                          /* SAS2IBMN */
+   {                                                      /* SAS2IBMN */
+     for (idebug=0; idebug LT db_rec_cnt; idebug++) {
+        wdb = db_ptrs[idebug];
+        ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, "%d.%x-%s",
+                        idebug, wdb, wdb);
+     }
+   }                                                       /* SAS2IBMN */
+/* SAS2IBMN #endif           */
+ 
+  /*
+   *  Realloc db memory for possibility add records from OSOFLI file
+   */
+ 
+   new_db_size = (int)(( db_rec_cnt + os_rec_cnt ) * (sizeof(char *)));
+   db_ptrs = (char **)realloc( db_ptrs, new_db_size );
+ 
+  /*
+   *   Allocate memory for work area
+   */
+ 
+   wrk_ptrs = (char **) malloc(new_db_size);
+   if ( !wrk_ptrs ) {
+       CTSAMSG_print (ERR_MALLOC, msgs, NULL, dest,
+                      "sort ptrs", os_rec_cnt);
+       rc = ESA_FATAL;
+       goto exit;
+   }
+ 
+   rc = UpdateDB(db_type,  init_file, cmp_file,
+                 db_ptrs,  db_rec_cnt,
+                 os_ptrs,  os_rec_cnt,
+                 wrk_ptrs, &res_rec_cnt, dest, msgs );
+   if (rc NE ESA_OK)
+      goto exit;
+ 
+  /*
+   *  Write result
+   */
+ 
+   if (res_rec_cnt)  {
+ 
+       /**   Open DB ( for write )  **/
+ 
+       /* strcpy(ddn_with,"DD:");                            SAS2IBMT */
+       /* strcat(ddn_with, init_file);                       SAS2IBMT */
+       /* strcpy(ddn_with,"//'");                            SAS2IBMT */
+       /* strcat(ddn_with, init_file);                       SAS2IBMT */
+       /* strcat(ddn_with,"'");                              SAS2IBMT */
+       /* ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+           "ESAOFIO: About to fopen %s", init_file);         SAS2IBMT */
+ 
+       dbfile_ptr = fopen(init_file , "w,recfm=*");
+ 
+       /**  Errors handling  **/
+ 
+       if ( !dbfile_ptr ) {
+          CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                        "fopen", init_file, strerror(errno) );
+          ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                         "file %s/%s error %d/%s",
+                         init_file, "fopen", errno,
+                         strerror(errno));
+          rc = ESA_FATAL;
+          goto exit;
+       }
+ 
+       /**   Write result   **/
+ 
+       rc = WriteSortedDB(dbfile_ptr, init_file,
+                          db_ptrs, res_rec_cnt, dest, msgs );
+       if ( rc NE ESA_OK ) {
+         rc = ESA_FATAL;
+         goto exit;
+       }
+    }
+ 
+  exit :;
+ 
+   if ( dbfile_ptr )
+      fclose( dbfile_ptr);
+ 
+   if (
+	     (rc_access EQ ESA_OK)
+		AND
+		 (rc_lock EQ ESA_OK)
+		AND
+		 (rc_rename EQ ESA_OK)
+ 	  )
+   {
+	   if (rc EQ ESA_OK)
+		  OS_OFLI_RemoveDB(cmp_file);
+       else
+          AboutOsFileDB (os_file, cmp_file, dest, msgs);
+   }
+   if (os_records)
+      free(os_records);
+   if (os_ptrs)
+      free(os_ptrs);
+   if (db_records)
+      free(db_records);
+   if (db_ptrs)
+      free(db_ptrs);
+   if (wrk_ptrs)
+      free(wrk_ptrs);
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+   return rc;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : OfflineIntrcptrDBAccess                   *
+*                                                             *
+* DESCRIPTION     : Check file existance                      *
+*                                                             *
+* INPUT           : db_type                                   *
+*                   db_file                                   *
+*                                                             *
+* OUTPUT          : total_records                             *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC OfflineIntrcptrDBAccess(int                            db_type,
+                               char                         * db_file,
+                               int                            issue_msg,
+                               CTSAMSG_DEST_TABLE_rec_typ   * dest,
+                               CTSAMSG_HANDLE_rec_typ       * msgs)
+ 
+ 
+{
+   ESA_RC        rc = ESA_OK;
+   FILE         *fptr = NULL;
+   static        char func[]="OfflineIntrcptrDBAccess";
+   /* SAS2IBMN int         irc;  */
+   char          line[2] = "";                          /* SAS2IBMN */
+   char          ddn_with[50]="";                         /* SAS2IBMT */
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func);
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, "db_file=%s",db_file);
+ 
+   /* SAS2IBMN - start */
+   /* Remove access() and use fopen() and fget() to check file
+    irc = access(db_file,0);
+    if ( irc NE 0 )          * File does not exist *    */
+ 
+    /* strcpy(ddn_with,"DD:");                               SAS2IBMT */
+    /* strcat(ddn_with, db_file);                            SAS2IBMT */
+    /* strcpy(ddn_with,"//'");                               SAS2IBMT */
+    /* strcat(ddn_with, db_file);                            SAS2IBMT */
+    /* strcat(ddn_with,"'");                                 SAS2IBMT */
+    /* ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+        "ESAOFIO: About to fopen %s", db_file);              SAS2IBMT */
+ 
+    fptr = fopen(db_file , "r");
+    if ( !fptr )                   /* open error        */
+    {
+      if ( issue_msg )
+         CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                       "fopen", db_file, strerror(errno) );
+ 
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "file %s/%s error %d/%s",
+                      db_file, "fopen", errno,
+                      strerror(errno));
+      rc = ESA_FATAL;
+      goto exit;
+    }
+    else
+    {
+      fgets(line, 2, fptr);
+ 
+      if ( ferror(fptr) )           /* error reading file */
+      {
+        if ( issue_msg )
+           CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                         "fgets", db_file, strerror(errno) );
+ 
+        ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                        "file %s/fgets error %d/%s",
+                        db_file, errno, strerror(errno));
+        rc = ESA_FATAL;
+        goto exit;
+      }
+      else
+        if ( feof(fptr) )            /* file empty */
+        {
+          if ( issue_msg )
+             CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                           "fgets", db_file, "feof");
+ 
+          ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                          "file %s/fgets  - file is empty",
+                          db_file);
+          rc = ESA_FATAL;
+          goto exit;
+        }
+    }
+   /* SAS2IBMN - end */
+ 
+   exit :;
+ 
+   if ( fptr )
+      fclose( fptr);
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func, rc);
+ 
+    return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : OfflineIntrcptrDBErase                    *
+*                                                             *
+* DESCRIPTION     : Delete files                              *
+*                                                             *
+* INPUT           : new_file                                  *
+*                   work_file                                 *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC OfflineIntrcptrDBErase(
+        char                         * new_file,
+        char                         * work_file,
+        int                            db_type,
+        int                            new_file_flag,
+        int                            work_file_flag,
+        CTSAMSG_DEST_TABLE_rec_typ   * dest,
+        CTSAMSG_HANDLE_rec_typ       * msgs)
+ 
+{
+   ESA_RC        rc = ESA_OK;
+   static        char func[]="OfflineIntrcptrDBErase";
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT,DIAG_COMMON, func);
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                    "New file=%s Work file=%s",
+                    new_file, work_file);
+ 
+    /*
+     * Delete work file
+     */
+ 
+    if ( work_file_flag )
+       OS_OFLI_RemoveDB(work_file);
+ 
+    /*
+     *  Delete new file
+     */
+ 
+    if ( new_file_flag )
+       OS_OFLI_RemoveDB(new_file);
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+    return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetBackUpFileName                         *
+*                                                             *
+* DESCRIPTION     : Build Backup file name                    *
+*                                                             *
+* INPUT           : db_type                                   *
+*                   file_name                                 *
+*                                                             *
+* OUTPUT          : backup_file_name                          *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+static ESA_RC  GetBackUpFileName(
+        int                            db_type,
+        char                         * file_name,
+        char                         * backup_file_name,
+        CTSAMSG_DEST_TABLE_rec_typ   * dest,
+        CTSAMSG_HANDLE_rec_typ       * msgs)
+{
+ 
+   ESA_RC     rc = ESA_OK;
+   char       *wrk;
+   char       errmsg[100];
+   static     char func[] = "GetBackUpFileName";
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   strcpy( backup_file_name, file_name );
+ 
+   wrk = strrchr( backup_file_name, '.' );
+   if ( wrk ) {
+      strcpy( wrk+1, "bkp");
+      goto exit;
+   }
+ 
+   wrk = strrchr( backup_file_name, '/' );
+   if ( wrk )
+      wrk = wrk + 1;
+   else
+      wrk = backup_file_name;
+ 
+   switch ( db_type ) {
+     case  OFLI_USER_DB:
+         strcpy( wrk, "ubkp");
+         break;
+     case  OFLI_GROUP_DB:
+         strcpy( wrk, "gbkp");
+         break;
+     case  OFLI_CONNECTION_DB:
+         strcpy( wrk, "cbkp");
+         break;
+     default:
+         sprintf( errmsg, "Invalid db_type=%d", db_type);
+         CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                       db_component, func, errmsg, 16, __LINE__);
+         rc = ESA_FATAL;
+   }
+ 
+   exit :;
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+   return rc;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : RenameDB                                  *
+*                                                             *
+* DESCRIPTION     : Rename DB                                 *
+*                                                             *
+* INPUT           : new_file                                  *
+*                   old_file                                  *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : CopyDB                                    *
+*                                                             *
+* DESCRIPTION     : Copy DB                                   *
+*                                                             *
+* INPUT           : db_type                                   *
+*                   file_from                                 *
+*                   file_to                                   *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+/* for MVS */
+ESA_RC CopyDB(int                            db_type,
+                     char                         * file_from,
+                     char                         * file_to,
+                     CTSAMSG_DEST_TABLE_rec_typ   * dest,
+                     CTSAMSG_HANDLE_rec_typ       * msgs)
+{
+   static                                char  func[] = "CopyDB";
+   ESA_RC                                rc = ESA_OK;
+   FILE                                 *fptr_in  = NULL;
+   FILE                                 *fptr_out = NULL;
+   OFFLINE_INTERCEPT_DB_RECORD_rec_typ   db_rec;
+   char                                  ddn_with[50]=""; /* SAS2IBMT */
+ 
+   /*
+    *  Initialize
+    */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 13,
+                   "db_type=%d file from=%s file to=%s",
+                   db_type, file_from, file_to);
+ 
+ 
+   rc = OfflineIntrcptrDBAccess( db_type,
+                                 file_from, 0, dest, msgs );
+   if ( rc NE ESA_OK ) {   /* DB file does not exist */
+       rc = ESA_OK;
+       goto exit;
+   }
+ 
+   /* strcpy(ddn_with,"DD:");                                SAS2IBMT */
+   /* strcat(ddn_with, file_from);                           SAS2IBMT */
+   /* strcpy(ddn_with,"//'");                                SAS2IBMT */
+   /* strcat(ddn_with, file_from);                           SAS2IBMT */
+   /* strcat(ddn_with,"'");                                  SAS2IBMT */
+   /* ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+       "ESAOFIO: About to fopen %s", file_from);             SAS2IBMT */
+ 
+   fptr_in = fopen(file_from , "r");
+ 
+   if ( !fptr_in ) {
+      CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                    "fopen", file_from, strerror(errno) );
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "file %s/%s error %d/%s",
+                      file_from, "fopen", errno,
+                      strerror(errno));
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   /* strcpy(ddn_with,"DD:");                                SAS2IBMT */
+   /* strcat(ddn_with, file_to);                             SAS2IBMT */
+   /* strcpy(ddn_with,"//'");                                SAS2IBMT */
+   /* strcat(ddn_with, file_to);                             SAS2IBMT */
+   /* strcat(ddn_with,"'");                                  SAS2IBMT */
+   /* ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+       "ESAOFIO: About to fopen %s", file_to);               SAS2IBMT */
+ 
+   fptr_out = fopen(file_to , "w,recfm=*");
+ 
+   if ( !fptr_out ) {
+      CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                    "fopen", file_to, strerror(errno) );
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "file %s/%s error %d/%s",
+                      file_to, "fopen", errno,
+                      strerror(errno));
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   while (fgets( (char *)&db_rec,
+          sizeof(OFFLINE_INTERCEPT_DB_RECORD_rec_typ), fptr_in) ) {
+ 
+       fputs ( (char *)&db_rec, fptr_out);
+       if ( ferror(fptr_out) )  {
+           CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                         "fputs", file_to, strerror(errno) );
+           ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                         "file %s/%s error %d/%s",
+                          file_to, "fputs", errno,
+                          strerror(errno));
+           rc = ESA_FATAL;
+           goto exit;
+       }
+   }
+ 
+   exit :;
+ 
+     if ( fptr_in )
+       fclose ( fptr_in );
+ 
+     if ( fptr_out )
+       fclose ( fptr_out );
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+   return rc;
+}
+ /* ifdef MVS */
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : OfflineIntrcptrDBBackup                   *
+*                                                             *
+* DESCRIPTION     : Backup function                           *
+*                                                             *
+* INPUT           : db_type                                   *
+*                   file_name                                 *
+*                   mode                                      *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC OfflineIntrcptrDBBackup(int                          db_type,
+                               char                       * file_name,
+                               int                          mode,
+                               CTSAMSG_DEST_TABLE_rec_typ * dest,
+                               CTSAMSG_HANDLE_rec_typ     * msgs)
+{
+ 
+   ESA_RC             rc = ESA_OK;
+   RESOURCE_typ       backup_file_name;
+   static             char func[] = "OfflineIntrcptrDBBackup";
+ 
+ 
+   /*
+    *  Initialize
+    */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   rc = GetBackUpFileName( db_type, file_name, backup_file_name,
+                           dest, msgs );
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   switch ( mode ) {
+     case DO_BACKUP:
+         rc = CopyDB( db_type, file_name,
+                      backup_file_name, dest, msgs );
+         break;
+     case DO_RESTORE:
+         rc = CopyDB( db_type, backup_file_name,
+                      file_name, dest, msgs );
+         break;
+     case DO_CLEAN:
+         rc = OS_OFLI_RemoveDB(backup_file_name);
+ 
+   }
+ 
+   exit :;
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+   return rc;
+}
+ 
+ 
+void AboutOsFileDB (char                       * os_file,
+                    char                       * cmp_file,
+                    CTSAMSG_DEST_TABLE_rec_typ * dest,
+                    CTSAMSG_HANDLE_rec_typ     * msgs)
+{
+   ESA_RC                                rc= ESA_OK, rc_lock= ESA_ERR, rc_rename= ESA_ERR;
+   OFFLINE_INTERCEPT_DB_RECORD_rec_typ   db_record;
+   FILE                                * cmp_ptr= NULL, * os_ptr= NULL;
+   int                                   ii= 0;
+   static char                           func[]= "AboutOsFileDB";
+   char                                  ddn_with[50]=""; /* SAS2IBMT */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1,
+	   "os_file=%s cmp_file=%s.", os_file, cmp_file);
+ 
+   rc_lock= CSA_lock (os_file, func, SCOPE_LOCAL);
+   if (rc_lock NE ESA_OK)
+   {
+      rc= rc_lock;
+      goto exit;
+   }
+ 
+   /* strcpy(ddn_with,"DD:");                                SAS2IBMT */
+   /* strcat(ddn_with, cmp_file);                            SAS2IBMT */
+   /* strcpy(ddn_with,"//'");                                SAS2IBMT */
+   /* strcat(ddn_with, cmp_file);                            SAS2IBMT */
+   /* strcat(ddn_with,"'");                                  SAS2IBMT */
+   /* ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+       "ESAOFIO: About to fopen %s", cmp_file);              SAS2IBMT */
+ 
+   cmp_ptr = fopen(cmp_file , "a,recfm=*");
+   if ( !cmp_ptr ) {
+      CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                    "fopen", cmp_file, strerror(errno) );
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, "file %s: %s error %d/%s.",
+                      cmp_file, "fopen", errno, strerror(errno));
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   /* strcpy(ddn_with,"DD:");                                SAS2IBMT */
+   /* strcat(ddn_with, os_file);                             SAS2IBMT */
+   /* strcpy(ddn_with,"//'");                                SAS2IBMT */
+   /* strcat(ddn_with, os_file);                             SAS2IBMT */
+   /* strcat(ddn_with,"'");                                  SAS2IBMT */
+   /* ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+       "ESAOFIO: About to fopen %s", os_file);               SAS2IBMT */
+ 
+   os_ptr = fopen(os_file , "r");
+   if ( !os_ptr ) {
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, "file %s: %s error %d/%s.",
+                      os_file, "fopen", errno, strerror(errno));
+      goto exit;
+   }
+ 
+   while (fgets( (char *)&db_record,
+	             sizeof(OFFLINE_INTERCEPT_DB_RECORD_rec_typ),
+				 os_ptr) )
+   {
+      if ( ferror(os_ptr) )  {
+         CTSAMSG_print(ERR_IO, msgs, NULL, dest, "fgets", os_file, strerror(errno) );
+         ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, "file %s: %s error %d/%s.",
+                        os_file, "fgets", errno, strerror(errno));
+         rc = ESA_FATAL;
+      }
+	  ii++;
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, "new %d record %s.",ii, db_record);
+ 
+      if (!strchr((char *)&db_record,'\n') )
+          strcat( (char *)&db_record, "\n");
+      rc = PutDBRecord(cmp_ptr, (char *)&db_record, cmp_file, dest, msgs);
+      if (rc NE ESA_OK)
+         goto exit;
+   }
+exit:
+ 
+   if (cmp_ptr)
+      fclose (cmp_ptr);
+   if (os_ptr)
+      fclose (os_ptr);
+ 
+   rc_rename= RenameDB (cmp_file, os_file, dest, msgs);
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, "rc=%d rc_lock=%d rc_rename=%d.",
+	   rc, rc_lock, rc_rename);
+ 
+   if (rc_lock EQ ESA_OK)
+      CSA_unlock (os_file, func);
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+}
+ 

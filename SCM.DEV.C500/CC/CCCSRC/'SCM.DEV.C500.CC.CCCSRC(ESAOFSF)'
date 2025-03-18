@@ -1,0 +1,5273 @@
+/**********************************************************************
+*
+* C Source: esaofsf.c
+* Description: Service progrm for offline
+* %created_by: leonid_s %
+* %date_created: Sun Jul 25 15:14:17 2004 %
+* %full_filespec: esaofsf.c#4.1.2.1.1:csrc:1 %
+*
+**********************************************************************/
+ 
+/**********************************************************************
+ *                              Changes Log                           *
+ **********************************************************************
+ * ID          When       Who      Description                        *
+ **********************************************************************
+ * BSAN100422  15/12/98   Alex     Reject mismatched events           *
+ * ps0381      09/06/99   Alex     Get by OE support                  *
+ * BSAN100846  09/25/00   AlexS    Last OE events are not handled     *
+ *                                  (mode OE)                         *
+ * AS1018      10/18/00   AlexS    Add/Update connections are not     *
+ *                                  handled (mode OE)                 *
+ * WSAN100361  05/10/00   Alex     Rename user/group support          *
+ * BSAN100874  10/25/00   Alex     Offline switch OE mode, if         *
+ *                                  specified, to ALL                 *
+ * IMH001      19-Nov-03  Ian H.   WSAN101432 Thread-safe code (errno)*
+ * BSAN102349   Nmore    25-Jan-05      Adding RSSPARAM to ignore uppercase conversion
+ *                                      Additional parameter to send ofli parameter to leaf functions
+ * SAS2IBMT    SeligT    13/11/16  SAS/C to IBM C Conversion Project  *
+ *                                 In SAS C, when using a data set    *
+ *                                 name in fopen, we had to use the   *
+ *                                 following construct: "dsn:dsname". *
+ *                                 However, in IBM C, we must use the *
+ *                                 following construct: //'dsname'.   *
+ *                                 Most of the data set names in this *
+ *                                 module come from the               *
+ *                                 OS_OFLI_Build_FileNames routine in *
+ *                                 the ESAOFOS module.                *
+ * CIQ#6       SeligT    19/03/17  Account Aggr includes Connections  *
+ *********************************************************************/
+ 
+#include "globs.h"
+ 
+#include ERRNO
+#include STRING
+#include STDIO
+#include STDLIB
+#include TIME
+ 
+#include SYS_TYPES_H
+ 
+/*
+ *   Common code header files
+ */
+#include ESA_API
+#include ESA_DIAG
+#include ESA_API_CODES
+#include ESA_INIT
+#include ESA_CHKSUM
+#include ESA_ESAADI
+#include ESA_ADMIN
+/*
+ *   Offline Int. header files
+ */
+#include ESA_ESAOFLI
+#include ESA_ESAOFIO
+#include ESA_CS_OS
+ 
+static char component [] = "OFFLINE INTERCEPTOR";
+static char os_key[MAX_RSS_USER_NAME_LEN + 1 + MAX_RSS_USER_NAME_LEN];
+char        ModeStr[30]="";
+#define MAX_CAREOE       200                  /* ps0381 */
+static  int       careoe_cnt = -1;            /* ps0381 */
+static  OE_typ    care_oe_table[MAX_CAREOE];  /* ps0381 */
+/* ps0381 */
+static ESA_RC CheckEvent(char                            * obj_code,
+                         char                            * object,
+                         OFFLINE_INTERCEPT_STUFF_rec_typ * offl_params);
+ 
+static char * GetEventRecord (      /* added this prototype SAS2IBMT */
+    OFFLINE_INTERCEPT_RS_RECORD_rec_typ * res_rec,
+    char                                * result_file,
+    FILE                                * fptr,
+    CTSAMSG_DEST_TABLE_rec_typ          * dest,
+    CTSAMSG_HANDLE_rec_typ              * msgs);
+ 
+ 
+ /*
+  * Handle errors macro for handling ioerr request file
+  */
+ 
+#define  HANDLE_FILE_IOERR(fp,fnm,opcode)                    \
+   if ( ferror( (fp) ) ) {                                   \
+       CTSAMSG_print(ERR_IO,                                 \
+                     msgs,                                   \
+                     NULL,                                   \
+                     dest,                                   \
+                     (opcode), (fnm), strerror(errno) );     \
+       ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,DIAG_DETAILES, \
+                       "file %s/%s error %d/%s",             \
+                       (fnm),(opcode), errno,                \
+                       strerror(errno));                     \
+       rc = ESA_FATAL;                                       \
+       goto exit;                                            \
+   }
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetEventRecord                            *
+*                                                             *
+* DESCRIPTION     : Get Event record, Uncompress              *
+*                                                             *
+* INPUT           : res_rec    - ptr to event record          *
+*                   result_file - file full path              *
+*                   fptr        - ptr to FILE struct          *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+static char * GetEventRecord (
+    OFFLINE_INTERCEPT_RS_RECORD_rec_typ * res_rec,
+    char                                * result_file,
+    FILE                                * fptr,
+    CTSAMSG_DEST_TABLE_rec_typ          * dest,
+    CTSAMSG_HANDLE_rec_typ              * msgs)
+{
+   char       *rc;
+   char       *record;
+   char       *token;
+   void       *strtok_handle = NULL;
+   OFFLINE_INTERCEPT_RS_RECORD_rec_typ db_record;
+   char   func[]="GetEventRecord";
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   rc = fgets( (char *)&db_record,
+                sizeof(OFFLINE_INTERCEPT_RS_RECORD_rec_typ), fptr);
+   if ( ferror(fptr) )  {
+       CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                     "fgets", result_file, strerror(errno) );
+       ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                     "file %s/%s error %d/%s",
+                     result_file, "fgets", errno,
+                    strerror(errno));
+       rc = NULL;
+       goto exit;
+    }
+ 
+    if ( rc EQ NULL )
+      goto exit;
+ 
+  /*
+   *  UnCompress record
+   */
+ 
+   record  = (char *)&db_record;
+   memset( (char *)res_rec, ' ',
+           sizeof(OFFLINE_INTERCEPT_RS_RECORD_rec_typ) );
+ 
+  /*
+   *   DB action
+   */
+ 
+   token   = my_strtok( record, DB_FIELDS_SEPARATOR_STR,
+                        &strtok_handle);
+   if ( !token ) {  /* Invalid record structure */
+     rc = NULL;
+     goto exit;
+   }
+   res_rec->db_action = *token;
+ 
+  /*
+   *   Object #1
+   */
+ 
+   token   = my_strtok( NULL, DB_FIELDS_SEPARATOR_STR, &strtok_handle);
+   if ( !token ) {  /* Invalid record structure */
+     rc = NULL;
+     goto exit;
+   }
+   memset( (char *)res_rec->obj1, ' ', sizeof(res_rec->obj1) );
+   strcpy( (char *)res_rec->obj1, token);
+ 
+  /*
+   *   Object #2
+   */
+ 
+   token   = my_strtok( NULL, DB_FIELDS_SEPARATOR_STR, &strtok_handle);
+   if ( !token ) {  /* Invalid record structure */
+     rc = NULL;
+     goto exit;
+   }
+   memset( (char *)res_rec->obj2, ' ', sizeof(res_rec->obj2) );
+   strcpy( (char *)res_rec->obj2, token);
+ 
+ exit :;
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, ESA_RC_VOID);
+   return rc;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : PutEventRecord                            *
+*                                                             *
+* DESCRIPTION     : Compress, Put Event record                *
+*                                                             *
+* INPUT           : res_rec    - ptr to event record          *
+*                   result_file - file full path              *
+*                   result_fptr - ptr to FILE struct          *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+static ESA_RC PutEventRecord (
+    OFFLINE_INTERCEPT_RS_RECORD_rec_typ * res_rec,
+    char                                * result_file,
+    FILE                                * result_fptr,
+    CTSAMSG_DEST_TABLE_rec_typ          * dest,
+    CTSAMSG_HANDLE_rec_typ              * msgs)
+{
+ 
+   ESA_RC     rc = ESA_OK;
+   char       *record;
+   OFFLINE_INTERCEPT_RS_RECORD_rec_typ db_record;
+   char   func[]="PutEventRecord";
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+  /*
+   *  Compress record
+   */
+ 
+   record  = (char *)&db_record;
+ 
+  /*
+   *   DB action
+   */
+ 
+   *record = res_rec->db_action;
+   record++;
+   *record = DB_FIELDS_SEPARATOR_CHAR;
+   record++;
+ 
+  /*
+   *   Object #1
+   */
+ 
+   strcpy( record, res_rec->obj1);
+   record += strlen(res_rec->obj1);
+   *record = DB_FIELDS_SEPARATOR_CHAR;
+   record++;
+ 
+  /*
+   *   Object #2
+   */
+ 
+   strcpy( record, res_rec->obj2);
+   record += strlen(res_rec->obj2);
+   if (strlen(res_rec->obj2) EQ 0) {
+      *record = ' ';
+      record++;
+   }
+   *record = DB_FIELDS_SEPARATOR_CHAR;
+   record++;
+ 
+   *record = '\n';
+   record++;
+   *record = '\0';
+ 
+  /*
+   *  Put record
+   */
+ 
+   fputs ( (char *)&db_record, result_fptr);
+   if ( ferror(result_fptr) )  {
+       CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                     "fputs", result_file, strerror(errno) );
+       ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                     "file %s/%s error %d/%s",
+                     result_file, "fputs", errno,
+                    strerror(errno));
+       rc = ESA_FATAL;
+    }
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+   return rc;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : SetEndTimeDate                            *
+*                                                             *
+* DESCRIPTION     : Obtain current date,time                  *
+*                                                             *
+* INPUT           : none                                      *
+*                                                             *
+* OUTPUT          : date, time                                *
+*                                                             *
+* RETURN VALUE    : none                                      *
+*                                                             *
+**************************************************************/
+ 
+void  SetEndTimeDate(char    *rdate, char *rtime)
+{
+   time_t      time_1970;
+   struct tm   time_rec;
+   char   func[]="SetEndTimeDate";
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   time (&time_1970);
+ 
+   memcpy ((char *)&time_rec,
+           (char *)ConvertTimeToTMStruct (&time_1970, &time_rec),
+           sizeof (time_rec));
+ 
+   sprintf (rdate, "%4d%02d%02d",
+            1900+time_rec.tm_year, time_rec.tm_mon+1, time_rec.tm_mday);
+ 
+   sprintf (rtime, "%02d%02d%02d",
+            time_rec.tm_hour, time_rec.tm_min, time_rec.tm_sec);
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, ESA_RC_VOID);
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : ParseKwdLine                              *
+*                                                             *
+* DESCRIPTION     : Get interesting keywords                  *
+*                                                             *
+* INPUT           : kwd_line                                  *
+*                                                             *
+* OUTPUT          : rss                                       *
+*                   api_code                                  *
+*                   chksum_flag                               *
+*                   addinfo_type                              *
+*                   kwd_name                                  *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+static void ParseKwdLine(char          *kwd_line,
+                         RSS_typ        rss,
+                         char          *api_code,
+                         char          *chksum_flg,
+                         char          *addinfo_typ,
+                         char          *kwd_name)
+{
+   char   *token;
+   void   *strtok_handle = NULL;
+   int    i=0;
+   char   func[]="ParseKwdLine";
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func);
+   /*
+    *  Initialize output parameters
+    */
+ 
+   *rss         = NULL_CHAR;
+   *api_code    = NULL_CHAR;
+   *chksum_flg  = NULL_CHAR;
+   *addinfo_typ = NULL_CHAR;
+   *kwd_name    = NULL_CHAR;
+ 
+   /*
+    *  Separate line
+    */
+ 
+   token = my_strtok(kwd_line, " \n", &strtok_handle);
+   while ( token AND ( i LT 5 ) ) {
+      switch (i) {
+        case 0:
+            strcpy( rss, token);
+            break;
+        case 1:
+            strcpy( api_code, token);
+            break;
+        case 2:
+            strcpy( chksum_flg, token);
+            break;
+        case 3:
+            strcpy( addinfo_typ, token);
+            break;
+        case 4:
+            strcpy( kwd_name, token );
+            break;
+      }
+      i++;
+      token = my_strtok(NULL, " \n", &strtok_handle);
+   }
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func, ESA_RC_VOID);
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetOfliKeywords                           *
+*                                                             *
+* DESCRIPTION     : Get interesting keywords                  *
+*                                                             *
+* INPUT           : rss_type                                  *
+*                   user_keywords                             *
+*                   group_keywords                            *
+*                   connection_kewords                        *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC GetOfliKeywords( RSS_typ                     rss_type,
+                        RESOURCE_typ                file_keywords,
+                        OFLI_KEYWORDS_rec_typ      *user_keywords,
+                        OFLI_KEYWORDS_rec_typ      *group_keywords,
+                        OFLI_KEYWORDS_rec_typ      *connection_keywords,
+                        OFLI_KEYWORDS_rec_typ      *rss_keywords,
+                        OFLI_KEYWORDS_rec_typ      *oe_keywords,
+                        CTSAMSG_DEST_TABLE_rec_typ *dest,
+                        CTSAMSG_HANDLE_rec_typ     *msgs)
+{
+  static       char func[] = "GetOfliKeywords";
+  ESA_RC       rc = ESA_OK;
+  char         kwd_line[1024];
+  RSS_typ      rss;
+  char         api_code[10];
+  char         chksum_flg[10];
+  char         addinfo_typ[10];
+  char         kwd_name[MAX_RSS_ADDINFO_KWD_LEN+1];
+  ADDINFO_typ  kwd_typ;
+  FILE        *fkwds = NULL;
+  char         ddn_with[50]="";                           /* SAS2IBMT */
+ 
+  /*
+   *  Initialize
+   */
+ 
+  ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+  ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,DIAG_OS,"RSS type %s",rss_type);
+ 
+  /*
+   *   Open file keywords
+   */
+ 
+     strcpy(ddn_with,"DD:");                              /* SAS2IBMT */
+     strcat(ddn_with, file_keywords);                     /* SAS2IBMT */
+  /* strcpy(ddn_with,"//'");                                 SAS2IBMT */
+  /* strcat(ddn_with, file_keywords);                        SAS2IBMT */
+  /* strcat(ddn_with,"'");                                   SAS2IBMT */
+  /* ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+      "ESAOFSF: About to fopen %s", file_keywords);          SAS2IBMT */
+ 
+  fkwds = fopen(ddn_with , "r");                          /* SAS2IBMT */
+  if ( !fkwds ) {
+     CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                   "fopen", file_keywords, strerror(errno) );
+     ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                     "file %s/%s error %d/%s",
+                     file_keywords, "fopen", errno,
+                     strerror(errno));
+     rc = ESA_FATAL;
+     goto exit;
+  }
+ 
+ 
+  while ( fgets( kwd_line, sizeof(kwd_line), fkwds) )   {
+ 
+     HANDLE_FILE_IOERR( fkwds, file_keywords, "fgets")
+ 
+     if ( kwd_line[0] NE '*' ) {
+ 
+        /*
+         *     Make data a string
+         */
+ 
+         ParseKwdLine(kwd_line, rss, api_code,
+                     chksum_flg, addinfo_typ, kwd_name );
+ 
+         if ( strlen(rss) GT 0 )
+            ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 15,
+   "rss=%s api_code=%s chksum_flag=%s addinfo_type=%s kwd_name=%s",
+   rss, api_code,  chksum_flg, addinfo_typ, kwd_name );
+ 
+         if ( ( My_stricmp( rss, rss_type ) EQ 0 ) AND
+              ( IsCheckSumKeyword(kwd_name,  /* WSAN100361 */
+                                  addinfo_typ, chksum_flg,
+                                  &kwd_typ)   EQ ESA_OK)  ) {
+            if ( atoi(api_code) EQ USER_API_KEYWORDS )
+              rc = SaveKeywords( user_keywords,
+                                 kwd_name, kwd_typ, dest, msgs );
+            else if ( atoi(api_code) EQ GROUP_API_KEYWORDS )
+              rc = SaveKeywords( group_keywords,
+                                 kwd_name, kwd_typ, dest, msgs );
+            else if ( atoi(api_code) EQ CONNECTION_API_KEYWORDS )
+              rc = SaveKeywords( connection_keywords,
+                                 kwd_name, kwd_typ, dest, msgs );
+            else if ( atoi(api_code) EQ RSS_API_KEYWORDS )
+               rc = SaveKeywords( rss_keywords,
+                                  kwd_name, kwd_typ, dest, msgs );
+            else if ( atoi(api_code) EQ OE_API_KEYWORDS )
+               rc = SaveKeywords( oe_keywords,
+                                  kwd_name, kwd_typ, dest, msgs );
+            if ( rc NE ESA_OK ) {
+               rc = ESA_FATAL;
+               goto exit;
+            }
+         }
+     }
+  } /* loop on keywords */
+ 
+ 
+  /*
+   *   Sort Obtained keywords
+   */
+ 
+  if ( user_keywords->cnt GT 1 )
+     qsort( (char *)user_keywords->kwds, user_keywords->cnt,
+            sizeof(OFLI_KWD_type_rec), &keywords_sort_compare);
+ 
+  if ( group_keywords->cnt GT 1 )
+     qsort( (char *)group_keywords->kwds, group_keywords->cnt,
+            sizeof(OFLI_KWD_type_rec), &keywords_sort_compare);
+ 
+  if ( connection_keywords->cnt GT 1 )
+     qsort( (char *)connection_keywords->kwds, connection_keywords->cnt,
+            sizeof(OFLI_KWD_type_rec), &keywords_sort_compare);
+ 
+  if ( rss_keywords->cnt GT 1 )
+     qsort( (char *)rss_keywords->kwds, rss_keywords->cnt,
+            sizeof(OFLI_KWD_type_rec), &keywords_sort_compare);
+ 
+  if ( oe_keywords->cnt GT 1 )
+     qsort( (char *)oe_keywords->kwds, oe_keywords->cnt,
+            sizeof(OFLI_KWD_type_rec), &keywords_sort_compare);
+ 
+  exit :;
+ 
+  if ( fkwds )
+     fclose(fkwds);
+ 
+  ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+  return rc;
+ 
+}
+/**************************************************************
+*                                                             *
+* Subroutine name : GetUserInfo                               *
+*                                                             *
+* DESCRIPTION     : get user information                      *
+*                                                             *
+* INPUT           : user_file - user result file              *
+*                   users_keywords                            *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC GetUserInfo(char                            *user_file,
+ /* BSAN100422 */  char                            *oe_file,
+                   OFLI_KEYWORDS_rec_typ           *user_keywords,
+                   OFFLINE_INTERCEPT_STUFF_rec_typ *offl_params,
+ /* BSAN100874 */  char                            *gtoe)
+{
+   ESA_RC                               rc = ESA_OK;
+   static                               char func[]="GetUserInfo";
+   unsigned int                         size;
+   int                                  i;
+   int                                  i_dump;
+   int                                  get_done = GET_DONE_WITH_FATAL;
+   void                                *io_handle = NULL;
+   OFFLINE_INTERCEPT_DB_RECORD_rec_typ  offli_db_record;
+   /* BSAN100874   ADMIN_PARAMS_rec_typ *admin_params;  */ /* ps0381 */
+   /* BSAN100874   char                  gtoe[8]= "ALL";*/ /* ps0381 */
+   int                                   ii;               /* ps0381 */
+   int                                   jj;               /* ps0381 */
+   OE_typ                                oe_filter;        /* ps0381 */
+ 
+   /*
+    *  Get User parameters
+    */
+ 
+ 
+    GET_USER_MODE          mode = GET_ALL_USERS;
+    short                  max_users = OFLI_GET_MAX_USER;
+    short                  actual_num;
+    HAVE_MORE_typ          have_more = HAVE_MORE;
+    void                  *get_user_handle = NULL;
+    short                  num_users_in=0;
+    USER_PARAMS_rec_typ   *user_params_in = NULL;
+    USER_PARAMS_rec_typ   *user_params    = NULL;
+    ADDINFO_rec_ptr       *addinfo        = NULL;
+    OBJ_EXISTS_typ        *objs_exist     = NULL;
+    char                   get_conn       = 'N';            /* CIQ#6 */
+   /*
+    *   Check Sum parameters
+    */
+ 
+    CHECKSUM_typ           CheckSum;
+    char                   CheckSumStr[sizeof(CHECKSUM_typ)+ 1];
+    ENVIRONMENT_rec_typ  * envir_ptr;
+ 
+   /*   BSAN100422
+    *   Get OE Offline file parameters
+    */
+ 
+    int                             oe_records_cnt;
+    int                             oe_sorted;
+    char                           *oe_db_records = NULL;
+    char                          **oe_db_ptrs    = NULL;
+    char                           *oe_foundb;
+    char                          **oe_found;
+    OE_typ                          oe_key;
+    char                          * oe_key_p;
+    CTSAMSG_DEST_TABLE_rec_typ    * dest;
+    CTSAMSG_HANDLE_rec_typ        * msgs;
+ 
+    CS_get_envir_address (&envir_ptr);
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+    strcpy (ModeStr, "GET_ALL_USERS");
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,DIAG_OS,"Result file %s", user_file);
+ 
+    /* BSAN100874 admin_params=&offl_params->admin_params; */ /* ps0381 */
+    /* BSAN100874 admin_params->cs_func.rssprm_get_opt_ptr */ /* ps0381 */
+    /* BSAN100874              (offl_params->rss_name,     */ /* ps0381 */
+    /* BSAN100874               "OFLI_GET_MODE",           */ /* ps0381 */
+    /* BSAN100874                sizeof(gtoe) - 1,         */ /* ps0381 */
+    /* BSAN100874                gtoe, OPT_TRUE, OPT_TRUE);*/ /* ps0381 */
+ 
+    if (strcmp(gtoe, "OE") NE 0) {                            /* ps0381 */
+        jj = 1;                                               /* ps0381 */
+        strcpy(care_oe_table[0], "");                         /* ps0381 */
+    }                                                         /* ps0381 */
+    else {                                                    /* ps0381 */
+      jj = careoe_cnt;                                        /* ps0381 */
+      if (jj GE 0) {                                          /* ps0381 */
+         mode = GET_SUBTREE_USERS;                            /* ps0381 */
+         strcpy (ModeStr, "GET_SUBTREE_USERS");
+         jj++;                                                /* ps0381 */
+      }                                                       /* ps0381 */
+      else {                                                  /* ps0381 */
+        jj = 1;                                               /* ps0381 */
+        strcpy(care_oe_table[0], "");                         /* ps0381 */
+      }                                                       /* ps0381 */
+    }                                                         /* ps0381 */
+ 
+    /* Start of BSAN100422 */
+ 
+    if (oe_file) {
+      msgs = offl_params->msgs;
+      dest = offl_params->dest;
+      oe_key_p = os_key;
+ 
+      rc = DB2Memory(oe_file, &oe_db_records, &oe_sorted, dest, msgs );
+      if ( rc NE ESA_OK ) {
+         rc = ESA_FATAL;
+         goto exit;
+      }
+ 
+      if ( oe_db_records ) {  /* file not empty */
+        rc = BuildSortInfo(oe_db_records, &oe_db_ptrs, &oe_records_cnt,
+                           dest, msgs);
+        if ( rc NE ESA_OK ) {
+         rc = ESA_FATAL;
+         goto exit;
+       }
+      }
+    }   /* if (oe_file) */
+ 
+    /* End   of BSAN100422 */
+ 
+    /*
+     * Get Array of max_users for output user names
+     */
+ 
+    size = max_users * sizeof (USER_PARAMS_rec_typ);
+    user_params  = (USER_PARAMS_rec_ptr)calloc (1, size);
+ 
+    if (user_params EQ NULL) {
+       CTSAMSG_print (ERR_MALLOC,
+                      offl_params->msgs, NULL, offl_params->dest,
+                      "user_params", size);
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    /*
+     * Get Array for obj_exist indicators
+     */
+ 
+    size = max_users * sizeof (OBJ_EXISTS_typ);
+    objs_exist = (OBJ_EXISTS_typ *)calloc (1, size);
+ 
+    if (objs_exist EQ NULL) {
+       CTSAMSG_print (ERR_MALLOC,
+                      offl_params->msgs, NULL, offl_params->dest,
+                      "user_params", size);
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    /*
+     * Get ADDINFO
+     */
+ 
+    rc = GetAddinfo( &addinfo, max_users, user_keywords,
+                     offl_params->dest, offl_params->msgs );
+    if (rc NE ESA_OK) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    /*
+     *  Open user DB
+     */
+ 
+    rc = OfflineIntrcptrDBOpen( &io_handle, OFLI_USER_DB,
+                                user_file, OPEN_FOR_WRITE,
+                                offl_params->dest, offl_params->msgs);
+    if ( rc NE ESA_OK ) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    for (ii=0; ii LT jj; ii++ )    {            /* ps0381 */
+ 
+      have_more = HAVE_MORE;                    /* ps0381 */
+      strcpy(oe_filter, care_oe_table[ii]);     /* ps0381 */
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,13, /* ps0381 */
+                    "ii=%d oe=%s",              /* ps0381 */
+                    ii, oe_filter);             /* ps0381 */
+ 
+      /*
+       *  Get Users ALL
+       */
+ 
+      while (have_more EQ HAVE_MORE) {
+ 
+         /*
+          *   Clear addinfo, and users output parameters
+          */
+ 
+         for (i=0; i LT max_users; i++ )
+            ADDINFO_clear( addinfo[i] );
+ 
+         size = max_users * sizeof (USER_PARAMS_rec_typ);
+         memset(user_params, NULL_CHAR, size);
+ 
+         API_LOGIN
+         if ( rc NE ESA_OK ) {
+            get_done = GET_DONE_WITH_FATAL;
+            rc = ESA_FATAL;
+            /* ps0381   break;          */
+            goto exit;        /* ps0381 */
+         }
+ 
+         /*
+          * API call GetUser
+          */
+ 
+         ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetUsers USA-API with %s mode", ModeStr);
+         CS_DIAG_USER_IN (ESA_COMP_RSS_INTERCEPT, mode, oe_filter,
+			 max_users, num_users_in, user_params_in, get_user_handle,
+			 addinfo);
+         rc = (offl_params->func_ptr->gtusers_ptr) (
+                     mode,
+          /*      envir_ptr->empty_oe,    Del by ps0381 */
+                     oe_filter,                  /* ps0381 */
+                     max_users,
+                     &actual_num, &have_more,
+                     &get_user_handle,
+                     num_users_in,
+                     user_params_in,
+                     user_params,
+                                               addinfo,
+                     objs_exist,
+                     &offl_params->admin_params,
+                     offl_params->err,
+                     get_conn);                             /* CIQ#6 */
+         ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetUsers USA-API completed with rc=%d (%s).",
+ 			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+		 if (rc EQ ESA_OK)
+            CS_DIAG_USER_OUT (ESA_COMP_RSS_INTERCEPT, oe_filter,
+			    actual_num, have_more, user_params, objs_exist,
+			    get_user_handle, addinfo);
+         API_LOGOUT
+         if ( rc EQ ESA_NOT_SUPP ) {
+            get_done = GET_DONE_SUCCESS;
+            rc = ESA_OK;
+            goto exit;
+         }
+         else if ( rc NE ESA_OK ) {
+            get_done = GET_DONE_WITH_FATAL;
+            goto exit;
+            break;
+         }
+         else
+            get_done = GET_DONE_SUCCESS;
+ 
+         /*
+          *  Print diagnostic information
+          */
+ 
+         ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+                         "Max_users=%d actual num=%d",
+                         max_users, actual_num);
+ 
+         for (i_dump=0; i_dump LT actual_num; i_dump++) {
+               ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 19,
+             "User=%s exist=%d DFLTGRP=%s rev_status=%d user_admin=%d",
+                 user_params[i_dump].user,
+                 objs_exist[i_dump],
+                 user_params[i_dump].def_group,
+                 user_params[i_dump].rev_status,
+                 user_params[i_dump].user_admin);
+            }
+ 
+         /*
+          *   Build check-sum buffer
+          */
+ 
+         for (i=0; i LT actual_num; i++) {
+            if ( objs_exist[i] EQ OBJ_EXIST ) {
+ 
+              /* Start of  BSAN100422  */
+ 
+                 if ( oe_file AND  oe_db_records ) {/* file not empty*/
+ 
+                   strcpy(oe_key, user_params[i].parent_oe);
+                   memset( os_key, ' ', sizeof(os_key) );
+                   os_key[sizeof(os_key)-1] = NULL_CHAR;
+                   memcpy(os_key, oe_key, strlen(oe_key));
+                   oe_foundb = bsearch( &oe_key_p, oe_db_ptrs,
+                                 oe_records_cnt,
+                                 sizeof(char *), db_search_compare);
+                   /* Avoid casting */
+ 
+                   memcpy ((char *)&oe_found, (char *)&oe_foundb,
+                           sizeof (oe_found));
+ 
+                   if (NOT oe_found) {
+                     CTSAMSG_print(MSG_OFLI_USR_EVT_IGN,
+                                   msgs, NULL, dest,
+                                   user_params[i].user,
+                                   user_params[i].parent_oe);
+                     continue;
+                    }
+            }
+ 
+            /* End   of  BSAN100422  */
+            GetUserCheckSum( &CheckSum, &user_params[i], addinfo[i] );
+                 memcpy (CheckSumStr, CheckSum, sizeof(CHECKSUM_typ));
+                 CheckSumStr[sizeof(CHECKSUM_typ)]= '\0';
+               ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,15,
+                               "user=%s check-sum=%s",
+                               user_params[i].user, CheckSumStr );
+ 
+               /* Write CheckSUm */
+ 
+               memset( (char *)offli_db_record.obj1, ' ',
+                       sizeof(offli_db_record.obj1) );
+ 
+               strcpy( (char *)offli_db_record.obj1,
+                       user_params[i].user );
+ 
+               memset( (char *)offli_db_record.obj2, ' ',
+                       sizeof(offli_db_record.obj2) );
+               offli_db_record.obj2[0] = NULL_CHAR;
+ 
+               memcpy( (char *)offli_db_record.CheckSum,
+                       (char *)CheckSum, sizeof( CheckSum ) );
+ 
+               offli_db_record.ess_flag = ' ';
+               offli_db_record.eol      = '\n';   /* NEW_LINE; */
+ 
+               rc = OfflineIntrcptrDBWrite( io_handle,
+                                            OFLI_USER_DB,
+                                            user_file,
+                                            &offli_db_record,
+                                            offl_params->dest,
+                                            offl_params->msgs);
+               if ( rc NE ESA_OK ) {
+                  get_done = GET_DONE_WITH_FATAL;
+                  rc = ESA_FATAL;
+                  goto exit;
+               }
+ 
+            }
+         }
+ 
+      }  /* while HAVE_MORE */
+    }    /* ii */                       /* ps0381 */
+ 
+    exit :;
+ 
+    /*
+     *  If was Unsuccessfull termination.
+     *  API call free his handle
+     */
+ 
+     if ( get_user_handle ) {
+        ESA_RC rcc= ESA_OK;
+        API_LOGIN
+        if ( rc EQ ESA_OK ) {
+           mode =  GET_FREE_HANDLE_USERS;
+           strcpy (ModeStr, "GET_FREE_HANDLE_USERS");
+ 
+           /*
+            *  API call GetUser ( FREE_HANDLE )
+            */
+ 
+           ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetUsers USA-API with %s mode", ModeStr);
+           CS_DIAG_USER_IN (ESA_COMP_RSS_INTERCEPT, mode,
+			   envir_ptr->empty_oe, 0, 0, user_params_in,
+			   get_user_handle, addinfo);
+           rcc= (offl_params->func_ptr->gtusers_ptr) ( mode,
+                                     envir_ptr->empty_oe,
+                                     max_users,
+                                     &actual_num,
+                                     &have_more,
+                                     &get_user_handle,
+                                     num_users_in,
+                                     user_params_in,
+                                     user_params,
+                                     addinfo,
+                                     objs_exist,
+                                     &offl_params->admin_params,
+                                     offl_params->err,
+                                     get_conn);             /* CIQ#6 */
+           ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetUsers USA-API completed with rc=%d (%s).",
+			rcc, (rcc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+           if (rcc EQ ESA_OK)
+              CS_DIAG_USER_OUT (ESA_COMP_RSS_INTERCEPT,
+			      envir_ptr->empty_oe, 0, have_more, user_params,
+			      objs_exist, get_user_handle, addinfo);
+           API_LOGOUT
+        }
+        else {
+           CTSAMSG_print(ERR_INTERNAL2,
+            offl_params->msgs, NULL, offl_params->dest,
+            component, func,
+            "GetUser handle not freed due to Login failure",
+            16, __LINE__);
+           rc = ESA_FATAL;
+           get_done = GET_DONE_WITH_FATAL;
+        }
+     }
+ 
+     /*
+      *  Close user DB and Sort.
+      */
+ 
+     if ( io_handle ) {
+        OfflineIntrcptrDBClose( &io_handle, OFLI_USER_DB,
+                                user_file,
+                                offl_params->dest,
+                                offl_params->msgs);
+        if (get_done NE GET_DONE_WITH_FATAL ) {
+          rc = OfflineIntrcptrDBSort ( OFLI_USER_DB,
+                                       user_file,
+                                       offl_params->dest,
+                                       offl_params->msgs);
+          if ( rc NE ESA_OK ) {
+             rc = ESA_FATAL;
+             get_done = GET_DONE_WITH_FATAL;
+          }
+        }
+     }
+ 
+    /*
+     *   Free
+     */
+ 
+    if ( user_params )
+       free( user_params );
+ 
+    if ( objs_exist )
+       free(  objs_exist );
+ 
+    if ( addinfo )
+       FreeAddinfo ( max_users, &addinfo );
+ 
+ 
+    if ( oe_db_records )              /* BSAN100422 */
+       free( oe_db_records );         /* BSAN100422 */
+                                      /* BSAN100422 */
+    if ( oe_db_ptrs )                 /* BSAN100422 */
+       free( oe_db_ptrs );            /* BSAN100422 */
+ 
+    if ( get_done NE GET_DONE_SUCCESS )
+       rc = ESA_FATAL;
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+    return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetOEInfo                                 *
+*                                                             *
+* DESCRIPTION     : get OE information                        *
+*                                                             *
+* INPUT           : oe_file - oe result file                  *
+*                   oe_keywords                               *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC GetOEInfo(char                            *oe_file,
+                 OFLI_KEYWORDS_rec_typ           *oe_keywords,
+                 OFFLINE_INTERCEPT_STUFF_rec_typ *offl_params,
+/* BSAN100874 */ char                            *gtoe)
+{
+   ESA_RC                               rc = ESA_OK;
+   static                               char func[]="GetOEInfo";
+   unsigned int                         size;
+   int                                  i;
+   int                                  i_dump;
+   int                                  get_done = GET_DONE_WITH_FATAL;
+   void                                *io_handle = NULL;
+   OFFLINE_INTERCEPT_DB_RECORD_rec_typ  offli_db_record;
+   /* BSAN100874 ADMIN_PARAMS_rec_typ  *admin_params;  */  /* ps0381 */
+   /* BSAN100874 char                   gtoe[8]= "ALL";*/  /* ps0381 */
+   int                                   ii;               /* ps0381 */
+   int                                   jj;               /* ps0381 */
+   OE_typ                                oe_filter;        /* ps0381 */
+ 
+ 
+   /*
+    *  Get OE parameters
+    */
+ 
+ 
+    GET_OE_MODE            mode = GET_ALL_OES;
+    short                  max_oes = OFLI_GET_MAX_OE;
+    short                  actual_num;
+    HAVE_MORE_typ          have_more = HAVE_MORE;
+    void                  *get_oe_handle = NULL;
+    short                  num_oes_in   = 0;
+    OE_PARAMS_rec_typ     *oe_params_in = NULL;
+    OE_PARAMS_rec_typ     *oe_params    = NULL;
+    ADDINFO_rec_ptr       *addinfo      = NULL;
+    OBJ_EXISTS_typ        *objs_exist   = NULL;
+ 
+   /*
+    *   Check Sum parameters
+    */
+ 
+    CHECKSUM_typ           CheckSum;
+    char                   CheckSumStr[sizeof(CHECKSUM_typ)+ 1];
+    ENVIRONMENT_rec_typ  * envir_ptr;
+ 
+    CS_get_envir_address (&envir_ptr);
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+    strcpy (ModeStr, "GET_ALL_OES");
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,DIAG_OS,"Result file %s", oe_file);
+ 
+    /* BSAN100874 admin_params=&offl_params->admin_params; */ /* ps0381 */
+    /* BSAN100874 admin_params->cs_func.rssprm_get_opt_ptr */ /* ps0381 */
+    /* BSAN100874              (offl_params->rss_name,     */ /* ps0381 */
+    /* BSAN100874               "OFLI_GET_MODE",           */ /* ps0381 */
+    /* BSAN100874                sizeof(gtoe) - 1,         */ /* ps0381 */
+    /* BSAN100874                gtoe, OPT_TRUE, OPT_TRUE);*/ /* ps0381 */
+ 
+    if (strcmp(gtoe, "OE") NE 0) {                            /* ps0381 */
+        jj = 1;                                               /* ps0381 */
+        strcpy(care_oe_table[0], "");                         /* ps0381 */
+    }                                                         /* ps0381 */
+    else {                                                    /* ps0381 */
+      jj = careoe_cnt;                                        /* ps0381 */
+      if (jj GE 0) {                                          /* ps0381 */
+         mode = GET_SUBTREE_OES;                              /* ps0381 */
+         strcpy (ModeStr, "GET_SUBTREE_OES");
+         jj++;                                                /* ps0381 */
+      }                                                       /* ps0381 */
+      else {                                                  /* ps0381 */
+        jj = 1;                                               /* ps0381 */
+        strcpy(care_oe_table[0], "");                         /* ps0381 */
+      }                                                       /* ps0381 */
+    }                                                         /* ps0381 */
+ 
+    /*
+     * Get Array of max_oes for output oe names
+     */
+ 
+    size = max_oes * sizeof (OE_PARAMS_rec_typ);
+    oe_params  = (OE_PARAMS_rec_ptr)calloc (1, size);
+ 
+    if (oe_params EQ NULL) {
+       CTSAMSG_print (ERR_MALLOC,
+                      offl_params->msgs, NULL, offl_params->dest,
+                      "oe_params", size);
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    /*
+     * Get Array for obj_exist indicators
+     */
+ 
+    size = max_oes * sizeof (OBJ_EXISTS_typ);
+    objs_exist = (OBJ_EXISTS_typ *)calloc (1, size);
+ 
+    if (objs_exist EQ NULL) {
+       CTSAMSG_print (ERR_MALLOC,
+                      offl_params->msgs, NULL, offl_params->dest,
+                      "oe_params", size);
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    /*
+     * Get ADDINFO
+     */
+ 
+    rc = GetAddinfo( &addinfo, max_oes, oe_keywords,
+                     offl_params->dest, offl_params->msgs );
+    if (rc NE ESA_OK) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    /*
+     *  Open OE DB
+     */
+ 
+    rc = OfflineIntrcptrDBOpen( &io_handle, OFLI_OE_DB,
+                                oe_file, OPEN_FOR_WRITE,
+                                offl_params->dest, offl_params->msgs);
+    if ( rc NE ESA_OK ) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+ 
+    for (ii=0;ii LT jj; ii++ )    {             /* ps0381 */
+ 
+      have_more = HAVE_MORE;                    /* ps0381 */
+      strcpy(oe_filter, care_oe_table[ii]);     /* ps0381 */
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,13, /* ps0381 */
+                    "ii=%d oe=%s",              /* ps0381 */
+                    ii, oe_filter);             /* ps0381 */
+ 
+      /*
+       *  Get OEs ALL
+       */
+ 
+      while (have_more EQ HAVE_MORE) {
+ 
+         /*
+          *   Clear addinfo and output parameters
+          */
+ 
+         for (i=0; i LT max_oes; i++ )
+            ADDINFO_clear( addinfo[i] );
+ 
+         size = max_oes * sizeof (OE_PARAMS_rec_typ);
+         memset(oe_params, NULL_CHAR, size);
+ 
+         API_LOGIN
+         if ( rc NE ESA_OK ) {
+            get_done = GET_DONE_WITH_FATAL;
+            rc = ESA_FATAL;
+            goto exit;
+         }
+ 
+         /*
+          * API call GetOE
+          */
+ 
+         ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetOEs USA-API with %s mode.", ModeStr);
+         CS_DIAG_OE_IN (ESA_COMP_RSS_INTERCEPT, mode, oe_filter,
+           max_oes, num_oes_in, oe_params_in, get_oe_handle, addinfo);
+         rc = (offl_params->func_ptr->getoes_ptr) (
+                                       mode,
+                /* Del by ps0381       envir_ptr->empty_oe,  */
+                                       oe_filter,
+                                       max_oes,
+                                       &actual_num,
+                                       &have_more,
+                                       &get_oe_handle,
+                                       num_oes_in,
+                                       oe_params_in,
+                                       oe_params,
+                                       addinfo,
+                                       objs_exist,
+                                       &offl_params->admin_params,
+                                       offl_params->err );
+         ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetOEs USA-API completed with rc=%d (%s).",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+		 if (rc EQ ESA_OK)
+            CS_DIAG_OE_OUT (ESA_COMP_RSS_INTERCEPT, oe_filter, actual_num,
+    			 have_more, oe_params, objs_exist, get_oe_handle, addinfo);
+         API_LOGOUT
+         if ( rc EQ ESA_NOT_SUPP ) {
+            get_done = GET_DONE_SUCCESS;
+            rc = ESA_OK;
+            goto exit;
+         }
+         else if ( rc NE ESA_OK ) {
+            get_done = GET_DONE_WITH_FATAL;
+            /* ps0381  break;    */
+            goto exit;   /* ps0381 */
+            break;
+         }
+         else
+            get_done = GET_DONE_SUCCESS;
+ 
+         /*
+          *  Print diagnostic information
+          */
+ 
+         ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+                         "Max_oes=%d actual num=%d",
+                         max_oes, actual_num);
+ 
+         if ( ESA_DIAG_get_debug_level(ESA_COMP_RSS_INTERCEPT) GE 19) {
+            for (i_dump=0; i_dump LT actual_num; i_dump++) {
+               ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+                   "OE=%s exist=%d parent=%s attr=%d",
+                   oe_params[i_dump].oe,
+                   objs_exist[i_dump],
+                   oe_params[i_dump].parent,
+                   oe_params[i_dump].attr);
+                   if ( objs_exist[i_dump] EQ OBJ_EXIST )
+                       ADDINFO_dump(addinfo[i_dump], 0);
+            }
+         }
+ 
+         /*
+          *   Build check-sum buffer
+          */
+ 
+         for (i=0; i LT actual_num; i++) {
+            if ( objs_exist[i] EQ OBJ_EXIST ) {
+               GetOECheckSum( &CheckSum, &oe_params[i], addinfo[i] );
+                memcpy (CheckSumStr, CheckSum, sizeof(CHECKSUM_typ));
+                      CheckSumStr[sizeof(CHECKSUM_typ)]= '\0';
+               ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,15,
+                               "oe=%s check-sum=%s",
+                               oe_params[i].oe, CheckSumStr);
+ 
+               /* Write CheckSUm */
+ 
+               memset( (char *)offli_db_record.obj1, ' ',
+                       sizeof(offli_db_record.obj1) );
+ 
+               strcpy( (char *)offli_db_record.obj1,
+                       oe_params[i].oe );
+ 
+               memset( (char *)offli_db_record.obj2, ' ',
+                       sizeof(offli_db_record.obj2) );
+               offli_db_record.obj2[0] = NULL_CHAR;
+ 
+               memcpy( (char *)offli_db_record.CheckSum,
+                       (char *)CheckSum, sizeof( CheckSum ) );
+ 
+               offli_db_record.ess_flag = ' ';
+               offli_db_record.eol      = '\n';   /* NEW_LINE; */
+ 
+               rc = OfflineIntrcptrDBWrite( io_handle,
+                                            OFLI_USER_DB,
+                                            oe_file,
+                                            &offli_db_record,
+                                            offl_params->dest,
+                                            offl_params->msgs);
+               if ( rc NE ESA_OK ) {
+                  get_done = GET_DONE_WITH_FATAL;
+                  rc = ESA_FATAL;
+                  goto exit;
+               }
+ 
+            }
+         }
+ 
+      }     /* while HAVE_MORE */
+    }       /* ii   ps0381     */
+ 
+    exit :;
+ 
+    /*
+     *  If was Unsuccessfull termination.
+     *  API call free his handle
+     */
+ 
+     if ( get_oe_handle ) {
+        ESA_RC rcc= ESA_OK;
+        API_LOGIN
+        if ( rc EQ ESA_OK ) {
+           mode =  GET_FREE_HANDLE_OES;
+           strcpy (ModeStr, "GET_FREE_HANDLE_OES");
+ 
+           /*
+            *  API call GetOE ( FREE_HANDLE )
+            */
+ 
+           ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetOEs USA-API with %s mode.", ModeStr);
+           CS_DIAG_OE_IN (ESA_COMP_RSS_INTERCEPT, mode,
+			   envir_ptr->empty_oe, 0, 0, oe_params_in,
+			   get_oe_handle, addinfo);
+           rcc= (offl_params->func_ptr->getoes_ptr) ( mode,
+                                    envir_ptr->empty_oe,
+                                    max_oes,
+                                    &actual_num,
+                                    &have_more,
+                                    &get_oe_handle,
+                                    num_oes_in,
+                                    oe_params_in,
+                                    oe_params,
+                                    addinfo,
+                                    objs_exist,
+                                    &offl_params->admin_params,
+                                    offl_params->err );
+           ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetOEs USA-API completed with rc=%d (%s).",
+			     rcc, (rcc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+           if (rcc EQ ESA_OK)
+              CS_DIAG_OE_OUT (ESA_COMP_RSS_INTERCEPT, envir_ptr->empty_oe,
+			      0, have_more, oe_params, objs_exist, get_oe_handle, addinfo);
+           API_LOGOUT
+        }
+        else {
+           CTSAMSG_print(ERR_INTERNAL2,
+            offl_params->msgs, NULL, offl_params->dest,
+            component, func,
+            "GetOE handle not freed due to Login failure",
+            16, __LINE__);
+           rc = ESA_FATAL;
+           get_done = GET_DONE_WITH_FATAL;
+        }
+     }
+ 
+     /*
+      *  Close user DB and Sort.
+      */
+ 
+     if ( io_handle ) {
+        OfflineIntrcptrDBClose( &io_handle, OFLI_USER_DB,
+                                oe_file,
+                                offl_params->dest, offl_params->msgs);
+        if (get_done NE GET_DONE_WITH_FATAL ) {
+          rc = OfflineIntrcptrDBSort ( OFLI_OE_DB,
+                                       oe_file, offl_params->dest,
+                                       offl_params->msgs);
+          if ( rc NE ESA_OK ) {
+             rc = ESA_FATAL;
+             get_done = GET_DONE_WITH_FATAL;
+          }
+        }
+     }
+ 
+    /*
+     *   Free
+     */
+ 
+    if ( oe_params )
+       free( oe_params );
+ 
+    if ( objs_exist )
+       free(  objs_exist );
+ 
+    if ( addinfo )
+       FreeAddinfo ( max_oes, &addinfo );
+ 
+    if ( get_done NE GET_DONE_SUCCESS )
+       rc = ESA_FATAL;
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+    return rc;
+ 
+}
+/**************************************************************
+*                                                             *
+* Subroutine name : GetGroupInfo                              *
+*                                                             *
+* DESCRIPTION     : get group information                     *
+*                                                             *
+* INPUT           : group_file - group result file            *
+*                   group_keywords                            *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC GetGroupInfo(char                            *group_file,
+ /* BSAN100422 */   char                            *oe_file,
+                    OFLI_KEYWORDS_rec_typ           *group_keywords,
+                    OFFLINE_INTERCEPT_STUFF_rec_typ *offl_params,
+ /* BSAN100874 */   char                            *gtoe)
+{
+   ESA_RC                               rc = ESA_OK;
+   static                               char func[]="GetGroupInfo";
+   unsigned int                         size;
+   int                                  i;
+   int                                  i_dump;
+   int                                  get_done  = GET_DONE_WITH_FATAL;
+   void                                *io_handle = NULL;
+   OFFLINE_INTERCEPT_DB_RECORD_rec_typ  offli_db_record;
+   /* BSAN100874 ADMIN_PARAMS_rec_typ  *admin_params;  */  /* ps0381 */
+   /* BSAN100874 char                   gtoe[8]= "ALL";*/  /* ps0381 */
+   int                                  ii;                /* ps0381 */
+   int                                  jj;                /* ps0381 */
+   OE_typ                               oe_filter;         /* ps0381 */
+ 
+   /*
+    *  Get Group parameters
+    */
+ 
+    GET_GROUP_MODE         mode = GET_ALL_GROUPS;
+    short                  max_groups = OFLI_GET_MAX_GROUP;
+    short                  actual_num;
+    HAVE_MORE_typ          have_more = HAVE_MORE;
+    void                  *get_group_handle = NULL;
+    short                  num_ug_in=0;
+    UG_PARAMS_rec_typ     *ug_params_in   = NULL;
+    UG_PARAMS_rec_typ     *ug_params      = NULL;
+    ADDINFO_rec_ptr       *addinfo        = NULL;
+    OBJ_EXISTS_typ        *objs_exist     = NULL;
+ 
+   /*
+    *   Check Sum parameters
+    */
+ 
+    CHECKSUM_typ           CheckSum;
+    char                   CheckSumStr[sizeof(CHECKSUM_typ)+ 1];
+    ENVIRONMENT_rec_typ  * envir_ptr;
+ 
+   /*   BSAN100422
+    *   Get OE Offline file parameters
+    */
+ 
+    int                             oe_records_cnt;
+    int                             oe_sorted;
+    char                           *oe_db_records = NULL;
+    char                          **oe_db_ptrs    = NULL;
+    char                           *oe_foundb;
+    char                          **oe_found;
+    OE_typ                          oe_key;
+    char                           *oe_key_p;
+    CTSAMSG_DEST_TABLE_rec_typ    * dest;
+    CTSAMSG_HANDLE_rec_typ        * msgs;
+ 
+ 
+    CS_get_envir_address (&envir_ptr);
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+    strcpy (ModeStr, "GET_ALL_GROUPS");
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,DIAG_OS,"Result file %s", group_file);
+ 
+    /* BSAN100874 admin_params=&offl_params->admin_params; */ /* ps0381 */
+    /* BSAN100874 admin_params->cs_func.rssprm_get_opt_ptr */ /* ps0381 */
+    /* BSAN100874              (offl_params->rss_name,     */ /* ps0381 */
+    /* BSAN100874               "OFLI_GET_MODE",           */ /* ps0381 */
+    /* BSAN100874                sizeof(gtoe) - 1,         */ /* ps0381 */
+    /* BSAN100874                gtoe, OPT_TRUE, OPT_TRUE);*/ /* ps0381 */
+ 
+    if (strcmp(gtoe, "OE") NE 0) {                            /* ps0381 */
+        jj = 1;                                               /* ps0381 */
+        strcpy(care_oe_table[0], "");                         /* ps0381 */
+    }                                                         /* ps0381 */
+    else {                                                    /* ps0381 */
+      jj = careoe_cnt;                                        /* ps0381 */
+      if (jj GE 0) {                                          /* ps0381 */
+         mode = GET_SUBTREE_GROUPS;                           /* ps0381 */
+         strcpy (ModeStr, "GET_SUBTREE_GROUPS");
+         jj++;                                                /* ps0381 */
+      }                                                       /* ps0381 */
+      else {                                                  /* ps0381 */
+        jj = 1;                                               /* ps0381 */
+        strcpy(care_oe_table[0], "");                         /* ps0381 */
+      }                                                       /* ps0381 */
+    }                                                         /* ps0381 */
+ 
+    /* Start of BSAN100422 */
+ 
+    if (oe_file) {
+      msgs = offl_params->msgs;
+      dest = offl_params->dest;
+      oe_key_p = os_key;
+ 
+      rc = DB2Memory(oe_file, &oe_db_records, &oe_sorted, dest, msgs );
+      if ( rc NE ESA_OK ) {
+        rc = ESA_FATAL;
+        goto exit;
+      }
+ 
+      if ( oe_db_records ) {  /* file not empty */
+       rc = BuildSortInfo(oe_db_records, &oe_db_ptrs, &oe_records_cnt,
+                          dest, msgs);
+       if ( rc NE ESA_OK ) {
+         rc = ESA_FATAL;
+         goto exit;
+       }
+      }
+    }   /* if (oe_file) */
+ 
+    /* End   of BSAN100422 */
+ 
+    /*
+     * Get Array of max_users for output user names
+     */
+ 
+    size = max_groups * sizeof (UG_PARAMS_rec_typ);
+    ug_params  = (UG_PARAMS_rec_ptr)calloc (1, size);
+ 
+    if (ug_params EQ NULL) {
+       CTSAMSG_print (ERR_MALLOC,
+                      offl_params->msgs, NULL, offl_params->dest,
+                      "ug_params", size);
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    /*
+     * Get Array for obj_exist indicators
+     */
+ 
+    size = max_groups * sizeof (OBJ_EXISTS_typ);
+    objs_exist = (OBJ_EXISTS_typ *)calloc (1, size);
+ 
+    if (objs_exist EQ NULL) {
+       CTSAMSG_print (ERR_MALLOC,
+                      offl_params->msgs, NULL, offl_params->dest,
+                      "ug_params", size);
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    /*
+     * Get ADDINFO
+     */
+ 
+    rc = GetAddinfo( &addinfo, max_groups, group_keywords,
+                     offl_params->dest, offl_params->msgs );
+    if (rc NE ESA_OK) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    /*
+     *  Open Group DB
+     */
+ 
+    rc = OfflineIntrcptrDBOpen( &io_handle, OFLI_GROUP_DB,
+                                group_file, OPEN_FOR_WRITE,
+                                offl_params->dest, offl_params->msgs);
+    if ( rc NE ESA_OK ) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+ 
+    for (ii=0; ii LT jj; ii++ )    {            /* ps0381 */
+ 
+      have_more = HAVE_MORE;                    /* ps0381 */
+      strcpy(oe_filter, care_oe_table[ii]);     /* ps0381 */
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,13, /* ps0381 */
+                    "ii=%d oe=%s",              /* ps0381 */
+                    ii, oe_filter);             /* ps0381 */
+ 
+      /*
+       *  Get Group ALL
+       */
+ 
+      while (have_more EQ HAVE_MORE) {
+ 
+         /*
+          *   Clear addinfo and output params
+          */
+ 
+         for (i=0; i LT max_groups; i++ )
+            ADDINFO_clear( addinfo[i] );
+ 
+         size = max_groups * sizeof (UG_PARAMS_rec_typ);
+         memset(ug_params, NULL_CHAR, size);
+ 
+         API_LOGIN
+         if ( rc NE ESA_OK ) {
+            get_done = GET_DONE_WITH_FATAL;
+            rc = ESA_FATAL;
+            goto exit;
+         }
+ 
+         /*
+          *  API call GetGroup
+          */
+ 
+         ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetUGs USA-API with %s mode.", ModeStr);
+         CS_DIAG_UG_IN (ESA_COMP_RSS_INTERCEPT,mode, oe_filter,
+			 max_groups, num_ug_in, ug_params_in, get_group_handle,
+			 addinfo);
+         rc = (offl_params->func_ptr->getugs_ptr) (mode,
+             /*     envir_ptr->empty_oe,  del by ps0381 */
+                                      oe_filter,
+                                      max_groups,
+                                      &actual_num,
+                                      &have_more,
+                                      &get_group_handle,
+                                      num_ug_in,
+                                      ug_params_in,
+                                      ug_params,
+                                      addinfo,
+                                      objs_exist,
+                                      &offl_params->admin_params,
+                                      offl_params->err);
+         ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetUGs USA-API completed with rc=%d (%s).",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+         if (rc EQ ESA_OK)
+            CS_DIAG_UG_OUT (ESA_COMP_RSS_INTERCEPT, oe_filter, actual_num,
+    			 have_more, ug_params, objs_exist, get_group_handle, addinfo);
+ 
+         API_LOGOUT
+         if ( rc EQ ESA_NOT_SUPP ) {
+            get_done = GET_DONE_SUCCESS;
+            rc = ESA_OK;
+            goto exit;
+         }
+         else if ( rc NE ESA_OK ) {
+            get_done = GET_DONE_WITH_FATAL;
+            /* ps0381 break;    */
+            goto exit; /* ps0381 */
+            break;
+         }
+         else
+            get_done = GET_DONE_SUCCESS;
+ 
+         /*
+          *  Print diagnostic information
+          */
+ 
+         ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+                         "max_groups=%d actual num=%d",
+                         max_groups, actual_num);
+ 
+         if ( ESA_DIAG_get_debug_level(ESA_COMP_RSS_INTERCEPT) GE 19) {
+            for (i_dump=0; i_dump LT actual_num; i_dump++) {
+               ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,8,
+                               "Group=%s exist=%d parent_group=%s",
+                               ug_params[i_dump].group,
+                               objs_exist[i_dump],
+                               ug_params[i_dump].parent_group);
+               if ( objs_exist[i_dump] EQ OBJ_EXIST )
+                  ADDINFO_dump(addinfo[i_dump], 0);
+            }
+         }
+ 
+         /*
+          *   Build check-sum buffer
+          */
+ 
+         for (i=0; i LT actual_num; i++) {
+            if ( objs_exist[i] EQ OBJ_EXIST ) {
+ 
+              /* Start of  BSAN100422  */
+ 
+                 if ( oe_file AND oe_db_records ) {/*file not empty */
+ 
+                   strcpy(oe_key, ug_params[i].parent_oe);
+                   memset( os_key, ' ', sizeof(os_key) );
+                   os_key[sizeof(os_key)-1] = NULL_CHAR;
+                   memcpy(os_key, oe_key, strlen(oe_key));
+                   oe_foundb = bsearch( &oe_key_p, oe_db_ptrs,
+                                      oe_records_cnt,
+                               sizeof(char *), db_search_compare);
+                   /* Avoid casting */
+ 
+                   memcpy ((char *)&oe_found, (char *)&oe_foundb,
+                           sizeof (oe_found));
+ 
+                   if (NOT oe_found) {
+                     CTSAMSG_print(MSG_OFLI_GRP_EVT_IGN,
+                                   msgs, NULL, dest,
+                                   ug_params[i].group,
+                                   ug_params[i].parent_oe);
+                     continue;
+                    }
+            }
+ 
+            /* End   of  BSAN100422  */
+               GetGroupCheckSum( &CheckSum, &ug_params[i], addinfo[i] );
+                   memcpy (CheckSumStr, CheckSum, sizeof(CHECKSUM_typ));
+                         CheckSumStr[sizeof(CHECKSUM_typ)]= '\0';
+               ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,15,
+                               "group=%s check-sum=%s",
+                               ug_params[i].group, CheckSumStr);
+ 
+               /* Write CheckSUm */
+ 
+               memset( (char *)offli_db_record.obj1, ' ',
+                       sizeof(offli_db_record.obj1) );
+ 
+               strcpy( (char *)offli_db_record.obj1,
+                       ug_params[i].group );
+ 
+               memset( (char *)offli_db_record.obj2, ' ',
+                       sizeof(offli_db_record.obj2) );
+               offli_db_record.obj2[0] = NULL_CHAR;
+ 
+               memcpy( (char *)offli_db_record.CheckSum,
+                       (char *)CheckSum, sizeof( CheckSum ) );
+ 
+               offli_db_record.ess_flag = ' ';
+               offli_db_record.eol      = '\n';   /* NEW_LINE; */
+ 
+               rc = OfflineIntrcptrDBWrite( io_handle,
+                                            OFLI_GROUP_DB,
+                                            group_file,
+                                            &offli_db_record,
+                                            offl_params->dest,
+                                            offl_params->msgs);
+               if ( rc NE ESA_OK ) {
+                  get_done = GET_DONE_WITH_FATAL;
+                  rc = ESA_FATAL;
+                  goto exit;
+               }
+ 
+            }
+         }
+ 
+      }    /* while HAVE_MORE */
+    }      /* ii */      /* ps0381 */
+ 
+    exit :;
+ 
+    /*
+     *  If was Unsuccessfull termination.
+     *  API call free his handle
+     */
+ 
+     if ( get_group_handle ) {
+        ESA_RC rcc= ESA_OK;
+        API_LOGIN
+        if ( rc EQ ESA_OK ) {
+           mode =  GET_FREE_HANDLE_GROUPS ;
+           strcpy (ModeStr, "GET_FREE_HANDLE_GROUPS");
+ 
+           /*
+            *  API call GetGroup ( FREE HANDLE )
+            */
+ 
+           ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetUGs USA-API with %s mode.", ModeStr);
+           CS_DIAG_UG_IN (ESA_COMP_RSS_INTERCEPT,mode,
+			   envir_ptr->empty_oe, 0, 0, ug_params_in,
+			   get_group_handle, addinfo);
+           rcc= (offl_params->func_ptr->getugs_ptr) (mode,
+                                   envir_ptr->empty_oe,
+                                   max_groups,
+                                   &actual_num,
+                                   &have_more,
+                                   &get_group_handle,
+                                   num_ug_in,
+                                   ug_params_in,
+                                   ug_params,
+                                   addinfo,
+                                   objs_exist,
+                                   &offl_params->admin_params,
+                                   offl_params->err);
+           ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetUGs USA-API completed with rc=%d (%s).",
+			     rcc, (rcc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+           if (rcc EQ ESA_OK)
+              CS_DIAG_UG_OUT (ESA_COMP_RSS_INTERCEPT, envir_ptr->empty_oe,
+    			   0, have_more, ug_params, objs_exist, get_group_handle, addinfo);
+           API_LOGOUT
+        }
+        else {
+           CTSAMSG_print(ERR_INTERNAL2,
+            offl_params->msgs, NULL, offl_params->dest,
+            component, func,
+            "GetGroup handle not freed due to Login failure",
+            16, __LINE__);
+           rc = ESA_FATAL;
+           get_done = GET_DONE_WITH_FATAL;
+        }
+     }
+ 
+     /*
+      *  Close DB and Sort.
+      */
+ 
+     if ( io_handle ) {
+        OfflineIntrcptrDBClose( &io_handle,
+                                OFLI_GROUP_DB,
+                                group_file,
+                                offl_params->dest, offl_params->msgs);
+        if (get_done NE GET_DONE_WITH_FATAL ) {
+          rc = OfflineIntrcptrDBSort ( OFLI_GROUP_DB,
+                                       group_file, offl_params->dest,
+                                       offl_params->msgs);
+          if ( rc NE ESA_OK ) {
+             rc = ESA_FATAL;
+             get_done = GET_DONE_WITH_FATAL;
+          }
+        }
+     }
+ 
+    /*
+     *   Free
+     */
+ 
+    if ( ug_params )
+       free( ug_params );
+ 
+    if ( objs_exist )
+       free(  objs_exist );
+ 
+    if ( addinfo )
+       FreeAddinfo ( max_groups, &addinfo );
+ 
+    if ( oe_db_records )              /* BSAN100422 */
+       free( oe_db_records );         /* BSAN100422 */
+                                      /* BSAN100422 */
+    if ( oe_db_ptrs )                 /* BSAN100422 */
+       free( oe_db_ptrs );            /* BSAN100422 */
+ 
+    if ( get_done NE GET_DONE_SUCCESS )
+       rc = ESA_FATAL;
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+    return rc;
+ 
+}
+ 
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetRSSParamsInfo                          *
+*                                                             *
+* DESCRIPTION     : get rss parameters information            *
+*                                                             *
+* INPUT           : rss_file - rss result file                *
+*                   rss_keywords                              *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC GetRSSParamsInfo(char                            *rss_file,
+                        OFLI_KEYWORDS_rec_typ           *rss_keywords,
+                        OFFLINE_INTERCEPT_STUFF_rec_typ *offl_params)
+{
+   ESA_RC                               rc = ESA_OK;
+   static                               char func[]="GetRSSParamsInfo";
+   int                                  get_done  = GET_DONE_WITH_FATAL;
+   void                                *io_handle = NULL;
+   OFFLINE_INTERCEPT_DB_RECORD_rec_typ  offli_db_record;
+ 
+   /*
+    *  Get RSS parameters
+    */
+ 
+    RSS_PARAMS_rec_typ     rss_params;
+    ADDINFO_rec_ptr       *addinfo        = NULL;
+ 
+   /*
+    *   Check Sum parameters
+    */
+ 
+    CHECKSUM_typ           CheckSum;
+    char                   CheckSumStr[sizeof(CHECKSUM_typ)+ 1];
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,DIAG_OS,"Result file %s", rss_file);
+ 
+    /*
+     * Get ADDINFO
+     */
+ 
+    rc = GetAddinfo( &addinfo, 1, rss_keywords,
+                     offl_params->dest, offl_params->msgs );
+    if (rc NE ESA_OK) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    /*
+     *  Open RSS DB
+     */
+ 
+    rc = OfflineIntrcptrDBOpen( &io_handle, OFLI_RSS_DB,
+                                rss_file, OPEN_FOR_WRITE,
+                                offl_params->dest, offl_params->msgs);
+    if ( rc NE ESA_OK ) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    API_LOGIN
+    if ( rc NE ESA_OK ) {
+       get_done = GET_DONE_WITH_FATAL;
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+ 
+    /*
+     *  API call GetRSSParameters
+     */
+ 
+    ADDINFO_clear( addinfo[0] );
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+		"    -> Call to CTSGetRSSParams USA-API.");
+    CS_DIAG_ADDINFO (ESA_COMP_RSS_INTERCEPT, addinfo[0], 0, FALSE);
+    rc = (offl_params->func_ptr->gtrsprm_ptr) (
+            &rss_params,
+            addinfo[0],
+            &offl_params->admin_params,
+            offl_params->err);
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+	  "     MinPwdLen=%d MaxExpire=%d MaxLogins=%d.",
+      rss_params.min_pass_len, rss_params.max_expire,
+	  rss_params.max_logins);
+    if (rc EQ ESA_OK)
+       CS_DIAG_ADDINFO (ESA_COMP_RSS_INTERCEPT, addinfo[0], 0, TRUE);
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetRSSParams USA-API completed with rc=%d (%s).",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+    API_LOGOUT
+    if ( rc EQ ESA_NOT_SUPP ) {
+       get_done = GET_DONE_SUCCESS;
+       rc = ESA_OK;
+       goto exit;
+    }
+    else if ( rc NE ESA_OK ) {
+       get_done = GET_DONE_WITH_FATAL;
+       goto exit;
+    }
+    else
+       get_done = GET_DONE_SUCCESS;
+ 
+    /*
+     *  Print diagnostic information
+     */
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18, "RSS Parameters:");
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+                    "Min. password length    : %d",
+                    rss_params.min_pass_len);
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+                    "Max. password expiration: %d",
+                    rss_params.max_expire);
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+                    "Max. number of logins   : %d",
+                    rss_params.max_logins);
+ 
+    if  ( ESA_DIAG_get_debug_level(ESA_COMP_RSS_INTERCEPT) GE 19)
+       ADDINFO_dump(addinfo[0], 0);
+ 
+ 
+    /*
+     *   Build check-sum buffer
+     */
+ 
+     GetRSSCheckSum( &CheckSum, &rss_params, addinfo[0] );
+         memcpy (CheckSumStr, CheckSum, sizeof(CHECKSUM_typ));
+         CheckSumStr[sizeof(CHECKSUM_typ)]= '\0';
+     ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,15,
+                     "RSS Parameters check-sum=%s",
+                     CheckSumStr );
+ 
+     /* Write CheckSUm */
+ 
+     memset( (char *)offli_db_record.obj1, ' ',
+             sizeof(offli_db_record.obj1) );
+ 
+     strcpy( (char *)offli_db_record.obj1,
+             offl_params->admin_params.rss_name);
+ 
+     memset( (char *)offli_db_record.obj2, ' ',
+             sizeof(offli_db_record.obj2) );
+     offli_db_record.obj2[0] = NULL_CHAR;
+ 
+     memcpy( (char *)offli_db_record.CheckSum,
+             (char *)CheckSum, sizeof( CheckSum ) );
+ 
+     offli_db_record.ess_flag = ' ';
+     offli_db_record.eol      = '\n';   /* NEW_LINE; */
+ 
+     rc = OfflineIntrcptrDBWrite( io_handle,
+                                  OFLI_RSS_DB,
+                                  rss_file,
+                                  &offli_db_record,
+                                  offl_params->dest, offl_params->msgs);
+     if ( rc NE ESA_OK ) {
+        get_done = GET_DONE_WITH_FATAL;
+        rc = ESA_FATAL;
+        goto exit;
+     }
+ 
+    exit :;
+ 
+ 
+     /*
+      *  Close DB
+      */
+ 
+     if ( io_handle )
+        OfflineIntrcptrDBClose( &io_handle, OFLI_RSS_DB, rss_file,
+                                offl_params->dest, offl_params->msgs);
+ 
+    /*
+     *   Free
+     */
+ 
+    if ( addinfo )
+       FreeAddinfo ( 1, &addinfo );
+ 
+    if ( get_done NE GET_DONE_SUCCESS )
+       rc = ESA_FATAL;
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+    return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetConnectionInfo                         *
+*                                                             *
+* DESCRIPTION     : get connection information                *
+*                                                             *
+* INPUT           : connection_file - connection result file  *
+*                   connection_keywords                       *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC GetConnectionInfo(
+        char                            *connection_file,
+ /* BSAN100422 */   char                *user_file,
+ /* BSAN100422 */   char                *ug_file,
+        OFLI_KEYWORDS_rec_typ           *connection_keywords,
+        OFFLINE_INTERCEPT_STUFF_rec_typ *offl_params)
+{
+   ESA_RC                               rc = ESA_OK;
+   static                               char func[]="GetConnectionInfo";
+   unsigned   int                       size;
+   int                                  i;
+   int                                  i_dump;
+   void                                *io_handle = NULL;
+   int                                  get_done  = GET_DONE_WITH_FATAL;
+   OFFLINE_INTERCEPT_DB_RECORD_rec_typ  offli_db_record;
+ 
+   /*
+    *  Get Connection parameters
+    */
+ 
+ 
+    GET_CONN_MODE          mode = GET_ALL_CONNS;
+    short                  max_connections = OFLI_GET_MAX_CONNECTION;
+    short                  actual_num;
+    HAVE_MORE_typ          have_more = HAVE_MORE;
+    void                  *get_connection_handle = NULL;
+    short                  num_user_in    = 0;
+    short                  num_ug_in      = 0;
+    USER_typ              *user_in        = NULL;
+    UG_typ                *ug_in          = NULL;
+    U2UG_PARAMS_rec_typ   *u2ug_params    = NULL;
+    ADDINFO_rec_ptr       *addinfo        = NULL;
+    OBJ_EXISTS_typ        *objs_exist     = NULL;
+ 
+   /*   BSAN100422
+    *   Get User Offline file parameters
+    */
+ 
+    CTSAMSG_DEST_TABLE_rec_typ    * dest;
+    CTSAMSG_HANDLE_rec_typ        * msgs;
+ 
+    int                             user_records_cnt;
+    int                             user_sorted;
+    char                           *user_db_records = NULL;
+    char                          **user_db_ptrs    = NULL;
+    char                           *user_foundb;
+    char                          **user_found;
+    USER_typ                        user_key;
+    char                           *user_key_p;
+ 
+    int                             ug_records_cnt;
+    int                             ug_sorted;
+    char                           *ug_db_records = NULL;
+    char                          **ug_db_ptrs    = NULL;
+    char                           *ug_foundb;
+    char                          **ug_found;
+    UG_typ                          ug_key;
+    char                           *ug_key_p;
+ 
+   /*
+    *   Check Sum parameters
+    */
+ 
+    CHECKSUM_typ           CheckSum;
+    char                   CheckSumStr[sizeof(CHECKSUM_typ)+ 1];
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+    strcpy (ModeStr, "GET_ALL_CONNS");
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,DIAG_OS,"Result file %s", connection_file);
+ 
+ 
+    /* Start of BSAN100422 */
+ 
+    if (user_file AND ug_file) {
+      msgs = offl_params->msgs;
+      dest = offl_params->dest;
+      user_key_p = os_key;
+      ug_key_p   = os_key;
+ 
+      rc = DB2Memory(user_file, &user_db_records,
+                     &user_sorted, dest, msgs );
+      if ( rc NE ESA_OK ) {
+        rc = ESA_FATAL;
+        goto exit;
+      }
+ 
+      if ( user_db_records ) {  /* file not empty */
+         rc = BuildSortInfo(user_db_records, &user_db_ptrs,
+                            &user_records_cnt,
+                            dest, msgs);
+         if ( rc NE ESA_OK ) {
+           rc = ESA_FATAL;
+           goto exit;
+         }
+ 
+      }
+      rc = DB2Memory(ug_file, &ug_db_records,
+                     &ug_sorted, dest, msgs );
+      if ( rc NE ESA_OK ) {
+         rc = ESA_FATAL;
+         goto exit;
+      }
+ 
+      if ( ug_db_records ) {  /* file not empty */
+         rc = BuildSortInfo(ug_db_records, &ug_db_ptrs,
+                            &ug_records_cnt,
+                            dest, msgs);
+         if ( rc NE ESA_OK ) {
+           rc = ESA_FATAL;
+           goto exit;
+         }
+ 
+      }
+    }    /* if (user_file AND ug_file) */
+ 
+    /* End   of BSAN100422 */
+ 
+    /*
+     * Get Array of max_users for output user names
+     */
+ 
+    size = max_connections * sizeof(U2UG_PARAMS_rec_typ);
+    u2ug_params  = (U2UG_PARAMS_rec_typ *)calloc (1, size);
+ 
+    if (u2ug_params EQ NULL) {
+       CTSAMSG_print (ERR_MALLOC,
+                      offl_params->msgs, NULL, offl_params->dest,
+                      "u2ug_params", size);
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    /*
+     * Get Array for obj_exist indicators
+     */
+ 
+    size = max_connections * sizeof (OBJ_EXISTS_typ);
+    objs_exist = (OBJ_EXISTS_typ *)calloc (1, size);
+ 
+    if (objs_exist EQ NULL) {
+       CTSAMSG_print (ERR_MALLOC,
+                      offl_params->msgs, NULL, offl_params->dest,
+                      "u2ug_params", size);
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    /*
+     * Get ADDINFO
+     */
+ 
+    rc = GetAddinfo( &addinfo, max_connections,
+                     connection_keywords,
+                     offl_params->dest, offl_params->msgs );
+    if (rc NE ESA_OK) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    /*
+     *  Open Connection DB
+     */
+ 
+    rc = OfflineIntrcptrDBOpen( &io_handle, OFLI_GROUP_DB,
+                                connection_file,
+                                OPEN_FOR_WRITE,
+                                offl_params->dest, offl_params->msgs);
+    if ( rc NE ESA_OK ) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    /*
+     *  Get Connection ALL
+     */
+ 
+    while (have_more EQ HAVE_MORE) {
+ 
+       /*
+        *   Clear addinfo and output params
+        */
+ 
+       for (i=0; i LT max_connections; i++ )
+          ADDINFO_clear( addinfo[i] );
+ 
+       size = max_connections * sizeof(U2UG_PARAMS_rec_typ);
+       memset(u2ug_params , NULL_CHAR, size);
+ 
+       API_LOGIN
+       if ( rc NE ESA_OK ) {
+          rc = ESA_FATAL;
+          get_done = GET_DONE_WITH_FATAL;
+          goto exit;
+       }
+ 
+       /*
+        *  API call GetConnection
+        */
+ 
+       ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetConns with %s mode.", ModeStr);
+       CS_DIAG_UG2UC_IN (ESA_COMP_RSS_INTERCEPT,mode,max_connections,
+			 num_ug_in, num_user_in, ug_in, user_in,
+			 get_connection_handle, addinfo);
+       rc = (offl_params->func_ptr->gtug2uc_ptr) (mode,
+                                     max_connections,
+                                     &actual_num,
+                                     &have_more,
+                                     &get_connection_handle,
+                                     num_ug_in,
+                                     num_user_in,
+                                     ug_in,
+                                     user_in,
+                                     u2ug_params,
+                                     addinfo,
+                                     objs_exist,
+                                     &offl_params->admin_params,
+                                     offl_params->err);
+       ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetConns USA-API completed with rc=%d (%s).",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+       if (rc EQ ESA_OK)
+          CS_DIAG_UG2UC_OUT(ESA_COMP_RSS_INTERCEPT,actual_num,have_more,
+	    		u2ug_params, objs_exist, get_connection_handle, addinfo);
+       API_LOGOUT
+       if ( rc EQ ESA_NOT_SUPP ) {
+          get_done = GET_DONE_SUCCESS;
+          rc = ESA_OK;
+          goto exit;
+       }
+       else if ( rc NE ESA_OK ) {
+          get_done = GET_DONE_WITH_FATAL;
+          break;
+       }
+       else
+          get_done = GET_DONE_SUCCESS;
+ 
+      /*
+       *  Print diagnostic information
+       */
+ 
+       ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+                       "max_conns=%d actual num=%d",
+                       max_connections, actual_num);
+ 
+       if ( ESA_DIAG_get_debug_level(ESA_COMP_RSS_INTERCEPT) GE 19) {
+ 
+          for (i_dump=0; i_dump LT actual_num; i_dump++) {
+             ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+             "User=%s Group=%s exist=%d connect_data=%d",
+             u2ug_params[i_dump].user,
+             u2ug_params[i_dump].group,
+             objs_exist[i_dump],
+             u2ug_params[i_dump].u2ug_admin_data);
+             if ( objs_exist[i_dump] EQ OBJ_EXIST )
+                ADDINFO_dump(addinfo[i_dump],0);
+          }
+       }
+ 
+ 
+       /*
+        *   Build check-sum buffer
+        */
+ 
+       for (i=0; i LT actual_num; i++) {
+          if ( objs_exist[i] EQ OBJ_EXIST ) {
+ 
+            /* Start of  BSAN100422  */
+ 
+               if (user_file AND user_db_records) { /*file not empty*/
+ 
+                 strcpy(user_key, u2ug_params[i].user);
+ 
+                 memset( os_key, ' ', sizeof(os_key) );
+                 os_key[sizeof(os_key)-1] = NULL_CHAR;
+                 memcpy(os_key, user_key, strlen(user_key));
+                 user_foundb = bsearch( &user_key_p, user_db_ptrs,
+                                    user_records_cnt,
+                                    sizeof(char *), db_search_compare);
+ 
+                 /* Avoid casting */
+ 
+                 memcpy ((char *)&user_found, (char *)&user_foundb,
+                         sizeof (user_found));
+ 
+                 if (NOT user_found) {
+                   CTSAMSG_print(MSG_OFLI_CNN_EVT_IGN,
+                                 msgs, NULL, dest,
+                                 u2ug_params[i].user,
+                                 u2ug_params[i].group,
+                                 "User", u2ug_params[i].user);
+                   continue;
+                  }
+               }  /* if (user_file AND user_db_records) */
+ 
+               if ( ug_file AND ug_db_records ) {  /* file not empty */
+ 
+                 strcpy(ug_key, u2ug_params[i].group);
+ 
+                 memset( os_key, ' ', sizeof(os_key) );
+                 os_key[sizeof(os_key)-1] = NULL_CHAR;
+                 memcpy(os_key, ug_key, strlen(ug_key));
+                 ug_foundb = bsearch( &ug_key_p, ug_db_ptrs,
+                                    ug_records_cnt,
+                                    sizeof(char *), db_search_compare);
+                 /* Avoid casting */
+ 
+                 memcpy ((char *)&ug_found, (char *)&ug_foundb,
+                         sizeof (ug_found));
+ 
+                 if (NOT ug_found) {
+                   CTSAMSG_print(MSG_OFLI_CNN_EVT_IGN,
+                                 msgs, NULL, dest,
+                                 u2ug_params[i].user,
+                                 u2ug_params[i].group,
+                                 "Group", u2ug_params[i].group);
+                   continue;
+                  }
+             } /* if ( ug_file AND ug_db_records ) */
+ 
+          /* End   of  BSAN100422  */
+             GetConnectionCheckSum( &CheckSum,
+                                    &u2ug_params[i], addinfo[i] );
+                 memcpy (CheckSumStr, CheckSum, sizeof(CHECKSUM_typ));
+                 CheckSumStr[sizeof(CHECKSUM_typ)]= '\0';
+             ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,15,
+                             "user=%s group=%s check-sum=%s",
+                             u2ug_params[i].user,
+                             u2ug_params[i].group, CheckSumStr);
+ 
+             /* Write CheckSUm */
+ 
+             memset( (char *)&offli_db_record.obj1, ' ',
+                     sizeof(offli_db_record.obj1) );
+ 
+             memset( (char *)&offli_db_record.obj2, ' ',
+                     sizeof(offli_db_record.obj2) );
+ 
+             strcpy( (char *)offli_db_record.obj1,
+                     u2ug_params[i].user );
+ 
+             strcpy( (char *)offli_db_record.obj2,
+                     u2ug_params[i].group );
+ 
+             memcpy( (char *)&offli_db_record.CheckSum,
+                     (char *)CheckSum, sizeof( CheckSum ) );
+ 
+             offli_db_record.ess_flag = ' ';
+             offli_db_record.eol      = '\n';   /* NEW_LINE; */
+ 
+             rc = OfflineIntrcptrDBWrite( io_handle,
+                                          OFLI_CONNECTION_DB,
+                                          connection_file,
+                                          &offli_db_record,
+                                          offl_params->dest,
+                                          offl_params->msgs);
+             if ( rc NE ESA_OK ) {
+                rc = ESA_FATAL;
+                get_done = GET_DONE_WITH_FATAL;
+                goto exit;
+             }
+ 
+          }
+       }
+ 
+    }
+ 
+    exit :;
+ 
+    /*
+     *  If was Unsuccessfull termination.
+     *  API call free his handle
+     */
+ 
+    if ( get_connection_handle ) {
+       ESA_RC rcc= ESA_OK;
+       API_LOGIN
+       if ( rc EQ ESA_OK ) {
+          mode =  GET_FREE_HANDLE_CONNS;
+          strcpy (ModeStr, "GET_FREE_HANDLE_CONNS");
+ 
+          /*
+           * API call GetConnection ( FREE HANDLE )
+           */
+ 
+          ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetConns with %s mode.", ModeStr);
+          CS_DIAG_UG2UC_IN(ESA_COMP_RSS_INTERCEPT,mode,0,
+			 0, 0, ug_in, user_in,
+			 get_connection_handle, addinfo);
+          rc= (offl_params->func_ptr->gtug2uc_ptr) (mode,
+                                               max_connections,
+                                   &actual_num,
+                                   &have_more,
+                                   &get_connection_handle,
+                                   num_ug_in,
+                                   num_user_in,
+                                   ug_in,
+                                   user_in,
+                                   u2ug_params,
+                                   addinfo,
+                                   objs_exist,
+                                   &offl_params->admin_params,
+                                   offl_params->err);
+           ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetConns USA-API completed with rc=%d (%s).",
+			     rcc, (rcc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+           if (rcc EQ ESA_OK)
+              CS_DIAG_UG2UC_OUT(ESA_COMP_RSS_INTERCEPT,0,have_more,
+    			u2ug_params, objs_exist, get_connection_handle, addinfo);
+           API_LOGOUT
+       }
+       else {
+          CTSAMSG_print(ERR_INTERNAL2,
+           offl_params->msgs, NULL, offl_params->dest,
+           component, func,
+           "GetConnection handle not freed due to Login failure",
+           16, __LINE__);
+          rc = ESA_FATAL;
+          get_done = GET_DONE_WITH_FATAL;
+       }
+    }
+ 
+    /*
+     *  Close DB and Sort.
+     */
+ 
+    if ( io_handle ) {
+       OfflineIntrcptrDBClose( &io_handle,
+                               OFLI_CONNECTION_DB,
+                               connection_file,
+                               offl_params->dest, offl_params->msgs);
+       if (get_done NE GET_DONE_WITH_FATAL ) {
+         rc = OfflineIntrcptrDBSort ( OFLI_CONNECTION_DB,
+                                      connection_file,
+                                      offl_params->dest,
+                                      offl_params->msgs);
+         if ( rc NE ESA_OK ) {
+            rc = ESA_FATAL;
+            get_done = GET_DONE_WITH_FATAL;
+         }
+       }
+    }
+ 
+    /*
+     *   Free
+     */
+ 
+    if ( u2ug_params )
+       free( u2ug_params );
+ 
+    if ( objs_exist )
+       free(  objs_exist );
+ 
+    if ( addinfo )
+       FreeAddinfo ( max_connections, &addinfo );
+ 
+ 
+    if ( user_db_records )              /* BSAN100422 */
+       free( user_db_records );         /* BSAN100422 */
+                                        /* BSAN100422 */
+    if ( user_db_ptrs )                 /* BSAN100422 */
+       free( user_db_ptrs );            /* BSAN100422 */
+ 
+ 
+    if ( ug_db_records )                /* BSAN100422 */
+       free( ug_db_records );           /* BSAN100422 */
+                                        /* BSAN100422 */
+    if ( ug_db_ptrs )                   /* BSAN100422 */
+       free( ug_db_ptrs );              /* BSAN100422 */
+ 
+    if ( get_done NE GET_DONE_SUCCESS)
+       rc = ESA_FATAL;
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+    return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : CompareInfo                               *
+*                                                             *
+* DESCRIPTION     : compare info                              *
+*                                                             *
+* INPUT           : init_file                                 *
+*                   regular_file                              *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC CompareInfo(char                          *init_file,
+                   char                          *regular_file,
+                   char                          *result_file,
+                   struct stat_data              *stat,
+                   int                            db_type,
+                   CTSAMSG_DEST_TABLE_rec_typ    *dest,
+                   CTSAMSG_HANDLE_rec_typ        *msgs,
+                   OFFLINE_INTERCEPT_STUFF_rec_typ *offl_params
+                   )
+{
+   ESA_RC                               rc = ESA_OK;
+   static                               char func[]="CompareInfo";
+   void                                *init_file_handle    = NULL;
+   void                                *regular_file_handle = NULL;
+   int                                  read_init    = 1;
+   int                                  read_regular = 1;
+   int                                  fin_init_file = 0;
+   int                                  fin_reg_file  = 0;
+   int                                  compare;
+   FILE                                *result_fptr = NULL;
+   OFFLINE_INTERCEPT_DB_RECORD_rec_typ  init_rec;
+   OFFLINE_INTERCEPT_DB_RECORD_rec_typ  reg_rec;
+   OFFLINE_INTERCEPT_RS_RECORD_rec_typ  res_rec;
+   OFFLINE_INTERCEPT_DB_RECORD_rec_typ  work_init_rec;
+   OFFLINE_INTERCEPT_DB_RECORD_rec_typ  work_reg_rec;
+   char                                 dsn_with[50]="";  /* SAS2IBMT */
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,DIAG_OS,
+                    "Init file=%s Regular file=%s",init_file, regular_file);
+ 
+ 
+    rc = OfflineIntrcptrDBAccess( db_type,
+                                  init_file, 0, dest, msgs );
+    if ( rc NE ESA_OK ) {   /* DB file does not exist */
+       rc = ESA_OK;
+       goto exit;
+    }
+ 
+    /*
+     *  Open init file ( READ )
+     */
+ 
+    rc = OfflineIntrcptrDBOpen( &init_file_handle, db_type,
+                                init_file, OPEN_FOR_READ, dest, msgs);
+    if ( rc NE ESA_OK ) {
+       rc = ESA_OK;
+       goto exit;
+    }
+ 
+    /*
+     *  Open regular file ( READ )
+     */
+ 
+    rc = OfflineIntrcptrDBOpen( &regular_file_handle,
+                                db_type,
+                                regular_file,
+                                OPEN_FOR_READ, dest, msgs);
+    if ( rc NE ESA_OK ) {
+       rc = ESA_OK;
+       goto exit;
+    }
+ 
+   /*
+    *  Open result file ( WRITE )
+    */
+ 
+    /* strcpy(dsn_with,"//'");                               SAS2IBMT */
+    /* strcat(dsn_with, result_file+4); copy name after dsn: SAS2IBMT */
+    /* strcat(dsn_with,"'");                                 SAS2IBMT */
+    /* strcpy(dsn_with,"DD:");                               SAS2IBMT */
+    /* strcat(dsn_with, result_file);                        SAS2IBMT */
+    /* ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+        "ESAOFSF: About to fopen %s", result_file);          SAS2IBMT */
+ 
+    result_fptr = fopen(result_file , "w,recfm=*");
+ 
+   /*
+    *  Error handling
+    */
+ 
+   if ( !result_fptr ) {
+      CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                    "fopen", result_file, strerror(errno) );
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "file %s/%s error %d/%s",
+                      result_file, "fopen", errno,
+                      strerror(errno));
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+ 
+   res_rec.eol     = '\n';
+ 
+   for ( ;; ) {
+ 
+       /*
+        *  Read first file
+        */
+ 
+      if ( read_init ) {
+         rc =  OfflineIntrcptrDBRead( init_file_handle,
+                                      db_type, init_file,
+                                      &init_rec, dest, msgs ,offl_params);
+         if ( rc EQ ESA_EOF ) { /* END_OF_FILE */
+ 
+            /* BSAN101765 - Tal Raveh
+            read_regular = 1;  This is simply plain wrong!  */
+ 
+            read_init    = 0;
+            fin_init_file = 1;
+         }
+         else if ( rc NE ESA_OK )    /* Errors */
+            goto exit;
+		 else
+			++stat->old;
+      }
+ 
+       /*
+        *  Read second file
+        */
+ 
+       if ( read_regular ) {
+           rc =  OfflineIntrcptrDBRead( regular_file_handle,
+                                        db_type, regular_file,
+                                        &reg_rec, dest, msgs,offl_params );
+           if ( rc EQ ESA_EOF ) {
+              read_init    = 1;
+              read_regular = 0;
+              fin_reg_file = 1;
+           }
+           else  if ( rc NE ESA_OK )    /* Errors */
+              goto exit;
+       }
+ 
+       /*
+        *  Compare
+        */
+ 
+        if ( fin_init_file AND fin_reg_file )
+           break;
+        else if ( !fin_init_file AND  fin_reg_file)
+           compare = -1; /* Object deleted */
+        else if ( fin_init_file  AND !fin_reg_file)
+           compare = 1;  /* Object added */
+        else {   /* See Sort Compare function */
+            memcpy( (char *)&work_init_rec, (char *)&init_rec,
+                    sizeof(OFFLINE_INTERCEPT_DB_RECORD_rec_typ) );
+ 
+            memcpy( (char *)&work_reg_rec,  (char *)&reg_rec,
+                    sizeof(OFFLINE_INTERCEPT_DB_RECORD_rec_typ) );
+ 
+            work_init_rec.obj1[strlen(work_init_rec.obj1)] = ' ';
+            work_init_rec.obj2[strlen(work_init_rec.obj2)] = ' ';
+ 
+            work_reg_rec.obj1[strlen(work_reg_rec.obj1)] = ' ';
+            work_reg_rec.obj2[strlen(work_reg_rec.obj2)] = ' ';
+ 
+             compare =  memcmp( (char *)&work_init_rec.obj1,
+                                (char *)&work_reg_rec.obj1,
+                                 sizeof(USER_typ) * 2);
+        }
+ 
+        /*
+         *  Object Updated
+         */
+ 
+        if ( compare EQ 0 ) {
+           read_init    = 1;
+           read_regular = 1;
+           if (  memcmp( (char *)&init_rec.CheckSum,
+                         (char *)&reg_rec.CheckSum,
+                         sizeof(CHECKSUM_typ) ) NE 0) {
+ 
+              (stat->updated)++;
+              res_rec.db_action = OBJECT_UPDATED;
+              res_rec.fil1      = ' ';
+              memcpy( (char *)&res_rec.obj1, (char *)&reg_rec.obj1,
+                      sizeof(USER_typ) * 2 );
+              res_rec.ess_flag = init_rec.ess_flag;
+              rc = PutEventRecord( &res_rec, result_file,
+                                   result_fptr, dest, msgs );
+              if (rc NE ESA_OK)
+                  goto exit;
+           }
+           continue;
+        }
+ 
+        /*
+         * Object Deleted
+         */
+ 
+        if ( compare LT 0 ) { /* Object deleted */
+           read_init    = 1;
+           read_regular = 0;
+           (stat->deleted)++;
+           res_rec.db_action = OBJECT_DELETED;
+           res_rec.fil1      = ' ';
+           memcpy( (char *)&res_rec.obj1, (char *)&init_rec.obj1,
+                   sizeof(USER_typ) * 2);
+           res_rec.ess_flag = init_rec.ess_flag;
+           rc = PutEventRecord( &res_rec, result_file,
+                                result_fptr, dest, msgs );
+           if (rc NE ESA_OK)
+              goto exit;
+        }
+ 
+        /*
+         *  Object Added
+         */
+ 
+        else {  /* Object ADDED */
+           read_init    = 0;
+           read_regular = 1;
+           (stat->added)++;
+           res_rec.db_action = OBJECT_ADDED;
+           res_rec.fil1      = ' ';
+           memcpy( (char *)&res_rec.obj1, (char *)&reg_rec.obj1,
+                   sizeof(USER_typ) * 2);
+           res_rec.ess_flag = ' ';
+           rc = PutEventRecord( &res_rec, result_file,
+                                result_fptr, dest, msgs );
+           if (rc NE ESA_OK)
+              goto exit;
+        }
+   }
+ 
+   rc = ESA_OK;
+ 
+   exit :;
+    if ( init_file_handle )
+       OfflineIntrcptrDBClose( &init_file_handle,
+                               db_type, init_file, dest, msgs);
+ 
+    if ( regular_file_handle )
+         OfflineIntrcptrDBClose( &regular_file_handle,
+                                 db_type, regular_file, dest, msgs);
+ 
+    if ( result_fptr )
+       fclose( result_fptr );
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+    return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetConnectionChanges                      *
+*                                                             *
+* DESCRIPTION     : Allocate memory,read connection changes   *
+*                                                             *
+* INPUT           : compare results files                     *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+static ESA_RC GetConnectionChanges(
+ char                                 * connection_compare_result_file,
+ OFFLINE_INTERCEPT_RS_RECORD_rec_typ ** connection_changes,
+ int                                  * connection_changes_count,
+ CTSAMSG_DEST_TABLE_rec_typ           * dest,
+ CTSAMSG_HANDLE_rec_typ               * msgs)
+{
+   ESA_RC  rc = ESA_OK;
+   static  char func[]="GetConnectionChanges";
+   FILE   *fptr = NULL;
+   int     size;
+   int     malloc_cnt;
+   int     records_cnt;
+   char    dsn_with[50]="";                               /* SAS2IBMT */
+ 
+   OFFLINE_INTERCEPT_RS_RECORD_rec_typ  *records;
+ 
+   /*
+    *   Initialize
+    */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,DIAG_OS,
+                   "Connection file=%s",connection_compare_result_file);
+ 
+   (*connection_changes_count) = 0;
+ 
+  /*
+   *   Open connection changes file
+   */
+ 
+   rc = OfflineIntrcptrDBAccess( OFLI_CONNECTION_DB,
+                                 connection_compare_result_file,
+                                 0,dest,msgs);
+    if ( rc NE ESA_OK ) {   /* DB file does not exist */
+       rc = ESA_OK;
+       goto exit;
+    }
+ 
+   /* strcpy(dsn_with,"//'");                                SAS2IBMT */
+   /* strcat(dsn_with, connection_compare_result_file+4);
+                                        copy name after dsn: SAS2IBMT */
+   /* strcat(dsn_with,"'");                                  SAS2IBMT */
+   /* strcpy(dsn_with,"DD:");                                SAS2IBMT */
+   /* strcat(dsn_with, connection_compare_result_file);      SAS2IBMT */
+   /* ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+       "ESAOFSF: About to fopen %s", connection_compare_result_file); */
+ 
+   fptr = fopen(connection_compare_result_file, "r");
+   if ( !fptr ) {
+      CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                    "fopen",connection_compare_result_file,
+                    strerror(errno) );
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "file %s/%s error %d/%s",
+                      connection_compare_result_file, "fopen", errno,
+                      strerror(errno));
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   /*
+    *  Allocate buffer for all changes records
+    */
+ 
+   size = MAX_EXPECTED_CNN_CHANGES *
+              sizeof(OFFLINE_INTERCEPT_RS_RECORD_rec_typ);
+ 
+   records = (OFFLINE_INTERCEPT_RS_RECORD_rec_typ  *)malloc(size);
+ 
+   if ( !records) {
+      CTSAMSG_print (ERR_MALLOC, msgs, NULL, dest,
+                     "connection changes area", size);
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   malloc_cnt  = MAX_EXPECTED_CNN_CHANGES;
+   records_cnt = 0;
+ 
+   /*
+    *  Read file
+    */
+ 
+   while ( GetEventRecord( &records[records_cnt],
+                          connection_compare_result_file ,
+                          fptr, dest, msgs) ) {
+ 
+     records_cnt++;
+     if ( records_cnt GE malloc_cnt ) {
+        malloc_cnt += MAX_EXPECTED_CNN_CHANGES;
+        size = (int)
+       (malloc_cnt * sizeof(OFFLINE_INTERCEPT_RS_RECORD_rec_typ));
+ 
+        records = (OFFLINE_INTERCEPT_RS_RECORD_rec_typ  *)
+                   realloc( (void *)records, size) ;
+        if ( !records) {
+            CTSAMSG_print (ERR_MALLOC, msgs, NULL, dest,
+                           "connection changes area", size);
+            rc = ESA_FATAL;
+            goto exit;
+        }
+     }
+   }
+ 
+   (*connection_changes)       = records;
+   (*connection_changes_count) = records_cnt;
+ 
+   exit :;
+ 
+   if ( fptr )
+      fclose( fptr );
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+   return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : DeleteUserDefaultConnection               *
+*                                                             *
+* DESCRIPTION     : User added. Delete User Default Connection*
+*                                                             *
+* INPUT           : userid                                    *
+*                   connection changes table                  *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+static ESA_RC DeleteUserDefaultConnection(
+        char                           *userid,
+        OFFLINE_INTERCEPT_RS_RECORD_rec_typ  *connection_changes,
+        int                            connection_changes_count,
+        OFFLINE_INTERCEPT_STUFF_rec_typ *offl_params)
+{
+   ESA_RC   rc = ESA_OK;
+   static   char func[]="DeleteUserDefaultConnection";
+   int      size = sizeof (ADDINFO_rec_typ);
+   int      i;
+   int      get_done = GET_DONE_WITH_FATAL;
+ 
+   /*
+    *  Get User parameters
+    */
+ 
+    unsigned int           sizep;
+    GET_USER_MODE          mode = GET_MANY_USERS;
+    short                  max_users = 1;
+    short                  actual_num;
+    HAVE_MORE_typ          have_more = HAVE_MORE;
+    void                  *get_user_handle = NULL;
+    short                  num_users_in=1;
+    USER_PARAMS_rec_typ    user_params_in[1];
+    USER_PARAMS_rec_typ    user_params[1];
+    ADDINFO_rec_ptr        addinfo = NULL;
+    OBJ_EXISTS_typ         objs_exist[1];
+    ENVIRONMENT_rec_typ  * envir_ptr;
+    char                   get_conn        = 'N';           /* CIQ#6 */
+ 
+    CS_get_envir_address (&envir_ptr);
+ 
+   /*
+    *   Initialize
+    */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, "User=%s", userid);
+ 
+   strcpy( user_params_in[0].user, userid);
+ 
+   /*
+    * Get ADDINFO
+    */
+ 
+   rc = ADDINFO_alloc(func, 1, &addinfo,
+                      offl_params->dest, offl_params->msgs);
+   if ( rc NE ESA_OK ) {
+      CTSAMSG_print (ERR_MALLOC,
+                     offl_params->msgs, NULL, offl_params->dest,
+                     "addinfo", size);
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   API_LOGIN
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   /*
+    *   Clear addinfo, and users output parameters
+    */
+ 
+    ADDINFO_clear( addinfo );
+ 
+    sizep = max_users * sizeof (USER_PARAMS_rec_typ);
+    memset(user_params, NULL_CHAR, sizep);
+ 
+   /*
+    *  API call GetUser
+    */
+ 
+   ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetUsers USA-API for user=%s.", user_params_in[0].user);
+   CS_DIAG_USER_IN (ESA_COMP_RSS_INTERCEPT, mode, envir_ptr->empty_oe,
+			 max_users, num_users_in, user_params_in, get_user_handle,
+			 &addinfo);
+   rc = (offl_params->func_ptr->gtusers_ptr) ( mode,
+                                  envir_ptr->empty_oe,
+                                  max_users,
+                                  &actual_num, &have_more,
+                                  &get_user_handle,
+                                  num_users_in, user_params_in,
+                                  user_params, &addinfo, objs_exist,
+                                  &offl_params->admin_params,
+                                  offl_params->err,
+                                  get_conn);                /* CIQ#6 */
+   ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetUsers USA-API completed with rc=%d (%s).",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+   if (rc EQ ESA_OK)
+      CS_DIAG_USER_OUT (ESA_COMP_RSS_INTERCEPT, envir_ptr->empty_oe,
+			 actual_num, have_more, user_params, objs_exist,
+			 get_user_handle, &addinfo);
+   API_LOGOUT
+   if ( rc EQ ESA_NOT_SUPP ) {
+      get_done = GET_DONE_SUCCESS;
+      rc = ESA_OK;
+      goto exit;
+   }
+   else if ( rc NE ESA_OK ) {
+      get_done = GET_DONE_WITH_FATAL;
+      rc = ESA_OK;
+      goto exit;
+   }
+   else
+      get_done = GET_DONE_SUCCESS;
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                   "user=%s default group=%s",
+                   user_params[0].user, user_params[0].def_group );
+ 
+   /*
+    *  Update Default connect changes to DUMMY - that no create Event
+    */
+ 
+   if ( strlen( user_params[0].def_group ) GT 0 ) {
+      for (i=0; i LT connection_changes_count; i++) {
+         if ( ( strcmp( user_params[0].user,
+                        connection_changes[i].obj1) EQ 0 ) AND
+              ( strcmp( user_params[0].def_group,
+                        connection_changes[i].obj2) EQ 0 )   )
+             connection_changes[i].db_action = DUMMY_CHANGES;
+      }
+   }
+ 
+   exit :;
+ 
+   /*
+    *  If was Unsuccessfull termination.
+    *  API call free his handle
+    */
+ 
+   if ( get_user_handle ) {
+ 
+      API_LOGIN
+      if ( rc EQ ESA_OK ) {
+         ESA_RC rcc= ESA_OK;
+         mode =  GET_FREE_HANDLE_USERS;
+ 
+         /*
+          * API call GetUser ( FREE HANDLE )
+          */
+ 
+           ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetUsers USA-API with GET_FREE_HANDLE_USERS mode");
+         CS_DIAG_USER_IN (ESA_COMP_RSS_INTERCEPT, mode,
+			   envir_ptr->empty_oe, 0, 0, user_params_in,
+			   get_user_handle, &addinfo);
+         rcc= (offl_params->func_ptr->gtusers_ptr) ( mode,
+                                               envir_ptr->empty_oe,
+                                   max_users,
+                                   &actual_num, &have_more,
+                                   &get_user_handle,
+                                   num_users_in, user_params_in,
+                                   user_params, &addinfo, objs_exist,
+                                   &offl_params->admin_params,
+                                   offl_params->err,
+                                   get_conn);               /* CIQ#6 */
+         ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetUsers USA-API completed with rc=%d (%s).",
+			rcc, (rcc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+         if (rcc EQ ESA_OK)
+            CS_DIAG_USER_OUT (ESA_COMP_RSS_INTERCEPT,
+			   envir_ptr->empty_oe, 0, have_more, user_params,
+			   objs_exist, get_user_handle, &addinfo);
+         API_LOGOUT
+      }
+      else {
+         CTSAMSG_print(ERR_INTERNAL2,
+                       offl_params->msgs, NULL, offl_params->dest,
+                       component, func,
+                       "GetUser handle not freed due to Login failure",
+                       16, __LINE__);
+      }
+   }
+ 
+   if ( addinfo )
+      ADDINFO_free( &addinfo );
+ 
+   if ( get_done NE GET_DONE_SUCCESS )
+      rc = ESA_FATAL;
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+   return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : DeleteUserConnections                     *
+*                                                             *
+* DESCRIPTION     : User deleted, Delete User Connections     *
+*                                                             *
+* INPUT           : userid                                    *
+*                   connection changes table                  *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+static ESA_RC DeleteUserConnections(
+        char                           *userid,
+        OFFLINE_INTERCEPT_RS_RECORD_rec_typ  *connection_changes,
+        int                            connection_changes_count)
+{
+   ESA_RC   rc = ESA_OK;
+   static   char func[]="DeleteUserConnections";
+   int      i;
+ 
+   /*
+    *   Initialize
+    */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, "User=%s", userid);
+ 
+  /*
+   *  Update connections changes to DUMMY
+   *  - that no create Event
+   */
+ 
+   for (i=0; i LT connection_changes_count; i++) {
+      if ( strcmp(connection_changes[i].obj1, userid) EQ 0 )
+        connection_changes[i].db_action = DUMMY_CHANGES;
+    }
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+    return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : DeleteGroupConnections                    *
+*                                                             *
+* DESCRIPTION     : Group deleted, Delete Group Connections   *
+*                                                             *
+* INPUT           : group                                     *
+*                   connection changes table                  *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+static ESA_RC DeleteGroupConnections(
+        char                                 *group_name,
+        OFFLINE_INTERCEPT_RS_RECORD_rec_typ  *connection_changes,
+        int                                   connection_changes_count)
+{
+   ESA_RC    rc = ESA_OK;
+   static    char func[]="DeleteGroupConnections";
+   int       i;
+ 
+   /*
+    *   Initialize
+    */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, "Group=%s", group_name);
+ 
+  /*
+   *  Update connections changes to DUMMY
+   *  - that no create Event
+   */
+ 
+   for (i=0; i LT connection_changes_count; i++) {
+      if ( strcmp(connection_changes[i].obj2, group_name) EQ 0 )
+        connection_changes[i].db_action = DUMMY_CHANGES;
+    }
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+    return rc;
+ 
+}
+ 
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : Event2RS                                  *
+*                                                             *
+* DESCRIPTION     : Notify of event to Control-SA             *
+*                                                             *
+* INPUT           : compare results files                     *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC Event2RS (
+        char                            *user_compare_result_file,
+        char                            *group_compare_result_file,
+        char                            *connection_compare_result_file,
+        char                            *rss_compare_result_file,
+        char                            *oe_compare_result_file,
+		  char                            *careoeof,
+        INTERCEPT_RSS_PARAMS_rec_typ    *rss_parm,
+        OFFLINE_INTERCEPT_STUFF_rec_typ *offl_params,
+/* BSAN100874 */       char             *gtoe)
+{
+   ESA_RC                                 rc = ESA_OK;
+   static                                 char func[]="Event2RS";
+   OFFLINE_INTERCEPT_RS_RECORD_rec_typ   *connection_changes = NULL;
+   int                                    connection_changes_count;
+   OFFLINE_INTERCEPT_RS_RECORD_rec_typ    changes_rec;
+   FILE                                  *fptr = NULL;
+   char                                   errmsg[100];
+   int                                    i;
+   char                                   dsn_with[50]="";/* SAS2IBMT */
+   /* BSAN100874 RESOURCE_typ            file_careoe;    */   /* ps0381 */
+   /* BSAN100874 ENVIRONMENT_rec_typ   * envir_ptr;      */   /* ps0381 */
+   /* BSAN100874 char                    gtoe[8]= "ALL"; */   /* ps0381 */
+ 
+   /*
+    *   Initialize
+    */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,DIAG_OS,
+                   "Files User=%s Group=%s Connection=%s rss=%s oe=%s",
+                   user_compare_result_file,
+                   group_compare_result_file,
+                   connection_compare_result_file,
+                   rss_compare_result_file,
+                   oe_compare_result_file);
+ 
+  /*
+   * Start of block inserted by ps0381
+   *                deleted  by BSAN100874
+   *
+   *  CS_get_envir_address (&envir_ptr);
+   *  envir_ptr->msg_admin_param.cs_func.rssprm_get_opt_ptr
+   *                 (offl_params->rss_name,
+   *                  "OFLI_GET_MODE",
+   *                  sizeof(gtoe) - 1,
+   *                  gtoe, OPT_TRUE, OPT_TRUE);
+   *
+   * if (strcmp(gtoe, "OE") EQ 0)  {
+   *  strcpy(file_careoe, careoeof);
+   *  rc = GetCAREOE( offl_params->rss_name,
+   *                  file_careoe,
+   *                  FALSE,
+   *                  offl_params->dest,
+   *                  offl_params->msgs);
+   *  if (rc EQ ESA_SKIP) {
+   *      strcpy(gtoe, "ALL");
+   *  }
+   *  else if ( rc NE ESA_OK ) {
+   *     rc = ESA_FATAL;
+   *    goto exit;
+   *  }
+   * }
+   *
+   * End of block inserted by ps0381
+   *              deleted  by BSAN100874
+   */
+ 
+   /*
+    *  OE changes processing
+    */
+ 
+   /*
+    *   Open OE changes file
+    */
+ 
+    rc = OfflineIntrcptrDBAccess( OFLI_OE_DB, oe_compare_result_file,
+                                  0,
+                                  offl_params->dest, offl_params->msgs);
+    if ( rc NE ESA_OK ) {   /* DB file does not exist */
+       rc = ESA_OK;
+       goto GetConnEvents;
+    }
+ 
+   /* strcpy(dsn_with,"//'");                                SAS2IBMT */
+   /* strcat(dsn_with, oe_compare_result_file+4);
+                                        copy name after dsn: SAS2IBMT */
+   /* strcat(dsn_with,"'");                                  SAS2IBMT */
+   /* strcpy(dsn_with,"DD:");                                SAS2IBMT */
+   /* strcat(dsn_with, oe_compare_result_file);              SAS2IBMT */
+   /* ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+       "ESAOFSF: About to fopen %s", oe_compare_result_file);/*SAS2IBMT*/
+ 
+   fptr = fopen(oe_compare_result_file, "r");
+   if ( !fptr ) {
+      CTSAMSG_print(ERR_IO,
+                    offl_params->msgs, NULL, offl_params->dest,
+                    "fopen",oe_compare_result_file, strerror(errno) );
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "file %s/%s error %d/%s",
+                      oe_compare_result_file, "fopen", errno,
+                      strerror(errno));
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   while ( GetEventRecord(&changes_rec, oe_compare_result_file ,
+                          fptr, offl_params->dest,
+                          offl_params->msgs) ) {
+ 
+      if ( changes_rec.ess_flag NE CHANGED_BY_ESS ) {
+         switch ( changes_rec.db_action ) {
+           case  OBJECT_UPDATED:
+            if (strcmp(gtoe, "OE") EQ 0)   /* ps0381 */
+               rc = CheckEvent("OE", changes_rec.obj1, offl_params);
+            else                           /* ps0381 */
+               rc = ESA_OK;                /* ps0381 */
+ 
+            if (rc EQ ESA_OK)   {          /* ps0381 */
+               for(;;){	/*RR - 18/12*/
+	    rc = CTSOEEvent(rss_parm->type, rss_parm->name,
+                            rss_parm->handle,
+                            changes_rec.obj1, ACT_UPDATE,
+                            &offl_params->admin_params);
+	    if ( rc NE ESA_EOF ) /* Endless loop whenever Q is full*/
+		break;
+	    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                   "Queue is full waiting %d seconds for retry",
+				WAIT_ON_Q_RETRY/1000 );
+	    OS_CS_wait( WAIT_ON_Q_RETRY );
+					
+	}
+			
+ 
+               if ( rc EQ ESA_OK )
+                  CTSAMSG_print(MSG_OFLI_OE_UPDATED,
+                            rss_parm->msg_params->ctsamsg_handle,
+                            NULL, rss_parm->msg_params->ctsamsg_dest,
+                            changes_rec.obj1, rss_parm->name);
+             }                            /* ps0381 */
+             else                         /* ps0381 */
+              rc = ESA_OK;                /* ps0381 */
+ 
+               break;
+           case OBJECT_ADDED:
+            if (strcmp(gtoe, "OE") EQ 0)   /* ps0381 */
+               rc = CheckEvent("OE", changes_rec.obj1, offl_params);
+            else                           /* ps0381 */
+               rc = ESA_OK;                /* ps0381 */
+ 
+            if (rc EQ ESA_OK)   {          /* ps0381 */
+               for(;;){	/*RR - 18/12*/
+					rc = CTSOEEvent(rss_parm->type, rss_parm->name,
+                               rss_parm->handle,
+                               changes_rec.obj1, ACT_ADD,
+                               &offl_params->admin_params);
+					if ( rc NE ESA_EOF ) /* Endless loop whenever Q is full*/
+						break;
+					ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "Queue is full waiting %d seconds for retry",
+			WAIT_ON_Q_RETRY/1000 );
+					OS_CS_wait( WAIT_ON_Q_RETRY );
+					
+				}
+				
+               if ( rc EQ ESA_OK )
+                  CTSAMSG_print(MSG_OFLI_OE_ADDED,
+                          rss_parm->msg_params->ctsamsg_handle,
+                          NULL, rss_parm->msg_params->ctsamsg_dest,
+                          changes_rec.obj1, rss_parm->name);
+             }                            /* ps0381 */
+             else                         /* ps0381 */
+              rc = ESA_OK;                /* ps0381 */
+ 
+               break;
+           case OBJECT_DELETED:
+               for(;;){	/*RR - 18/12*/
+					rc = CTSOEEvent(rss_parm->type, rss_parm->name,
+                               rss_parm->handle,
+                               changes_rec.obj1, ACT_DELETE,
+                               &offl_params->admin_params);
+					if ( rc NE ESA_EOF ) /* Endless loop whenever Q is full*/
+						break;
+					ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "Queue is full waiting %d seconds for retry",
+			WAIT_ON_Q_RETRY/1000 );
+					OS_CS_wait( WAIT_ON_Q_RETRY );
+					
+				}
+			
+               if ( rc EQ ESA_OK )
+                  CTSAMSG_print(MSG_OFLI_OE_DELETED,
+                         rss_parm->msg_params->ctsamsg_handle,
+                         NULL, rss_parm->msg_params->ctsamsg_dest,
+                         changes_rec.obj1, rss_parm->name);
+               break;
+           default :
+               sprintf( errmsg, "Invalid db_action=%d",
+                        changes_rec.db_action );
+               CTSAMSG_print(ERR_INTERNAL2,
+                             offl_params->msgs, NULL,
+                             offl_params->dest,
+                             component, func, errmsg, 16, __LINE__);
+               rc = ESA_FATAL;
+               goto exit;
+         }  /* case  */
+         if ( rc NE ESA_OK ) {
+            rc = ESA_FATAL;
+            goto exit;
+         }
+      }
+   } /* loop on oe changes file */
+ 
+   fclose( fptr );
+   fptr = NULL;
+ 
+   GetConnEvents :
+   rc = GetConnectionChanges( connection_compare_result_file,
+                              &connection_changes,
+                              &connection_changes_count,
+                              offl_params->dest, offl_params->msgs );
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   /*
+    *  Group changes processing
+    */
+ 
+   /*GetGroupEvents :*/
+   /*
+    *   Open group changes file
+    */
+ 
+   rc = OfflineIntrcptrDBAccess( OFLI_GROUP_DB,
+                                 group_compare_result_file,
+                                 0,
+                                 offl_params->dest, offl_params->msgs) ;
+   if ( rc NE ESA_OK ) {   /* DB file does not exist */
+      rc = ESA_OK;
+      goto GetUserEvents;
+   }
+ 
+   /* strcpy(dsn_with,"//'");                                SAS2IBMT */
+   /* strcat(dsn_with, group_compare_result_file+4);
+                                        copy name after dsn: SAS2IBMT */
+   /* strcat(dsn_with,"'");                                  SAS2IBMT */
+   /* strcpy(dsn_with,"DD:");                                SAS2IBMT */
+   /* strcat(dsn_with, group_compare_result_file);           SAS2IBMT */
+   /* ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+       "ESAOFSF: About to fopen %s", group_compare_result_file);      */
+ 
+   fptr = fopen(group_compare_result_file, "r");
+   if ( !fptr ) {
+      CTSAMSG_print(ERR_IO,
+                    offl_params->msgs, NULL, offl_params->dest,
+                    "fopen",group_compare_result_file,
+                    strerror(errno) );
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "file %s/%s error %d/%s",
+                      group_compare_result_file, "fopen", errno,
+                      strerror(errno));
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   while ( GetEventRecord(&changes_rec, group_compare_result_file ,
+                          fptr, offl_params->dest,
+                          offl_params->msgs) ) {
+ 
+      if ( changes_rec.ess_flag NE CHANGED_BY_ESS ) {
+         switch ( changes_rec.db_action ) {
+           case  OBJECT_UPDATED:
+            if (strcmp(gtoe, "OE") EQ 0)   /* ps0381 */
+               rc = CheckEvent("UG", changes_rec.obj1, offl_params);
+            else                           /* ps0381 */
+               rc = ESA_OK;                /* ps0381 */
+ 
+            if (rc EQ ESA_OK)   {          /* ps0381 */
+               for(;;){	/*RR - 18/12*/
+					rc = CTSUGEvent(rss_parm->type, rss_parm->name,
+                               rss_parm->handle,
+                               changes_rec.obj1, ACT_UPDATE,
+                               &offl_params->admin_params);
+					if ( rc NE ESA_EOF ) /* Endless loop whenever Q is full*/
+						break;
+					ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "Queue is full waiting %d seconds for retry",
+			WAIT_ON_Q_RETRY/1000 );
+					OS_CS_wait( WAIT_ON_Q_RETRY );
+					
+				}
+				
+ 
+			   if ( rc EQ ESA_OK )
+                  CTSAMSG_print(MSG_OFLI_UG_UPDATED,
+                         rss_parm->msg_params->ctsamsg_handle,
+                         NULL, rss_parm->msg_params->ctsamsg_dest,
+                         changes_rec.obj1, rss_parm->name);
+             }                            /* ps0381 */
+             else                         /* ps0381 */
+              rc = ESA_OK;                /* ps0381 */
+ 
+               break;
+           case OBJECT_ADDED:
+            if (strcmp(gtoe, "OE") EQ 0)   /* ps0381 */
+               rc = CheckEvent("UG", changes_rec.obj1, offl_params);
+            else                           /* ps0381 */
+               rc = ESA_OK;                /* ps0381 */
+ 
+            if (rc EQ ESA_OK)   {          /* ps0381 */
+               for(;;){	/*RR - 18/12*/
+					rc = CTSUGEvent(rss_parm->type, rss_parm->name,
+                               rss_parm->handle,
+                               changes_rec.obj1, ACT_ADD,
+                               &offl_params->admin_params);
+					if ( rc NE ESA_EOF ) /* Endless loop whenever Q is full*/
+						break;
+					ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "Queue is full waiting %d seconds for retry",
+			WAIT_ON_Q_RETRY/1000 );
+					OS_CS_wait( WAIT_ON_Q_RETRY );
+					
+				}
+				
+               if ( rc EQ ESA_OK )
+                  CTSAMSG_print(MSG_OFLI_UG_ADDED,
+                      rss_parm->msg_params->ctsamsg_handle,
+                      NULL, rss_parm->msg_params->ctsamsg_dest,
+                      changes_rec.obj1, rss_parm->name);
+             }                            /* ps0381 */
+             else                         /* ps0381 */
+              rc = ESA_OK;                /* ps0381 */
+ 
+               break;
+           case OBJECT_DELETED:
+               for(;;){	/*RR - 18/12*/
+					rc = CTSUGEvent(rss_parm->type, rss_parm->name,
+                               rss_parm->handle,
+                               changes_rec.obj1, ACT_DELETE,
+                               &offl_params->admin_params);
+					if ( rc NE ESA_EOF ) /* Endless loop whenever Q is full*/
+						break;
+					ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "Queue is full waiting %d seconds for retry",
+			WAIT_ON_Q_RETRY/1000 );
+					OS_CS_wait( WAIT_ON_Q_RETRY );
+					
+				}
+			
+               if ( rc EQ ESA_OK ) {
+                  CTSAMSG_print(MSG_OFLI_UG_DELETED,
+                        rss_parm->msg_params->ctsamsg_handle,
+                        NULL, rss_parm->msg_params->ctsamsg_dest,
+                        changes_rec.obj1, rss_parm->name);
+                  rc = DeleteGroupConnections( changes_rec.obj1,
+                                          connection_changes,
+                                          connection_changes_count);
+                  if ( rc NE ESA_OK ) {
+                     rc = ESA_FATAL;
+                     goto exit;
+                  }
+               }
+               break;
+           default :
+               sprintf( errmsg, "Invalid db_action=%d",
+                        changes_rec.db_action );
+               CTSAMSG_print(ERR_INTERNAL2,
+                             offl_params->msgs, NULL, offl_params->dest,
+                             component, func, errmsg, 16, __LINE__);
+               rc = ESA_FATAL;
+               goto exit;
+         }
+ 
+         if ( rc NE ESA_OK ) {
+            rc = ESA_FATAL;
+            goto exit;
+         }
+      }
+   } /* loop on user changes file */
+ 
+   fclose( fptr );
+   fptr = NULL;
+ 
+   /*
+    *  User changes processing
+    */
+ 
+    GetUserEvents :
+   /*
+    *   Open user changes file
+    */
+ 
+    rc = OfflineIntrcptrDBAccess( OFLI_USER_DB,
+                                  user_compare_result_file,
+                                  0,
+                                  offl_params->dest, offl_params->msgs);
+    if ( rc NE ESA_OK ) {   /* DB file does not exist */
+       rc = ESA_OK;
+       goto ConnEventProc;
+    }
+ 
+   /* strcpy(dsn_with,"//'");                                SAS2IBMT */
+   /* strcat(dsn_with, user_compare_result_file+4);
+                                        copy name after dsn: SAS2IBMT */
+   /* strcat(dsn_with,"'");                                  SAS2IBMT */
+   /* strcpy(dsn_with,"DD:");                                SAS2IBMT */
+   /* strcat(dsn_with, user_compare_result_file);            SAS2IBMT */
+   /* ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+       "ESAOFSF: About to fopen %s", user_compare_result_file);       */
+ 
+   fptr = fopen(user_compare_result_file, "r");
+   if ( !fptr ) {
+      CTSAMSG_print(ERR_IO,
+                    offl_params->msgs, NULL, offl_params->dest,
+                    "fopen",user_compare_result_file, strerror(errno) );
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "file %s/%s error %d/%s",
+                      user_compare_result_file, "fopen", errno,
+                      strerror(errno));
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   while ( GetEventRecord(&changes_rec, user_compare_result_file ,
+                          fptr, offl_params->dest,
+                          offl_params->msgs) ) {
+ 
+      if ( changes_rec.ess_flag NE CHANGED_BY_ESS ) {
+         switch ( changes_rec.db_action ) {
+           case  OBJECT_UPDATED:
+            if (strcmp(gtoe, "OE") EQ 0)   /* ps0381 */
+               rc = CheckEvent("US", changes_rec.obj1, offl_params);
+            else                           /* ps0381 */
+               rc = ESA_OK;                /* ps0381 */
+ 
+            if (rc EQ ESA_OK)   {          /* ps0381 */
+				for(;;){	/*RR - 18/12*/
+					rc = CTSUserEvent(rss_parm->type, rss_parm->name,
+						             rss_parm->handle,
+							         changes_rec.obj1, ACT_UPDATE,
+								     &offl_params->admin_params);
+					ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "Rc returned from CTSUserEent is %d ", rc );
+					if ( rc NE ESA_EOF ) /* Endless loop whenever Q is full*/
+						break;
+					ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "Queue is full waiting %d seconds for retry",
+			WAIT_ON_Q_RETRY/1000 );
+					OS_CS_wait( WAIT_ON_Q_RETRY );
+					
+				}
+               if ( rc EQ ESA_OK )
+                  CTSAMSG_print(MSG_OFLI_USER_UPDATED,
+                            rss_parm->msg_params->ctsamsg_handle,
+                            NULL, rss_parm->msg_params->ctsamsg_dest,
+                            changes_rec.obj1, rss_parm->name);
+             }                            /* ps0381 */
+             else                         /* ps0381 */
+              rc = ESA_OK;                /* ps0381 */
+ 
+               break;
+           case OBJECT_ADDED:
+            if (strcmp(gtoe, "OE") EQ 0)   /* ps0381 */
+               rc = CheckEvent("US", changes_rec.obj1, offl_params);
+            else                           /* ps0381 */
+               rc = ESA_OK;                /* ps0381 */
+ 
+            if (rc EQ ESA_OK)   {          /* ps0381 */
+               for(;;){	/*RR - 18/12*/
+					rc = CTSUserEvent(rss_parm->type, rss_parm->name,
+                                 rss_parm->handle,
+                                 changes_rec.obj1, ACT_ADD,
+                                 &offl_params->admin_params);
+					if ( rc NE ESA_EOF ) /* Endless loop whenever Q is full*/
+						break;
+					ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "Queue is full waiting %d seconds for retry",
+			 WAIT_ON_Q_RETRY/1000 );
+					OS_CS_wait( WAIT_ON_Q_RETRY );
+					
+				}
+               if ( rc EQ ESA_OK ) {
+                  CTSAMSG_print(MSG_OFLI_USER_ADDED,
+                          rss_parm->msg_params->ctsamsg_handle,
+                          NULL, rss_parm->msg_params->ctsamsg_dest,
+                          changes_rec.obj1, rss_parm->name);
+                  rc = DeleteUserDefaultConnection( changes_rec.obj1,
+                              connection_changes,
+                              connection_changes_count,
+                              offl_params);
+                  if ( rc NE ESA_OK ) {
+                     rc = ESA_FATAL;
+                     goto exit;
+                  }
+               }
+             }                            /* ps0381 */
+             else                         /* ps0381 */
+              rc = ESA_OK;                /* ps0381 */
+ 
+               break;
+           case OBJECT_DELETED:
+               for(;;){	/*RR - 18/12*/
+					rc = CTSUserEvent(rss_parm->type, rss_parm->name,
+                                 rss_parm->handle,
+                                 changes_rec.obj1, ACT_DELETE,
+                                 &offl_params->admin_params);
+					if ( rc NE ESA_EOF ) /* Endless loop whenever Q is full*/
+						break;
+					ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "Queue is full waiting %d seconds for retry",
+			WAIT_ON_Q_RETRY/1000 );
+					OS_CS_wait( WAIT_ON_Q_RETRY );
+					
+				}
+               if ( rc EQ ESA_OK ) {
+                  CTSAMSG_print(MSG_OFLI_USER_DELETED,
+                         rss_parm->msg_params->ctsamsg_handle,
+                         NULL, rss_parm->msg_params->ctsamsg_dest,
+                         changes_rec.obj1, rss_parm->name);
+                  rc = DeleteUserConnections( changes_rec.obj1,
+                                              connection_changes,
+                                              connection_changes_count);
+                  if ( rc NE ESA_OK ) {
+                     rc = ESA_FATAL;
+                     goto exit;
+                  }
+               }
+               break;
+           default :
+               sprintf( errmsg, "Invalid db_action=%d",
+                        changes_rec.db_action );
+               CTSAMSG_print(ERR_INTERNAL2,
+                             offl_params->msgs, NULL,
+                             offl_params->dest,
+                             component, func, errmsg, 16, __LINE__);
+               rc = ESA_FATAL;
+               goto exit;
+         } /* case */
+ 
+         if ( rc NE ESA_OK ) {
+            rc = ESA_FATAL;
+            goto exit;
+         }
+      }
+   } /* loop on user changes file */
+ 
+   fclose( fptr );
+   fptr = NULL;
+ 
+   ConnEventProc :
+   /*
+    *  Connection changes processing
+    */
+ 
+   for (i=0; i LT connection_changes_count; i++) {
+ 
+      if ( ( connection_changes[i].db_action EQ  DUMMY_CHANGES  ) OR
+           ( connection_changes[i].ess_flag  EQ  CHANGED_BY_ESS )  )
+         continue;
+ 
+      switch ( connection_changes[i].db_action ) {
+        case  OBJECT_UPDATED:
+            if (strcmp(gtoe, "OE") EQ 0) {  /* ps0381 */
+               rc = CheckEvent("US",
+                               /* AS1018 changes_rec.obj1, */
+                               connection_changes[i].obj1,  /* AS1018 */
+                               offl_params);
+               if (rc EQ ESA_OK)
+                  rc = CheckEvent("UG",
+                                  /* AS1018 changes_rec.obj2, */
+                                  connection_changes[i].obj2,  /* AS1018 */
+                                  offl_params);
+            }
+            else                           /* ps0381 */
+               rc = ESA_OK;                /* ps0381 */
+ 
+           if (rc EQ ESA_OK)   {          /* ps0381 */
+				for(;;){	/*RR - 18/12*/
+					rc = CTSConnEvent(rss_parm->type, rss_parm->name,
+                              rss_parm->handle,
+                              connection_changes[i].obj2,
+                              connection_changes[i].obj1,
+                              ACT_UPDATE, &offl_params->admin_params);
+					if ( rc NE ESA_EOF ) /* Endless loop whenever Q is full*/
+						break;
+					ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "Queue is full waiting %d seconds for retry",
+			WAIT_ON_Q_RETRY/1000 );
+					OS_CS_wait( WAIT_ON_Q_RETRY );
+					
+				}
+			
+            if ( rc EQ ESA_OK )
+               CTSAMSG_print(MSG_OFLI_U2UG_UPDATED,
+                   rss_parm->msg_params->ctsamsg_handle,
+                   NULL, rss_parm->msg_params->ctsamsg_dest,
+                   connection_changes[i].obj1,
+                   connection_changes[i].obj2, rss_parm->name);
+             }                            /* ps0381 */
+             else                         /* ps0381 */
+              rc = ESA_OK;                /* ps0381 */
+ 
+            break;
+        case OBJECT_ADDED:
+            if (strcmp(gtoe, "OE") EQ 0) {  /* ps0381 */
+               rc = CheckEvent("US",
+                               /* AS1018 changes_rec.obj1, */
+                               connection_changes[i].obj1,  /* AS1018 */
+                               offl_params);
+               if (rc EQ ESA_OK)
+                  rc = CheckEvent("UG",
+                                  /* AS1018 changes_rec.obj2, */
+                                  connection_changes[i].obj2,  /* AS1018 */
+                                  offl_params);
+            }
+            else                           /* ps0381 */
+               rc = ESA_OK;                /* ps0381 */
+ 
+           if (rc EQ ESA_OK)   {          /* ps0381 */
+            for(;;){	/*RR - 18/12*/
+					rc = CTSConnEvent(rss_parm->type, rss_parm->name,
+                              rss_parm->handle,
+                              connection_changes[i].obj2,
+                              connection_changes[i].obj1,
+                              ACT_ADD, &offl_params->admin_params);
+					if ( rc NE ESA_EOF ) /* Endless loop whenever Q is full*/
+						break;
+					ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "Queue is full waiting %d seconds for retry",
+			WAIT_ON_Q_RETRY/1000 );
+					OS_CS_wait( WAIT_ON_Q_RETRY );
+					
+			}
+			
+            if ( rc EQ ESA_OK )
+               CTSAMSG_print(MSG_OFLI_U2UG_ADDED,
+                  rss_parm->msg_params->ctsamsg_handle,
+                  NULL, rss_parm->msg_params->ctsamsg_dest,
+                  connection_changes[i].obj1,
+                  connection_changes[i].obj2, rss_parm->name);
+             }                            /* ps0381 */
+             else                         /* ps0381 */
+              rc = ESA_OK;                /* ps0381 */
+ 
+            break;
+        case OBJECT_DELETED:
+            for(;;){	/*RR - 18/12*/
+					rc = CTSConnEvent(rss_parm->type, rss_parm->name,
+                              rss_parm->handle,
+                              connection_changes[i].obj2,
+                              connection_changes[i].obj1,
+                              ACT_DELETE, &offl_params->admin_params);
+					if ( rc NE ESA_EOF ) /* Endless loop whenever Q is full*/
+						break;
+					ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "Queue is full waiting %d seconds for retry",
+			WAIT_ON_Q_RETRY/1000 );
+					OS_CS_wait( WAIT_ON_Q_RETRY );
+					
+			}
+			
+            if ( rc EQ ESA_OK )
+               CTSAMSG_print(MSG_OFLI_U2UG_DELETED,
+                  rss_parm->msg_params->ctsamsg_handle,
+                  NULL, rss_parm->msg_params->ctsamsg_dest,
+                  connection_changes[i].obj1,
+                  connection_changes[i].obj2, rss_parm->name);
+            break;
+        default :
+            sprintf( errmsg, "Invalid db_action=%d",
+                     changes_rec.db_action );
+            CTSAMSG_print(ERR_INTERNAL2,
+                          offl_params->msgs, NULL, offl_params->dest,
+                          component, func, errmsg, 16, __LINE__);
+            rc = ESA_FATAL;
+            goto exit;
+      }
+ 
+      if ( rc NE ESA_OK ) {
+         rc = ESA_FATAL;
+         goto exit;
+      }
+ 
+   }
+ 
+   rc = OfflineIntrcptrDBAccess( OFLI_RSS_DB, rss_compare_result_file,
+                                 0,
+                                 offl_params->dest, offl_params->msgs);
+   if ( rc NE ESA_OK ) {   /* DB file does not exist */
+      rc = ESA_OK;
+      goto exit;
+   }
+ 
+  /*
+   *   Open RSS Parameters changes file
+   */
+ 
+   /* strcpy(dsn_with,"//'");                                SAS2IBMT */
+   /* strcat(dsn_with, rss_compare_result_file+4);
+                                        copy name after dsn: SAS2IBMT */
+   /* strcat(dsn_with,"'");                                  SAS2IBMT */
+   /* strcpy(dsn_with,"DD:");                                SAS2IBMT */
+   /* strcat(dsn_with, rss_compare_result_file);             SAS2IBMT */
+   /* ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+       "ESAOFSF: About to fopen %s", rss_compare_result_file);        */
+ 
+   fptr = fopen(rss_compare_result_file, "r");
+   if ( !fptr ) {
+      CTSAMSG_print(ERR_IO,
+                    offl_params->msgs, NULL, offl_params->dest,
+                    "fopen",rss_compare_result_file, strerror(errno) );
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "file %s/%s error %d/%s",
+                      rss_compare_result_file, "fopen", errno,
+                      strerror(errno));
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   while ( GetEventRecord(&changes_rec, rss_compare_result_file ,
+                          fptr, offl_params->dest,
+                          offl_params->msgs) ) {
+ 
+      if ( changes_rec.ess_flag NE CHANGED_BY_ESS ) {
+         switch ( changes_rec.db_action ) {
+           case  OBJECT_UPDATED:
+               for(;;){	/*RR - 18/12*/
+					 rc = CTSParamsModEvent(rss_parm->type, rss_parm->name,
+                                 rss_parm->handle,
+                                 &offl_params->admin_params);
+					if ( rc NE ESA_EOF ) /* Endless loop whenever Q is full*/
+						break;
+					ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "Queue is full waiting %d seconds for retry",
+			 WAIT_ON_Q_RETRY/1000 );
+					OS_CS_wait( WAIT_ON_Q_RETRY );
+					
+			}
+			
+ 
+			   if ( rc EQ ESA_OK )
+                  CTSAMSG_print(MSG_OFLI_RSSP_UPDATED,
+                            rss_parm->msg_params->ctsamsg_handle,
+                            NULL, rss_parm->msg_params->ctsamsg_dest,
+                            changes_rec.obj1);
+               break;
+ 
+           default :
+               sprintf( errmsg, "Invalid db_action=%d",
+                        changes_rec.db_action );
+               CTSAMSG_print(ERR_INTERNAL2,
+                             offl_params->msgs, NULL, offl_params->dest,
+                             component, func, errmsg, 16, __LINE__);
+               rc = ESA_FATAL;
+               goto exit;
+         }
+ 
+         if ( rc NE ESA_OK ) {
+            rc = ESA_FATAL;
+            goto exit;
+         }
+      }
+   } /* loop on RSS Parameters changes file */
+ 
+   fclose( fptr );
+   fptr = NULL;
+ 
+   exit :;
+ 
+   if ( fptr )
+      fclose ( fptr );
+ 
+   if ( connection_changes )
+      free (connection_changes);
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+   return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetInitialStatData                        *
+*                                                             *
+* DESCRIPTION     : Obtain initial stat data                  *
+*                                                             *
+* INPUT           : file                                      *
+*                                                             *
+* OUTPUT          : stat_data structure                       *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+static ESA_RC GetInitialStatData(
+        char                                *req_file,
+        int                                  file_type,
+        struct stat_data                    *stat_data,
+        CTSAMSG_DEST_TABLE_rec_typ          *dest,
+        CTSAMSG_HANDLE_rec_typ              *msgs)
+{
+   ESA_RC   rc = ESA_OK;
+   static   char func[]="GetInitialStatData";
+ 
+   /*
+    *   Initialize
+    */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,DIAG_OS,"file=%s", req_file);
+ 
+   stat_data->old	  = 0;
+   stat_data->total   = 0;
+   stat_data->added   = 0;
+   stat_data->deleted = 0;
+   stat_data->updated = 0;
+ 
+   rc = OfflineIntrcptrDBRecCnt(file_type, req_file,
+                                &(stat_data->total), dest, msgs);
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+   return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetStatData                               *
+*                                                             *
+* DESCRIPTION     : Obtain initial stat data                  *
+*                                                             *
+* INPUT           : user_file                                 *
+*                   group_file                                *
+*                   connection_file                           *
+*                                                             *
+* OUTPUT          : stat_data structure                       *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC  GetStatData(
+        char                                *user_file,
+        char                                *group_file,
+        char                                *connection_file,
+        char                                *rss_file,
+        char                                *oe_file,
+        OFFLINE_INTERCEPT_STAT_DATA_rec_typ *stat_data,
+        CTSAMSG_DEST_TABLE_rec_typ          *dest,
+        CTSAMSG_HANDLE_rec_typ              *msgs)
+{
+   ESA_RC                                 rc = ESA_OK;
+   static                                 char func[]="GetStatData";
+ 
+   /*
+    *   Initialize
+    */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,DIAG_OS,
+               "Files User=%s Group=%s Connection=%s rss=%s oe=%s",
+               user_file, group_file, connection_file, rss_file,oe_file);
+ 
+   rc = GetInitialStatData( oe_file, OFLI_OE_DB,
+                            &(stat_data->oe_stat), dest, msgs );
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   rc = GetInitialStatData( user_file, OFLI_USER_DB,
+                            &(stat_data->user_stat), dest, msgs );
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   rc = GetInitialStatData( group_file, OFLI_GROUP_DB,
+                            &(stat_data->group_stat), dest, msgs );
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   rc = GetInitialStatData( connection_file, OFLI_CONNECTION_DB,
+                            &(stat_data->connection_stat), dest, msgs );
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   rc = GetInitialStatData( rss_file, OFLI_RSS_DB,
+                            &(stat_data->rss_stat), dest, msgs );
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   exit :;
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+   return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : CheckFileExistance                        *
+*                                                             *
+* DESCRIPTION     : Check file existance                      *
+*                                                             *
+* INPUT           : user_file                                 *
+*                   group_file                                *
+*                   connection_file                           *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC CheckFileExistance(
+        char                                *user_file,
+        char                                *group_file,
+        char                                *connection_file,
+        char                                *rss_file,
+        char                                *oe_file,
+        CTSAMSG_DEST_TABLE_rec_typ          *dest,
+        CTSAMSG_HANDLE_rec_typ              *msgs)
+{
+   ESA_RC  rc = ESA_OK;
+   int     issue_msg = 0;
+   static  char func[]="CheckFileExistance";
+ 
+   /*
+    *   Initialize
+    */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,DIAG_DETAILES,
+            "Files User=%s Group=%s Connection=%s rss=%s oe=%s",
+            user_file, group_file, connection_file, rss_file, oe_file);
+ 
+   rc = OfflineIntrcptrDBAccess( OFLI_RSS_DB,
+                                 rss_file, issue_msg ,dest, msgs );
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   exit :;
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+   return rc;
+ 
+}
+ 
+/****************************************************
+ * Procedure Name: do_offl_stats
+ * Description   : Print statistics to MSG file and Log
+ * Input         :
+ * Output        :
+ * Input/Output  :
+ * Return Value  :
+ * Side Effects  : 3 messages are written to log event queue (optional)
+ *                 and to MSG.
+ * Scope         : Local
+ ***************************************************/
+ 
+void PrintOfflineInterceptorStatistics(
+          INTERCEPT_RSS_PARAMS_rec_typ        * rss_parm,
+          OFFLINE_INTERCEPT_STAT_DATA_rec_typ * stat_data,
+          ADMIN_PARAMS_rec_typ                * admin_params)
+{
+   ESA_RC rc;
+   char   flag [16];
+   int    do_log_events = 0;
+   char   func[]="PrintOfflineInterceptorStatistics";
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   rc = admin_params->cs_func.rssprm_get_ptr (rss_parm->name,
+                                              OFFLINE_RSS_VERB_KWD,
+                                              sizeof (flag), flag);
+   if (rc EQ ESA_OK)
+      do_log_events = (flag[0] EQ 'Y') ? 1 : 0;
+ 
+   if (do_log_events)
+      CTSLogEvent (rss_parm->type, rss_parm->name,
+                   rss_parm->handle,
+                   MSG_OFLI_FULL_STATS,
+                   "OEs        ",
+                   rss_parm->name,
+                   stat_data->oe_stat.added,
+                   stat_data->oe_stat.deleted,
+                   stat_data->oe_stat.updated,
+                   stat_data->oe_stat.total);
+ 
+   CTSAMSG_print (MSG_OFLI_FULL_STATS,
+                  rss_parm->msg_params->ctsamsg_handle,
+                  NULL,
+                  rss_parm->msg_params->ctsamsg_dest,
+                  "OEs        ",
+                  rss_parm->name,
+                  stat_data->oe_stat.added,
+                  stat_data->oe_stat.deleted,
+                  stat_data->oe_stat.updated,
+                  stat_data->oe_stat.total);
+ 
+ 
+   if (do_log_events)
+      CTSLogEvent (rss_parm->type, rss_parm->name,
+                   rss_parm->handle,
+                   MSG_OFLI_FULL_STATS,
+                   "users      ",
+                   rss_parm->name,
+                   stat_data->user_stat.added,
+                   stat_data->user_stat.deleted,
+                   stat_data->user_stat.updated,
+                   stat_data->user_stat.total);
+ 
+   CTSAMSG_print (MSG_OFLI_FULL_STATS,
+                  rss_parm->msg_params->ctsamsg_handle,
+                  NULL,
+                  rss_parm->msg_params->ctsamsg_dest,
+                  "users      ",
+                  rss_parm->name,
+                  stat_data->user_stat.added,
+                  stat_data->user_stat.deleted,
+                  stat_data->user_stat.updated,
+                  stat_data->user_stat.total);
+ 
+   if (do_log_events)
+      CTSLogEvent (rss_parm->type, rss_parm->name,
+                   rss_parm->handle,
+                   MSG_OFLI_FULL_STATS,
+                   "user groups",
+                   rss_parm->name,
+                   stat_data->group_stat.added,
+                   stat_data->group_stat.deleted,
+                   stat_data->group_stat.updated,
+                   stat_data->group_stat.total);
+ 
+   CTSAMSG_print (MSG_OFLI_FULL_STATS,
+                  rss_parm->msg_params->ctsamsg_handle,
+                  NULL,
+                  rss_parm->msg_params->ctsamsg_dest,
+                  "user groups",
+                  rss_parm->name,
+                  stat_data->group_stat.added,
+                  stat_data->group_stat.deleted,
+                  stat_data->group_stat.updated,
+                  stat_data->group_stat.total);
+ 
+   if (do_log_events)
+      CTSLogEvent (rss_parm->type, rss_parm->name,
+                   rss_parm->handle,
+                   MSG_OFLI_FULL_STATS,
+                   "connections",
+                   rss_parm->name,
+                   stat_data->connection_stat.added,
+                   stat_data->connection_stat.deleted,
+                   stat_data->connection_stat.updated,
+                   stat_data->connection_stat.total);
+ 
+   CTSAMSG_print (MSG_OFLI_FULL_STATS,
+                  rss_parm->msg_params->ctsamsg_handle,
+                  NULL,
+                  rss_parm->msg_params->ctsamsg_dest,
+                  "connections",
+                  rss_parm->name,
+                  stat_data->connection_stat.added,
+                  stat_data->connection_stat.deleted,
+                  stat_data->connection_stat.updated,
+                  stat_data->connection_stat.total);
+ 
+    if (do_log_events)
+      CTSLogEvent (rss_parm->type, rss_parm->name,
+                   rss_parm->handle,
+                   MSG_OFLI_FULL_STATS,
+                   "RSS Parameters",
+                   rss_parm->name,
+                   stat_data->rss_stat.added,
+                   stat_data->rss_stat.deleted,
+                   stat_data->rss_stat.updated,
+                   stat_data->rss_stat.total);
+ 
+   CTSAMSG_print (MSG_OFLI_FULL_STATS,
+                  rss_parm->msg_params->ctsamsg_handle,
+                  NULL,
+                  rss_parm->msg_params->ctsamsg_dest,
+                  "RSS Parameters",
+                  rss_parm->name,
+                  stat_data->rss_stat.added,
+                  stat_data->rss_stat.deleted,
+                  stat_data->rss_stat.updated,
+                  stat_data->rss_stat.total);
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, ESA_RC_VOID);
+} /* do_offl_stats */
+ 
+ 
+/* ps0381 functions */
+/**************************************************************
+*                                                             *
+* Subroutine name : ParseOELine                               *
+*                                                             *
+* DESCRIPTION     : Parse careoe line                         *
+*                                                             *
+* INPUT           : oe_line                                   *
+*                                                             *
+* OUTPUT          : rss                                       *
+*                   code                                      *
+*                   oe                                        *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+static void ParseOELine(char *oe_line, char *rss, char *code, char *oe)
+{
+   char   func[]="ParseOELine";
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+   rss[0] = code[0] = oe[0] = '\0';
+   sscanf(oe_line, " %s %s %[^\n]", rss, code, oe);
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, ESA_RC_VOID);
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetCAREOE                                 *
+*                                                             *
+* DESCRIPTION     : Get interesting OE                        *
+*                                                             *
+* INPUT           : rss_name                                  *
+*                   file_careoe                               *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC GetCAREOE( RSS_typ                     rss_name,
+                  RESOURCE_typ                file_name,
+                  int                         msg_flag,
+                  CTSAMSG_DEST_TABLE_rec_typ *dest,
+                  CTSAMSG_HANDLE_rec_typ     *msgs)
+{
+  static       char func[] = "GetCAREOE";
+  ESA_RC       rc = ESA_OK;
+  RESOURCE_typ file_careoe;
+  int          header_msg = TRUE;
+  char         oe_line [1024];
+  RSS_typ      rss;
+  char         code[10] ;
+  OE_typ       oe;
+  FILE        *careoe = NULL;
+  char         ddn_with[50]="";                           /* SAS2IBMT */
+ 
+  /*
+   *  Initialize
+   */
+ 
+  ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+  ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, "RSS name %s",rss_name);
+ 
+  strcpy(file_careoe, file_name);
+  careoe_cnt = -1;
+ 
+  /*
+   *   Open file CAREOE
+   */
+ 
+  strcpy(ddn_with,"DD:");                                 /* SAS2IBMT */
+  strcat(ddn_with, file_careoe);                          /* SAS2IBMT */
+  /* strcpy(ddn_with,"//'");                                 SAS2IBMT */
+  /* strcat(ddn_with, file_careoe);                          SAS2IBMT */
+  /* strcat(ddn_with,"'");                                   SAS2IBMT */
+  ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,              /* SAS2IBMT */
+      "ESAOFSF: About to fopen %s", file_careoe);
+ 
+  /* SAS2IBMT careoe = fopen(file_careoe , "r");                     */
+  careoe = fopen(ddn_with , "r");                         /* SAS2IBMT */
+  if ( !careoe) {
+     CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                   "fopen", file_careoe, strerror(errno) );
+     ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                     "file %s/%s error %d/%s",
+                     file_careoe, "fopen", errno,
+                     strerror(errno));
+     rc = ESA_FATAL;
+     goto exit;
+  }
+ 
+ 
+  while ( fgets( oe_line, sizeof(oe_line), careoe) )   {
+ 
+     HANDLE_FILE_IOERR( careoe, file_careoe, "fgets")
+ 
+     if ( oe_line [0] NE '*' ) {  /* Record with the data */
+         /*   Parse the record  */
+         ParseOELine(oe_line, rss, code, oe);
+ 
+         ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 15,  /* BSAN100874 */
+                "rss=%d/%s code=%d/%s oe=%d/%s",     /* BSAN100874 */
+                strlen(rss),  rss,                   /* BSAN100874 */
+                strlen(code), code,                  /* BSAN100874 */
+                strlen(oe),   oe);                   /* BSAN100874 */
+ 
+         if (strlen(rss) EQ 0)             /* BSAN100874 */
+            continue;                      /* BSAN100874 */
+         else if (strcmp(rss, "*") EQ 0)   /* BSAN100874 */
+            continue;                      /* BSAN100874 */
+         else if (strlen(oe)  EQ 0)        /* BSAN100874 */
+            continue;                      /* BSAN100874 */
+         else if (strcmp(code, "2") EQ 0)  /* BSAN100874 */
+            continue;                      /* BSAN100874 */
+ 
+         if ( strlen(rss) GT 0 )
+            ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 15,
+                            "rss=%s code=%s oe=%s",
+                            rss, code,  oe );
+ 
+         if ( My_stricmp( rss, rss_name ) EQ 0 ) {
+            careoe_cnt++;
+            if (careoe_cnt LT MAX_CAREOE) {
+              if (header_msg) {
+                 header_msg = FALSE;
+                 if (msg_flag)
+                   CTSAMSG_print(ERR_3_STRINGS,
+                                 msgs,  NULL, dest,
+                     "Offline interceptor containers list:", "", "");
+              }
+              strcpy(care_oe_table[careoe_cnt] , oe);
+              if (msg_flag)
+                CTSAMSG_print(ERR_3_STRINGS,
+                              msgs,  NULL, dest,
+                              oe, "", "");
+            }
+            else {
+              careoe_cnt--;
+            }
+         }  /* My RSS name    */
+     }      /* Line with data */
+  } /* loop on careoe */
+ 
+  exit :;
+ 
+  if (rc EQ ESA_OK) {
+     if (careoe_cnt LT 0)  {
+       if (msg_flag)
+         CTSAMSG_print(ERR_3_STRINGS,
+                       msgs,  NULL, dest,
+                       "List Of Containers", "Is", "Empty");
+       rc = ESA_SKIP;
+     }
+  }
+ 
+  if ( careoe)
+     fclose(careoe);
+ 
+  ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+  return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetCAREOETable                            *
+*                                                             *
+* DESCRIPTION     : get care OE  table			              *
+*                                                             *
+* INPUT           : none	                                  *
+*                                                             *
+* OUTPUT          : _careoe_cnt                               *
+*					_care_oe_table							  *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+EXT ESA_RC GetCAREOETable (int       *_careoe_cnt,
+						   OE_typ    *_care_oe_table)
+{
+	static       char func[] = "GetCAREOE";
+	ESA_RC       rc = ESA_OK;
+	int			 i;
+ 
+   /*
+	*  Initialize
+	*/
+	ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+	*_careoe_cnt = careoe_cnt + 1;
+ 
+	for (i = 0; i < *_careoe_cnt; i++)
+	{
+		strncpy(_care_oe_table[i], care_oe_table[i], MAX_RSS_OE_NAME_LEN);
+	}
+ 
+	ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+	return rc;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetConnectionInfoByOE                     *
+*                                                             *
+* DESCRIPTION     : get connection information                *
+*                                                             *
+* INPUT           : connection_file - connection result file  *
+*                   connection_keywords                       *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC GetConnectionInfoByOE(
+        char                            *connection_file,
+        char                            *user_file,
+        char                            *ug_file,
+        OFLI_KEYWORDS_rec_typ           *connection_keywords,
+        OFFLINE_INTERCEPT_STUFF_rec_typ *offl_params)
+{
+   ESA_RC                               rc = ESA_OK;
+   char       func[]="GetConnectionInfoByOE";
+   unsigned   int                       size;
+   int                                  i;
+   int                                  i_dump;
+   void                                *io_handle = NULL;
+   int                                  get_done  = GET_DONE_SUCCESS;
+   OFFLINE_INTERCEPT_DB_RECORD_rec_typ  offli_db_record;
+   ADMIN_PARAMS_rec_typ                * admin_params;
+   int                                   ii;
+   int                                   jj;
+   int                                   kk;
+   char                                 *ug_ptr;
+   char                                  db_key[1024];
+   USER_typ                              db_user;
+   UG_typ                                db_group;
+   ESA_RC                                mask_rc;
+   OE_typ                                oe_filter;
+   int                                   isInOE;
+ 
+   /*
+    *  Get Connection parameters
+    */
+ 
+ 
+    GET_CONN_MODE          mode = GET_ALL_CONNS;
+    short                  max_connections = OFLI_GET_MAX_CONNECTION;
+    short                  actual_num;
+    HAVE_MORE_typ          have_more = HAVE_MORE;
+    void                  *get_connection_handle = NULL;
+    short                  num_user_in    = 0;
+    short                  num_ug_in      = 1;
+    USER_typ              *user_in        = NULL;
+    UG_typ                 ug_in[2];
+    U2UG_PARAMS_rec_typ   *u2ug_params    = NULL;
+    ADDINFO_rec_ptr       *addinfo        = NULL;
+    OBJ_EXISTS_typ        *objs_exist     = NULL;
+ 
+   /*   BSAN100422
+    *   Get User Offline file parameters
+    */
+ 
+    CTSAMSG_DEST_TABLE_rec_typ    * dest;
+    CTSAMSG_HANDLE_rec_typ        * msgs;
+ 
+    int                             user_records_cnt = 0;
+    int                             user_sorted;
+    char                           *user_db_records = NULL;
+    char                          **user_db_ptrs    = NULL;
+    char                           *user_foundb;
+    char                          **user_found;
+    USER_typ                        user_key;
+    char                           *user_key_p;
+ 
+    int                             ug_records_cnt = 0;
+    int                             ug_sorted;
+    char                           *ug_db_records = NULL;
+    char                          **ug_db_ptrs    = NULL;
+    char                           *ug_foundb;
+    char                          **ug_found;
+    UG_typ                          ug_key;
+    char                           *ug_key_p;
+ 
+   /*
+    *   Check Sum parameters
+    */
+ 
+    CHECKSUM_typ           CheckSum;
+    char                   CheckSumStr[sizeof(CHECKSUM_typ)+ 1];
+    ENVIRONMENT_rec_typ  * envir_ptr;
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+    CS_get_envir_address (&envir_ptr);
+    strcpy (ModeStr, "GET_ALL_CONNS");
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,DIAG_OS,
+                    "Result file %s", connection_file);
+    /* Start of BSAN100422 */
+ 
+    if (user_file AND ug_file) {
+      msgs = offl_params->msgs;
+      dest = offl_params->dest;
+      user_key_p = os_key;
+      ug_key_p   = os_key;
+ 
+      rc = DB2Memory(user_file, &user_db_records,
+                     &user_sorted, dest, msgs );
+      if ( rc NE ESA_OK ) {
+        rc = ESA_FATAL;
+        goto exit;
+      }
+ 
+      if ( user_db_records ) {  /* file not empty */
+         rc = BuildSortInfo(user_db_records, &user_db_ptrs,
+                            &user_records_cnt,
+                            dest, msgs);
+         if ( rc NE ESA_OK ) {
+           rc = ESA_FATAL;
+           goto exit;
+         }
+ 
+      }
+      rc = DB2Memory(ug_file, &ug_db_records,
+                     &ug_sorted, dest, msgs );
+      if ( rc NE ESA_OK ) {
+         rc = ESA_FATAL;
+         goto exit;
+      }
+ 
+      if ( ug_db_records ) {  /* file not empty */
+         rc = BuildSortInfo(ug_db_records, &ug_db_ptrs,
+                            &ug_records_cnt,
+                            dest, msgs);
+         if ( rc NE ESA_OK ) {
+           rc = ESA_FATAL;
+           goto exit;
+         }
+ 
+      }
+    }    /* if (user_file AND ug_file) */
+ 
+    /* End   of BSAN100422 */
+ 
+    admin_params=&offl_params->admin_params;
+    mode = GET_GROUPS_CONNS;
+    strcpy (ModeStr, "GET_GROUPS_CONNS");
+    jj = ug_records_cnt;
+ 
+    /*
+     * Get Array of max_users for output user names
+     */
+ 
+    size = max_connections * sizeof(U2UG_PARAMS_rec_typ);
+    u2ug_params  = (U2UG_PARAMS_rec_typ *)calloc (1, size);
+ 
+    if (u2ug_params EQ NULL) {
+       CTSAMSG_print (ERR_MALLOC,
+                      offl_params->msgs, NULL, offl_params->dest,
+                      "u2ug_params", size);
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    /*
+     * Get Array for obj_exist indicators
+     */
+ 
+    size = max_connections * sizeof (OBJ_EXISTS_typ);
+    objs_exist = (OBJ_EXISTS_typ *)calloc (1, size);
+ 
+    if (objs_exist EQ NULL) {
+       CTSAMSG_print (ERR_MALLOC,
+                      offl_params->msgs, NULL, offl_params->dest,
+                      "u2ug_params", size);
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    /*
+     * Get ADDINFO
+     */
+ 
+    rc = GetAddinfo( &addinfo, max_connections,
+                     connection_keywords,
+                     offl_params->dest, offl_params->msgs );
+    if (rc NE ESA_OK) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    /*
+     *  Open Connection DB
+     */
+ 
+    rc = OfflineIntrcptrDBOpen( &io_handle, OFLI_GROUP_DB,
+                                connection_file,
+                                OPEN_FOR_WRITE,
+                                offl_params->dest, offl_params->msgs);
+    if ( rc NE ESA_OK ) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,13,
+           "ug_records_cnt=%d(%d) user_records_cnt=%d.",
+           ug_records_cnt, jj, user_records_cnt);
+    for (ii=0; ii LT jj; ii++ )    {
+ 
+      ug_ptr = ug_db_ptrs[ii];
+      BuildKeyFromDBfile(ug_ptr, db_key, db_group, db_user);
+      strcpy(ug_in[0],  db_group);
+ 
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,13,"ii=%d ug=%s",ii, ug_in[0]);
+ 
+      /*
+       *  Get Connection ALL
+       */
+ 
+      have_more = HAVE_MORE;
+ 
+      while (have_more EQ HAVE_MORE) {
+ 
+         /*
+          *   Clear addinfo and output params
+          */
+ 
+         for (i=0; i LT max_connections; i++ )
+            ADDINFO_clear( addinfo[i] );
+ 
+         size = max_connections * sizeof(U2UG_PARAMS_rec_typ);
+         memset(u2ug_params , NULL_CHAR, size);
+ 
+         API_LOGIN
+         if ( rc NE ESA_OK ) {
+            rc = ESA_FATAL;
+            get_done = GET_DONE_WITH_FATAL;
+            goto exit;
+         }
+ 
+         /*
+          *  API call GetConnection
+          */
+ 
+         ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetConns with %s mode.", ModeStr);
+         CS_DIAG_UG2UC_IN (ESA_COMP_RSS_INTERCEPT,mode,max_connections,
+			 num_ug_in, num_user_in, ug_in, user_in,
+			 get_connection_handle, addinfo);
+         rc = (offl_params->func_ptr->gtug2uc_ptr) (mode,
+                                             max_connections,
+                                       &actual_num,
+                                       &have_more,
+                                       &get_connection_handle,
+                                       num_ug_in,
+                                       num_user_in,
+                                       ug_in,
+                                       user_in,
+                                       u2ug_params,
+                                       addinfo,
+                                       objs_exist,
+                                       &offl_params->admin_params,
+                                       offl_params->err);
+         ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetConns USA-API completed with rc=%d (%s).",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+         if (rc EQ ESA_OK)
+            CS_DIAG_UG2UC_OUT(ESA_COMP_RSS_INTERCEPT,actual_num,have_more,
+    			u2ug_params, objs_exist, get_connection_handle, addinfo);
+ 
+         API_LOGOUT
+         if ( rc EQ ESA_NOT_SUPP ) {
+            get_done = GET_DONE_SUCCESS;
+            rc = ESA_OK;
+            goto exit;
+         }
+         else if ( rc NE ESA_OK ) {
+            get_done = GET_DONE_WITH_FATAL;
+            break;
+         }
+         else
+            get_done = GET_DONE_SUCCESS;
+ 
+        /*
+         *  Print diagnostic information
+         */
+ 
+         ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+                         "max_conns=%d actual num=%d",
+                         max_connections, actual_num);
+ 
+         if ( ESA_DIAG_get_debug_level(ESA_COMP_RSS_INTERCEPT) GE 19) {
+ 
+            for (i_dump=0; i_dump LT actual_num; i_dump++) {
+               ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+               "User=%s Group=%s exist=%d connect_data=%d",
+               u2ug_params[i_dump].user,
+               u2ug_params[i_dump].group,
+               objs_exist[i_dump],
+               u2ug_params[i_dump].u2ug_admin_data);
+               if ( objs_exist[i_dump] EQ OBJ_EXIST )
+                  ADDINFO_dump(addinfo[i_dump],0);
+            }
+         }
+ 
+ 
+         /*
+          *   Build check-sum buffer
+          */
+ 
+         for (i=0; i LT actual_num; i++) {
+            if ( objs_exist[i] EQ OBJ_EXIST ) {
+ 
+              isInOE = FALSE;
+              for (kk=0; kk LE careoe_cnt; kk++ )    {  /* BSAN100846 */
+ 
+                strcpy(oe_filter, care_oe_table[kk]);
+                ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,15,
+                              "kk=%d oe=%s",
+                              kk, oe_filter);
+                strcpy(user_key, u2ug_params[i].user);
+                ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+    	        	"    -> Call to CTSIsUserInOE USA-API for USER=%s OE=%s.",
+					user_key, oe_filter);
+                mask_rc = (offl_params->func_ptr->isuserinoe_ptr) (
+                                        user_key,
+                                        oe_filter,
+                                        admin_params,
+                                        offl_params->err);
+                ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+	    		"    <- CTSIsUserInOE USA-API completed with rc=%d (%s).",
+		         	mask_rc, (mask_rc EQ ESA_OK) ? "YES" : "NO");
+                if (mask_rc EQ ESA_OK) {
+                   isInOE = TRUE;
+                   break;
+                }
+               }     /* for kk */
+ 
+               if (!isInOE)
+                  continue;    /* next object */
+ 
+              /* Start of  BSAN100422  */
+ 
+                 if (user_file AND user_db_records) {/*file not empty*/
+ 
+                   strcpy(user_key, u2ug_params[i].user);
+ 
+                   memset( os_key, ' ', sizeof(os_key) );
+                   os_key[sizeof(os_key)-1] = NULL_CHAR;
+                   memcpy(os_key, user_key, strlen(user_key));
+                   user_foundb = bsearch( &user_key_p, user_db_ptrs,
+                                      user_records_cnt,
+                                  sizeof(char *), db_search_compare);
+ 
+                   /* Avoid casting */
+ 
+                   memcpy ((char *)&user_found, (char *)&user_foundb,
+                           sizeof (user_found));
+ 
+                   if (NOT user_found) {
+                     CTSAMSG_print(MSG_OFLI_CNN_EVT_IGN,
+                                   msgs, NULL, dest,
+                                   u2ug_params[i].user,
+                                   u2ug_params[i].group,
+                                   "User", u2ug_params[i].user);
+                     continue;
+                    }
+                 }  /* if (user_file AND user_db_records) */
+ 
+                 if ( ug_file AND ug_db_records ) {/*file not empty*/
+ 
+                   strcpy(ug_key, u2ug_params[i].group);
+ 
+                   memset( os_key, ' ', sizeof(os_key) );
+                   os_key[sizeof(os_key)-1] = NULL_CHAR;
+                   memcpy(os_key, ug_key, strlen(ug_key));
+                   ug_foundb = bsearch( &ug_key_p, ug_db_ptrs,
+                                      ug_records_cnt,
+                                 sizeof(char *), db_search_compare);
+                   /* Avoid casting */
+ 
+                   memcpy ((char *)&ug_found, (char *)&ug_foundb,
+                           sizeof (ug_found));
+ 
+                   if (NOT ug_found) {
+                     CTSAMSG_print(MSG_OFLI_CNN_EVT_IGN,
+                                   msgs, NULL, dest,
+                                   u2ug_params[i].user,
+                                   u2ug_params[i].group,
+                                   "Group", u2ug_params[i].group);
+                     continue;
+                    }
+               } /* if ( ug_file AND ug_db_records ) */
+ 
+            /* End   of  BSAN100422  */
+               GetConnectionCheckSum( &CheckSum,
+                                      &u2ug_params[i], addinfo[i] );
+                 memcpy (CheckSumStr, CheckSum, sizeof(CHECKSUM_typ));
+                 CheckSumStr[sizeof(CHECKSUM_typ)]= '\0';
+               ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,15,
+                               "user=%s group=%s check-sum=%s",
+                               u2ug_params[i].user,
+                               u2ug_params[i].group, CheckSumStr);
+ 
+               /* Write CheckSUm */
+ 
+               memset( (char *)&offli_db_record.obj1, ' ',
+                       sizeof(offli_db_record.obj1) );
+ 
+               memset( (char *)&offli_db_record.obj2, ' ',
+                       sizeof(offli_db_record.obj2) );
+ 
+               strcpy( (char *)offli_db_record.obj1,
+                       u2ug_params[i].user );
+ 
+               strcpy( (char *)offli_db_record.obj2,
+                       u2ug_params[i].group );
+ 
+               memcpy( (char *)&offli_db_record.CheckSum,
+                       (char *)CheckSum, sizeof( CheckSum ) );
+ 
+               offli_db_record.ess_flag = ' ';
+               offli_db_record.eol      = '\n';   /* NEW_LINE; */
+ 
+               rc = OfflineIntrcptrDBWrite( io_handle,
+                                            OFLI_CONNECTION_DB,
+                                            connection_file,
+                                            &offli_db_record,
+                                            offl_params->dest,
+                                            offl_params->msgs);
+               if ( rc NE ESA_OK ) {
+                  rc = ESA_FATAL;
+                  get_done = GET_DONE_WITH_FATAL;
+                  goto exit;
+               }
+ 
+            }
+         }
+ 
+      }    /* while HAVE_MORE */
+    }      /* ii  ps0381      */
+ 
+    exit :;
+ 
+    /*
+     *  If was Unsuccessfull termination.
+     *  API call free his handle
+     */
+ 
+    if ( get_connection_handle ) {
+ 
+       API_LOGIN
+       if ( rc EQ ESA_OK ) {
+          ESA_RC rcc= ESA_OK;
+          mode =  GET_FREE_HANDLE_CONNS;
+          strcpy (ModeStr, "GET_FREE_HANDLE_CONNS");
+ 
+          /*
+           * API call GetConnection ( FREE HANDLE )
+           */
+ 
+          ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetConns with %s mode.", ModeStr);
+          CS_DIAG_UG2UC_IN(ESA_COMP_RSS_INTERCEPT,mode,0,
+			 0, 0, ug_in, user_in,
+			 get_connection_handle, addinfo);
+          rcc= (offl_params->func_ptr->gtug2uc_ptr) (mode,
+                                               max_connections,
+                                   &actual_num,
+                                   &have_more,
+                                   &get_connection_handle,
+                                   num_ug_in,
+                                   num_user_in,
+                                   ug_in,
+                                   user_in,
+                                   u2ug_params,
+                                   addinfo,
+                                   objs_exist,
+                                   &offl_params->admin_params,
+                                   offl_params->err);
+         ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetConns USA-API completed with rc=%d (%s).",
+			     rcc, (rcc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+         if (rcc EQ ESA_OK)
+            CS_DIAG_UG2UC_OUT(ESA_COMP_RSS_INTERCEPT,0,have_more,
+    			u2ug_params, objs_exist, get_connection_handle, addinfo);
+         API_LOGOUT
+       }
+       else {
+          CTSAMSG_print(ERR_INTERNAL2,
+           offl_params->msgs, NULL, offl_params->dest,
+           component, func,
+           "GetConnection handle not freed due to Login failure",
+           16, __LINE__);
+          rc = ESA_FATAL;
+          get_done = GET_DONE_WITH_FATAL;
+       }
+    }
+ 
+    /*
+     *  Close DB and Sort.
+     */
+ 
+    if ( io_handle ) {
+       OfflineIntrcptrDBClose( &io_handle,
+                               OFLI_CONNECTION_DB,
+                               connection_file,
+                               offl_params->dest, offl_params->msgs);
+       if (get_done EQ GET_DONE_SUCCESS) {
+         rc = OfflineIntrcptrDBSort ( OFLI_CONNECTION_DB,
+                                      connection_file,
+                                      offl_params->dest,
+                                      offl_params->msgs);
+         if ( rc NE ESA_OK ) {
+            rc = ESA_FATAL;
+            get_done = GET_DONE_WITH_FATAL;
+         }
+       }
+    }
+ 
+    /*
+     *   Free
+     */
+ 
+    if ( u2ug_params )
+       free( u2ug_params );
+ 
+    if ( objs_exist )
+       free(  objs_exist );
+ 
+    if ( addinfo )
+       FreeAddinfo ( max_connections, &addinfo );
+ 
+ 
+    if ( user_db_records )
+       free( user_db_records );
+ 
+    if ( user_db_ptrs )
+       free( user_db_ptrs );
+ 
+ 
+    if ( ug_db_records )
+       free( ug_db_records );
+ 
+    if ( ug_db_ptrs )
+       free( ug_db_ptrs );
+ 
+    if ( get_done NE GET_DONE_SUCCESS)
+       rc = ESA_FATAL;
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+    return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : CheckEvent                                *
+*                                                             *
+* DESCRIPTION     : Check before sending to ESS               *
+*                                                             *
+* INPUT           : obj_code, object                          *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_OK, ESA_SKIP                          *
+*                                                             *
+**************************************************************/
+ 
+static ESA_RC CheckEvent(char                            * obj_code,
+                         char                            * object,
+                         OFFLINE_INTERCEPT_STUFF_rec_typ * offl_params)
+{
+   ESA_RC          rc = ESA_OK;
+   ESA_RC          mask_rc = ESA_OK;
+   char            func[]="CheckEvent";
+   OE_typ          oe_filter;
+   int             kk;
+   int             isInOE;
+   ADMIN_PARAMS_rec_typ  * admin_params;
+ 
+   /*
+    *   Initialize
+    */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   admin_params=&offl_params->admin_params;
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,15,
+                   "Obj_code=%s Object=%s",
+                   obj_code, object );
+ 
+   isInOE = FALSE;
+   /* BSAN100846 for (kk=0; kk LT careoe_cnt; kk++ )    {  */
+   for (kk=0; kk LE careoe_cnt; kk++ )    {  /* BSAN100846 */
+ 
+      strcpy(oe_filter, care_oe_table[kk]);
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,15,
+                    "kk=%d oe=%s",
+                    kk, oe_filter);
+      if (strcmp(obj_code, "US") EQ 0)
+	  {
+         ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+    	        	"    -> Call to CTSIsUserInOE USA-API for USER=%s OE=%s.",
+					object, oe_filter);
+         mask_rc = (offl_params->func_ptr->isuserinoe_ptr) (
+                                 object,
+                                 oe_filter,
+                                 admin_params,
+                                 offl_params->err);
+         ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+	    		"    <- CTSIsUserInOE USA-API completed with rc=%d (%s).",
+		         	mask_rc, (mask_rc EQ ESA_OK) ? "YES" : "NO");
+	  }
+      else if (strcmp(obj_code, "UG") EQ 0)
+	  {
+         ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+    		"    -> Call to CTSIsUGInOE USA-API for UG=%s OE=%s.", object, oe_filter);
+         mask_rc = (offl_params->func_ptr->isuginoe_ptr) (
+                                 object,
+                                 oe_filter,
+                                 admin_params,
+                                 offl_params->err);
+         ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+	    		"    <- CTSIsUGInOE USA-API completed with rc=%d (%s).",
+		    	mask_rc, (mask_rc EQ ESA_OK) ? "YES" : "NO");
+ 
+	  }
+      else if (strcmp(obj_code, "OE") EQ 0)
+	  {
+         ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+    		"    -> Call to CTSIsOEInOE USA-API for OE=%s OE=%s.", object, oe_filter);
+         mask_rc = (offl_params->func_ptr->isoeinoe_ptr) (
+                                 object,
+                                 oe_filter,
+                                 admin_params,
+                                 offl_params->err);
+         ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+	    		"    <- CTSIsOEInOE USA-API completed with rc=%d (%s).",
+		    	mask_rc, (mask_rc EQ ESA_OK) ? "YES" : "NO");
+	  }
+      if (mask_rc EQ ESA_OK) {
+         isInOE = TRUE;
+         break;
+      }
+     }     /* for kk */
+ 
+     if (!isInOE)
+        rc = ESA_SKIP;
+     else
+        rc = ESA_OK;
+ 
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+    return rc;
+ 
+}

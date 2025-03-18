@@ -1,0 +1,332 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: ctsqcr.c %
+ * Instance        : %instance: 1 %
+ * Created by      : %created_by: alevin %
+ * Created on      : %date_created: Thu Jul 29 10:50:01 2004 %
+ * Current Version : %version: 3 %
+ * Last Modified by: %derived_by: alevin %
+ * Last Modified on: %date_modified: Wed Sep 17 12:31:46 2003 %
+ */
+ 
+/******************************************************************
+ * Mod.ID  Who      When         Description
+ * ================================================================
+ * ws0455  ShmuelK  17/06/01     OS/390&MVS changes
+ *                  to support Q-resize option
+ * IMH001  Ian H.   17/09/03      Add support for CheckAndPrintVersion
+ * BS10076 SeligT   11/12/17      Organize Connector Locking
+ *                                Functions and Structures
+ ******************************************************************/
+ 
+#define    THIS_IS_MAIN
+#include   "globs.h"
+ 
+#include   STDIO
+#include   STRING
+ 
+#include   ESA_API
+#include   ESA_CTSAMSG
+#include   ESA_QUEUE
+#include   ESA_CS_OS
+#include   ESA_INIT
+#include   ESA_API_CODES
+/*#include   ESA_OS_CONSOLE*/
+#include   ESA_RSSF
+#include   ESA_VER
+ 
+#define QSIZE       80000
+ 
+/**************************************************************
+*                                                             *
+*   QCR main                                                  *
+*                                                             *
+**************************************************************/
+ 
+ 
+int main (int argc, char **argv)
+ 
+{
+   ESA_RC                rc= ESA_OK ;
+   void                * lock_handle= NULL;
+   Q_HANDLE              NewQ_handle;
+   RESOURCE_typ          TempQueueName;
+   unsigned int          message_size;
+   char                  msg_ptr[ERR_MSG_TEXT_LEN+ 1];
+   /* BS10076 changed for SAS C to IBM C conversion
+   char                  ReSize[]="/r", ReSIZE[]="/R"; */
+   char                  ReSize[]="r",  ReSIZE[]="R";     /* BS10076 */
+   char PrgPrm[]="Missing resize parameter: CTSQCR [/R [queue name]]";
+   ENVIRONMENT_rec_typ * envir_ptr;
+   char                  fn[]="CTSQCR";
+   char                  qname[]="CTSQCR"; /*ws0455 */
+   int                   seconds; /*ws0455*/
+   char                  wait_seconds[RSSPRM_VALUE_LEN+ 1]; /*ws0455*/
+   char                  wait_queue_char[10] = " ";       /* BS10076 */
+   char                  wait_queue_interval_char[10]=" ";/* BS10076 */
+   int                   wait_queue_value;                /* BS10076 */
+   int                   wait_queue_interval_value;       /* BS10076 */
+ 
+  /*
+   *    Prolog
+   */
+ 
+   rc= CG_prolog (ESA_QCR_PROC, argc, argv);
+ 
+   CS_get_envir_address (&envir_ptr);
+ 
+   if (rc NE ESA_OK) {
+      fprintf (stderr, PROLOG_INIT_ERROR, ESA_MAIN_QCR,
+               ESA_rc2str(rc));
+      goto exit;
+   }
+ 
+   ESA_DIAG_enter (ESA_COMP_QUEUE, 1, fn);
+ 
+   if ( (ESA_DIAG_get_debug_level(ESA_COMP_ACSINTF) GT DIAG_BASIC) OR
+        (ESA_DIAG_get_debug_level(ESA_COMP_QUEUE)   GT DIAG_BASIC) )
+      ESA_DIAG_printf(0,0,"Line %04d: On %s Compiled %s.",
+                      __LINE__,__TIMESTAMP__,__FILE__);
+ 
+/* IMH001 start */
+ 
+   rc = CheckAndPrintVersion (argc, argv);
+   if (rc EQ ESA_OK)
+       goto exit;
+ 
+    rc = ESA_OK;
+/* IMH001 end */
+ 
+  /*
+   *    Get parameters from environment
+   */
+ 
+   if ( envir_ptr->file_queue[0] EQ NULL_CHAR )    /* queue file */
+   {
+      fprintf (stderr, "Undefined queue file\n");
+      rc  = ESA_ERR;
+      goto exit;
+   }
+ 
+   if (envir_ptr->queue_size EQ 0 )
+      envir_ptr->queue_size= QSIZE ; /* Default    */;
+ 
+ 
+   /*  spr191  start */
+ 
+   /***** init lock *****/
+ 
+   /* * * * * * * BS10076 start * * * * * * */
+   rc = rssprm_get_opt (ALL_RSS, "WAIT_QUEUE",
+                    sizeof(wait_queue_char),
+                    wait_queue_char,
+                    OPT_TRUE,
+                    OPT_FALSE);
+ 
+   if (rc EQ ESA_OK)
+      wait_queue_value = atoi(wait_queue_char);
+   else
+      wait_queue_value = WAIT_QUEUE_TOTAL;
+ 
+   ESA_DIAG_printf (ESA_COMP_QUEUE, 6,
+                    "WAIT_QUEUE parm = <%s> = <%d>",
+                    wait_queue_char,
+                    wait_queue_value);
+ 
+   rc = rssprm_get_opt (ALL_RSS, "WAIT_QUEUE_INTERVAL",
+                    sizeof(wait_queue_interval_char),
+                    wait_queue_interval_char,
+                    OPT_TRUE,
+                    OPT_FALSE);
+ 
+   if (rc EQ ESA_OK)
+      wait_queue_interval_value = atoi(wait_queue_interval_char);
+   else
+      wait_queue_interval_value = WAIT_QUEUE_INTERVAL_DFLT;
+ 
+   ESA_DIAG_printf (ESA_COMP_QUEUE, 6,
+                    "WAIT_QUEUE_INTERVAL parm = <%s> = <%d>",
+                    wait_queue_interval_char,
+                    wait_queue_interval_value);
+   /* * * * * * * BS10076 end * * * * * * */
+ 
+   /* BS10076
+   rc = OS_CS_lock_init (qname, LOCK_RES_FILE, &lock_handle, NULL,
+                         SCOPE_REMOTE, &envir_ptr->msg_params);      */
+   rc = OS_CS_lock_init (qname, &lock_handle,             /* BS10076 */
+                         wait_queue_value,                /* BS10076 */
+                         wait_queue_interval_value,       /* BS10076 */
+                         SCOPE_REMOTE, &envir_ptr->msg_params);
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   /***** Lock File *****/
+ 
+   /* BS10076 remove these lines
+   CLEAR (wait_seconds);
+   rc= envir_ptr->msg_admin_param.cs_func.rssprm_get_ptr (ALL_RSS,
+             WAIT_LOCK, 10, wait_seconds);
+   if (rc NE ESA_OK)
+      goto exit;
+   seconds= atoi (wait_seconds);                                     */
+ 
+   rc = OS_CS_lock ( lock_handle,
+          /* BS10076 seconds,                                        */
+                     &envir_ptr->msg_params );
+   if (rc NE ESA_OK) {
+      CTSAMSG_print(ERR_QUEUE_LOCKED,
+                  envir_ptr->ctsamsg_handle,
+                  NULL,
+                  envir_ptr->ctsamsg_dest,
+                  qname );
+      rc = ESA_LOCKED;
+      goto exit;
+   }
+ 
+   /* spr191 end   */
+ 
+   if (argc GT 1)
+   {
+   ESA_DIAG_printf (ESA_COMP_QUEUE, 6,                    /* BS10076 */
+                    "Parm 1 = <%s>", argv[1]);            /* BS10076 */
+    if (
+       (strcmp (ReSize, argv[1]) NE 0)
+            AND
+          (strcmp (ReSIZE, argv[1]) NE 0)
+          )
+    {
+    printf (PrgPrm);
+          /*OS_CONSOLE_print (PrgPrm,
+                        OS_CONS_ROLLABLE_YES,
+                        OS_CONS_SEV_ERROR);*/
+          CTSAMSG_print(ERR_3_STRINGS ,
+            envir_ptr->ctsamsg_handle, NULL,
+                  envir_ptr->ctsamsg_dest,
+                  PrgPrm, " .", " Exit from program.");
+          goto exit;
+    }
+ 
+    if (argc GT 2)
+       {
+             ESA_DIAG_printf (ESA_COMP_QUEUE, 6,          /* BS10076 */
+                              "Parm 2 = <%s>", argv[2]);  /* BS10076 */
+             strcpy (TempQueueName, argv[2]);
+        }
+       else
+    {
+          #ifdef TMPQUEUEFILE
+          rc = CS_os_file_name(TMPQUEUEFILE, TempQueueName);
+             if (rc NE ESA_OK)
+                goto exit;
+          #else
+           sprintf (TempQueueName, "%st", envir_ptr->file_queue);
+          #endif
+    }
+   /***** Resize Queue File *****/
+ 
+      rc= OS_Q_create (TempQueueName,
+                       envir_ptr->queue_size,
+                       &envir_ptr->msg_params);
+      ESA_DIAG_printf (ESA_COMP_QUEUE, 5,
+    "Create queue %s, with rc=%ld.", TempQueueName, rc);
+      if (rc NE ESA_OK)
+         goto exit;
+ 
+      /* Copy all records from old queue to new */
+      rc = OS_Q_open (TempQueueName,
+                      &NewQ_handle,
+                      &envir_ptr->msg_params);
+      ESA_DIAG_printf (ESA_COMP_QUEUE, 5, "Open queue %s with rc=%d.",
+                       TempQueueName, (int)rc);
+      if (rc NE ESA_OK)
+         goto exit;
+ 
+      rc = OS_Q_open (envir_ptr->file_queue,
+                      &envir_ptr->q_handle,
+                      &envir_ptr->msg_params);
+      ESA_DIAG_printf (ESA_COMP_QUEUE, 5, "Open queue %s with rc=%d.",
+                envir_ptr->file_queue,(int)rc);
+                    /* TempQueueName, (int)rc); ws0455 */
+      if (rc NE ESA_OK)
+         goto exit;
+ 
+      while (1)
+   {
+          rc= OS_Q_get ((void *) msg_ptr,
+                   (int *) & message_size,
+                   (int)ERR_MSG_TEXT_LEN,
+                   envir_ptr->q_wait,
+                   &envir_ptr->q_handle);
+          if (rc NE ESA_OK)
+             break;
+          ESA_DIAG_printf (ESA_COMP_QUEUE, 5, "get rec=%.*s.",
+                           message_size, msg_ptr);
+          rc= OS_Q_put ((void *) msg_ptr,
+                   (int)message_size,
+                   envir_ptr->q_wait ,
+                   &NewQ_handle);
+          ESA_DIAG_printf (ESA_COMP_QUEUE, 5, "put rec. rc=%d.",rc);
+          if (rc NE ESA_OK)
+             break;
+   }
+ 
+      if (
+            (rc EQ ESA_OK)
+           OR
+            (rc EQ ESA_EOF)
+           OR
+            (rc EQ ESA_MBX_EMPTY)
+         )
+         rc= ESA_OK;
+      else
+         goto exit;
+ 
+      OS_Q_close (&envir_ptr->q_handle);
+      OS_Q_close (&NewQ_handle);
+ 
+      rc= OS_Q_rename (TempQueueName,
+                 envir_ptr->file_queue,
+           &envir_ptr->msg_params);
+   if (rc EQ ESA_OK)
+         CTSAMSG_print(MSG_FILE_RENAME,
+                 envir_ptr->ctsamsg_handle, NULL,
+                       envir_ptr->ctsamsg_dest,
+           TempQueueName,
+                       envir_ptr->file_queue);
+      goto exit;
+   }
+ 
+   /* Create/Clear QUEUE */
+ 
+   rc = OS_Q_create (envir_ptr->file_queue,
+                  envir_ptr->queue_size,
+      &envir_ptr->msg_params);
+ 
+   if (rc NE ESA_OK) {
+      fprintf (stderr, "Failed to create queue file %s, rc = %ld\n",
+               envir_ptr->file_queue, rc);
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+  exit: ;
+ 
+   if ( lock_handle ) {
+      if ( rc NE ESA_LOCKED )
+         OS_CS_unlock( lock_handle, &envir_ptr->msg_params);
+ 
+      OS_CS_lock_term( &lock_handle, &envir_ptr->msg_params);
+   }
+ 
+   rc = (rc EQ ESA_NOT_SUPP ? ESA_OK   : rc );
+ 
+   CG_epilog (rc , 0);
+   ESA_DIAG_exit (ESA_COMP_QUEUE, 1, fn, rc);
+ 
+   return (rc EQ ESA_OK ? PLAT_OK_STAT : PLAT_FAIL_STAT);
+ 
+} /* QCR main */
+ 

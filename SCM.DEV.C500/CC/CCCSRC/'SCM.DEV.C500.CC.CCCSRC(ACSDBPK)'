@@ -1,0 +1,1522 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: acsdbpk.c %
+ * Instance        : %instance: 1 %
+ * Created by      : %created_by: ihoffma %
+ * Created on      : %date_created: Wed Nov 19 19:02:33 2003 %
+ * Current Version : %version: 3 %
+ * Last Modified by: %derived_by: ihoffma %
+ * Last Modified on: %date_modified: Wed Nov 19 19:02:33 2003 %
+ */
+ 
+/**************************************************************
+ * Mod.ID   Who      When         Description
+ * ============================================================
+ * IMH001   Ian H.   19-Nov-03    WSAN101342 Thread-safe code (ERRNO)
+ * SAS2IBMA AvnerL   21-Dec-16    SAS/C to IBM C Conversion Project
+ * WS10078KG KailasP 23-Apr-20    Support Roles and Source
+ * BS10106  KailasP  06-Aug-20    Initialize num of role/source kwds
+ * WS10082K KailasP  24-Jan-23    Addinfo related changes
+ *************************************************************/
+#define ACSDBPK_C
+ 
+#include   "globs.h"
+ 
+#include   ERRNO    /* IMH001 */
+#include   ESA_API
+#include   ESA_ESAADI /* WS10082M */
+#include   ESA_MSG
+#include   ESA_RSS
+#include   ESA_RSSF
+#include   ESA_SYNC
+#include   ESA_CS_DBPKG
+#include   ESA_CS_SINFO
+#include   STDLIB
+ 
+#define CS_DAIG_RssApiPrm        DBPK001
+#define CS_DAIG_RssApiKwd        DBPK002
+#define CS_DAIG_RssApiKwdsForRss DBPK003
+ 
+ 
+void CS_DAIG_RssApiPrm (void);
+void CS_DAIG_RssApiKwd (void);
+void CS_DAIG_RssApiKwdsForRss (void);
+ 
+ 
+/****************************************************
+ * Procedure Name: CS_db_key_put
+ * Description   : put row to file_keywrds for spacific RSS and API
+ * Input         : buf - row structure
+ * Return Value  : ESA_RC
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_db_key_put (RSSAPIKWD_rec_ptr buf)
+{
+   char                  fn[]="CS_db_key_put";
+   ESA_RC                rc = ESA_OK;
+   FILE                * file_handle= NULL;
+   RSSAPI_KWD_rec_typ  * out_buf= NULL;
+   RSSAPI_KWD_rec_ptr    kwd_ptr= NULL;
+   int                   i= 0;
+   ENVIRONMENT_rec_typ * envir_ptr;
+ 
+   CS_get_envir_address (&envir_ptr);
+ 
+   ESA_DIAG_enter (ESA_COMP_ACSDBPK, DIAG_COMMON, fn);
+   ESA_DIAG_printf (ESA_COMP_ACSDBPK, 13,
+                    "Keywords file is %s", envir_ptr->file_rsskwds);
+   rc= CSA_alloc((char **)&out_buf,
+                 0,
+                 (sizeof(RSSAPI_KWD_rec_typ)* buf->num_keywords),
+                 1, fn, "Max rss-api  keywords");
+   if (rc NE ESA_OK)
+       goto cleanup;
+   kwdrow_trans_for_put (buf, out_buf);
+   rc= CS_kwds_check (buf->num_keywords, out_buf);
+   if (rc NE ESA_OK)
+     goto cleanup;
+   rc= CSA_open (envir_ptr->file_rsskwds, fn,
+                 FILE_CREAT, &file_handle, SCOPE_LOCAL);
+   if (rc NE ESA_OK)
+     goto cleanup;
+ 
+   rc= CSA_fputs (envir_ptr->file_rsskwds,
+                  FILE_NOTE_LINE,
+                  file_handle);
+   if (rc NE ESA_OK)
+      goto cleanup;
+ 
+   for (i= 0; i LT envir_ptr->kwd_num; i++) {
+     kwd_ptr= envir_ptr->keywrds+ i;
+     if (My_memicmp ((char *)kwd_ptr->rss, (char *)out_buf->rss,
+                 RSS_NAME_LEN) EQ 0 AND
+         memcmp ((char *)kwd_ptr->api, (char *)out_buf->api,
+                 ADINF_TYP_LEN) EQ 0)
+        continue;
+     rc= CSA_fputs (envir_ptr->file_rsskwds,
+                    (char *)(envir_ptr->keywrds+ i),
+                    file_handle);
+     if (rc NE ESA_OK)
+        goto cleanup;
+ 
+     ESA_DIAG_printf (ESA_COMP_ACSDBPK, 15,
+         "Output %d record=(%s)", i+ 1, envir_ptr->keywrds+ i);
+   } /* for */
+ 
+ 
+   /*
+    *   Add rows  into keywrds_file
+    */
+ 
+   for (i= 0; i LT buf->num_keywords; i++) {
+      rc= CSA_fputs (envir_ptr->file_rsskwds,
+                     (char *)(out_buf +i),
+                     file_handle);
+      if (rc NE ESA_OK)
+        goto cleanup;
+ 
+      ESA_DIAG_printf (ESA_COMP_ACSDBPK, 16,
+               "Output %d record=(%s)", i+ 1, out_buf+ i);
+   }
+ 
+   CSA_close (envir_ptr->file_rsskwds, fn);
+ 
+   rc= rssapikwd_load ();
+ 
+  cleanup:
+   if (rc NE ESA_OK)
+    CSA_close (envir_ptr->file_rsskwds, fn);
+   if (out_buf NE NULL)
+      CSA_free((char **)&out_buf);
+ 
+   if (rc NE ESA_OK)
+     CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+   ESA_DIAG_exit (ESA_COMP_ACSDBPK, DIAG_COMMON, fn, rc);
+   return(rc);
+}
+ 
+/****************************************************
+ * Procedure Name: CS_db_key_get
+ * Description   : get list of keywords  for specific RSS and API
+ * Input         : rss       - RSS name
+ *                 api       - API function code
+ * Input/Output  : buf       - pointer to RSSAPIKWD_rec_typ
+ * Return Value  : ESA_RC
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_db_key_get (RSS_typ                rss,
+                      short                  api,
+                      RSSAPIKWD_rec_ptr      buf)
+{
+  char                  fn[]="CS_db_key_get";
+  int                   i= 0, j= 0;
+  char                  str_api[ADINF_TYP_LEN+ 1];
+  RSSAPI_KWD_rec_ptr    kwd_ptr= NULL;
+  ESA_RC                rc= ESA_OK;
+  RSS_typ               rss_wrk, rss_type;
+  short                 func_name;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSDBPK, DIAG_COMMON, fn);
+  ESA_DIAG_printf (ESA_COMP_ACSDBPK, 13,
+           "rss %s api %d envir_ptr->kwd_num=%d.", rss, (int)api, envir_ptr->kwd_num);
+ 
+  rc= rssprm_get (rss, RSS_TYPE, RSS_NAME_LEN, rss_type);
+  if (rc NE ESA_OK)
+     goto cleanup;
+ 
+  func_name= api;
+  if (api EQ FUNC_ADDRES)
+      func_name= FUNC_UPDRES;
+  memset ((char *)buf, '\0', sizeof (RSSAPIKWD_rec_typ));
+  buf->num_keywords= 0;
+  sprintf (str_api, "%02d", (int)func_name);
+  for (i= 0,j= 0; i LT envir_ptr->kwd_num; i++ ) {
+     kwd_ptr= envir_ptr->keywrds+ i;
+     memset ((char *)rss_wrk, '\0', sizeof (rss_wrk));
+     memcpy ((char *)rss_wrk, (char *)kwd_ptr->rss, RSS_NAME_LEN);
+     strtok (rss_wrk, WHITECHARS);
+     ESA_DIAG_printf (ESA_COMP_ACSDBPK, 13,
+          "kwd_ptr=%.*s rss_wrk=%s str_api=%s kwd_ptr->api=%.2s.",
+		  sizeof(RSSAPI_KWD_rec_typ),(char *)kwd_ptr, rss_wrk, str_api, (char *)kwd_ptr->api);
+     if (strncmp (rss_type, rss_wrk, RSS_NAME_LEN) NE 0)
+        continue;
+     if (memcmp ((char *)str_api, (char *)kwd_ptr->api,
+                 ADINF_TYP_LEN) NE 0)
+        continue;
+     kwdrow_trans_for_get (kwd_ptr, buf);
+     j++;
+     ESA_DIAG_printf (ESA_COMP_ACSDBPK, 16,
+                  "Rss type %s Keyword %s.", rss_type, kwd_ptr);
+  }
+  if (j EQ 0 AND
+      api NE FUNC_GTRSPRM) {
+     rc= ESA_KEY_NOT_FOUND;
+     CTSAMSG_print (ERR_CS_RSS_ENTITY,
+                    envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                    envir_ptr->msg_admin_param.ctsamsg_dest,
+                    rss, envir_ptr->file_rsskwds,
+                    CS_func_nmbr_to_func_name (api));
+  }
+  cleanup:
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+  ESA_DIAG_exit (ESA_COMP_ACSDBPK, DIAG_COMMON, fn, rc);
+  return (rc);
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : rssapikwd_load                           *
+*                                                             *
+* Description      : Load file_keywrds to the memory          *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC rssapikwd_load (void)
+{
+  char fn[]="rssapikwd_load";
+  ESA_RC                rc = ESA_OK;
+  FILE                * file_handle= NULL;
+  RSSAPI_KWD_rec_typ    in_buf;
+  RSS_typ               rss_type;
+  char                  rss_type_jj[RSS_NAME_LEN+3], * chk_ptr;
+  ADDINFO_typ           info_type;
+  int                   api, ii, jj, alloc_kwd_num= 0;
+  char                * filled_already= NULL, * chk_ptr2;
+  char                  tmp_str[sizeof (RSSAPI_KWD_rec_typ)+ 1];
+ 
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSDBPK, DIAG_COMMON, fn);
+  ESA_DIAG_printf (ESA_COMP_ACSDBPK, DIAG_DETAILES,
+    "...-> : file_rsskwds=%s envir_ptr= %p.", envir_ptr->file_rsskwds, envir_ptr);
+ 
+  rc= CSA_open (envir_ptr->file_rsskwds, fn,
+                FILE_OPEN_FOR_UPDATE, &file_handle, SCOPE_LOCAL);
+  if (rc NE ESA_OK)
+   goto cleanup;
+ 
+  for (ii= 0; ii LT envir_ptr->max_rss_num; ii++)
+  {
+     envir_ptr->interest[ii].num_usr_kwds= 0;
+     envir_ptr->interest[ii].num_ug_kwds=  0;
+     envir_ptr->interest[ii].num_oe_kwds=  0;
+     envir_ptr->interest[ii].num_u2ug_kwds=0;
+     envir_ptr->interest[ii].num_res_kwds= 0;
+     envir_ptr->interest[ii].num_ace_kwds= 0;
+     envir_ptr->interest[ii].num_rss_kwds= 0;
+     envir_ptr->interest[ii].num_entity_kwds= 0;
+     envir_ptr->interest[ii].num_xrol_kwds= 0;    /* BS10106 */
+     envir_ptr->interest[ii].num_xsgp_kwds= 0;    /* BS10106 */
+  }
+  envir_ptr->num_entity_kwds= 0;
+ 
+  CSA_free ((char **)&envir_ptr->keywrds);
+ 
+  /*
+   *   Load file_keywrds into memory (*keywrds)
+   */
+ 
+  for (envir_ptr->kwd_num= 0; ; envir_ptr->kwd_num++) {
+ 
+    rc= CSA_fgets (envir_ptr->file_rsskwds,
+                   (char *)&in_buf,
+                   sizeof(RSSAPI_KWD_rec_typ),
+                   file_handle);
+    if (rc NE ESA_OK)
+    {
+        if (rc EQ ESA_EOF)
+            rc= ESA_OK;
+        goto cleanup;
+    }
+ 
+    if (in_buf.rss[0] EQ SKIP_LINE OR
+        in_buf.rss[0] EQ '\n'      OR
+        in_buf.rss[0] EQ ' ') {
+      envir_ptr->kwd_num--;
+      continue;
+    }
+ 
+    /*
+     *   Load row to the allocated Buffer *keywrds
+     */
+    ESA_DIAG_printf (ESA_COMP_ACSDBPK, DIAG_DETAILES+ 1,
+                   "Record %d is %s.", envir_ptr->kwd_num+ 1, &in_buf);
+ 
+    memcpy (rss_type_jj, in_buf.rss, sizeof (rss_type_jj));
+    rss_type_jj[RSS_NAME_LEN+ 2]= '\0';
+    strtok (rss_type_jj, WHITECHARS);
+    chk_ptr=strtok (NULL, WHITECHARS);
+    if (chk_ptr NE NULL)
+    {
+       strcpy (tmp_str, (char *)in_buf.rss);
+       chk_ptr2= strstr (tmp_str+ strlen(rss_type_jj), chk_ptr);
+       if (chk_ptr2 NE NULL)
+       {
+          memset ((char *)&in_buf, ' ', sizeof (RSS_NAME_LEN)+ 1 );
+          memcpy ((char *)&in_buf, rss_type_jj, strlen (rss_type_jj) );
+          strcpy ((char *)in_buf.api, chk_ptr2);
+       }
+       else
+       {
+          rc= ESA_ERR;
+          goto cleanup;
+       }
+    }
+    for (ii= 0; ii LT envir_ptr->max_rss_num; ii++) {
+ 
+       /*
+         when RSS type - found:
+      */
+      rc= rssprm_get (envir_ptr->interest[ii].rss, RSS_TYPE,
+                      RSS_NAME_LEN, rss_type);
+      if (rc NE ESA_OK)
+         goto cleanup;
+      if (My_stricmp (rss_type_jj, rss_type) EQ 0)
+      {
+        strcpy (envir_ptr->interest[ii].ess_rss_type, rss_type_jj);
+        break;
+      }
+    } /* END - FOR loop on known RSSs */
+    /*
+      EXIT returning fatal error - if RSS is unknown.
+    */
+    if (ii GE envir_ptr->max_rss_num)
+    {
+      CTSAMSG_print (ERR_CS_RSS_TYPE_ENTITY,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     in_buf.rss, envir_ptr->file_rssparm, fn);
+      envir_ptr->kwd_num--;
+      continue;
+    }
+    /*
+     *   Initialize Buffer *keywrds
+     */
+    if (envir_ptr->kwd_num EQ 0) {
+      rc= CSA_alloc ((char **)&envir_ptr->keywrds, STRUC_KWD_REC,
+                     sizeof (RSSAPI_KWD_rec_typ),
+                     RSSAPIKWD_INIT_NUM, fn, "Keywords");
+      alloc_kwd_num= RSSAPIKWD_INIT_NUM;
+    }
+    else {
+      if (envir_ptr->kwd_num GE alloc_kwd_num) {
+        rc= CSA_realloc ((char **)&envir_ptr->keywrds, STRUC_KWD_REC,
+                         sizeof (RSSAPI_KWD_rec_typ),
+                         alloc_kwd_num+ RSSAPIKWD_INC_NUM);
+        alloc_kwd_num += RSSAPIKWD_INC_NUM;
+      }
+    }
+    if (rc NE ESA_OK)
+      goto cleanup;
+ 
+    memcpy ((char *)(envir_ptr->keywrds+ envir_ptr->kwd_num),
+            (char *)(&in_buf),
+            sizeof (RSSAPI_KWD_rec_typ));
+    strtok (in_buf.rss, WHITECHARS);
+ 
+    info_type= CS_addinfo_typ_to_enum (in_buf.addtyp);
+    if (info_type EQ TYPE_AI_IGNORED)
+       envir_ptr->interest[ii].num_entity_kwds++;
+    in_buf.fil2= '\0'; /*in_buf.api[ADINF_TYP_LEN]= '\0';*/
+    api= atoi(in_buf.api);
+ 
+    if      (api EQ FUNC_ADDUSER)
+        envir_ptr->interest[ii].num_usr_kwds++;
+    else if (api EQ FUNC_ADDUG)
+        envir_ptr->interest[ii].num_ug_kwds++;
+    else if (api EQ FUNC_ADDOE)
+        envir_ptr->interest[ii].num_oe_kwds++;
+    else if (api EQ FUNC_ADDU2UG)
+        envir_ptr->interest[ii].num_u2ug_kwds++;
+    else if (api EQ FUNC_UPDRES)
+        envir_ptr->interest[ii].num_res_kwds++;
+    else if (api EQ FUNC_ADDACE)
+        envir_ptr->interest[ii].num_ace_kwds++;
+    else if (api EQ FUNC_GTRSPRM)
+        envir_ptr->interest[ii].num_rss_kwds++;
+    /* WS10078KG- Start */
+    else if (api EQ FUNC_ADDXROL)
+        envir_ptr->interest[ii].num_xrol_kwds++;
+    else if (api EQ FUNC_ADDXSGP)
+        envir_ptr->interest[ii].num_xsgp_kwds++;
+    /* WS10078KG - End */
+    else
+        ESA_DIAG_printf (ESA_COMP_ACSDBPK, 15,
+            "Record %d is has invalid api %d.",
+            envir_ptr->kwd_num+ 1, api);
+    ESA_DIAG_printf (ESA_COMP_ACSDBPK, 16,
+"For RSS %s(%s):us %d ug %d cn %d oe %d res %d ace %d rs %d es=%d/%s.",
+    envir_ptr->interest[ii].rss,
+    envir_ptr->interest[ii].rss_type,
+    envir_ptr->interest[ii].num_usr_kwds,
+    envir_ptr->interest[ii].num_ug_kwds,
+    envir_ptr->interest[ii].num_oe_kwds,
+    envir_ptr->interest[ii].num_u2ug_kwds,
+    envir_ptr->interest[ii].num_res_kwds,
+    envir_ptr->interest[ii].num_ace_kwds,
+    envir_ptr->interest[ii].num_rss_kwds,
+    envir_ptr->interest[ii].ess_rss,
+    envir_ptr->interest[ii].ess_rss_type);
+    /* WS10078KG - Start */
+    ESA_DIAG_printf (ESA_COMP_ACSDBPK, 16,
+    "For RSS %s(%s):xrol=%d xsgp=%d.",
+    envir_ptr->interest[ii].rss,
+    envir_ptr->interest[ii].rss_type,
+    envir_ptr->interest[ii].num_xrol_kwds,
+    envir_ptr->interest[ii].num_xsgp_kwds);
+    /* WS10078KG - End */
+ 
+  } /* for */
+ 
+  cleanup:
+  if (rc EQ ESA_OK)
+     rc= CSA_alloc ((char **)&filled_already,
+                 0,
+                 envir_ptr->max_rss_num,
+                 1,
+                 fn,
+                 "work filled_already");
+  if (rc EQ ESA_OK)
+     memset (filled_already, ' ', envir_ptr->max_rss_num);
+ 
+  for (ii= 0, rss_type_jj[0]= '\0';
+         (ii LT envir_ptr->max_rss_num)
+        AND
+         (rc EQ ESA_OK);
+       ii++)
+  {
+     if (filled_already[ii] EQ SKIP_LINE)
+        continue;
+     if (envir_ptr->num_entity_kwds LT
+                         envir_ptr->interest[ii].num_entity_kwds)
+         envir_ptr->num_entity_kwds=
+              envir_ptr->interest[ii].num_entity_kwds;
+ 
+     rssprm_get (envir_ptr->interest[ii].rss, RSS_TYPE,
+                 RSS_NAME_LEN, rss_type);
+     if (0 LT (envir_ptr->interest[ii].num_usr_kwds  +
+               envir_ptr->interest[ii].num_ug_kwds   +
+               envir_ptr->interest[ii].num_oe_kwds   +
+               envir_ptr->interest[ii].num_u2ug_kwds +
+               envir_ptr->interest[ii].num_res_kwds  +
+               envir_ptr->interest[ii].num_ace_kwds  +
+               envir_ptr->interest[ii].num_rss_kwds  +
+/* BS10106 */  envir_ptr->interest[ii].num_xrol_kwds +
+/* BS10106 */  envir_ptr->interest[ii].num_xsgp_kwds +
+               envir_ptr->interest[ii].num_entity_kwds))
+     {
+        for (jj= ii+ 1; jj LT envir_ptr->max_rss_num; jj++)
+        {
+           rssprm_get (envir_ptr->interest[jj].rss, RSS_TYPE,
+                       RSS_NAME_LEN, rss_type_jj);
+           if (My_stricmp (rss_type_jj, rss_type) EQ 0)
+           {
+               envir_ptr->interest[jj].num_usr_kwds =
+                   envir_ptr->interest[ii].num_usr_kwds;
+               envir_ptr->interest[jj].num_ug_kwds=
+                   envir_ptr->interest[ii].num_ug_kwds;
+               envir_ptr->interest[jj].num_oe_kwds=
+                   envir_ptr->interest[ii].num_oe_kwds;
+               envir_ptr->interest[jj].num_u2ug_kwds=
+                   envir_ptr->interest[ii].num_u2ug_kwds;
+               envir_ptr->interest[jj].num_res_kwds=
+                   envir_ptr->interest[ii].num_res_kwds;
+               envir_ptr->interest[jj].num_ace_kwds=
+                   envir_ptr->interest[ii].num_ace_kwds;
+               envir_ptr->interest[jj].num_rss_kwds=
+                   envir_ptr->interest[ii].num_rss_kwds;
+               envir_ptr->interest[jj].num_entity_kwds=
+                   envir_ptr->interest[ii].num_entity_kwds;
+/* BS10106 */  envir_ptr->interest[jj].num_xrol_kwds=
+/* BS10106 */      envir_ptr->interest[ii].num_xrol_kwds;
+/* BS10106 */  envir_ptr->interest[jj].num_xsgp_kwds=
+/* BS10106 */      envir_ptr->interest[ii].num_xsgp_kwds;
+               filled_already[jj]= SKIP_LINE;
+ 
+           }
+        }
+     }
+  }
+  for (ii= 0; ii LT envir_ptr->max_rss_num; ii++)
+  {
+     if (envir_ptr->interest[ii].num_usr_kwds    EQ 0)
+         envir_ptr->interest[ii].num_usr_kwds    =  1;
+     if (envir_ptr->interest[ii].num_ug_kwds     EQ 0)
+         envir_ptr->interest[ii].num_ug_kwds     =  1;
+     if (envir_ptr->interest[ii].num_oe_kwds     EQ 0)
+         envir_ptr->interest[ii].num_oe_kwds     =  1;
+     if (envir_ptr->interest[ii].num_u2ug_kwds   EQ 0)
+         envir_ptr->interest[ii].num_u2ug_kwds   =  1;
+     if (envir_ptr->interest[ii].num_res_kwds    EQ 0)
+         envir_ptr->interest[ii].num_res_kwds    =  1;
+     if (envir_ptr->interest[ii].num_ace_kwds    EQ 0)
+         envir_ptr->interest[ii].num_ace_kwds    =  1;
+     if (envir_ptr->interest[ii].num_rss_kwds    EQ 0)
+         envir_ptr->interest[ii].num_rss_kwds    =  1;
+     if (envir_ptr->interest[ii].num_entity_kwds EQ 0)
+         envir_ptr->interest[ii].num_entity_kwds =  1;
+     if (envir_ptr->interest[ii].num_xrol_kwds   EQ 0)  /* BS10106 */
+         envir_ptr->interest[ii].num_xrol_kwds   =  1;  /* BS10106 */
+     if (envir_ptr->interest[ii].num_xsgp_kwds   EQ 0)  /* BS10106 */
+         envir_ptr->interest[ii].num_xsgp_kwds   =  1;  /* BS10106 */
+  }
+  envir_ptr->num_entity_kwds += ADDITIONAL_ENTITY_KWRDS_NUM;
+  /*
+    ALLOCATE memory for entity info .
+    */
+  if (envir_ptr->entity_info NE NULL)
+      CSA_free ((char **)&envir_ptr->entity_info);
+  rc= CSA_alloc ((char **)&envir_ptr->entity_info,
+          STRUC_ADDINFO,
+/*WS10082K* sizeof(ADDINFO_rec_typ)* envir_ptr->num_entity_kwds, */
+/*WS10082K*/ envir_ptr->num_entity_kwds,
+           1,
+           fn,
+          "entity info");
+  CSA_close (envir_ptr->file_rsskwds, fn);
+  if (rc EQ ESA_OK)
+    rc= CS_kwds_check (envir_ptr->kwd_num, envir_ptr->keywrds);
+  CSA_free ((char **)&filled_already);
+  ESA_DIAG_printf (ESA_COMP_ACSDBPK, 14,
+                   "Loaded keywords: %d.", envir_ptr->kwd_num);
+  if (rc NE ESA_OK)
+  {
+    envir_ptr->kwd_num= 0;
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+  }
+  else
+    ESA_DIAG_printf (ESA_COMP_ACSDBPK, DIAG_BASIC,
+      "*****>... File %s with %d parameters loaded.",
+	  envir_ptr->file_rsskwds, envir_ptr->kwd_num);
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSDBPK, DIAG_DETAILES+ 1,
+	  "        keywrds ptr= %p.", envir_ptr->keywrds);
+  CS_DAIG_RssApiKwd ();
+  CS_DAIG_RssApiKwdsForRss ();
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSDBPK, DIAG_COMMON, fn, rc);
+  return rc;
+}
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name: kwdrow_trans_for_get                        *
+*                                                             *
+* Description   : Build list of keywords for specific RSS-API *
+*                 for get function from the memory format     *
+*                                                             *
+* Return Value  : ESA_RC                                      *
+*                                                             *
+**************************************************************/
+ 
+void kwdrow_trans_for_get (RSSAPI_KWD_rec_typ * in_row,
+                           RSSAPIKWD_rec_typ  * out_row)
+{
+   RSSAPI_KWD_rec_typ   in_buf;
+   char               * id_end= NULL;
+   char fn[]="kwdrow_trans_for_get";
+ 
+   ESA_DIAG_enter (ESA_COMP_ACSDBPK, DIAG_COMMON+ 1, fn);
+   if (out_row->num_keywords EQ 0) {
+      memset ((char *)out_row, '\0', sizeof (RSSAPIKWD_rec_typ));
+      out_row->num_keywords= 0;
+   }
+ 
+   memcpy ((char *)(&in_buf), (char *)in_row,
+           sizeof (RSSAPI_KWD_rec_typ));
+ 
+   in_buf.fil1= '\0';
+   id_end   = strpbrk(in_buf.rss,WHITECHARS);
+ 
+   if (id_end NE NULL)
+      (*id_end)= NULL_CHAR;
+ 
+   id_end   = strpbrk(in_buf.rss,"\n");
+ 
+   if (id_end NE NULL)
+      (*id_end)= NULL_CHAR;
+ 
+   strcpy (out_row->rss, in_buf.rss);
+ 
+   in_buf.fil2= '\0';
+ 
+   out_row->api= (short)atoi (in_buf.api);
+ 
+   in_buf.fil3= '\0';
+ 
+   out_row->kwd[out_row->num_keywords].keyword_type=
+       in_buf.keyword_type;
+ 
+   in_buf.fil4= '\0';
+ 
+   strcpy (out_row->kwd[out_row->num_keywords].addtyp, in_buf.addtyp);
+ 
+   in_buf.end_row= ' ';
+   id_end   = strpbrk(in_buf.keyword,WHITECHARS);
+   if (id_end NE NULL)
+      (*id_end)= NULL_CHAR;
+   id_end   = strpbrk(in_buf.keyword,"\n");
+   if (id_end NE NULL)
+      (*id_end)= NULL_CHAR;
+   strcpy (out_row->kwd[out_row->num_keywords].keyword,in_buf.keyword);
+ 
+   out_row->kwd[out_row->num_keywords].keylen=
+       (short)strlen (in_buf.keyword);
+ 
+   out_row->num_keywords++;
+   ESA_DIAG_exit (ESA_COMP_ACSDBPK, DIAG_COMMON+ 1, fn, ESA_RC_VOID);
+}
+ 
+/***********************************************************
+*                                                          *
+* Procedure Name: kwdrow_trans_for_put                     *
+*                                                          *
+* Description   : Transform to memory format list of       *
+*                 keywords from put function               *
+* input         : in_row  - input row                      *
+* output        : out_row - transormated row               *
+* Return Value  : ESA_RC                                   *
+*                                                          *
+***********************************************************/
+ 
+void kwdrow_trans_for_put (RSSAPIKWD_rec_typ  * in_row,
+                           RSSAPI_KWD_rec_typ * out_row)
+{
+   RSSAPI_KWD_rec_ptr  out_ptr= NULL;
+   char                str_api[3];
+   int                 i= 0;
+   char fn[]="kwdrow_trans_for_put";
+ 
+   ESA_DIAG_enter (ESA_COMP_ACSDBPK, DIAG_COMMON, fn);
+   memset ((char *)out_row,' ',
+           sizeof(RSSAPI_KWD_rec_typ)* in_row->num_keywords);
+ 
+   for (i= 0; i LT in_row->num_keywords; i++) {
+      out_ptr= out_row+ i;
+      memcpy ((char *)out_ptr->rss, (char *)in_row->rss,
+              strlen (in_row->rss));
+      sprintf (str_api, "%02d", (int)in_row->api);
+      memcpy ((char *)out_ptr->api, (char *)str_api, ADINF_TYP_LEN);
+      out_ptr->keyword_type= in_row->kwd[i].keyword_type;
+      memcpy ((char *)out_ptr->addtyp, (char *)in_row->kwd[i].addtyp,
+              ADINF_TYP_LEN);
+      memcpy ((char *)out_ptr->keyword, (char *)in_row->kwd[i].keyword,
+              (unsigned)in_row->kwd[i].keylen);
+      out_ptr->end_row= '\n';
+      out_ptr->end_string= '\0';
+   }
+   ESA_DIAG_exit (ESA_COMP_ACSDBPK, DIAG_COMMON, fn, ESA_RC_VOID);
+}
+ 
+/****************************************************
+ * Procedure Name: CS_db_prm_get
+ * Description   : get row from file_params for specific RSS and API
+ * Input         : rss       - RSS name
+ *                 api       - API function code
+ * Input/Output  : buf       - pointer to RSSAPIPRM_rec_typ
+ * Return Value  : ESA_RC
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_db_prm_get (RSS_typ           rss,
+                      short             api,
+                      RSSAPIPRM_rec_ptr buf)
+{
+  char                  fn[]="CS_db_prm_get";
+  int                   i= 0;
+  short                 func_name;
+  char                  str_api[3];
+  RSSAPI_PRM_rec_ptr    prm_ptr= NULL;
+  ESA_RC                rc= ESA_OK;
+  RSS_typ               rss_wrk, type_wrk, rss_type;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSDBPK, DIAG_COMMON, fn);
+  ESA_DIAG_printf (ESA_COMP_ACSDBPK, 13,
+           "rss %s api %d prm_num=%d.", rss, (int)api, envir_ptr->prm_num);
+ 
+  func_name= api;
+ 
+/*  if (api EQ FUNC_ADDRES)
+      func_name= FUNC_UPDRES;*/
+ 
+  sprintf (str_api, "%02d", (int)func_name);
+ 
+  for (i= 0; i LT envir_ptr->prm_num; i++ ) {
+     prm_ptr= envir_ptr->params+ i;
+     memcpy ((char *)rss_wrk, (char *)prm_ptr->rss, RSS_NAME_LEN);
+     rss_wrk[RSS_NAME_LEN]= '\0';
+     strtok (rss_wrk, WHITECHARS);
+     if (strncmp (rss, rss_wrk, RSS_NAME_LEN) NE 0)
+        continue;
+     if (memcmp ((char *)str_api, (char *)prm_ptr->api,
+                 ADINF_TYP_LEN) NE 0)
+        continue;
+     prmrow_trans_for_get (prm_ptr, buf);
+     break;
+  }
+ 
+  if (i GE envir_ptr->prm_num) {
+    rc= rssprm_get (rss, RSS_TYPE, RSS_NAME_LEN, rss_type);
+       if (rc NE ESA_OK)
+           goto cleanup;
+ 
+    for (i= 0; i LT envir_ptr->prm_num; i++ ) {
+       prm_ptr= envir_ptr->params+ i;
+       memset ((char *)type_wrk, '0', sizeof (type_wrk));
+       memcpy ((char *)type_wrk, (char *)prm_ptr->type, RSS_NAME_LEN);
+       strtok (type_wrk, WHITECHARS);
+       ESA_DIAG_printf (ESA_COMP_ACSDBPK, 13,
+                "%d: prm_ptr=%.*s type_wrk=%s str_api=%s prm_ptr->api=%.2s.",
+         i+ 1, sizeof (RSSAPI_PRM_rec_typ), (char *)prm_ptr, type_wrk, str_api, (char *)prm_ptr->api);
+       if (strncmp (rss_type, type_wrk, RSS_NAME_LEN) NE 0)
+          continue;
+       if (memcmp ((char *)str_api, (char *)prm_ptr->api,
+                   ADINF_TYP_LEN) NE 0)
+          continue;
+       prmrow_trans_for_get (prm_ptr, buf);
+       break;
+   }
+ }
+  if (i GE envir_ptr->prm_num) {
+     rc= ESA_KEY_NOT_FOUND;
+     CTSAMSG_print (ERR_CS_RSS_ENTITY,
+                    envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                    envir_ptr->msg_admin_param.ctsamsg_dest,
+                    rss, envir_ptr->file_rssapi,
+                    CS_func_nmbr_to_func_name (func_name));
+  }
+  else
+     ESA_DIAG_printf (ESA_COMP_ACSDBPK, 14,
+      "Type=%s Rss=%s api=%d kwds=%d Pre=%c/%s Act=%c Post=%c/%s.",
+       buf->type, buf->rss, (int)buf->api, (int)buf->script_kwd_num,
+       buf->pre, buf->pre_prog, buf->act, buf->post,  buf->post_prog);
+ 
+ cleanup:
+  ESA_DIAG_exit (ESA_COMP_ACSDBPK, DIAG_COMMON, fn, rc);
+  return (rc);
+}
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : rssapiprm_load                           *
+*                                                             *
+* Description      : Load file_params to the memory           *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC rssapiprm_load (void)
+{
+  char                  fn[]="rssapiprm_load";
+  ESA_RC                rc = ESA_OK;
+  FILE                * file_handle= NULL;
+  RSSAPI_PRM_rec_typ    in_buf;
+  char                  line [132], empty='-';
+  char                  str_api[sizeof (in_buf.api)+ 1];
+  char                  str_kwd_num[sizeof (in_buf.script_kwd_num)+ 1];
+  char                * rss,* api,* pre, * rss_type;
+  char                * act, * post, * pre_prog, * script_kwd_num;
+  char                * post_prog, * newline= NULL, * stopptr;
+  int                   i= 0, alloc_prm_num= 0;
+  short                 api_code= 0;
+  unsigned long int     kwd_num;
+  char                  component[30], *comp_val;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSDBPK, DIAG_COMMON, fn);
+  ESA_DIAG_printf (ESA_COMP_ACSDBPK, DIAG_DETAILES,
+    "...-> : file_rssapi=%s envir_ptr= %p.", envir_ptr->file_rssapi, envir_ptr);
+ 
+  rc= CSA_open (envir_ptr->file_rssapi, fn,
+                FILE_OPEN_FOR_READ, &file_handle, SCOPE_LOCAL);
+  if (rc NE ESA_OK)
+   goto cleanup;
+ 
+  CSA_free ((char **)&envir_ptr->params);
+ 
+  comp_val = NULL;   /* AJK001 */
+  /*
+   *   Load file_params into memory (*params)
+   */
+ 
+  for (envir_ptr->prm_num= 0, i= 1; ; envir_ptr->prm_num++, i++) {
+ 
+    rss_type=       NULL;
+    rss=            NULL;
+    api=            NULL;
+    script_kwd_num= NULL;
+    pre=            NULL;
+    act=            NULL;
+    post=           NULL;
+    pre_prog=       NULL;
+    post_prog=      NULL;
+ 
+    rc= CSA_fgets (envir_ptr->file_rssapi,
+                   line,
+                   sizeof(line),
+                   file_handle);
+    if (rc NE ESA_OK)
+    {
+        if (rc EQ ESA_EOF)
+            rc= ESA_OK;
+        goto cleanup;
+    }
+ 
+    ESA_DIAG_printf (ESA_COMP_ACSDBPK, DIAG_DETAILES+ 1,
+                     "readed %d record %s.", i, line);
+ 
+    newline = strchr(line,'\n');
+    if (newline NE NULL)
+      strcpy (newline,"\0");
+ 
+    rss_type=       strtok (line, WHITECHARS);
+    rss=            strtok (NULL, WHITECHARS);
+    api=            strtok (NULL, WHITECHARS);
+    script_kwd_num= strtok (NULL, WHITECHARS);
+    pre=            strtok (NULL, WHITECHARS);
+    act=            strtok (NULL, WHITECHARS);
+    post=           strtok (NULL, WHITECHARS);
+    pre_prog=       strtok (NULL, WHITECHARS);
+    post_prog=      strtok (NULL, WHITECHARS);
+ 
+    if (line[0] EQ NULL_CHAR OR line[0] EQ SKIP_LINE OR rss EQ NULL) {
+      envir_ptr->prm_num--;
+      ESA_DIAG_printf (ESA_COMP_ACSDBPK, 15,
+                   "Skipped %d record", i);
+      continue;
+    }
+ 
+    if (rss EQ NULL OR rss_type EQ NULL OR script_kwd_num EQ NULL OR
+        api EQ NULL OR pre EQ NULL OR act EQ NULL OR
+        post EQ NULL OR pre_prog EQ NULL OR post_prog EQ NULL) {
+      if ((rss EQ NULL) OR (strlen(rss) EQ 0)) {
+        comp_val = rss;
+        strcpy(component, C_RSS_NAME);
+      }
+     else
+      if ((rss_type EQ NULL) OR (strlen(rss_type) EQ 0)) {
+        comp_val = rss_type;
+        strcpy(component,C_RSS_TYPE);
+      }
+     else
+      if (rss_type[0] NE empty AND rss[0] NE empty) {
+        comp_val = rss_type;
+        strcpy(component,C_RSS_TYPE);
+        strcat(component," + ");
+        strcat(component,C_RSS_NAME);
+      }
+     else
+      if ((act EQ NULL) OR (strlen(act) EQ 0)) {
+         comp_val = act;
+         strcpy(component,C_ACTUAL_ACTV);
+      }
+     else
+      if ((post EQ NULL) OR (strlen(post) EQ 0)) {
+        comp_val = post;
+        strcpy(component,C_POSTSCRIPT_ACTV);
+      }
+     else
+      if ((pre_prog EQ NULL) OR (strlen(pre_prog) EQ 0)) {
+        comp_val = pre_prog;
+        strcpy(component,C_PRE_NAME);
+      }
+     else
+      if ((post_prog EQ NULL) OR (strlen(post_prog) EQ 0)) {
+        comp_val = post_prog;
+        strcpy(component,C_POST_NAME);
+      }
+ 
+      CTSAMSG_print (ERR_CS_PRM_LEN,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     component,
+                     (comp_val EQ NULL) ? "NULL" : comp_val,
+                     envir_ptr->file_rssapi, envir_ptr->prm_num);
+      rc= ESA_FATAL;
+      goto cleanup;
+    }
+    api_code= CS_func_name_to_func_nmbr (api);
+    if (api_code             EQ 0) {
+      rc= ESA_FATAL;
+      goto cleanup;
+    }
+    kwd_num= strtoul (script_kwd_num, &stopptr, 10);
+    if (*stopptr NE '\0')
+    {
+      CTSAMSG_print (ERR_CS_PRM_NOT_NUMERIC,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     "Number of Script Keywords", script_kwd_num,
+                     envir_ptr->file_rssapi);
+ 
+      rc= ESA_FATAL;
+      goto cleanup;
+    }
+    if (strlen(rss)            GT sizeof(in_buf.rss)            OR
+        strlen(rss_type)       GT sizeof(in_buf.type)           OR
+        strlen(script_kwd_num) GT sizeof(in_buf.script_kwd_num) OR
+        strlen(pre)            GT sizeof(in_buf.pre)            OR
+        strlen(act)            GT sizeof(in_buf.act)            OR
+        strlen(post)           GT sizeof(in_buf.post)           OR
+        strlen(pre_prog)       GT sizeof(in_buf.pre_prog)       OR
+        strlen(post_prog)      GT sizeof(in_buf.post_prog)) {
+ 
+      if (strlen(rss) GT sizeof(in_buf.rss)) {
+        comp_val = rss;
+        strcpy(component,C_RSS_NAME);
+      }
+     else
+     if (strlen(rss_type) GT sizeof(in_buf.type)) {
+        comp_val = rss;
+        strcpy(component,C_RSS_TYPE);
+      }
+     else
+      if (strlen(pre) GT sizeof(in_buf.pre)) {
+        comp_val = pre;
+        strcpy(component,C_PRESCRIPT_ACTV);
+      }
+     else
+      if (strlen(act) GT sizeof(in_buf.act)) {
+         comp_val = act;
+         strcpy(component,C_ACTUAL_ACTV);
+      }
+     else
+      if (strlen(post) GT sizeof(in_buf.post)) {
+        comp_val = post;
+        strcpy(component,C_POSTSCRIPT_ACTV);
+      }
+     else
+      if (strlen(pre_prog) GT sizeof(in_buf.pre_prog)) {
+        comp_val = pre_prog;
+        strcpy(component,C_PRE_NAME);
+      }
+     else
+      if (strlen(post_prog) GT sizeof(in_buf.post_prog)) {
+        comp_val = post_prog;
+        strcpy(component,C_POST_NAME);
+      }
+     else
+      if (strlen(script_kwd_num) GT sizeof(in_buf.script_kwd_num)) {
+        comp_val = script_kwd_num;
+        strcpy(component,"Number of Script Keywords");
+      }
+ 
+      CTSAMSG_print (ERR_CS_PRM_LEN,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     component, comp_val,
+                     envir_ptr->file_rssapi, envir_ptr->prm_num);
+      rc= ESA_FATAL;
+      goto cleanup;
+    }
+ 
+    /*
+     *   Initialize Buffer *params
+     */
+    if (envir_ptr->prm_num EQ 0) {
+      rc= CSA_alloc ((char **)&envir_ptr->params, STRUC_PRM_REC,
+                     sizeof (RSSAPI_PRM_rec_typ),
+                     RSSAPIPRM_INIT_NUM, fn, "Params");
+      alloc_prm_num= RSSAPIPRM_INIT_NUM;
+    }
+    else {
+      if (envir_ptr->prm_num GE alloc_prm_num) {
+        rc= CSA_realloc ((char **)&envir_ptr->params, STRUC_PRM_REC,
+                         sizeof (RSSAPI_PRM_rec_typ),
+                         alloc_prm_num+ RSSAPIPRM_INC_NUM);
+        alloc_prm_num += RSSAPIPRM_INC_NUM;
+      }
+    }
+    if (rc NE ESA_OK)
+      goto cleanup;
+    /*
+     *   Load row to the allocated Buffer *params
+     */
+    ESA_DIAG_printf (ESA_COMP_ACSDBPK, 15,
+                   "Record %d is %s.", envir_ptr->prm_num+ 1, &in_buf);
+    memset ((char *)(&in_buf), ' ', sizeof (RSSAPI_PRM_rec_typ));
+    sprintf (str_api,"%02d", (int)api_code);
+    sprintf (str_kwd_num,"%02d", (int)kwd_num);
+    memcpy  ((char *)in_buf.api, (char *)str_api, sizeof (in_buf.api));
+    memcpy  ((char *)in_buf.script_kwd_num, (char *)str_kwd_num,
+             sizeof (in_buf.script_kwd_num));
+    memcpy ((char *)in_buf.type, (char *)rss_type, strlen(rss_type));
+    memcpy ((char *)in_buf.rss, (char *)rss, strlen(rss));
+    in_buf.pre= *pre;
+    in_buf.act= *act;
+    in_buf.post= *post;
+    memcpy ((char *)in_buf.pre_prog, (char *)pre_prog,
+            strlen(pre_prog));
+    memcpy ((char *)in_buf.post_prog, (char *)post_prog,
+            strlen(post_prog));
+    memcpy ((char *)(envir_ptr->params+ envir_ptr->prm_num),
+            (char *)(&in_buf),
+            sizeof (RSSAPI_PRM_rec_typ));
+ 
+  } /* for */
+  /*
+   qsort(envir_ptr->params,
+         (unsigned )envir_ptr->prm_num,
+         sizeof(RSSAPI_PRM_rec_typ),
+         &RSSAPI_PRM_compare);
+   */
+ cleanup:
+  CSA_close (envir_ptr->file_rssapi, fn);
+  ESA_DIAG_printf (ESA_COMP_ACSDBPK, 14,
+                   "prm_num %d.", envir_ptr->prm_num);
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+  else
+    ESA_DIAG_printf (ESA_COMP_ACSDBPK, DIAG_BASIC,
+          "*****>... File %s with %d parameters loaded.",
+		  envir_ptr->file_rssapi, envir_ptr->prm_num);
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSDBPK, DIAG_DETAILES+ 1,
+    "        params ptr= %p.", envir_ptr->params);
+  CS_DAIG_RssApiPrm ();
+  ESA_DIAG_exit (ESA_COMP_ACSDBPK, DIAG_COMMON, fn, rc);
+  return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : prmrow_trans_for_get
+*                                                             *
+* Description      : Transform row of params from memory format
+*                              for get function
+* input            : in_row  - input row
+* output           : out_row - transormated row
+* Return Value     : ESA_RC                                   *
+*                                                             *
+**************************************************************/
+ 
+void prmrow_trans_for_get (RSSAPI_PRM_rec_typ * in_row,
+                           RSSAPIPRM_rec_typ  * out_row)
+{
+   RSSAPI_PRM_rec_typ   in_buf;
+   char               * id_end= NULL;
+   char                 fn[]="prmrow_trans_for_get";
+ 
+   ESA_DIAG_enter (ESA_COMP_ACSDBPK, DIAG_COMMON, fn);
+   memset ((char *)out_row, '\0', sizeof (RSSAPIPRM_rec_typ));
+ 
+   memcpy ((char *)(&in_buf), (char *)in_row,
+           sizeof (RSSAPI_PRM_rec_typ));
+ 
+   in_buf.fil0 = '\0';
+ 
+   id_end   = strpbrk(in_buf.type,WHITECHARS);
+ 
+   if (id_end NE NULL)
+      (*id_end)= NULL_CHAR;
+ 
+   id_end   = strpbrk(in_buf.type,"\n");
+ 
+   if (id_end NE NULL)
+      (*id_end)= NULL_CHAR;
+ 
+   strcpy (out_row->type, in_buf.type);
+ 
+   in_buf.fil1 = '\0';
+ 
+   id_end   = strpbrk(in_buf.rss,WHITECHARS);
+ 
+   if (id_end NE NULL)
+      (*id_end)= NULL_CHAR;
+ 
+   id_end   = strpbrk(in_buf.rss,"\n");
+ 
+   if (id_end NE NULL)
+      (*id_end)= NULL_CHAR;
+ 
+   strcpy (out_row->rss, in_buf.rss);
+ 
+   in_buf.fil2= '\0';
+ 
+   out_row->api= (short)atoi (in_buf.api);
+ 
+   in_buf.fil7= '\0';
+ 
+   out_row->script_kwd_num= (short)atoi (in_buf.script_kwd_num);
+ 
+   out_row->pre= in_buf.pre;
+ 
+   out_row->act= in_buf.act;
+ 
+   out_row->post= in_buf.post;
+ 
+   in_buf.fil6= '\0';
+ 
+   id_end   = strpbrk(in_buf.pre_prog,WHITECHARS);
+ 
+   if (id_end NE NULL)
+      (*id_end)= NULL_CHAR;
+ 
+   id_end   = strpbrk(in_buf.pre_prog,"\n");
+ 
+   if (id_end NE NULL)
+      (*id_end)= NULL_CHAR;
+ 
+   strcpy (out_row->pre_prog, in_buf.pre_prog);
+ 
+   in_buf.end_row= '\0';
+ 
+   id_end   = strpbrk(in_buf.post_prog,WHITECHARS);
+ 
+   if (id_end NE NULL)
+      (*id_end)= NULL_CHAR;
+ 
+   id_end   = strpbrk(in_buf.post_prog,"\n");
+ 
+   if (id_end NE NULL)
+      (*id_end)= NULL_CHAR;
+ 
+   strcpy (out_row->post_prog, in_buf.post_prog);
+   ESA_DIAG_exit (ESA_COMP_ACSDBPK, DIAG_COMMON, fn, ESA_RC_VOID);
+}
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : keywords_checksum
+*                                                             *
+* Description      : Build checksum for keywords
+*                                                             *
+* input            :
+*                                                             *
+* Return Value     :
+*                                                             *
+**************************************************************/
+ 
+void keywords_checksum (CHECKSUM_typ checksum)
+{
+  RSSAPI_KWD_rec_typ    kwd;
+  char                  checksum_str[sizeof(RSSAPI_KWD_rec_typ)];
+  char                * rss= NULL, *api= NULL, *keyword_type= NULL;
+  char                * addtyp= NULL, *keyword= NULL, *newline= NULL;
+  char                  msgcode[3];
+  int                   ii= 0, contin= 0, last= 1, apinmb;
+  void                * handle= NULL;
+  ESA_RC                rc= ESA_OK;
+  char                  fn[]="keywords_checksum";
+  char str_check_ascii
+      [ADINF_TYP_LEN+RSS_NAME_LEN+MAX_RSS_ADDINFO_KWD_LEN+5];
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+  ESA_DIAG_enter (ESA_COMP_ACSDBPK, DIAG_COMMON, fn);
+  ESA_DIAG_printf (ESA_COMP_ACSDBPK, DIAG_COMMON,
+    "...-> : ---------- Count checksum for %d (%p) RssApiKwds.",
+	envir_ptr->kwd_num, envir_ptr->keywrds);
+ 
+  for (ii= 0; ii LT envir_ptr->kwd_num; ii++) {
+    memcpy ((char *)(&kwd), (char *)(envir_ptr->keywrds+ ii),
+            sizeof(RSSAPI_KWD_rec_typ));
+    kwd.end_row=  ' ';
+    newline= strpbrk((char *)&kwd,"\n");
+    if (newline NE NULL)
+      *newline= ' ';
+    rss=          strtok ((char *)&kwd, WHITECHARS);
+    api=          strtok (NULL, WHITECHARS);
+    keyword_type= strtok (NULL, WHITECHARS);
+    addtyp=       strtok (NULL, WHITECHARS);
+    keyword=      strtok (NULL, WHITECHARS);
+    CLEAR (checksum_str);
+    if (rss NE NULL)
+      strcpy (checksum_str, rss);
+    if (api NE NULL) {
+      apinmb= atoi(api);
+      rc= CS_api_to_msg_code ((short)apinmb, msgcode);
+      if (rc EQ ESA_OK)
+        strcat (checksum_str, msgcode);
+      else
+        ESA_DIAG_printf (ESA_COMP_ACSDBPK, DIAG_COMMON,
+                     "   ???   API %d is unsupported.", api);
+    }
+    if (addtyp NE NULL)
+      strcat (checksum_str, addtyp);
+    if (keyword_type NE NULL) {
+      if (*keyword_type EQ KWD_FOR_ADDINFO_1A_CHECK OR
+          *keyword_type EQ KWD_FOR_ADDINFO_2A_CHECK OR
+          *keyword_type EQ KWD_FOR_ADDINFO_1B_CHECK OR
+          *keyword_type EQ KWD_FOR_ADDINFO_2B_CHECK OR
+          *keyword_type EQ KWD_FOR_ENTITY_CHECK)
+        *keyword_type= '2';
+      else
+        *keyword_type= '1';
+      strcat (checksum_str, keyword_type);
+    }
+    if (keyword NE NULL)
+      strcat (checksum_str, keyword);
+    if (strlen (checksum_str) EQ 0)
+      continue;
+    strcpy(str_check_ascii,checksum_str);
+    ESA_DIAG_printf (ESA_COMP_ACSDBPK, 15,
+                     "Checksum string %d: /%s/ (%d).",
+                     ii+ 1,str_check_ascii,strlen(checksum_str));
+/* for MVS */
+  ebc2asc (checksum_str,str_check_ascii,(int)strlen(checksum_str));
+ /* MVS */
+    if (ii LT envir_ptr->kwd_num- 1)
+      ChkSumL (str_check_ascii, (int)strlen(checksum_str),
+               contin, &handle, checksum);
+    else
+      ChkSumL (str_check_ascii, (int)strlen(checksum_str),
+               last, &handle, checksum);
+    ESA_DIAG_printf (ESA_COMP_ACSDBPK, DIAG_COMMON,
+      "          %Row %d: (%s %s %s %s %s) StrCheck(%s) == %.8s.",
+	  ii+ 1, rss, api, keyword_type, addtyp, keyword,
+	  str_check_ascii, checksum);
+  }
+  ESA_DIAG_printf (ESA_COMP_ACSDBPK, DIAG_DETAILES,
+    "...<- : ---------- All RssApiKwds Checksum %.8s.", checksum);
+  ESA_DIAG_exit (ESA_COMP_ACSDBPK, DIAG_COMMON, fn, rc);
+}
+ 
+/****************************************************************
+* Procedure Name   : CS_kwds_check
+* Description      : Check if entity keywords is in rssprm file
+*                      are equals to defined keywords.
+* Input            : Defined keyword
+* Output           :
+* Return Value     :
+* Scope            : global
+*******************************************************************/
+ 
+ESA_RC CS_kwds_check (int                kwd_num,
+                      RSSAPI_KWD_rec_ptr keywrds)
+{
+  char                fn[]="CS_kwds_check";
+  ESA_RC              rc= ESA_OK;
+  char                keyword[MAX_RSS_ADDINFO_KWD_LEN+ 1];
+  RSSAPI_KWD_rec_ptr  kwd_ptr= NULL;
+  int                 ii= 0, entity= 0;
+  unsigned int        kk = 0;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSDBPK, DIAG_COMMON, fn);
+  CS_get_envir_address (&envir_ptr);
+ 
+  for (ii= 0; ii LT kwd_num AND rc EQ ESA_OK; ii++ ) {
+    kwd_ptr= keywrds+ ii;
+    kwd_ptr->fil1= '\0';
+    if (kwd_ptr->rss[0] EQ ' ' OR
+        strlen (kwd_ptr->rss) EQ 0) {
+      CTSAMSG_print (ERR_CS_INVL_KWD_ENTRY,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn,
+                     C_RSS_NAME, kwd_ptr->rss);
+      rc= ESA_ERR;
+      goto cleanup;
+    }
+    kwd_ptr->fil2= '\0';
+    kk= strspn (kwd_ptr->api, POSITIVE_VALUE);
+    if ((strlen (kwd_ptr->api) EQ 0) OR
+        (kk NE strlen (kwd_ptr->api))) {
+      CTSAMSG_print (ERR_CS_INVL_KWD_ENTRY,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     fn, C_API, kwd_ptr->api);
+      rc= ESA_ERR;
+      goto cleanup;
+    }
+    entity= atoi(kwd_ptr->api);
+ 
+    kwd_ptr->fil3= '\0';
+    if (kwd_ptr->keyword_type NE KWD_FOR_ADDINFO_1A       AND
+        kwd_ptr->keyword_type NE KWD_FOR_ADDINFO_1A_CHECK AND
+        kwd_ptr->keyword_type NE KWD_FOR_ADDINFO_1B       AND
+        kwd_ptr->keyword_type NE KWD_FOR_ADDINFO_1B_CHECK AND
+        kwd_ptr->keyword_type NE KWD_FOR_ENTITY_INFO      AND
+        kwd_ptr->keyword_type NE KWD_FOR_ENTITY_CHECK     AND
+        kwd_ptr->keyword_type NE KWD_FOR_ADDINFO_2B       AND
+        kwd_ptr->keyword_type NE KWD_FOR_ADDINFO_2B_CHECK AND
+        kwd_ptr->keyword_type NE KWD_FOR_ADDINFO_2A       AND
+        kwd_ptr->keyword_type NE KWD_FOR_ADDINFO_2A_CHECK) {
+      CTSAMSG_print (ERR_CS_INVL_KWD_ENTRY,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn,
+                     C_KWD_CHKSUM_TYPE, &kwd_ptr->keyword_type);
+      rc= ESA_ERR;
+      goto cleanup;
+    }
+    kwd_ptr->fil4= '\0';
+    if (kwd_ptr->addtyp[0] EQ ' ' OR
+        strlen (kwd_ptr->addtyp) EQ 0) {
+      CTSAMSG_print (ERR_CS_INVL_KWD_ENTRY,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn,
+                     C_KWD_ADDTYPE, kwd_ptr->addtyp);
+      rc= ESA_ERR;
+      goto cleanup;
+    }
+    CLEAR (keyword);
+    memcpy ((char *)keyword, (char *)kwd_ptr->keyword,
+            MAX_RSS_ADDINFO_KWD_LEN);
+    strtok (keyword, WHITECHARS);
+    if (strlen (kwd_ptr->keyword) EQ 0) {
+      CTSAMSG_print (ERR_CS_INVL_KWD_ENTRY,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn,
+                     C_KEYWORD, kwd_ptr->keyword);
+      rc= ESA_ERR;
+      goto cleanup;
+    }
+    kwd_ptr->fil1= ' ';
+    kwd_ptr->fil2= ' ';
+    kwd_ptr->fil3= ' ';
+    kwd_ptr->fil4= ' ';
+ 
+    if ((kwd_ptr->keyword_type NE KWD_FOR_ENTITY_CHECK) AND
+        (kwd_ptr->keyword_type NE KWD_FOR_ENTITY_INFO))
+      continue;
+ 
+    switch (entity) {
+      case FUNC_ADDUSER:
+          if (strcmp (keyword, C_USER_ID) EQ 0)           break;
+          if (strcmp (keyword, C_USER_GROUP_DEF) EQ 0)    break;
+          if (strcmp (keyword, C_USER_PASSWD) EQ 0)       break;
+          if (strcmp (keyword, C_USER_PASSWD_LIFE) EQ 0)  break;
+          if (strcmp (keyword, C_USER_REV_STATUS) EQ 0)   break;
+          if (strcmp (keyword, C_USER_ADMIN) EQ 0)        break;
+          if (strcmp (keyword, C_USER_OE_PARENT) EQ 0)    break;
+          rc= ESA_ERR;
+          break;
+      case FUNC_ADDUG:
+          if (strcmp (keyword, C_GROUP_ID) EQ 0)          break;
+          if (strcmp (keyword, C_GROUP_PARENT) EQ 0)      break;
+          if (strcmp (keyword, C_GROUP_OE_PARENT) EQ 0)   break;
+          rc= ESA_ERR;
+          break;
+      case FUNC_ADDOE:
+          if (strcmp (keyword, C_OE_ID) EQ 0)          break;
+          if (strcmp (keyword, C_OE_PARENT) EQ 0)      break;
+          rc= ESA_ERR;
+          break;
+      case FUNC_ADDU2UG:
+          if (strcmp (keyword, C_USER_ID) EQ 0)           break;
+          if (strcmp (keyword, C_GROUP_ID) EQ 0)          break;
+          if (strcmp (keyword, C_U2UG_MISC) EQ 0)         break;
+          if (strcmp (keyword, C_U2UG_ATTRS) EQ 0)        break;
+          if (strcmp (keyword, C_U2UG_DEF_GROUP) EQ 0)    break;
+          rc= ESA_ERR;
+          break;
+      default:
+          break;
+    }
+    if (rc NE ESA_OK) {
+      CTSAMSG_print (ERR_CS_INVALID_KEYWORD,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     keyword, envir_ptr->file_rsskwds);
+      goto cleanup;
+    }
+  }
+  cleanup:
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_REC_ERR,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   ii+ 1, envir_ptr->file_rsskwds);
+  ESA_DIAG_exit (ESA_COMP_ACSDBPK, DIAG_COMMON, fn, rc);
+  return (rc);
+}
+ 
+void CS_DAIG_RssApiKwd (void)
+{
+   int                   jj= 0;
+   RSSAPI_KWD_rec_typ  * keywrds, keywrds_space;
+   ENVIRONMENT_rec_typ * envir_ptr;
+   char                * rss,* api,* keyword_typ, * addtyp, * keyword;
+   char                  fn[]="CS_DAIG_RssApiKwd";
+ 
+   ESA_DIAG_enter (ESA_COMP_ACSDBPK, DIAG_COMMON, fn);
+   if (ESA_DIAG_get_debug_level(ESA_COMP_ACSCB) LE DIAG_BASIC)
+		goto cleanup;
+   CS_get_envir_address (&envir_ptr);
+   ESA_DIAG_printf (ESA_COMP_ACSCB, 0, "     RssApiKwd rows --------------------");
+   for (jj= 0;
+        (envir_ptr->keywrds NE NULL) AND (jj LT envir_ptr->kwd_num);
+		jj++)
+   {
+      memcpy ((char *)&keywrds_space,
+		      (char *)(envir_ptr->keywrds+ jj),
+			  sizeof (RSSAPI_KWD_rec_typ));
+      keywrds= &keywrds_space;
+      keywrds->end_string= '\0';
+      rss=            strtok ((char *)keywrds, WHITECHARS);
+      api=            strtok (NULL, WHITECHARS);
+      keyword_typ=    strtok (NULL, WHITECHARS);
+      addtyp=         strtok (NULL, WHITECHARS);
+      keyword=        strtok (NULL, WHITECHARS);
+      ESA_DIAG_printf (ESA_COMP_ACSCB, 0,
+	  "       %d : rss=%s api=%s KwdTyp=%c AddInfoTyp=%s Kwd=%s.",
+	   jj+ 1, rss, api, *keyword_typ, addtyp, keyword);
+   }
+   ESA_DIAG_printf (ESA_COMP_ACSCB, 0, "     ---------------------------------");
+cleanup:
+  ESA_DIAG_exit (ESA_COMP_ACSDBPK, DIAG_COMMON, fn, ESA_RC_VOID);
+  return;
+}
+ 
+void CS_DAIG_RssApiKwdsForRss (void)
+{
+   int                   kk= 0;
+   ENVIRONMENT_rec_typ * envir_ptr;
+   char                  fn[]="CS_DAIG_RssApiKwdsForRss";
+ 
+   ESA_DIAG_enter (ESA_COMP_ACSDBPK, DIAG_COMMON, fn);
+   if (ESA_DIAG_get_debug_level(ESA_COMP_ACSCB) LE DIAG_DETAILES)
+		goto cleanup;
+   CS_get_envir_address (&envir_ptr);
+   ESA_DIAG_printf (ESA_COMP_ACSCB, 0, "     Rss Api Keywords (%p) ====================",
+			  envir_ptr->interest);
+   for (kk= 0; kk LT envir_ptr->max_rss_num ; kk++)
+   {
+ 
+      ESA_DIAG_printf (ESA_COMP_ACSCB, 0, "       %d Rss %s (%p) --------------------",
+		kk+ 1,envir_ptr->interest[kk].rss,envir_ptr->interest[kk].rss);
+ 
+      ESA_DIAG_printf (ESA_COMP_ACSCB, 0, "         Number of OE keywords = %d.",
+		      envir_ptr->interest[kk].num_oe_kwds);
+      ESA_DIAG_printf (ESA_COMP_ACSCB, 0, "                GROUP keywords = %d.",
+		      envir_ptr->interest[kk].num_ug_kwds);
+      ESA_DIAG_printf (ESA_COMP_ACSCB, 0, "                 USER keywords = %d.",
+		      envir_ptr->interest[kk].num_usr_kwds);
+      ESA_DIAG_printf (ESA_COMP_ACSCB, 0, "           CONNECTION keywords = %d.",
+		      envir_ptr->interest[kk].num_u2ug_kwds);
+      ESA_DIAG_printf (ESA_COMP_ACSCB, 0, "             RESOURCE keywords = %d.",
+		      envir_ptr->interest[kk].num_res_kwds);
+      ESA_DIAG_printf (ESA_COMP_ACSCB, 0, "                  ACE keywords = %d.",
+		      envir_ptr->interest[kk].num_ace_kwds);
+      ESA_DIAG_printf (ESA_COMP_ACSCB, 0, "                  RSS keywords = %d.",
+		      envir_ptr->interest[kk].num_rss_kwds);
+      ESA_DIAG_printf (ESA_COMP_ACSCB, 0, "               ENTITY keywords = %d.",
+		      envir_ptr->interest[kk].num_entity_kwds);
+      /* BS10106 - Start */
+      ESA_DIAG_printf (ESA_COMP_ACSCB, 0, "ROLE keywords = %d.",
+        envir_ptr->interest[kk].num_xrol_kwds);
+      ESA_DIAG_printf (ESA_COMP_ACSCB, 0, "SOURCE keywords = %d.",
+        envir_ptr->interest[kk].num_xsgp_kwds);
+      /* BS10106 - End */
+      ESA_DIAG_printf (ESA_COMP_ACSCB, 0, "       --------------------");
+   }
+   ESA_DIAG_printf (ESA_COMP_ACSCB, 0, "     ====================");
+cleanup:
+  ESA_DIAG_exit (ESA_COMP_ACSDBPK, DIAG_COMMON, fn, ESA_RC_VOID);
+  return;
+}
+ 
+void CS_DAIG_RssApiPrm (void)
+{
+   int                   jj= 0;
+   RSSAPI_PRM_rec_typ  * params, params_space;
+   ENVIRONMENT_rec_typ * envir_ptr;
+   char                * rss,* api,* pre, * rss_type, * post_prog;
+   char                * act, * post, * pre_prog, * script_kwd_num;
+   char                  fn[]="CS_DAIG_RssApiPrm";
+ 
+   ESA_DIAG_enter (ESA_COMP_ACSDBPK, DIAG_COMMON, fn);
+   if (ESA_DIAG_get_debug_level(ESA_COMP_ACSCB) LE DIAG_BASIC)
+		goto cleanup;
+   CS_get_envir_address (&envir_ptr);
+   ESA_DIAG_printf (ESA_COMP_ACSCB, 0, "     RssApiPrm rows --------------------");
+   for (jj= 0;
+        (envir_ptr->params NE NULL) AND (jj LT envir_ptr->prm_num);
+		jj++)
+   {
+      memcpy ((char *)&params_space,
+		      (char *)(envir_ptr->params+ jj),
+			  sizeof (RSSAPI_PRM_rec_typ));
+      params= &params_space;
+	  params->end_string= '\0';
+      rss_type=       strtok ((char *)params, WHITECHARS);
+      rss=            strtok (NULL, WHITECHARS);
+      api=            strtok (NULL, WHITECHARS);
+      script_kwd_num= strtok (NULL, WHITECHARS);
+      pre=            strtok (NULL, WHITECHARS);
+      act=            strtok (NULL, WHITECHARS);
+      post=           strtok (NULL, WHITECHARS);
+      pre_prog=       strtok (NULL, WHITECHARS);
+      post_prog=      strtok (NULL, WHITECHARS);
+ 
+      ESA_DIAG_printf (ESA_COMP_ACSCB, 0,
+	  "       %d: rss=%s %s api=%s SN=%s Pre=%c-%s Act=%c Post=%c-%s.",
+	   jj+ 1, rss, rss_type, api, script_kwd_num, *pre, pre_prog, *act, *post, post_prog);
+   }
+   ESA_DIAG_printf (ESA_COMP_ACSCB, 0,
+	          "     ---------------------------------");
+cleanup:
+  ESA_DIAG_exit (ESA_COMP_ACSDBPK, DIAG_COMMON, fn, ESA_RC_VOID);
+  return;
+}

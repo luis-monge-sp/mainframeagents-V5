@@ -1,0 +1,1406 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: esaofos.c %
+ * Instance        : %instance: 1 %
+ * Created by      : %created_by: ihoffma %
+ * Created on      : %date_created: Wed Nov 19 13:14:57 2003 %
+ * Current Version : %version: 4 %
+ * Last Modified by: %derived_by: ihoffma %
+ * Last Modified on: %date_modified: Wed Nov 19 13:14:57 2003 %
+ */
+ 
+/**************************************************************
+ * Mod.ID  Who      When         Description
+ * ============================================================
+ * IMH001  Ian H.   17-Nov-2003  QAP1098903. For connections:
+ *                               "D"-type record (delete) written
+ *                               to OSF file instead of "U".
+ * IMH002  Ian H.   19-Nov-2003  WSAN101432 Thread-safe code (errno)
+ * BSAN102349   Nmore    25-Jan-05  Adding RSSPARAM to ignore uppercase conversion
+ * SAS2IBMN NuritY  10/10/16     SAS/C to IBM C Conversion:
+ *                               1. Replace calls to access() with
+ *                                  fopen() fget() and fclose().
+ *                               2. dsn:dsn -> //'dsn'
+ *                               3. remove() does not have to be handled
+ *                                  because it deletes the file.
+ **************************************************************/
+ 
+#include "globs.h"
+ 
+/* WSAN100128 start *
+#define  OS_OFLI_WAIT        1
+* WSAN100128 end*/
+ 
+#include ERRNO     /* IMH002 */
+ 
+#include ESA_API
+#include ESA_INIT
+#include ESA_CS_OS
+#include ESA_OS_OFLI
+ 
+ 
+#include ESA_ESAOFLI
+#include ESA_ESAOFIO
+ 
+#include STDIO
+#include STDLIB
+#include CTYPE         /* BSAN100840 */
+ 
+/* for MVS ISAN000045 */
+#include UNISTD
+ /* MVS */
+ 
+ 
+/* WSAN100361 */
+static ESA_RC OS_OFLI_object_renamed(RSS_typ        rss_type,
+                 RSS_typ                            rss_name,
+                 OFFLINE_INTERCEPT_STUFF_rec_typ  * offl_params,
+                 RESOURCE_typ                       ofli_path,
+                 char                             * db_file,
+                 char                             * object_type,
+                 char                             * object_name,
+                 char                             * new_object_name,
+                 CHECKSUM_typ                       CheckSum,
+                 ADMIN_PARAMS_rec_typ             * admin_params);
+ 
+static int  compo = ESA_COMP_RSS_INTERCEPT;
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetOSFileName                             *
+*                                                             *
+* DESCRIPTION     : Build file name                           *
+*                                                             *
+* INPUT           : base                                      *
+*                   ifile_name                                *
+*                                                             *
+* OUTPUT          : init_file_name                            *
+*                                                             *
+* RETURN VALUE    : none                                      *
+*                                                             *
+**************************************************************/
+ 
+static void GetOSFileName (char       * base,
+                           const char * ifile_name,
+                           char       * init_file_name)
+{
+  char func[]="GetOSFileName";
+ 
+  ESA_DIAG_enter (ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func );
+   strcpy (init_file_name, base);
+ 
+ 
+/* for MVS */
+   if (strlen (base) GT 0)
+      strcat (init_file_name, ".");
+ /* MVS */
+ 
+   strcat (init_file_name, ifile_name);
+   strcat (init_file_name, "'");                      /* SAS2IBMN */
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, ESA_RC_VOID);
+} /* GetOSFileName */
+ 
+/***************************************************************
+ * Procedure Name: OS_OFLI_init                                *
+ * Description   : Lock the Offline Interrceptor files sync.   *
+ * Input         :                                             *
+ * Output        : handle                                      *
+ * Input/Output  : CTSAMSG params                              *
+ * Return Value  : ESA_RC                                      *
+ * Comments      : Call OFLI_term for free.                    *
+ ***************************************************************/
+ 
+static ESA_RC OS_OFLI_init (
+    RSS_typ                           rss_name,
+    RSS_typ                           rss_type,
+    const int                         keywords_type,
+    OFLI_KEYWORDS_rec_typ           * keywords,
+    OFFLINE_INTERCEPT_STUFF_rec_typ * offl_params,
+    int                               db_type,
+    const char                      * db_file_name,
+    RESOURCE_typ                      db_file,
+    RESOURCE_typ                      ofli_path_r,
+    FUNC_PTR_rec_typ                * func_ptr,
+    ADMIN_PARAMS_rec_typ            * admin_params)
+ 
+{
+ ESA_RC                       rc = ESA_OK;
+/* WSAN100128 start*
+ RESOURCE_typ                 RName;
+* WSAN100128 end*/
+ static  char                 func[] = "OS_OFLI_init";
+ ENVIRONMENT_rec_typ        * envir_ptr;
+ 
+ CS_get_envir_address (&envir_ptr);
+ 
+ /*
+  *  Initialize
+  */
+ 
+  ESA_DIAG_enter (compo, DIAG_COMMON, func );
+ 
+  ESA_DIAG_printf(compo, 13,
+                 "rss_name=%s rss_type=%s keywords_type=%d",
+                  rss_name, rss_type, keywords_type);
+ 
+ /*
+  * Initialize internal vars
+  */
+ 
+  rc = BuildOfflParams(OS_OFLI, rss_name, rss_type,
+                       admin_params, offl_params);
+  if (rc NE ESA_OK) {
+    rc = ESA_FATAL;
+    goto exit;
+  }
+ 
+/*WSAN100128 start*/
+ /*
+  *  Get  SYNC_SEMAPHORE  parameter
+  *
+ 
+  rc = admin_params->cs_func.rssprm_get_ptr (rss_name, SYNC_SEMAPHORE,
+                                             sizeof (RName), RName);
+ 
+  if (rc NE ESA_OK) {
+     ESA_DIAG_printf (compo, 1, "ssprm_get(%s) failed",
+                      SYNC_SEMAPHORE);
+     rc = ESA_FATAL;
+     goto exit;
+  }
+ 
+ *
+  *  Lock INIT
+  *
+ 
+  rc = OS_CS_lock_init(RName, LOCK_RES_FILE,
+                       &(offl_params->lock_handle),
+                       offl_params->lock_file_handle,
+                       SCOPE_REMOTE, &(offl_params->msg_params));
+ 
+  if (rc NE ESA_OK ) {
+     ESA_DIAG_printf (compo, 1, "OS_CS_lock_init failed");
+     rc = ESA_FATAL;
+     goto exit;
+  }
+ 
+ *
+  *  Lock
+  *
+ 
+  rc = OS_CS_lock ( offl_params->lock_handle, OS_OFLI_WAIT,
+                    &(offl_params->msg_params));
+  if (rc NE ESA_OK ){
+     ESA_DIAG_printf (compo, 1, "OS_CS_lock failed");
+     rc = ESA_FATAL;
+     goto exit;
+  }
+ 
+  offl_params->lock_done = 1;
+*WSAN100128 end*/
+  offl_params->func_ptr  = func_ptr;
+ 
+ /*
+  *  Determine whether LOGIN_MODE_FIRST need
+  */
+ 
+  if (offl_params->ofli_admin_login_req EQ 'Y')   {
+ 
+     if (  (strcmp( (char *)offl_params->admin_params.admin_uname,
+                    (char *)admin_params->admin_uname) EQ 0 ) AND
+           (strcmp( (char *)offl_params->admin_params.admin_gname,
+                    (char *)admin_params->admin_gname) EQ 0 )   )
+        offl_params->admin_params.login_handle =
+            admin_params->login_handle;
+     else {
+        offl_params->admin_params.login_handle = NULL;
+        ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+	    	"    -> Call to CTSRSSLogin USA-API for rss=%s adm=%s ug=%s mode=%s(%d).",
+			offl_params->rss_name,
+            offl_params->ofli_admin_user,
+            offl_params->ofli_admin_group,
+            "LOGIN_MODE_FIRST",LOGIN_MODE_FIRST);
+ 
+/*     Removed according to the wish to avoid password exposing
+        ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 99, "pwd=%s",
+                          offl_params->ofli_admin_pswd);*/
+ 
+        rc = (offl_params->func_ptr->rss_login_ptr) (
+                          offl_params->rss_name,
+                          offl_params->ofli_admin_user,
+                          offl_params->ofli_admin_group,
+                          offl_params->ofli_admin_pswd,
+                          LOGIN_MODE_FIRST,
+                          &(offl_params->admin_params.login_handle),
+                          &offl_params->admin_params,
+                          offl_params->err);
+        ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSRSSLogin USA-API completed with rc=%d (%s) hndl=%p.",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK",
+			offl_params->admin_params.login_handle);
+        if (rc NE ESA_OK) {
+           rc = ESA_FATAL;
+           goto exit;
+        }
+ 
+        offl_params->login_first_done = 1;
+     }
+  }
+ 
+ /*
+  *  Build DB file name
+  */
+ 
+  strcpy(ofli_path_r, offl_params->ofli_path);
+  GetOSFileName(offl_params->ofli_path, db_file_name, db_file);
+ 
+ /*
+  *  Get keywords
+  *  fisrt parameter to OS_OFLI_get_keywords_from_env was: rss_name
+  *                                                   now  rss_type
+  */
+ 
+  rc = OS_OFLI_get_keywords_from_env( rss_type, envir_ptr->keywrds,
+                                      envir_ptr->kwd_num,
+                                      keywords_type, keywords,
+                                      offl_params->dest,
+                                      offl_params->msgs);
+  if ( rc NE ESA_OK ) {
+     ESA_DIAG_printf (compo, DIAG_BASIC, "OS_OFLI_get_keywords_from_env failed");
+     rc = ESA_FATAL;
+     goto exit;
+  }
+ 
+  exit:;
+ 
+  ESA_DIAG_exit (compo, DIAG_COMMON, func, rc);
+ 
+  return rc;
+ 
+} /* OS_OFLI_init */
+ 
+/***************************************************************
+ * Procedure Name: OFLI_term                                   *
+ * Description   : Unlock the Offline Interrceptor files :     *
+ *               : users,user groups and connections info      *
+ * Input         :                                             *
+ * Output        : LockHandle                                  *
+ * Input/Output  : CTSAMSG params                              *
+ * Return Value  : ESA_RC                                      *
+ ***************************************************************/
+ 
+static ESA_RC OS_OFLI_term (
+    OFLI_KEYWORDS_rec_typ           * keywords,
+    OFFLINE_INTERCEPT_STUFF_rec_typ * offl_params)
+{
+ 
+ ESA_RC       rc     = ESA_OK, rc2= ESA_OK;
+ static char  func[] = "OS_OFLI_term";
+ 
+ /*
+  *  Initialize
+  */
+ 
+ ESA_DIAG_enter (compo, DIAG_COMMON, func );
+ 
+ if (offl_params->login_first_done EQ 1)
+ {
+      ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+	    	"    -> Call to CTSRSSLogout USA-API for rss=%s adm=%s ug=%s mode=%s(%d).",
+			offl_params->rss_name,
+            offl_params->ofli_admin_user,
+            offl_params->ofli_admin_group,
+            "LOGOUT_MODE_LAST",LOGOUT_MODE_LAST);
+     (offl_params->func_ptr->rss_logout_ptr) (offl_params->rss_name,
+                   offl_params->ofli_admin_user,
+                   offl_params->ofli_admin_group,
+                   LOGOUT_MODE_LAST,
+                   &(offl_params->admin_params.login_handle),
+                   &offl_params->admin_params,
+                   offl_params->err);
+     ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSRSSLogout USA-API completed with rc=%d (%s) hndl=%p.",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK",
+			offl_params->admin_params.login_handle);
+ }
+/*WSAN100128 start*/
+ /*
+  *  Unlock
+  */
+ 
+ if ( offl_params->lock_done )
+ {
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+                   "...-> OS_CS_unlock: hndl=%p.",
+				   offl_params->lock_handle);
+    rc2=OS_CS_unlock (offl_params->lock_handle,
+	                     &offl_params->msg_params);
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+	"...<- OS_CS_unlock: rc=%d (%s).",
+			rc2, (rc2 EQ ESA_OK) ? "OS==OK" : "OS##OK");
+ }
+ /*
+  *  Lock terminate
+  */
+ 
+ if ( offl_params->lock_handle )
+ {
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+                   "...-> OS_CS_lock_term: hndl=%p.",
+				   offl_params->lock_handle);
+    rc2=OS_CS_lock_term ( &offl_params->lock_handle,
+                            &offl_params->msg_params);
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+	"...<- OS_CS_lock_term: rc=%d (%s).",
+			rc2, (rc2 EQ ESA_OK) ? "OS==OK" : "OS##OK");
+ }
+ /*
+  *  Free keywords memory
+  */
+/*WSAN100128 end*/
+ 
+ if ( keywords->kwds )
+    free( keywords->kwds);
+ 
+ ESA_DIAG_exit (compo, DIAG_COMMON, func, rc);
+ 
+ return rc;
+} /* OS_OFLI_term */
+ 
+/***************************************************************
+ * Procedure Name: OS_OFLI_user_upd                            *
+ * Description   : Update offline intercetor database that     *
+ *                 a user was added/delete/updated             *
+ * Input         : rss_type    -                               *
+ *                 rss_name    -                               *
+ *                 user        - user name                     *
+ *                 conn_flag   - update connections of the user*
+ * Output        :                                             *
+ * Input/Output  : CTSAMSG params                              *
+ * Return Value  : ESA_RC                                      *
+ ***************************************************************/
+ 
+ESA_RC OS_OFLI_user_upd (RSS_typ                  rss_type,
+                         RSS_typ                  rss_name,
+                         USER_typ                 user,
+                         OS_OFLI_UPCON_FLAG_typ   conn_flag,
+                         FUNC_PTR_rec_typ       * func_ptr,
+                         ADMIN_PARAMS_rec_typ   * admin_params)
+{
+  ESA_RC                            rc = ESA_OK;
+  ESA_RC                            rcu;
+  UG_typ                            def_group;
+  CHECKSUM_typ                      CheckSum;
+  RESOURCE_typ                      db_file;
+  RESOURCE_typ                      ofli_path;
+  OFFLINE_INTERCEPT_STUFF_rec_typ   offl_params;
+  OFLI_KEYWORDS_rec_typ             user_keywords
+                                         = { 0, 0, NULL, NULL };
+  OFLI_KEYWORDS_rec_typ             connection_keywords
+                                         = { 0, 0, NULL, NULL };
+  static char                       func[] = "OS_OFLI_user_upd";
+  ENVIRONMENT_rec_typ             * envir_ptr;
+  int                               user_renamed  = FALSE;   /* WSAN100361 */
+  USER_typ                          new_user_name = "";      /* WSAN100361 */
+ 
+  CS_get_envir_address (&envir_ptr);
+  /*
+   *  Initialize
+   */
+ 
+   ESA_DIAG_enter (compo, DIAG_COMMON, func );
+ 
+   ESA_DIAG_printf(compo, 13,
+                   "User:%s RSS:%s(%s) Conn Flag:%d",
+                   (char*)user, (char *)rss_name,
+                   (char *)rss_type, conn_flag);
+ 
+  /*
+   *  Init processing
+   */
+ 
+   db_file[0] = NULL_CHAR;
+   rc =  OS_OFLI_init (rss_name, rss_type,
+                       USER_API_KEYWORDS, &user_keywords,
+                       &offl_params, OFLI_USER_DB,
+                       OSOFLI_USER_FILE_NAME,
+                       db_file, ofli_path, func_ptr, admin_params);
+ 
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+  /*
+   *  Get User info
+   */
+ 
+   rcu = GetSingleUserInfo(user, &CheckSum, &user_keywords,
+                           &offl_params, def_group,
+                           &user_renamed, new_user_name); /* WSAN100361 */
+ 
+   if (rcu EQ ESA_KEY_NOT_FOUND) {  /* User Not found */
+      memset (CheckSum, '\0', sizeof(CheckSum));
+      rc = PutOSRecord(db_file, OBJECT_DELETED,
+                      (char *)user, NULL, CheckSum,
+                      offl_params.dest, offl_params.msgs);
+   }
+   else if (rcu EQ ESA_OK) {  /* User found */
+      if (user_renamed) {                                     /* WSAN100361 */
+         rc = OS_OFLI_object_renamed(rss_type, rss_name,      /* WSAN100361 */
+                                     &offl_params, ofli_path, /* WSAN100361 */
+                                     db_file, "User",         /* WSAN100361 */
+                                     (char *)user,            /* WSAN100361 */
+                                     (char *)new_user_name,   /* WSAN100361 */
+                                     CheckSum,                /* WSAN100361 */
+                                     admin_params);           /* WSAN100361 */
+         goto exit;                                           /* WSAN100361 */
+      }    /* User Has renamed */                             /* WSAN100361 */
+      rc = PutOSRecord(db_file, OBJECT_UPDATED,
+                       (char *)user, NULL, CheckSum,
+                       offl_params.dest, offl_params.msgs);
+   }
+   else
+	  goto exit;
+ 
+   if ( rc NE ESA_OK ) {
+      goto exit;
+   }
+ 
+  /*
+   *   Get Connection DB file name
+   */
+ 
+  db_file[0] = NULL_CHAR;
+  GetOSFileName(ofli_path, OSOFLI_CONNECTION_FILE_NAME, db_file);
+ 
+  if ( rcu NE ESA_OK ) {  /* User Not found */
+     memset (CheckSum, '\0', sizeof(CheckSum));
+     rc = PutOSRecord(db_file, OBJECT_DELETED,
+                    (char *)user, DB_REMOVE_MASS_STR, CheckSum,
+                    offl_params.dest, offl_params.msgs);
+     goto exit;
+   }
+ 
+  /*
+   *   UPdate Connections flag processing
+   */
+ 
+   if ( conn_flag EQ OS_OFLI_UPDCONN_NO )
+      goto exit;
+ 
+  /*
+   *   Get Connection keywords
+   *  fisrt parameter to OS_OFLI_get_keywords_from_env was: rss_name
+   *                                                   now  rss_type
+   */
+ 
+   rc = OS_OFLI_get_keywords_from_env(rss_type, envir_ptr->keywrds,
+                                      envir_ptr->kwd_num,
+                                      CONNECTION_API_KEYWORDS,
+                                      &connection_keywords,
+                                      offl_params.dest,
+                                      offl_params.msgs);
+  if ( rc NE ESA_OK ) {
+     ESA_DIAG_printf (compo, DIAG_BASIC, "OS_OFLI_get_keywords_from_env failed");
+     rc = ESA_FATAL;
+     goto exit;
+  }
+ 
+ /*
+  *   Delete "old" user's connections
+  */
+ 
+  memset (CheckSum, '\0', sizeof(CheckSum));
+  rc = PutOSRecord(db_file, OBJECT_DELETED,
+                   (char *)user, DB_REMOVE_MASS_STR, CheckSum,
+                   offl_params.dest, offl_params.msgs);
+  if ( rc NE ESA_OK ) {
+     rc = ESA_FATAL;
+     goto exit;
+  }
+ 
+ /*
+  *  Add New user's connections
+  */
+ 
+  rc = AddAllUsersConnections(user, db_file,
+                              &connection_keywords, &offl_params);
+  if ( rc NE ESA_OK ) {
+     goto exit;
+  }
+ 
+  exit:;
+ 
+  /*
+   * Terminate processing
+   */
+ 
+  OS_OFLI_term( &user_keywords, &offl_params);
+ 
+  /*
+   *  Free connection keywords if used
+   */
+ 
+  if ( connection_keywords.kwds )
+    free( connection_keywords.kwds);
+ 
+  ESA_DIAG_exit (compo, DIAG_COMMON, func, rc);
+  return rc;
+} /* OS_OFLI_user_upd */
+ 
+/***************************************************************
+ * Procedure Name: OS_OFLI_ug_upd                             *
+ * Description   : Update offline interceptor database that    *
+ *               : a ug was added/delete/updated               *
+ * Input         : rss_type    -                               *
+ *               : rss_name    -                               *
+ *               : ug          - group name                    *
+ * Output        :                                             *
+ * Input/Output  : CTSAMSG params                              *
+ * Return Value  : ESA_RC                                      *
+ ***************************************************************/
+ 
+ESA_RC OS_OFLI_ug_upd (RSS_typ                  rss_type,
+                       RSS_typ                  rss_name,
+                       UG_typ                   ug,
+                       OS_OFLI_UPCON_FLAG_typ   conn_flag,
+                       FUNC_PTR_rec_typ       * func_ptr,
+                       ADMIN_PARAMS_rec_typ   * admin_params)
+{
+  ESA_RC                            rc  = ESA_OK;
+  ESA_RC                            rcg = ESA_OK;
+  CHECKSUM_typ                      CheckSum;
+  RESOURCE_typ                      db_file;
+  RESOURCE_typ                      ofli_path;
+  OFFLINE_INTERCEPT_STUFF_rec_typ   offl_params;
+  OFLI_KEYWORDS_rec_typ             group_keywords
+                                           = { 0, 0, NULL, NULL };
+  OFLI_KEYWORDS_rec_typ             connection_keywords
+                                           = { 0, 0, NULL, NULL };
+  static char                       func[] = "OS_OFLI_ug_upd";
+  ENVIRONMENT_rec_typ             * envir_ptr;
+  int                               group_renamed  = FALSE; /* WSAN100361 */
+  UG_typ                            new_group_name = "";    /* WSAN100361 */
+ 
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  /*
+   *  Initialize
+   */
+ 
+  ESA_DIAG_enter (compo, DIAG_COMMON, func );
+ 
+  ESA_DIAG_printf(compo, 13,
+                  "User Group:%s RSS:%s(%s) conn_flag=%d",
+                  (char*)ug, (char *)rss_name, (char *)rss_type,
+                  conn_flag);
+ 
+  /*
+   *  Init processing
+   */
+ 
+   db_file[0] = NULL_CHAR;
+   rc =  OS_OFLI_init (rss_name, rss_type,
+                       GROUP_API_KEYWORDS, &group_keywords,
+                       &offl_params,OFLI_GROUP_DB,
+                       OSOFLI_GROUP_FILE_NAME,
+                       db_file, ofli_path, func_ptr, admin_params);
+ 
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+  /*
+   *  Get Group info
+   */
+ 
+   rcg = GetSingleGroupInfo(ug, &CheckSum, &group_keywords,
+                            &offl_params,
+                            &group_renamed, new_group_name); /* WSAN100361 */
+ 
+  /*
+   * Update Group db
+   */
+ 
+   if ( rcg EQ ESA_KEY_NOT_FOUND) {
+     memset (CheckSum, '\0', sizeof(CheckSum));
+     rc = PutOSRecord(db_file, OBJECT_DELETED,
+                     (char *)ug, NULL, CheckSum,
+                     offl_params.dest, offl_params.msgs);
+   }
+   else if (rcg EQ ESA_OK) {
+     if (group_renamed) {                                     /* WSAN100361 */
+         rc = OS_OFLI_object_renamed(rss_type, rss_name,      /* WSAN100361 */
+                                     &offl_params, ofli_path, /* WSAN100361 */
+                                     db_file, "Group",        /* WSAN100361 */
+                                     (char *)ug,              /* WSAN100361 */
+                                     (char *)new_group_name,  /* WSAN100361 */
+                                     CheckSum,                /* WSAN100361 */
+                                     admin_params);           /* WSAN100361 */
+         goto exit;                                           /* WSAN100361 */
+     }  /* Group has renamed */                               /* WSAN100361 */
+     rc = PutOSRecord(db_file, OBJECT_UPDATED,
+                      (char *)ug, NULL, CheckSum,
+                      offl_params.dest, offl_params.msgs);
+  }
+  else
+	 goto exit;
+ 
+  if ( rc NE ESA_OK ) {
+     goto exit;
+  }
+ 
+  /*
+   *   Get Connection DB file name
+   */
+ 
+  db_file[0] = NULL_CHAR;
+  GetOSFileName(ofli_path, OSOFLI_CONNECTION_FILE_NAME, db_file);
+ 
+  if ( rcg NE ESA_OK ) {  /* Group Not found */
+     memset (CheckSum, '\0', sizeof(CheckSum));
+     rc = PutOSRecord(db_file, OBJECT_DELETED,
+                      DB_REMOVE_MASS_STR, (char *)ug, CheckSum,
+                      offl_params.dest, offl_params.msgs);
+     goto exit;
+   }
+ 
+  /*
+   *   UPdate Connections flag processing
+   */
+ 
+   if ( conn_flag EQ OS_OFLI_UPDCONN_NO )
+      goto exit;
+ 
+  /*
+   *   Get Connection keywords
+   *   fisrt parameter to OS_OFLI_get_keywords_from_env was: rss_name
+   *                                                    now  rss_type
+   */
+ 
+   rc = OS_OFLI_get_keywords_from_env(rss_type, envir_ptr->keywrds,
+                                      envir_ptr->kwd_num,
+                                      CONNECTION_API_KEYWORDS,
+                                      &connection_keywords,
+                                      offl_params.dest,
+                                      offl_params.msgs);
+  if ( rc NE ESA_OK ) {
+     ESA_DIAG_printf (compo, DIAG_BASIC, "OS_OFLI_get_keywords_from_env failed");
+     rc = ESA_FATAL;
+     goto exit;
+  }
+ 
+ /*
+  *   Delete "old" group's connections
+  */
+ 
+  memset (CheckSum, '\0', sizeof(CheckSum));
+  rc = PutOSRecord(db_file, OBJECT_DELETED,
+                   DB_REMOVE_MASS_STR, (char *)ug, CheckSum,
+                   offl_params.dest, offl_params.msgs);
+  if ( rc NE ESA_OK ) {
+     rc = ESA_FATAL;
+     goto exit;
+  }
+ 
+ /*
+  *  Add New group's connections
+  */
+ 
+  rc = AddAllGroupsConnections(ug, db_file, &connection_keywords,
+                               &offl_params);
+  if ( rc NE ESA_OK ) {
+     goto exit;
+  }
+ 
+  exit:;
+ 
+  /*
+   * Terminate processing
+   */
+ 
+  OS_OFLI_term( &group_keywords, &offl_params);
+ 
+  /*
+   *  Free connection keywords
+   */
+ 
+  if ( connection_keywords.kwds )
+    free( connection_keywords.kwds);
+ 
+  ESA_DIAG_exit (compo, DIAG_COMMON, func, rc);
+  return rc;
+} /* OS_OFLI_ug_upd */
+ 
+/***************************************************************
+ * Procedure Name: OS_OFLI_oe_upd                             *
+ * Description   : Update offline interceptor database that    *
+ *               : a oe was added/delete/updated               *
+ * Input         : rss_type    -                               *
+ *               : rss_name    -                               *
+ *               : oe          - oe name                       *
+ * Output        :                                             *
+ * Input/Output  : CTSAMSG params                              *
+ * Return Value  : ESA_RC                                      *
+ ***************************************************************/
+ 
+ESA_RC OS_OFLI_oe_upd (RSS_typ                  rss_type,
+                       RSS_typ                  rss_name,
+                       UG_typ                   oe,
+                       FUNC_PTR_rec_typ       * func_ptr,
+                       ADMIN_PARAMS_rec_typ   * admin_params)
+{
+  ESA_RC                            rc  = ESA_OK;
+  ESA_RC                            rce = ESA_OK;
+  CHECKSUM_typ                      CheckSum;
+  RESOURCE_typ                      db_file;
+  RESOURCE_typ                      ofli_path;
+  OFFLINE_INTERCEPT_STUFF_rec_typ   offl_params;
+  OFLI_KEYWORDS_rec_typ             oe_keywords
+                                           = { 0, 0, NULL, NULL };
+  static char                       func[] = "OS_OFLI_oe_upd";
+ 
+  /*
+   *  Initialize
+   */
+ 
+  ESA_DIAG_enter (compo, DIAG_COMMON, func );
+ 
+  ESA_DIAG_printf(compo, 13,
+                  "OE:%s RSS:%s(%s)",
+                  (char*)oe, (char *)rss_name, (char *)rss_type);
+ 
+  /*
+   *  Init processing
+   */
+ 
+   db_file[0] = NULL_CHAR;
+   rc =  OS_OFLI_init (rss_name, rss_type,
+                       OE_API_KEYWORDS, &oe_keywords,
+                       &offl_params,OFLI_OE_DB, OSOFLI_OE_FILE_NAME,
+                       db_file, ofli_path, func_ptr, admin_params);
+ 
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+  /*
+   *  Get OE info
+   */
+ 
+   rce = GetSingleOEInfo(oe, &CheckSum, &oe_keywords, &offl_params);
+ 
+  /*
+   * Update OE
+   */
+ 
+   if ( rce EQ ESA_KEY_NOT_FOUND) {
+     memset (CheckSum, '\0', sizeof(CheckSum));
+     rc = PutOSRecord(db_file, OBJECT_DELETED,
+                     (char *)oe, NULL, CheckSum,
+                     offl_params.dest, offl_params.msgs);
+   }
+  else if (rc EQ ESA_OK)
+     rc = PutOSRecord(db_file, OBJECT_UPDATED,
+                      (char *)oe, NULL, CheckSum,
+                      offl_params.dest, offl_params.msgs);
+ 
+  exit:;
+ 
+  /*
+   * Terminate processing
+   */
+ 
+  OS_OFLI_term (&oe_keywords, &offl_params);
+ 
+  ESA_DIAG_exit (compo, DIAG_COMMON, func, rc);
+  return rc;
+} /* OS_OFLI_oe_upd */
+ 
+/***************************************************************
+ * Procedure Name: OS_OFLI_conn_upd                           *
+ * Description   : Update offline interceptor database that    *
+ *               : a user to ug connection was updated         *
+ * Input         : rss_type    -                               *
+ *               : rss_name    -                               *
+ *               : user        - user name                     *
+ *               : ug          - group name                    *
+ * Output        :                                             *
+ * Input/Output  : CTSAMSG params                              *
+ * Return Value  : ESA_RC                                      *
+ ***************************************************************/
+ 
+ESA_RC OS_OFLI_conn_upd (RSS_typ                  rss_type,
+                         RSS_typ                  rss_name,
+                         USER_typ                 user,
+                         UG_typ                   ug,
+                         FUNC_PTR_rec_typ       * func_ptr,
+                         ADMIN_PARAMS_rec_typ   * admin_params)
+{
+   ESA_RC                            rc = ESA_OK;
+   CHECKSUM_typ                      CheckSum;
+   RESOURCE_typ                      db_file;
+   RESOURCE_typ                      ofli_path;
+   OFFLINE_INTERCEPT_STUFF_rec_typ   offl_params;
+   OFLI_KEYWORDS_rec_typ             connection_keywords
+                                             = { 0, 0, NULL, NULL };
+   static char                       func[] = "OS_OFLI_conn_upd";
+ 
+  /*
+   *  Initialize
+   */
+ 
+   ESA_DIAG_enter (compo, DIAG_COMMON, func );
+ 
+   ESA_DIAG_printf(compo, 13,
+                   "Connection:%s(UG)-%s(U) RSS:%s(%s)",
+                   (char *)ug, (char *)user, (char *)rss_name,
+                   (char *)rss_type);
+ 
+  /*
+   *  Init processing
+   */
+ 
+   db_file[0] = NULL_CHAR;
+   rc =  OS_OFLI_init (rss_name, rss_type,
+                       CONNECTION_API_KEYWORDS,
+                       &connection_keywords,
+                       &offl_params,OFLI_CONNECTION_DB,
+                       OSOFLI_CONNECTION_FILE_NAME,
+                       db_file, ofli_path, func_ptr, admin_params);
+ 
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+  /*
+   *  Get Connection pair info
+   */
+ 
+   rc = GetSingleConnectionPairInfo(user, ug, &CheckSum,
+                                    &connection_keywords, &offl_params);
+  /*
+   * Update Connection db
+   */
+ 
+   if ( rc EQ ESA_KEY_NOT_FOUND) {                  /* IMH001 */
+     memset (CheckSum, '\0', sizeof(CheckSum));
+     rc = PutOSRecord(db_file, OBJECT_DELETED,
+                     (char *)user, (char *)ug, CheckSum,
+                     offl_params.dest, offl_params.msgs);
+   }
+  else if (rc EQ ESA_OK)
+     rc = PutOSRecord(db_file, OBJECT_UPDATED,
+                      (char *)user, (char *)ug, CheckSum,
+                      offl_params.dest, offl_params.msgs);
+ 
+  exit:;
+ 
+  /*
+   * Terminate processing
+   */
+ 
+   OS_OFLI_term( &connection_keywords, &offl_params);
+ 
+   ESA_DIAG_exit (compo, DIAG_COMMON, func, rc);
+   return rc;
+ 
+} /* OS_OFLI_conn_upd */
+ 
+/***************************************************************
+ * Procedure Name: OS_OFLI_rssprm_upd                         *
+ * Description   : Update offline interceptor database that    *
+ *               : a rss parameters  was updated               *
+ * Input         : rss_type    -                               *
+ *               : rss_name    -                               *
+ *               : rss_param   - rss parameters                *
+ * Output        :                                             *
+ * Input/Output  : CTSAMSG params                              *
+ * Return Value  : ESA_RC                                      *
+ ***************************************************************/
+ 
+ESA_RC OS_OFLI_rssprm_upd (RSS_typ                  rss_type,
+                           RSS_typ                  rss_name,
+                           RSS_PARAMS_rec_typ     * rss_params,
+                           FUNC_PTR_rec_typ       * func_ptr,
+                           ADMIN_PARAMS_rec_typ   * admin_params)
+{
+  ESA_RC                            rc = ESA_OK;
+  char                            * wptr;           /* BSAN100840 */
+  RSS_typ                           rss_name_upper; /* BSAN100840 */
+  CHECKSUM_typ                      CheckSum;
+  RESOURCE_typ                      db_file;
+  RESOURCE_typ                      ofli_path;
+  OFFLINE_INTERCEPT_STUFF_rec_typ   offl_params;
+  OFLI_KEYWORDS_rec_typ             rss_keywords = {0, 0, NULL, NULL};
+  static char                       func[] = "OS_OFLI_rssparm_upd";
+ 
+  /*
+   *  Initialize
+   */
+ 
+  ESA_DIAG_enter (compo, DIAG_COMMON, func );
+ 
+  /*
+   *  Init processing
+   */
+ 
+   db_file[0] = NULL_CHAR;
+   rc =  OS_OFLI_init (rss_name, rss_type,
+                       RSS_API_KEYWORDS, &rss_keywords,
+                       &offl_params,OFLI_RSS_DB, OSOFLI_RSS_FILE_NAME,
+                       db_file, ofli_path, func_ptr, admin_params);
+ 
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+  /*
+   *  Get RSS Parameters info
+   */
+ 
+   rc = GetRSSParamsInfoForOS( &CheckSum, &rss_keywords, &offl_params);
+   if ( rc NE ESA_OK ) {
+      goto exit;
+   }
+ 
+  /*
+   * BSAN100840 . Uppercase the RSS name
+   */
+ 
+   strcpy(rss_name_upper, rss_name);        /* BSAN100840 */
+   wptr = (char *)rss_name_upper;           /* BSAN100840 */
+ 
+   /*BSAN102349 [Nmore, 24/01/2006]*/
+ 
+   if(offl_params.respect_rss_case == 'N')
+   {
+       ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 11,
+           "--RSS %s - converting the RSS Name to upper case",wptr);
+ 
+       for (; *wptr; wptr++) {                  /* BSAN100840 */
+          *wptr = (char)toupper(*wptr);         /* BSAN100840 */
+       }                                        /* BSAN100840 */
+   }
+ 
+   rc = PutOSRecord(db_file, OBJECT_UPDATED,
+              /* Del by  BSAN100840  (char *)rss_name, NULL, */
+              (char *)rss_name_upper, NULL,    /* BSAN100840 */
+              CheckSum, offl_params.dest, offl_params.msgs);
+  exit:;
+ 
+  /*
+   * Terminate processing
+   */
+ 
+  OS_OFLI_term( &rss_keywords, &offl_params);
+ 
+  ESA_DIAG_exit (compo, DIAG_COMMON, func, rc);
+  return rc;
+} /* OS_OFLI_rssparm_upd */
+ 
+/**************************************************************
+ * Procedure Name: OS_OFLI_sync                                *
+ * Description   : Synchronize the offline interceptor db with *
+ *                 the RSS db.                                 *
+ * Input         : rss_type    -                               *
+ *                 rss_name    -                               *
+ * Output        :                                             *
+ * Input/Output  : CTSAMSG params                              *
+ * Return Value  : ESA_RC                                      *
+ **************************************************************/
+ 
+ESA_RC OS_OFLI_sync (RSS_typ                  rss_type,
+                     RSS_typ                  rss_name,
+                     FUNC_PTR_rec_typ       * func_ptr,
+                     ADMIN_PARAMS_rec_typ   * admin_params)
+ 
+{
+ return(ESA_OK);
+} /* OS_OFLI_sync */
+ 
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : OfflineIntrcptrDBGetFileName              *
+*                                                             *
+* DESCRIPTION     : Create file name                          *
+*                                                             *
+* INPUT           : base                                      *
+*                   ifile_name                                *
+*                   rfile_name                                *
+*                   wfile_name                                *
+*                                                             *
+* OUTPUT          : init_file_name                            *
+*                   regular_file_name                         *
+*                   work_file_name                            *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC OS_OFLI_Build_FileNames (char                    * RssName,
+                                INTERCEPT_FILES_rec_typ * Files,
+                                ADMIN_PARAMS_rec_typ    * admin_params)
+ 
+{
+  ESA_RC        rc = ESA_OK;
+  char          func[]="OS_OFLI_Build_FileNames";
+  RESOURCE_typ  work_path, ofli_path;
+  ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+  work_path[0] = NULL_CHAR;
+  rc = admin_params->cs_func.rssprm_get_ptr (RssName,
+                        OFLI_WORK_PATH_PARAM,
+                        sizeof (work_path), work_path);
+ 
+  ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, DIAG_BASIC, "work path=%s", work_path);
+ 
+  if ( rc NE ESA_OK ) {
+     ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 0,
+             "RSS %s Missing parameter %s",RssName,OFLI_WORK_PATH_PARAM);
+     rc = ESA_FATAL;
+     goto cleanup;
+  }
+ 
+/* for MVS */
+  /* SAS2IBMN strcpy( ofli_path, "dsn:");  */
+  strcpy( ofli_path, "//'");
+  strcat( ofli_path, work_path);
+ /* MVS */
+ 
+  strcpy(Files->user_init_result_file, ofli_path);
+  strcpy(Files->user_regular_result_file, ofli_path);
+  strcpy(Files->user_compare_result_file, ofli_path);
+  strcpy(Files->user_os_file, ofli_path);
+  strcpy(Files->group_init_result_file, ofli_path);
+  strcpy(Files->group_regular_result_file, ofli_path);
+  strcpy(Files->group_compare_result_file, ofli_path);
+  strcpy(Files->group_os_file, ofli_path);
+  strcpy(Files->connection_init_result_file, ofli_path);
+  strcpy(Files->connection_regular_result_file, ofli_path);
+  strcpy(Files->connection_compare_result_file, ofli_path);
+  strcpy(Files->connection_os_file, ofli_path);
+  strcpy(Files->rss_init_result_file, ofli_path);
+  strcpy(Files->rss_regular_result_file, ofli_path);
+  strcpy(Files->rss_compare_result_file, ofli_path);
+  strcpy(Files->rss_os_file, ofli_path);
+  strcpy(Files->oe_init_result_file, ofli_path);
+  strcpy(Files->oe_regular_result_file, ofli_path);
+  strcpy(Files->oe_compare_result_file, ofli_path);
+  strcpy(Files->oe_os_file, ofli_path);
+  strcpy(Files->careoeof, ofli_path);
+ 
+ 
+/* for MVS */
+    if ( strlen(ofli_path) GT 0 ) {
+  strcat(Files->user_init_result_file, ".");
+  strcat(Files->user_regular_result_file, ".");
+  strcat(Files->user_compare_result_file, ".");
+  strcat(Files->user_os_file, ".");
+  strcat(Files->group_init_result_file, ".");
+  strcat(Files->group_regular_result_file, ".");
+  strcat(Files->group_compare_result_file, ".");
+  strcat(Files->group_os_file, ".");
+  strcat(Files->connection_init_result_file, ".");
+  strcat(Files->connection_regular_result_file, ".");
+  strcat(Files->connection_compare_result_file, ".");
+  strcat(Files->connection_os_file, ".");
+  strcat(Files->rss_init_result_file, ".");
+  strcat(Files->rss_regular_result_file, ".");
+  strcat(Files->rss_compare_result_file, ".");
+  strcat(Files->rss_os_file, ".");
+  strcat(Files->oe_init_result_file, ".");
+  strcat(Files->oe_regular_result_file, ".");
+  strcat(Files->oe_compare_result_file, ".");
+  strcat(Files->oe_os_file, ".");
+  strcat(Files->careoeof, ".");
+    }
+ 
+  strcat(Files->user_init_result_file, USER_INIT_FILE_NAME);
+  strcat(Files->user_regular_result_file, USER_REGULAR_FILE_NAME);
+  strcat(Files->user_compare_result_file, USER_COMPARE_FILE_NAME);
+  strcat(Files->user_os_file, OSOFLI_USER_FILE_NAME);
+  strcat(Files->group_init_result_file, GROUP_INIT_FILE_NAME);
+  strcat(Files->group_regular_result_file, GROUP_REGULAR_FILE_NAME);
+  strcat(Files->group_compare_result_file, GROUP_COMPARE_FILE_NAME);
+  strcat(Files->group_os_file, OSOFLI_GROUP_FILE_NAME);
+  strcat(Files->connection_init_result_file,
+      CONNECTION_INIT_FILE_NAME);
+  strcat(Files->connection_regular_result_file,
+      CONNECTION_REGULAR_FILE_NAME);
+  strcat(Files->connection_compare_result_file,
+      CONNECTION_COMPARE_FILE_NAME);
+  strcat(Files->connection_os_file, OSOFLI_CONNECTION_FILE_NAME);
+  strcat(Files->rss_init_result_file, RSS_INIT_FILE_NAME);
+  strcat(Files->rss_regular_result_file, RSS_REGULAR_FILE_NAME);
+  strcat(Files->rss_compare_result_file, RSS_COMPARE_FILE_NAME);
+  strcat(Files->rss_os_file, OSOFLI_RSS_FILE_NAME);
+  strcat(Files->oe_init_result_file, OE_INIT_FILE_NAME);
+  strcat(Files->oe_regular_result_file, OE_REGULAR_FILE_NAME);
+  strcat(Files->oe_compare_result_file, OE_COMPARE_FILE_NAME);
+  strcat(Files->oe_os_file, OSOFLI_OE_FILE_NAME);
+  strcat(Files->careoeof, OFLI_CAREOE_FILE_NAME);
+  /* MVS */
+ 
+  /* SAS2IBMN - start */
+  strcat(Files->user_init_result_file, "'");
+  strcat(Files->user_regular_result_file, "'");
+  strcat(Files->user_compare_result_file, "'");
+  strcat(Files->user_os_file, "'");
+  strcat(Files->group_init_result_file, "'");
+  strcat(Files->group_regular_result_file, "'");
+  strcat(Files->group_compare_result_file, "'");
+  strcat(Files->group_os_file, "'");
+  strcat(Files->connection_init_result_file, "'");
+  strcat(Files->connection_regular_result_file, "'");
+  strcat(Files->connection_compare_result_file, "'");
+  strcat(Files->connection_os_file, "'");
+  strcat(Files->rss_init_result_file, "'");
+  strcat(Files->rss_regular_result_file, "'");
+  strcat(Files->rss_compare_result_file, "'");
+  strcat(Files->rss_os_file, "'");
+  strcat(Files->oe_init_result_file, "'");
+  strcat(Files->oe_regular_result_file, "'");
+  strcat(Files->oe_compare_result_file, "'");
+  strcat(Files->oe_os_file, "'");
+  strcat(Files->careoeof, "'");
+  /* SAS2IBMN - end */
+ 
+cleanup:
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+    return rc;
+} /* OS_Build_Filenames */
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : RemoveDB                                  *
+*                                                             *
+* DESCRIPTION     : Remove DB                                 *
+*                                                             *
+* INPUT           : file_name                                 *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC OS_OFLI_RemoveDB(char     * file_name)
+ 
+{
+   static char func[] = "OS_OFLI_RemoveDB";
+   int         irc;
+   ESA_RC rc = ESA_OK;
+   FILE      * fptr ;                                      /* SAS2IBMN */
+ 
+   /*
+    *  Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   /* SAS2IBMN - start */
+   /* Remove access() and use fopen() and fget() to check file
+    if (access(file_name,0) NE 0 ) goto exit;  * ISAN000045 bypass if no file *
+   */
+ 
+    fptr = fopen(file_name , "r");
+    if ( !fptr )                   /* open error = probabely no file */
+      goto exit;
+    else
+      fclose(fptr);
+    /* SAS2IBMN - end */
+ 
+    irc = remove(file_name);
+    if ( irc NE 0 ) {
+         ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 13,
+                         "remove %s failed, error %d / %s",
+                         file_name, errno, strerror(errno));
+         rc = ESA_ERR;
+         goto exit;
+     }
+ 
+   exit :;
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+    return rc;
+}
+ 
+/* WSAN100361 */
+/***************************************************************
+ * Procedure Name: OS_OFLI_object_renamed                      *
+ * Description   : Handling object renamed action              *
+ * Input         : rss_type    -                               *
+ *                 rss_name    -                               *
+ *                 user        - user name                     *
+ *                 conn_flag   - update connections of the user*
+ * Output        :                                             *
+ * Input/Output  : CTSAMSG params                              *
+ * Return Value  : ESA_RC                                      *
+ ***************************************************************/
+ 
+static ESA_RC OS_OFLI_object_renamed(RSS_typ        rss_type,
+                 RSS_typ                            rss_name,
+                 OFFLINE_INTERCEPT_STUFF_rec_typ  * offl_params,
+                 RESOURCE_typ                       ofli_path,
+                 char                             * db_file,
+                 char                             * object_type,
+                 char                             * object_name,
+                 char                             * new_object_name,
+                 CHECKSUM_typ                       CheckSum,
+                 ADMIN_PARAMS_rec_typ             * admin_params)
+{
+  ESA_RC                            rc = ESA_OK;
+  CHECKSUM_typ                      CheckSum_Del;
+  OFLI_KEYWORDS_rec_typ             connection_keywords
+                                         = { 0, 0, NULL, NULL };
+  static char                       func[] = "OS_OFLI_object_renamed";
+  ENVIRONMENT_rec_typ             * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  /*
+   *  Initialize
+   */
+ 
+   ESA_DIAG_enter (compo, DIAG_COMMON, func );
+ 
+   ESA_DIAG_printf(compo, 13,
+                   "RSS:%s(%s) Obj_type=%s Old=%s New=%s",
+                   (char *)rss_name, (char *)rss_type,
+                   object_type, object_name, new_object_name);
+ 
+   /* "Old" Object deleted */
+ 
+   memset ((char *)CheckSum_Del, '\0', sizeof(CheckSum_Del));
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 13,
+                   "%s Renamed(Del-Old)=%s",
+                   object_type, object_name );
+   rc = PutOSRecord(db_file, OBJECT_DELETED,
+                    (char *)object_name, NULL, CheckSum_Del,
+                    offl_params->dest, offl_params->msgs);
+   if ( rc NE ESA_OK ) {
+       rc = ESA_FATAL;
+       goto exit;
+   }
+ 
+   /* "New" Object Added */
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 13,
+                   "%s Renamed(Add-New)=%s",
+                   object_type, new_object_name);
+   rc = PutOSRecord(db_file, OBJECT_UPDATED,
+                   (char *)new_object_name, NULL, CheckSum,
+                   offl_params->dest, offl_params->msgs);
+   if ( rc NE ESA_OK ) {
+       rc = ESA_FATAL;
+       goto exit;
+   }
+ 
+   strcpy(db_file, "");
+   GetOSFileName(ofli_path, OSOFLI_CONNECTION_FILE_NAME, db_file);
+ 
+   /* Delete all "old" object connections */
+ 
+   rc = PutOSRecord(db_file, OBJECT_DELETED,
+                    object_name, DB_REMOVE_MASS_STR, CheckSum_Del,
+                    offl_params->dest, offl_params->msgs);
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   /* Get keywords for GetConn */
+ 
+   rc = OS_OFLI_get_keywords_from_env(rss_type, envir_ptr->keywrds,
+                                      envir_ptr->kwd_num,
+                                      CONNECTION_API_KEYWORDS,
+                                      &connection_keywords,
+                                      offl_params->dest,
+                                      offl_params->msgs);
+   if ( rc NE ESA_OK ) {
+       ESA_DIAG_printf (compo, 11,
+                    "OS_OFLI_get_keywords_from_env failed");
+       rc = ESA_FATAL;
+       goto exit;
+   }
+ 
+   if (strcmp(object_type, "User") EQ 0)
+     /*  Add New User connections  */
+     rc = AddAllUsersConnections(new_object_name, db_file,
+                                 &connection_keywords,
+                                 offl_params);
+   else
+     /* Add new group connections */
+     rc = AddAllGroupsConnections(new_object_name, db_file,
+                                  &connection_keywords,
+                                  offl_params);
+ 
+   exit :;
+ 
+   if ( connection_keywords.kwds )
+      free( connection_keywords.kwds);
+ 
+   ESA_DIAG_exit (compo, DIAG_COMMON, func, rc);
+   return rc;
+} /* OS_OFLI_object_renamed */
+ 
+ 
+ESA_RC RenameDB(char                          * new_file,
+                char                          * old_file,
+                CTSAMSG_DEST_TABLE_rec_typ    * dest,
+                CTSAMSG_HANDLE_rec_typ        * msgs)
+ 
+ 
+{
+   static char func[] = "RenameDB";
+   char        db_component[] = "OFFLINE INTERCEPTOR OS";
+   ESA_RC      rc = ESA_OK;
+   int         irc;
+ 
+   char        errmsg[1050];
+ 
+   /*
+    *  Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                    "new_file='%s' old_file='%s'",
+                    new_file, old_file);
+ 
+/* for MVS */
+    irc = 0; /* to prevent warning during compilation :
+               (no reference to identifier "irc")     */
+ 
+    rc = CopyDB(0, new_file, old_file, dest, msgs);
+    if ( rc NE ESA_OK ) {
+        sprintf( errmsg, "(CopyDB) create new %s failed", old_file);
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                      db_component, func, errmsg, 16, __LINE__);
+        rc = ESA_ERR;
+        goto exit;
+    }
+    rc = OS_OFLI_RemoveDB(new_file);
+    if ( rc NE ESA_OK ) {
+        sprintf( errmsg,"(OS_OFLI_RemoveDB) create new %s failed",
+                            old_file);
+        CTSAMSG_print(ERR_INTERNAL2, msgs, NULL, dest,
+                      db_component, func, errmsg, 16, __LINE__);
+        rc = ESA_ERR;
+        goto exit;
+    }
+ /* MVS */
+ 
+   exit :;
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+    return rc;
+}

@@ -1,0 +1,242 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: acsrvcs.c %
+ * Instance        : %instance: 1 %
+ * Created by      : %created_by: leonid_s %
+ * Created on      : %date_created: Thu May 15 09:13:13 2003 %
+ * Current Version : %version: 6 %
+ * Last Modified by: %derived_by: leonid_s %
+ * Last Modified on: %date_modified: Thu May 15 09:13:13 2003 %
+ */
+ 
+/***********************************************
+ * Mod.ID   Who      When         Description
+ * =============================================
+ * SAS2IBMA AvnerL   21-Dec-16    SAS/C to IBM C Conversion Project
+ * BS10129  AvnerL  28-Dec-23    Recompile due to WS10078 ESAINIT
+ **********************************************/
+ 
+#include "globs.h"
+ 
+#include ESA_MSG
+#include ESA_API
+#include ESA_ADMIN
+#include ESA_PROC
+ 
+/****************************************************
+ * Procedure Name: acsrvc
+ * Description   : CS - services
+ * Return Value  : ESA_RC
+ * Comments      :
+ * Scope         :
+ ****************************************************
+ *
+ * DETAILED DESCRIPTION
+ * ====================
+ *
+ * This function is the main dispatcher for all services that are
+ * handeled by the CS process:
+ * - SET service (= UPLOAD_ESS_DEF - add/update/delete RSS object).
+ * - GET service (= DOWNLOAD_CSA_DEF - synchronize RSS object).
+ * - GLOBA SYNCHRONIZATION - synchronize ESS - RSS data.
+ * - KEYWORDS SERVICE - set interesting keywords.
+ * - DOWNLOAD SERVICE
+ * There is a function, with a similar name, that handles all CD
+ * services.
+ * Upon activation of the current function - the process has read and
+ * analyzed a legal "START SERVICE" message - but it did not send any
+ * response yet. The function sends "CONFIRMATION MESSAGE" ("CC") for
+ * requests originated from the ESS (Hndshake and Start-interceptor)
+ * and activate the relevant function to take care of each service
+ * according to it's type.
+ *********************************************************************/
+ 
+ESA_RC acsrvc (RSS_MSG_HDR_rec_typ * msg_hdr,
+               MSG_typ             * msg_ptr_read,
+               RSS_MSG_HDR_rec_typ * msg_hdr_cd)
+{
+  ESA_RC                   rc= ESA_OK,rc_tmp;
+  RSS_STATUS_typ           rss_status= RSS_UP;
+  ERR_STRUCT_rec_typ       MsgErr;
+  ENVIRONMENT_rec_typ    * envir_ptr;
+  char                     fn[]="acsrvc";
+ 
+  ESA_DIAG_enter  (ESA_COMP_ACSGPFM, DIAG_COMMON, fn);
+  CS_get_envir_address (&envir_ptr);
+ 
+  /*
+    VERIFY that the input message's service type is legal CS service.
+  */
+  if (msg_hdr->mhsid NE DOWNLOAD_CSA_DEF    AND /* GET service */
+      msg_hdr->mhsid NE UPLOAD_ESS_DEF      AND /* SET service */
+      msg_hdr->mhsid NE UPLOAD_ESS_SPECSET  AND /* SET special service */
+      msg_hdr->mhsid NE GLOBAL_SYNC_SERVICE AND /* GLBL SYNC service*/
+      msg_hdr->mhsid NE KEYWORDS_SERVICE    AND /* KEYWORD service */
+      msg_hdr->mhsid NE ADMIN_SERVICE       AND /* ADMIN service */
+      msg_hdr->mhsid NE DWNLD_SERVICE) {         /* DWONLOAD service */
+ 
+     rc=ESA_FATAL;
+     CTSAMSG_print (ERR_CS_UNDEF_SERVICE,
+                    envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                    envir_ptr->msg_admin_param.ctsamsg_dest, fn ,
+                    msg_hdr->mhsid);
+     goto cleanup;
+  }
+ 
+  if (msg_hdr->mhsid NE KEYWORDS_SERVICE)
+  {
+    CLEAR_STRUCT(MsgErr);
+    ESA_DIAG_printf (ESA_COMP_ACSGPFM, DIAG_BASIC,
+    		"    -> Call to CTSRSSCheck USA-API for COnnector=%s.",
+			envir_ptr->msg_admin_param.rss_name);
+    rc = envir_ptr->func_ptr.rss_check_ptr (
+                                  envir_ptr->msg_admin_param.rss_name,
+                                  &rss_status,
+                                  &envir_ptr->msg_admin_param,
+                                  &MsgErr);
+    ESA_DIAG_printf (ESA_COMP_ACSGPFM, DIAG_BASIC,
+			"    <- CTSRSSCheck USA-API completed with rc=%d (%s) RssStat=%s.",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK",
+			(rss_status == RSS_UP) ? "Connector_UP" : "Connector_DOWN");
+ 
+    ESA_DIAG_printf (ESA_COMP_ACSGPFM, 15,
+      "Connector %s check completed with return code:%s and status:%d",
+                     envir_ptr->msg_admin_param.rss_name,
+                     ESA_rc2str(rc),
+                     rss_status);
+ 
+    if (
+          (rc NE ESA_OK)
+         OR
+          (rss_status EQ RSS_DOWN)
+       )
+           rss_status= RSS_DOWN;
+    else
+           rss_status= RSS_UP;
+ 
+    envir_ptr->interest[envir_ptr->rss_num].rss_status= rss_status;
+ 
+    if (rss_status EQ RSS_DOWN)
+    {
+       rc_tmp= CTSRssStatusEvent (envir_ptr->msg_admin_param.rss_type,
+                                  envir_ptr->msg_admin_param.rss_name,
+                                  NULL,
+                                  &rss_status,
+                                  &envir_ptr->msg_admin_param);
+       ESA_DIAG_printf (ESA_COMP_ACSGPF, 13,
+                        "call to CTSRssStatusEvent: rc=%d.",
+                        (int)rc_tmp);
+	   if (MsgErr.length GT 0)
+      	  memcpy ((char *)(&envir_ptr->msg_err),
+		          (char *)(&MsgErr),
+        		  sizeof(ERR_STRUCT_rec_typ));
+       goto cleanup;
+    }
+  }
+  if (
+      (msg_hdr->mhsid NE KEYWORDS_SERVICE)
+          AND
+      (msg_hdr->mhsid NE ADMIN_SERVICE)
+     )
+  {
+     PASSWD_typ tmp_def_passwd;
+     PASSWD_typ tmp_passwd;
+ 
+     strcpy (tmp_def_passwd,
+             envir_ptr->msg_admin_param.def_admin_passwd);
+     strcpy (tmp_passwd,
+             envir_ptr->msg_admin_param.admin_passwd);
+     rc= ADM_loginout (LOGIN_MODE_FIRST, LOGIN_UNDEFINED_ADMIN, fn);
+     if (rc NE ESA_OK)
+       goto cleanup;
+     if (
+           (strcmp (tmp_def_passwd,
+                    envir_ptr->msg_admin_param.def_admin_passwd) NE 0)
+          OR
+           (strcmp (tmp_passwd,
+                    envir_ptr->msg_admin_param.admin_passwd) NE 0)
+        )
+     {
+         rc= CS_broadcast (CS_BRDCT_EVNT_ADMIN,
+                           EVENT_ADMIN_CHANGED);
+         if (rc NE ESA_OK)
+            goto cleanup;
+     }
+  }
+ 
+  /*
+      SEND confirmation message.
+  */
+  rc = CS_confirm (msg_hdr);
+  if (rc NE ESA_OK)
+    goto cleanup;
+ 
+  /*
+    HANDLE rthe service according to the service type.
+  */
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSGPFM, DIAG_BASIC," ");
+  ESA_DIAG_printf (ESA_COMP_ACSGPFM, DIAG_BASIC," ");
+  ESA_DIAG_printf (ESA_COMP_ACSGPFM, DIAG_BASIC,
+			"          -------------------------------");
+  switch (msg_hdr->mhsid) {
+    case DOWNLOAD_CSA_DEF:
+        ESA_DIAG_printf (ESA_COMP_ACSGPFM, DIAG_BASIC,
+			"*****>... %c: Get transaction started.", DOWNLOAD_CSA_DEF);
+        ESA_DIAG_printf (ESA_COMP_ACSGPFM, DIAG_BASIC,
+			"          -------------------------------");
+        rc = CS_download_csa_definitions (msg_ptr_read, msg_hdr_cd);
+        break;
+ 
+    case UPLOAD_ESS_DEF:
+        ESA_DIAG_printf (ESA_COMP_ACSGPFM, DIAG_BASIC,
+			"*****>... %c: Set transaction started.", UPLOAD_ESS_DEF);
+        ESA_DIAG_printf (ESA_COMP_ACSGPFM, DIAG_BASIC,
+			"          -------------------------------");
+        rc = CS_upload_ess_definitions (msg_ptr_read, msg_hdr_cd);
+        break;
+    case UPLOAD_ESS_SPECSET:
+        ESA_DIAG_printf (ESA_COMP_ACSGPFM, DIAG_BASIC,
+			"*****>... %c: Set special transaction started.", UPLOAD_ESS_SPECSET);
+        ESA_DIAG_printf (ESA_COMP_ACSGPFM, DIAG_BASIC,
+			"          -------------------------------");
+        rc = CS_upload_ess_definitions (msg_ptr_read, msg_hdr_cd);
+        break;
+    case ADMIN_SERVICE:
+        ESA_DIAG_printf (ESA_COMP_ACSGPFM, DIAG_BASIC,
+			"*****>... %c: IIQ/IDN Administrator transaction started.", ADMIN_SERVICE);
+        ESA_DIAG_printf (ESA_COMP_ACSGPFM, DIAG_BASIC,
+			"          -------------------------------");
+        rc = CS_upload_ess_definitions (msg_ptr_read, msg_hdr_cd);
+        break;
+    case KEYWORDS_SERVICE:
+        ESA_DIAG_printf (ESA_COMP_ACSGPFM, DIAG_BASIC,
+			"*****>... %c: USA-API Keywords transaction started.", KEYWORDS_SERVICE);
+        ESA_DIAG_printf (ESA_COMP_ACSGPFM, DIAG_BASIC,
+			"          -------------------------------");
+        rc = CS_upload_ess_definitions (msg_ptr_read, msg_hdr_cd);
+        break;
+ 
+    case GLOBAL_SYNC_SERVICE:
+        ESA_DIAG_printf (ESA_COMP_ACSGPFM, DIAG_BASIC,
+			"*****>... %c: Global Sync transaction started.", GLOBAL_SYNC_SERVICE);
+        ESA_DIAG_printf (ESA_COMP_ACSGPFM, DIAG_BASIC,
+			"          -------------------------------");
+        rc = CS_sync_ess_definitions (msg_ptr_read, msg_hdr_cd);
+        break;
+ 
+    case DWNLD_SERVICE:
+        ESA_DIAG_printf (ESA_COMP_ACSGPFM, DIAG_BASIC,
+			"*****>... %c: Aggregation transaction started.", DWNLD_SERVICE);
+        ESA_DIAG_printf (ESA_COMP_ACSGPFM, DIAG_BASIC,
+			"          -------------------------------");
+        rc = CS_dwnld_ess_definitions (msg_ptr_read, msg_hdr_cd);
+        break;
+  }
+ 
+  cleanup:
+  ESA_DIAG_exit   (ESA_COMP_ACSGPFM, DIAG_COMMON, fn, rc);
+  return (rc);
+ 
+} /* END - acsrvc (CS) function */

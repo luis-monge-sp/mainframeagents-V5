@@ -1,0 +1,1205 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: acsrss.c %
+ * Instance        : %instance: 1 %
+ * Created by      : %created_by: leonid_s %
+ * Created on      : %date_created: Mon May 17 14:41:01 2004 %
+ * Current Version : %version: 8 %
+ * Last Modified by: %derived_by: leonid_s %
+ * Last Modified on: %date_modified: Mon Mar 01 14:04:40 2004 %
+ */
+ 
+/**************************************************************
+ * Mod.ID  Who      When         Description
+ * ============================================================
+ * IMH001  Ian H.   19-Nov-03    WSAN101342 Thread-safe code (ERRNO)
+ * SAS2IBMA AvnerL  21-Dec-16    SAS/C to IBM C Conversion Project
+ * BS10076  SeligT  11-Dec-17    Organize Connector Locking
+ *                               Functions and Structures
+ * BS10129  AvnerL   28-Dec-23    Recompile due to WS10078 ESAINIT
+ * WS10082K KailasP 25-Jan-22    Addinfo related changes
+ *************************************************************/
+ 
+#include "globs.h"
+ 
+#include ERRNO
+#include ESA_API
+#include ESA_RSS
+#include ESA_CS_SINFO
+#include ESA_CS_OS
+ 
+#define RssDefPrmSet                RSKY101
+#define PrepareRssParmKwdsForScript RSKY102
+#define CS_DAIG_RssParm             RSKY103
+#define CS_DAIG_RssKwdsForScript    RSKY104
+ 
+void CS_DAIG_RssParm (void);
+void CS_DAIG_RssKwdsForScript (void);
+ 
+static void RssDefPrmSet (char * RssPrmName, char * RssPrmValue);
+static void PrepareRssParmKwdsForScript (void);
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : rssprm_load                              *
+*                                                             *
+* Description      : Load file_rssprm to the memory           *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC rssprm_load (void)
+{
+  ESA_RC                rc = ESA_OK;
+  FILE                * file_handle= NULL;
+  RSSPRM_rec_typ        in_buf;
+  int                   jj= 0,alloc_rss_num= 0,from_row_num= -1;
+  char                * endline= NULL, * rss= NULL;
+  char                * rssprm_name= NULL, * rssprm_value= NULL ;
+  char                * comp_val = NULL;   /* AJK003 */
+  char                  empty_str[1], component[40];
+  char line [RSSPRM_VALUE_LEN+ RSSPRM_NAME_LEN+ RSS_NAME_LEN+ 4];
+  ENVIRONMENT_rec_typ * envir_ptr;
+  unsigned long int     kwd_num= 0;
+  char                * stopptr;
+  char                  RssPrmValue[RSSPRM_VALUE_LEN];
+  char                * OfliList[24];
+  unsigned int          OfliListNumber= 0;
+  char                  fn[]= "rssprm_load";
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSRSS, DIAG_COMMON, fn);
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSRSS, DIAG_DETAILES,
+    "...-> : file_rssparm=%s envir_ptr= %p.",
+	envir_ptr->file_rssparm, envir_ptr);
+ 
+  empty_str[0]= '\0';
+ 
+  rc= CSA_open (envir_ptr->file_rssparm, fn,
+                FILE_OPEN_FOR_READ, &file_handle, SCOPE_LOCAL);
+  if (rc NE ESA_OK)
+   goto cleanup;
+ 
+  /*
+   *   Load file_rssparm into memory (rssprm)
+   */
+ 
+  for (envir_ptr->rssprm_num=0, jj= 1; ;envir_ptr->rssprm_num++, jj++)
+  {
+    rss=          NULL;
+    rssprm_name=  NULL;
+    rssprm_value= NULL;
+ 
+    rc= CSA_fgets (envir_ptr->file_rssparm,
+                   line,
+                   sizeof(line),
+                   file_handle);
+    if (rc NE ESA_OK)
+    {
+        if (rc EQ ESA_EOF)
+            rc= ESA_OK;
+        goto cleanup;
+    }
+    ESA_DIAG_printf (ESA_COMP_ACSRSS, 15,
+        "Readed %d record: %s", jj, line);
+ 
+    endline = strchr(line,'\n');
+    if (endline NE NULL)
+        endline= '\0';
+ 
+    rss=          strtok (line, WHITECHARS);
+    if (rss)
+      rssprm_name=  strtok (NULL, WHITECHARS);
+    if (rssprm_name)
+      rssprm_value= strtok (NULL, WHITECHARS);
+ 
+    if (rssprm_value)
+	     endline = strtok (NULL, WHITECHARS);
+    else
+      endline = NULL;
+ 
+	while (endline NE NULL)
+	{
+	    rssprm_value[strlen(rssprm_value)] = ' ';
+        endline=  strtok (NULL, WHITECHARS);
+	}
+	if (rssprm_value EQ NULL)
+		rssprm_value = empty_str;
+ 
+	if (line[0] EQ NULL_CHAR OR
+        line[0] EQ SKIP_SIGN OR
+        rss     EQ NULL) {
+       envir_ptr->rssprm_num--;
+       ESA_DIAG_printf (ESA_COMP_ACSRSS, 15,
+                        "Skipped %d record" , jj);
+       continue;
+    }
+ 
+    if (rss EQ NULL OR
+        rssprm_name EQ NULL OR
+        rssprm_value EQ NULL)
+	{
+ 
+      if (rss EQ NULL)
+	  {
+        strcpy(component,C_RSS_NAME);
+        comp_val = rss;
+      }
+ 
+      if (rssprm_name EQ NULL)
+	  {
+        strcpy (component , C_PRM_NAME);
+        comp_val = rssprm_name;
+      }
+ 
+      if (rssprm_value EQ NULL)
+	  {
+        strcpy (component , C_PRM_VALUE);
+        comp_val = rssprm_value;
+      }
+ 
+      CTSAMSG_print (ERR_CS_PRM_LEN,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     component,comp_val,
+                     envir_ptr->file_rssparm, jj);
+      rc= ESA_FATAL;
+      goto cleanup;
+    }
+ 
+    if (strlen(rss)          GT sizeof(in_buf.rss)          OR
+        strlen(rssprm_name)  GT sizeof(in_buf.rssprm_name)  OR
+        strlen(rssprm_value) GT sizeof(in_buf.rssprm_value)) {
+ 
+      if (strlen(rss) GT sizeof(in_buf.rss))
+	  {
+        strcpy(component,C_RSS_NAME);
+        comp_val = rss;
+      }
+ 
+      if (strlen(rssprm_name)  GT sizeof(in_buf.rssprm_name))
+	  {
+        strcpy (component , C_PRM_NAME);
+        comp_val = rssprm_name;
+      }
+ 
+      if (strlen(rssprm_value) GT sizeof(in_buf.rssprm_value))
+	  {
+        strcpy (component , C_PRM_VALUE);
+        comp_val = rssprm_value;
+      }
+ 
+      CTSAMSG_print (ERR_CS_PRM_LEN,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     component, comp_val,
+                     envir_ptr->file_rssparm, jj);
+      rc= ESA_FATAL;
+      goto cleanup;
+    }
+ 
+    if (
+          (strcmp (rssprm_name, DELETE_INTERCEPT_CHECK) == 0)
+         OR
+          (strcmp (rssprm_name, SEND_RSSPRM_TO_SCRIPT) == 0)
+         OR
+          (strcmp (rssprm_name, ADMIN_CASE_SENSITIVE) == 0)
+         OR
+          (strcmp (rssprm_name, ADMIN_FILE_REQUEST) == 0)
+         OR
+          (strcmp (rssprm_name, ADMIN_USER_REQUEST) == 0)
+         OR
+          (strcmp (rssprm_name, SEND_PWD_TO_SCRIPT) == 0)
+         OR
+          (strcmp (rssprm_name, COMPRESS_FILE_MODE) == 0)
+         OR
+          (strcmp (rssprm_name, OFLI_INTERCEPT) == 0)
+         OR
+          (strcmp (rssprm_name, PASS_PASSWORD) == 0)
+         OR
+          (strcmp (rssprm_name, OFLI_VERBOSE) == 0)
+         OR
+          (strcmp (rssprm_name, DIAG_FROM_CTSAMSG) == 0)
+         OR
+          (strcmp (rssprm_name, DOWNLOAD_TO_FILE) == 0)
+         OR
+          (strcmp (rssprm_name, OCCUPIED_QUEUE_DATA) == 0)
+         OR
+          (strcmp (rssprm_name, TRUNCATE_ADD_INFO) == 0)
+         OR
+          (strcmp (rssprm_name, SEND_LAST_TMP_MSG) == 0)
+         OR
+          (strcmp (rssprm_name, PWD_CHG_WITH_GET_USER) == 0)
+       )
+	{
+ 
+       if (
+             (strlen (rssprm_value) NE strlen (ESS_YES_FLAG))
+            OR
+             (
+                (My_memicmp (rssprm_value, ESS_YES_FLAG, 1) NE ESA_OK)
+               AND
+                (My_memicmp (rssprm_value, ESS_NOT_FLAG, 1) NE ESA_OK)
+             )
+          )
+	   {
+          CTSAMSG_print (MSG_KWD_VALUE_INVALID,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     rssprm_value,
+                     rssprm_name);
+          RssDefPrmSet (rssprm_name, RssPrmValue);
+		  rssprm_value= RssPrmValue;
+          CTSAMSG_print (MSG_PRM_SET_DEF_VALUE ,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     rssprm_name,
+                     rssprm_value);
+       }
+	}
+ 
+    if (
+          (strcmp (rssprm_name, STAT_CHKSUM_INTRVL) == 0)
+         OR
+          (strcmp (rssprm_name, CHECK_SYNC_OBJS) == 0)
+         OR
+          (strcmp (rssprm_name, STATIST_INTRVL) == 0)
+         OR
+          (strcmp (rssprm_name, STOP_REQ_MSGS) == 0)
+         OR
+          (strcmp (rssprm_name, WAIT_QUEUE) == 0)
+         OR
+          (strcmp (rssprm_name, WAIT_LOCK) == 0)
+         OR
+          (strcmp (rssprm_name, OFLI_INTERVAL) == 0)
+         OR
+          (strcmp (rssprm_name, OFLI_RUN_INTERVAL) == 0)
+         OR
+          (strcmp (rssprm_name, OFLI_WAIT_INTERVAL) == 0)
+         OR
+          (strcmp (rssprm_name, RSS_STATUS_INTERVAL) == 0)
+         OR
+          (strcmp (rssprm_name, CTSAMSG_MAX_GEN_NAME) == 0)
+         OR
+          (strcmp (rssprm_name, CTSAMSG_MAX_LINES_NAME) == 0)
+         OR
+          (strcmp (rssprm_name, CTSAMSG_MAX_INTERVAL_NAME) == 0)
+         OR
+          (strcmp (rssprm_name, MAX_SEND_MSGS_SEQ_CE) == 0)
+         OR
+          (strcmp (rssprm_name, MIN_APC_INTRVL) == 0)
+         OR
+          (strcmp (rssprm_name, CO_LOOP_SLEEP_TIME_PRM) == 0) /* WSAN100671 */
+         OR
+          (strcmp (rssprm_name, CO_SLEEP_TIME_PRM) == 0)      /* WSAN100671 */
+       )
+	{
+       kwd_num= strtoul (rssprm_value, &stopptr, 10);
+       if (*stopptr NE '\0')
+	   {
+          CTSAMSG_print (ERR_CS_PRM_NOT_NUMERIC,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     rssprm_name, rssprm_value,
+                     envir_ptr->file_rssparm);
+          RssDefPrmSet (rssprm_name, RssPrmValue);
+	      rssprm_value= RssPrmValue;
+          CTSAMSG_print (MSG_PRM_SET_DEF_VALUE ,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     rssprm_name,
+                     rssprm_value);
+	   }
+ 
+       if (
+             (strcmp (rssprm_name, OFLI_INTERVAL) == 0)
+            OR
+             (strcmp (rssprm_name, OFLI_RUN_INTERVAL) == 0)
+            OR
+             (strcmp (rssprm_name, OFLI_WAIT_INTERVAL) == 0)
+            OR
+             (strcmp (rssprm_name, RSS_STATUS_INTERVAL) == 0)
+          )
+	   {
+          if (
+                (strlen (rssprm_value) NE TIME_LEN)
+               OR
+                (*(rssprm_value+ 2) GT '5')
+               OR
+                (*(rssprm_value +4) GT '5')
+             )
+		  {
+             CTSAMSG_print (MSG_KWD_VALUE_INVALID,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     rssprm_value,
+                     rssprm_name);
+             RssDefPrmSet (rssprm_name, RssPrmValue);
+             rssprm_value= RssPrmValue;
+             CTSAMSG_print (MSG_PRM_SET_DEF_VALUE ,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     rssprm_name,
+                     rssprm_value);
+		  }
+	   }
+	}
+    if (strcmp (rssprm_name, OFFLI_RUN_TIME_LIST) == 0)
+	{
+       GetOfliList (rssprm_value, RssPrmValue,
+	                OfliList, &OfliListNumber);
+	   if (OfliListNumber EQ 0)
+	   {
+          CTSAMSG_print (MSG_KWD_VALUE_INVALID,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     rssprm_value,
+                     rssprm_name);
+          RssDefPrmSet (rssprm_name, RssPrmValue);
+	      rssprm_value= RssPrmValue;
+          CTSAMSG_print (MSG_PRM_SET_DEF_VALUE ,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     rssprm_name,
+                     rssprm_value);
+	   }
+	}
+ 
+    /*
+     *   Initialize Buffer *keywords
+     */
+ 
+    if (envir_ptr->rssprm_num EQ 0) {
+      rc= CSA_alloc ((char **)&envir_ptr->rssprm, STRUC_RSSPRM_REC,
+                     sizeof (RSSPRM_rec_typ),
+                     RSSPRM_INIT_NUM, fn, "Rss params");
+      alloc_rss_num= RSSPRM_INIT_NUM;
+    }
+    else {
+       if (envir_ptr->rssprm_num GE alloc_rss_num) {
+          rc= CSA_realloc ((char **)&envir_ptr->rssprm,
+                           STRUC_RSSPRM_REC,
+                           sizeof (RSSPRM_rec_typ),
+                           alloc_rss_num+ RSSPRM_INC_NUM);
+          alloc_rss_num += RSSPRM_INC_NUM;
+       }
+    }
+ 
+    if (rc NE ESA_OK)
+      goto cleanup;
+ 
+    /*
+     *   Load row to the allocated Buffer *keywrds
+     */
+    ESA_DIAG_printf (ESA_COMP_ACSRSS, 15,
+                     "Accepted %d record" , envir_ptr->rssprm_num+ 1);
+ 
+    memset ((char *)(&in_buf), ' ', sizeof (RSSPRM_rec_typ));
+ 
+    strcpy ((char *)in_buf.rss,(char *)rss);
+ 
+    strcpy ((char *)in_buf.rssprm_name, (char *) rssprm_name);
+ 
+    strcpy ((char *)in_buf.rssprm_value, (char *)rssprm_value);
+ 
+    memcpy ((char *)(envir_ptr->rssprm+ envir_ptr->rssprm_num),
+            (char *)(&in_buf), sizeof (RSSPRM_rec_typ));
+ 
+    if (strcmp (rssprm_name, RSS_TYPE) EQ 0)
+      envir_ptr->max_rss_num++;
+ 
+  } /* for */
+ 
+ cleanup:
+ 
+  CSA_close (envir_ptr->file_rssparm, fn);
+ 
+  if (rc EQ ESA_KEY_NOT_FOUND)
+      rc= ESA_OK;
+ 
+  /*if (
+	    (envir_ptr->max_rss_num EQ 0)
+       AND
+	    (
+		   (envir_ptr->p_main_name EQ ESA_ACS_PROC)
+          OR
+		   (envir_ptr->p_main_name EQ ESA_ACE_PROC)
+          OR
+		   (envir_ptr->p_main_name EQ ESA_ACD_PROC)
+        )
+	 )	
+  {
+     CTSAMSG_print (MSG_KWD_MISSING,
+                    envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                    envir_ptr->msg_admin_param.ctsamsg_dest,
+                    RSS_TYPE, envir_ptr->file_rssparm);
+     rc= ESA_FATAL;
+  }*/
+ 
+  if (rc EQ ESA_OK)
+     rc= CSA_alloc ((char **)&envir_ptr->interest, STRUC_INTEREST_REC,
+                    sizeof (RSS_INTEREST_rec_typ),
+                    envir_ptr->max_rss_num+ 1, fn,
+                    "Inresrest records");
+ 
+  if (rc EQ ESA_OK)
+  {
+     for (jj= 0;
+          (jj LT envir_ptr->max_rss_num) AND (rc EQ ESA_OK) ;
+          jj++)
+        rc= rssprm_next_rss (envir_ptr->interest[jj].rss,
+                             envir_ptr->interest[jj].rss_type,
+                             &from_row_num) ;
+     if (rc EQ ESA_OK)
+		PrepareRssParmKwdsForScript ();
+  }
+  if (rc NE ESA_OK) {
+     CTSAMSG_print (ERR_CS_FUNCTION,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+  }
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSRSS, 14,
+      "From %s table accepted %d records",
+                   envir_ptr->file_rssparm, envir_ptr->rssprm_num);
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSRSS, DIAG_DETAILES+ 1,
+    "        envir_ptr->rssprm = %p.", envir_ptr->rssprm);
+  CS_DAIG_RssParm ();
+  CS_DAIG_RssKwdsForScript ();
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSRSS, DIAG_COMMON, fn, rc);
+  return rc;
+}
+ 
+ 
+/****************************************************
+ * Procedure Name: rssprm_get
+ * Description   : Get parameter from file for RSS
+ *
+ * Input         : RSS name
+ *                 parameter name
+ *                 max_value_len
+ * Output        : parameter value
+ *
+ * Return Value  : ESA_OK             upon success
+ *                 ESA_KEY_NOT_FOUND  on any other situation
+ ****************************************************/
+ 
+ESA_RC rssprm_get (RSS_typ const       rss,
+                   char const        * rssprm_name,
+                   unsigned int        max_value_len,
+                   char              * rssprm_value)
+{
+  char fn[]="rssprm_get";
+ 
+  ESA_RC               rc=  ESA_KEY_NOT_FOUND;
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSRSS, DIAG_COMMON+ 1, fn);
+  ESA_DIAG_printf (ESA_COMP_ACSRSS, 13,
+                   "INPUT: rss %s param.name %s value_len %u.",
+                   rss, rssprm_name, max_value_len);
+ 
+  rc= rssprm_get_opt (rss,
+                      rssprm_name,
+                      max_value_len,
+                      rssprm_value,
+					  OPT_FALSE,
+					  OPT_FALSE);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSRSS, DIAG_COMMON+ 1, fn, rc);
+  return (rc);
+}
+ 
+/****************************************************
+ * Procedure Name: rssprm_get_opt
+ * Description   : Get parameter from file for RSS
+ *
+ * Input         : RSS name
+ *                 parameter name
+ *                 max_value_len
+ *                 optional_prm    TRUE  - The parameter is optional
+ *                                 FALSE - The parameter must exist
+ *                 optional_value  TRUE  - The parameter value may
+ *                                         empty.
+ *                                 FALSE - The parameter value may
+ *                                         not be empty
+ * Output        : parameter value
+ *
+ * Return Value  : ESA_OK             upon success
+ *                 ESA_KEY_NOT_FOUND  on if parameter not found
+ *                 ESS_ERR            in other situation
+ ****************************************************/
+ 
+ESA_RC rssprm_get_opt (RSS_typ const   rss,
+                       char const    * rssprm_name,
+                       unsigned int    max_value_len,
+                       char          * rssprm_value,
+					   OPTION_typ      optional_prm,
+					   OPTION_typ      optional_value)
+{
+  char                  fn[]="rssprm_get_opt";
+  int                   i= 0;
+  RSSPRM_rec_ptr        rss_ptr= NULL;
+  char                  rss_value[RSSPRM_VALUE_LEN+ 1];
+  char                  s_name [RSSPRM_NAME_LEN+ 1];
+  char                  s_rss [RSS_NAME_LEN+ 1];
+  char                  i_name [RSSPRM_NAME_LEN+ 1];
+  char                  i_rss [RSS_NAME_LEN+ 1];
+  ESA_RC                rc=  ESA_KEY_NOT_FOUND;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSRSS, DIAG_COMMON+ 1, fn);
+  ESA_DIAG_printf (ESA_COMP_ACSRSS, DIAG_COMMON,
+    "...-> : rss=%s prm_name=%s max_value=%u opt:prm=%d val=%d.",
+	rss, rssprm_name, max_value_len, optional_prm, optional_value);
+ 
+  CLEAR (i_rss);
+  CLEAR (i_name);
+  CLEAR (s_rss);
+  CLEAR (s_name);
+  CLEAR (rss_value);
+  strncpy (i_rss, rss, RSS_NAME_LEN);
+  strncpy (i_name, rssprm_name, RSSPRM_NAME_LEN);
+ 
+  while (rc EQ ESA_KEY_NOT_FOUND)
+  {
+    for (i= 0; i LT envir_ptr->rssprm_num; i++ ) {
+       rss_ptr= envir_ptr->rssprm+ i;
+       memcpy (s_rss, (char *)rss_ptr->rss, RSS_NAME_LEN);
+       memcpy (s_name,(char *)rss_ptr->rssprm_name, RSSPRM_NAME_LEN);
+       ESA_DIAG_printf (ESA_COMP_ACSRSS, 15,
+                      "Next row: rss %.*s name %.*s.",
+                       RSS_NAME_LEN, s_rss,
+                       RSSPRM_NAME_LEN, s_name);
+       if (My_stricmp (i_rss, s_rss) NE 0)
+          continue;
+       if (strcmp (i_name ,s_name) NE 0)
+          continue;
+       break;
+    }
+    if (i LT envir_ptr->rssprm_num) {
+       envir_ptr->rssprm_row= i;
+       memcpy (rss_value,(char *) rss_ptr->rssprm_value,
+		        RSSPRM_VALUE_LEN) ;
+       ESA_DIAG_printf (ESA_COMP_ACSRSS, 15,
+                        "param.value %.*s.",
+                        RSSPRM_VALUE_LEN,
+                        rss_value);
+       if (strlen(rss_value) LE max_value_len)
+       {
+          strcpy (rssprm_value, rss_value);
+		  if (strlen(rss_value) EQ 0)
+			  rc= ESA_WARN;
+		  else
+              rc= ESA_OK;
+       }
+       else
+          rc=ESA_ERR;
+       break;
+    }
+ 
+    if (strcmp (i_rss, ALL_RSS) EQ 0)
+       break;
+    else
+       strcpy (i_rss, ALL_RSS);
+  }
+ 
+  if (rc NE ESA_OK)
+  {
+     if (rc EQ ESA_KEY_NOT_FOUND)
+	 {
+        if(
+		     (envir_ptr->p_main_name NE ESA_ACSPRC_PROC)
+            AND
+		     (optional_prm      EQ OPT_FALSE)
+ 	      )
+              CTSAMSG_print (ERR_CS_RSS_KWD_FAIL,
+                             envir_ptr->msg_admin_param.ctsamsg_handle,
+                             NULL,
+                             envir_ptr->msg_admin_param.ctsamsg_dest,
+                             rssprm_name, rss ,
+                             envir_ptr->file_rssparm,fn);
+	 }
+     else if (rc EQ ESA_WARN)
+	 {
+        rc= ESA_OK;
+	    if (optional_value EQ OPT_FALSE)
+		{
+           CTSAMSG_print (ERR_CS_RSS_KWD_EMPTY,
+                          envir_ptr->msg_admin_param.ctsamsg_handle,
+                          NULL,
+                          envir_ptr->msg_admin_param.ctsamsg_dest,
+                          rssprm_name, rss ,
+                          envir_ptr->file_rssparm,fn);
+		   rc= ESA_ERR;
+		}
+	 }
+ 
+	 else
+        CTSAMSG_print (ERR_CS_RSS_LEN_KWD_FAIL,
+                       envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                       envir_ptr->msg_admin_param.ctsamsg_dest,
+                       rssprm_name, rss, max_value_len,
+                       envir_ptr->file_rssparm,fn);
+  }
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSRSS, DIAG_COMMON,
+    "...<- : prm_value=%s.", rssprm_value);
+  ESA_DIAG_exit (ESA_COMP_ACSRSS, DIAG_COMMON+ 1, fn, rc);
+  return (rc);
+}
+ 
+/****************************************************
+ * Procedure Name: rssprm_get_name
+ * Description   : get rss
+ * Input         : rssprm_value
+ *                 rssprm_name
+ * Output        : rss
+ * Return Value  : ESA_RC
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC rssprm_get_name (RSS_typ      rssprm_value,
+                        char const * rssprm_name,
+                        char       * rss)
+{
+  char                  fn[]="rssprm_get_name";
+  int                   i= 0;
+  RSSPRM_rec_ptr        rss_ptr= NULL;
+  char                  rss_value[RSSPRM_VALUE_LEN+ 1];
+  char                  s_name [RSSPRM_NAME_LEN+ 1];
+  char                  s_rss [RSS_NAME_LEN+ 1];
+  char                  i_name [RSSPRM_NAME_LEN+ 1];
+  char                  i_value [RSSPRM_VALUE_LEN+ 1];
+  ESA_RC                rc= ESA_OK;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSRSS, DIAG_COMMON, fn);
+  ESA_DIAG_printf (ESA_COMP_ACSRSS, DIAG_COMMON,
+    "...-> : prm_name=%s prm_value=%s.", rssprm_name, rssprm_value);
+ 
+  CLEAR (i_value);
+  CLEAR (i_name);
+  CLEAR (s_rss);
+  CLEAR (s_name);
+  CLEAR (rss_value);
+ 
+  memcpy (i_value, (char *)rssprm_value, RSSPRM_VALUE_LEN);
+  memcpy (i_name, rssprm_name, RSSPRM_NAME_LEN);
+  ESA_DIAG_printf (ESA_COMP_ACSRSS, 15,
+                   "envir_ptr->rssprm_num %d i_value %s i_name %s.",
+                   (int)envir_ptr->rssprm_num, i_value, i_name);
+  for (i= 0; i LT envir_ptr->rssprm_num; i++ ) {
+     rss_ptr= envir_ptr->rssprm+ i;
+     memcpy (rss_value, (char *)rss_ptr->rssprm_value,
+		      RSSPRM_VALUE_LEN);
+     memcpy (s_name,(char *)rss_ptr->rssprm_name, RSSPRM_NAME_LEN);
+     ESA_DIAG_printf (ESA_COMP_ACSRSS, 16,
+                      "Next row: value %s name %s.",
+                       rss_value, s_name);
+     if (strlen (i_value) NE 0)
+        if (My_stricmp (i_value, rss_value) NE 0)
+           continue;
+     if (strcmp (i_name ,s_name) NE 0)
+        continue;
+     break;
+  }
+ 
+  if (i LT envir_ptr->rssprm_num) {
+     if (strlen (i_value) EQ 0)
+        strcpy (rssprm_value, rss_value);
+     memcpy (s_rss, (char *)rss_ptr->rss , RSS_NAME_LEN);
+     strcpy (rss, s_rss);
+     ESA_DIAG_printf (ESA_COMP_ACSRSS, 15,
+                   "rss %s.", rss);
+     rc= ESA_OK;
+  }
+  else {
+    CTSAMSG_print (ERR_CS_RSS_KWD_FAIL,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   rssprm_name, rssprm_value,
+                   envir_ptr->file_rssparm,fn);
+    rc= ESA_KEY_NOT_FOUND;
+  }
+  ESA_DIAG_printf (ESA_COMP_ACSRSS, DIAG_COMMON,
+    "...<- : rss_name=%s.", rss);
+  ESA_DIAG_exit (ESA_COMP_ACSRSS, DIAG_COMMON, fn, rc);
+  return (rc);
+}
+ 
+/****************************************************
+ * Procedure Name: rssprm_next_rss
+ * Description   : Get next rss name
+ *
+ * Input         : from_row_num
+ *
+ * Output        : rss_name
+ *
+ * Return Value  : ESA_OK             upon success
+ *                 ESA_KEY_NOT_FOUND  on any other situation
+ ****************************************************/
+ 
+ESA_RC rssprm_next_rss (RSS_typ   rss_name,
+                        RSS_typ   rss_type,
+                        int     * from_row_num)
+{
+  char                  fn[]="rssprm_next_rss";
+  int                   i= 0;
+  RSSPRM_rec_ptr        rss_ptr= NULL;
+  char                  s_name [RSSPRM_NAME_LEN+ 1];
+  char                  s_rss [RSS_NAME_LEN+ 1];
+  char                  s_type [RSSPRM_VALUE_LEN+ 1];
+  ESA_RC                rc= ESA_OK;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSRSS, DIAG_COMMON, fn);
+  ESA_DIAG_printf (ESA_COMP_ACSRSS, DIAG_COMMON,
+    "...-> : from_row=%d.", *from_row_num);
+ 
+  CLEAR (s_rss);
+  CLEAR (s_name);
+  CLEAR (s_type);
+  for (i= (*from_row_num)+ 1; i LT envir_ptr->rssprm_num; i++ ) {
+     rss_ptr= envir_ptr->rssprm+ i;
+     memcpy (s_rss, (char *)rss_ptr->rss, RSS_NAME_LEN);
+     memcpy (s_name,(char *)rss_ptr->rssprm_name, RSSPRM_NAME_LEN);
+     memcpy (s_type,(char *)rss_ptr->rssprm_value, RSSPRM_VALUE_LEN);
+     ESA_DIAG_printf (ESA_COMP_ACSRSS, 16,
+                      "row %d: rss=%s name=%s.",
+                       i, s_rss, s_name);
+     if (strcmp (s_name, RSS_TYPE) NE 0)
+        continue;
+     break;
+  }
+  *from_row_num= i;
+  if (i LT envir_ptr->rssprm_num) {
+    strcpy (rss_name, s_rss);
+    strcpy (rss_type, s_type);
+    rc= ESA_OK;
+  }
+  else
+    rc= ESA_KEY_NOT_FOUND;
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSRSS, DIAG_COMMON,
+    "...<- : rss_name=%s rss_type=%s from_row=%d.",
+	rss_name, rss_type, *from_row_num);
+  ESA_DIAG_exit (ESA_COMP_ACSRSS, DIAG_COMMON, fn, rc);
+  return (rc);
+}
+ 
+/****************************************************
+ * Procedure Name: rsslist_get
+ * Description   : Get List of rss-es from file for RSS
+ *
+ * Output        : rss_num - number rss-es in list
+ *                 rss_rec - array of rss records
+ * Return Value  : ESA_OK             upon success
+ *                 ESA_KEY_NOT_FOUND  on any other situation
+ ****************************************************/
+ 
+ESA_RC rsslist_get (unsigned int  * rss_num,
+                    RSS_rec_typ  ** rss_rec)
+{
+  ESA_RC                rc= ESA_OK;
+  int                   ii;
+  char                  fn[]="rsslist_get";
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSRSS, DIAG_COMMON, fn);
+ 
+  (* rss_num)= envir_ptr->max_rss_num;
+ 
+  if (envir_ptr->rss_rec EQ NULL)
+  {
+      rc= CSA_alloc ((char **)&envir_ptr->rss_rec, 0,
+                     sizeof (RSS_rec_typ),
+                     envir_ptr->max_rss_num, fn,
+                     "List of Rss records");
+	 if (rc NE ESA_OK)
+	     goto cleanup;
+  }
+ 
+  for (ii= 0; ii LT envir_ptr->max_rss_num; ii++ )
+  {
+     strcpy (envir_ptr->rss_rec[ii].rss_name,
+             envir_ptr->interest[ii].rss);
+     strcpy (envir_ptr->rss_rec[ii].rss_type,
+             envir_ptr->interest[ii].rss_type);
+     envir_ptr->rss_rec[ii].rss_status=
+         envir_ptr->interest[ii].rss_status;
+     ESA_DIAG_printf (ESA_COMP_ACSRSS, 16,
+                      "row %d: rss=%s type=%s status=%d.",
+                       ii,
+					   envir_ptr->rss_rec[ii].rss_name,
+					   envir_ptr->rss_rec[ii].rss_type,
+					   (int)envir_ptr->rss_rec[ii].rss_status);
+  }
+ 
+  (* rss_rec)= envir_ptr->rss_rec;
+ 
+cleanup:
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSRSS, DIAG_COMMON, fn, rc);
+  return (rc);
+ 
+}
+ 
+/****************************************************
+ * Procedure Name: RssDefPrmSet
+ * Description   : Set default RSS parameter
+ * Input         : RssPrmName
+ * Output        : RssPrmValue
+ ****************************************************/
+ 
+static void RssDefPrmSet (char * RssPrmName, char * RssPrmValue)
+{
+  char                  fn[]="RssDefPrmSet";
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSRSS, DIAG_COMMON, fn);
+  ESA_DIAG_printf (ESA_COMP_ACSRSS, 13,
+                   "Input RssPrmName=%s RssPrmValue=%s.",
+                    RssPrmName, RssPrmValue);
+  if (
+	    (strcmp (RssPrmName, ADMIN_CASE_SENSITIVE) == 0)
+       OR
+  	    (strcmp (RssPrmName, ADMIN_FILE_REQUEST) == 0)
+       OR
+  	    (strcmp (RssPrmName, ADMIN_USER_REQUEST) == 0)
+       OR
+        (strcmp (RssPrmName, COMPRESS_FILE_MODE) == 0)
+       OR
+  	    (strcmp (RssPrmName, OFLI_INTERCEPT) == 0)
+       OR
+  	    (strcmp (RssPrmName, DIAG_FROM_CTSAMSG) == 0)
+     )
+     strcpy (RssPrmValue, ESS_YES_FLAG);
+ 
+  else if (
+        (strcmp (RssPrmName, DELETE_INTERCEPT_CHECK) == 0)
+       OR
+        (strcmp (RssPrmName, SEND_RSSPRM_TO_SCRIPT) == 0)
+       OR
+  	    (strcmp (RssPrmName, PASS_PASSWORD) == 0)
+       OR
+  	    (strcmp (RssPrmName, OFLI_VERBOSE) == 0)
+       OR
+  	    (strcmp (RssPrmName, DOWNLOAD_TO_FILE) == 0)
+       OR
+        (strcmp (RssPrmName, OCCUPIED_QUEUE_DATA) == 0)
+       OR
+        (strcmp (RssPrmName, TRUNCATE_ADD_INFO) == 0)
+       OR
+        (strcmp (RssPrmName, SEND_LAST_TMP_MSG) == 0)
+       OR
+        (strcmp (RssPrmName, "SET_TRAN_FOR_ALL_CS") == 0)
+       OR
+        (strcmp (RssPrmName, PWD_CHG_WITH_GET_USER) == 0)
+     )
+	 strcpy (RssPrmName, ESS_NOT_FLAG);
+ 
+  else if (strcmp (RssPrmName, STAT_CHKSUM_INTRVL) == 0)
+     sprintf (RssPrmValue, "%d", STAT_CHKSUM_INTERVAL);
+ 
+  else if (strcmp (RssPrmName, STATIST_INTRVL) == 0)
+     sprintf (RssPrmValue, "%d", STATIST_INTERVAL);
+ 
+  else if (strcmp (RssPrmName, CHECK_SYNC_OBJS) == 0)
+     strcpy (RssPrmValue, ZERO_VALUE);
+ 
+  else if (strcmp (RssPrmName, STOP_REQ_MSGS) == 0)
+     strcpy (RssPrmValue, ZERO_VALUE);
+ 
+  else if (strcmp (RssPrmName, WAIT_QUEUE) == 0)
+     /* BS10076 strcpy (RssPrmValue, WAIT_QUEUE_VALUE);              */
+     strcpy (RssPrmValue, WAIT_QUEUE_TOTALC);             /* BS10076 */
+ 
+  else if (strcmp (RssPrmName, WAIT_LOCK) == 0)
+     /* BS10076 strcpy (RssPrmValue, WAIT_LOCK_VALUE);               */
+     strcpy (RssPrmValue, WAIT_LOCK_TOTALC);              /* BS10076 */
+ 
+  else if (strcmp (RssPrmName, WAIT_QUEUE_INTERVAL) == 0) /* BS10076 */
+     strcpy (RssPrmValue, WAIT_QUEUE_INTERVAL_DFLTC);     /* BS10076 */
+ 
+  else if (strcmp (RssPrmName, WAIT_LOCK_INTERVAL) == 0)  /* BS10076 */
+     strcpy (RssPrmValue, WAIT_LOCK_INTERVAL_DFLTC);      /* BS10076 */
+ 
+  else if (strcmp (RssPrmName, OFLI_INTERVAL) == 0)
+     strcpy (RssPrmValue, DEF_OFLI_INTERVAL);
+ 
+  else if (strcmp (RssPrmName, OFLI_RUN_INTERVAL) == 0)
+     strcpy (RssPrmValue, DEF_OFLI_RUN_INTERVAL);
+ 
+  else if (strcmp (RssPrmName, OFLI_WAIT_INTERVAL) == 0)
+     strcpy (RssPrmValue, DEF_OFLI_WAIT_INTERVAL);
+ 
+  else if (strcmp (RssPrmName, RSS_STATUS_INTERVAL) == 0)
+     strcpy (RssPrmValue, DEFAULT_STATUS_INTERVAL);
+ 
+  else if (strcmp (RssPrmName, CTSAMSG_MAX_GEN_NAME) == 0)
+     sprintf (RssPrmValue, "%d", CTSAMSG_MAX_GEN_VAL);
+ 
+  else if (strcmp (RssPrmName, CTSAMSG_MAX_LINES_NAME) == 0)
+     sprintf (RssPrmValue, "%d", CTSAMSG_MAX_LINES_VAL);
+ 
+  else if (strcmp (RssPrmName, CTSAMSG_MAX_INTERVAL_NAME) == 0)
+     sprintf (RssPrmValue, "%d", CTSAMSG_MAX_INTERVAL_VAL);
+ 
+  else if (strcmp (RssPrmName, OFFLI_RUN_TIME_LIST) == 0)
+     strcpy (RssPrmValue, DEF_OFFLI_RUN_TIME_LIST);
+ 
+  else if (strcmp (RssPrmName, MAX_SEND_MSGS_SEQ_CE) == 0)
+     strcpy (RssPrmValue, DEF_MAX_SEND_MSGS_SEQ_CE);
+ 
+  else if (strcmp (RssPrmName, CO_LOOP_SLEEP_TIME_PRM) == 0) /* WSAN100671 */
+     sprintf (RssPrmValue, "%d", CO_LOOP_SLEEP_TIME);
+ 
+  else if (strcmp (RssPrmName, CO_SLEEP_TIME_PRM) == 0)      /* WSAN100671 */
+     sprintf (RssPrmValue, "%d", CO_SLEEP_TIME);
+ 
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSRSS, 13,
+                   "Output RssPrmName=%s RssPrmValue=%s.",
+                    RssPrmName, RssPrmValue);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSRSS, DIAG_COMMON, fn, ESA_OK);
+ 
+}
+ 
+void GetOfliList (char          * RssPrmValue,
+	              char          * OfliListSpace,
+				  char         ** OfliList,
+				  unsigned int  * OfliListNumber)
+{
+  char           fn[]="GetOfliList";
+  unsigned int   kk= 0, ll= 0, TimeNum;
+  char         * ChrPtr, * StopPtr;
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSRSS, DIAG_COMMON, fn);
+ 
+  strcpy (OfliListSpace, RssPrmValue);
+  for (kk= 1,OfliList[0]=strtok(OfliListSpace,","); kk LT 24 ; kk++)
+  {
+     OfliList[kk]= strtok (NULL, ",");
+     if (OfliList[kk] EQ NULL)
+        break;
+  }
+  for (ll= 0; ll LT kk; ll++)
+  {
+     /* Check time growing */
+    if (
+          (kk GT ll+ 1)
+         AND
+	      (strcmp (OfliList[ll], OfliList[ll+ 1]) GE 0)
+       )
+	   break;
+    /* Check number of hours */
+    ChrPtr= strtok (OfliList[ll], ":");
+    if (ChrPtr EQ NULL)
+       break;
+    TimeNum= strtoul (ChrPtr, &StopPtr, 10);
+    if (*StopPtr NE '\0')
+       break;
+    if (TimeNum GE 24)
+       break;
+    /* Check number number of minutes */
+    ChrPtr += strlen (ChrPtr)+ 1;
+    TimeNum= strtoul (ChrPtr, &StopPtr, 10);
+    if (*StopPtr NE '\0')
+       break;
+    if (TimeNum GE 60)
+       break;
+  }
+  if (ll LT kk)
+     (*OfliListNumber)= 0;
+  else
+     (*OfliListNumber)= kk;
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSRSS, DIAG_COMMON, fn, ESA_OK);
+}
+ 
+static void PrepareRssParmKwdsForScript (void)
+{
+  ESA_RC                rc= ESA_OK;
+  char                  fn[]="PrepareRssParmKwdsForScript";
+  int                   kk= 0, ll= 0, jj= 0;
+  char                  RssPrmValue[2];
+  RSSPRM_rec_typ      * RssPrmRec;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSRSS, DIAG_COMMON, fn);
+  ESA_DIAG_printf (ESA_COMP_ACSRSS, 13,
+                   "Number of Rss=%d.", envir_ptr->max_rss_num);
+ 
+  for (kk= 0;
+       (kk LT envir_ptr->max_rss_num) AND (rc EQ ESA_OK) ;
+       kk++)
+  {
+     rc= rssprm_get_opt (envir_ptr->interest[kk].rss,
+                         SEND_RSSPRM_TO_SCRIPT, 1,
+                         RssPrmValue,
+					     OPT_TRUE,
+					     OPT_FALSE);
+ 
+     if ( (rc NE ESA_OK) OR (RssPrmValue[0] NE ESS_YES_SIGN) )
+        continue;
+     for (ll= 0, jj= 0; ll LT envir_ptr->rssprm_num; ll++)
+	 {
+		RssPrmRec= envir_ptr->rssprm+ ll;
+        if (
+			  (My_stricmp (RssPrmRec->rss,
+            			   envir_ptr->interest[kk].rss)	NE 0)
+             AND
+			  (My_stricmp (RssPrmRec->rss, ALL_RSS)	NE 0)
+           )
+           continue;
+        jj++;
+	 }
+     ESA_DIAG_printf (ESA_COMP_ACSRSS, 13,
+                   "Rss=%s RssParams=%u.",
+                    envir_ptr->interest[kk].rss, jj);
+	 if (envir_ptr->interest[kk].RssPrmAddInfo EQ NULL)
+     {
+		 rc= CSA_alloc ((char **)&envir_ptr->interest[kk].RssPrmAddInfo,
+		                 STRUC_ADDINFO,                  /* WS10082K */
+                    jj, 1, fn, "RssPrmAddInfo");   /* WS10082K */
+		/*WS10082K* STRUC_ADDINFO, sizeof (ADDINFO_rec_typ),     */
+  /*WS10082K*         jj, fn, "RssPrmAddInfo");        */
+         ESA_DIAG_printf (ESA_COMP_ACSRSS, 13,
+                         "RssPrmAddInfo = NULL");
+	 }
+     else
+	 {   /*WS10082K - ToBeChecked! */
+         rc=CSA_realloc((char **)&envir_ptr->interest[kk].RssPrmAddInfo,
+/*WS10082K*/            STRUC_ADDINFO, jj, 1);
+/*WS10082K*             STRUC_ADDINFO, sizeof (ADDINFO_rec_typ), jj);*/
+         ESA_DIAG_printf (ESA_COMP_ACSRSS, 13,
+                         "RssPrmAddInfo NOT = NULL");
+ 
+     }
+	 if (rc NE ESA_OK)
+        continue;
+ 
+	 envir_ptr->interest[kk].RssPrmAddInfo->num_pairs= jj;
+     envir_ptr->interest[kk].RssPrmAddInfo->num_pairs= jj;
+ 
+     for (ll= 0, jj= 0; ll LT envir_ptr->rssprm_num; ll++)
+	 {
+		RssPrmRec= envir_ptr->rssprm+ ll;
+        if (
+			  (My_stricmp (RssPrmRec->rss,
+            			   envir_ptr->interest[kk].rss)	NE 0)
+             AND
+			  (My_stricmp (RssPrmRec->rss, ALL_RSS)	NE 0)
+		   )
+           continue;
+ 
+        if (envir_ptr->interest[kk].RssPrmAddInfo->pair[jj].keyword NE NULL)
+	   ESA_DIAG_printf (ESA_COMP_ACSRSS, 13,
+	   "RssPrmAddInfo keyword=%s value=%s kk=%d jj=%d",
+	    envir_ptr->interest[kk].RssPrmAddInfo->pair[jj].keyword,
+		envir_ptr->interest[kk].RssPrmAddInfo->pair[jj].value,
+	    kk, jj);
+ 
+	    strcpy(envir_ptr->interest[kk].RssPrmAddInfo->pair[jj].keyword,
+			    RssPrmRec->rssprm_name);
+        envir_ptr->interest[kk].RssPrmAddInfo->pair[jj].keylen=
+			    strlen (RssPrmRec->rssprm_name);
+        strcpy(envir_ptr->interest[kk].RssPrmAddInfo->pair[jj].value,
+			    RssPrmRec->rssprm_value);
+        envir_ptr->interest[kk].RssPrmAddInfo->pair[jj].vallen=
+			    strlen (RssPrmRec->rssprm_value);
+		jj++;
+	 }
+ 
+  }
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSRSS, DIAG_COMMON, fn, ESA_OK);
+}
+ 
+void CS_DAIG_RssParm (void)
+{
+   int                   jj= 0;
+   RSSPRM_rec_typ      * rssprm= NULL;
+   ENVIRONMENT_rec_typ * envir_ptr;
+   char                  fn[]= "rssprm_load";
+ 
+   ESA_DIAG_enter (ESA_COMP_ACSRSS, DIAG_COMMON, fn);
+ 
+   if (ESA_DIAG_get_debug_level(ESA_COMP_ACSCB) LE DIAG_BASIC)
+		goto cleanup;
+   CS_get_envir_address (&envir_ptr);
+   ESA_DIAG_printf (ESA_COMP_ACSCB, 0, "     RssParm rows --------------------");
+   for (jj= 0;
+        (envir_ptr->rssprm NE NULL) AND (jj LT envir_ptr->rssprm_num);
+		jj++)
+   {
+      rssprm= envir_ptr->rssprm+ jj;
+      ESA_DIAG_printf (ESA_COMP_ACSCB, 0,"       %d : rss=%s prm=%s value=%s.", jj+ 1,
+	     rssprm->rss, rssprm->rssprm_name, rssprm->rssprm_value);
+   }
+   ESA_DIAG_printf (ESA_COMP_ACSRSS, DIAG_BASIC,
+    "     max_rss_num= %d.", envir_ptr->max_rss_num);
+   ESA_DIAG_printf (ESA_COMP_ACSRSS, DIAG_BASIC,
+    "     rssprm_num = %d.", envir_ptr->rssprm_num);
+   ESA_DIAG_printf (ESA_COMP_ACSCB, 0, "     ---------------------------------");
+cleanup:
+   ESA_DIAG_exit (ESA_COMP_ACSRSS, DIAG_COMMON, fn, ESA_RC_VOID);
+   return;
+}
+ 
+void CS_DAIG_RssKwdsForScript (void)
+{
+   int                   kk= 0, jj= 0;
+   ONE_FIELD_rec_typ   * pair= NULL;
+   ENVIRONMENT_rec_typ * envir_ptr;
+   char                  fn[]= "rssprm_load";
+ 
+   ESA_DIAG_enter (ESA_COMP_ACSRSS, DIAG_COMMON, fn);
+   if (ESA_DIAG_get_debug_level(ESA_COMP_ACSCB) LE DIAG_DETAILES)
+		goto cleanup;
+   CS_get_envir_address (&envir_ptr);
+   ESA_DIAG_printf (ESA_COMP_ACSCB, 0,"     Rss Keywords for Script (%p) ====================",
+			  envir_ptr->interest);
+   for (kk= 0; kk LT envir_ptr->max_rss_num ; kk++)
+   {
+ 
+      ESA_DIAG_printf (ESA_COMP_ACSCB, 0,"       Rss %s (%p) --------------------",
+			  envir_ptr->interest[kk].rss, envir_ptr->interest[kk].RssPrmAddInfo);
+      for (jj= 0;
+           (envir_ptr->interest[kk].RssPrmAddInfo NE NULL)
+		 	 AND
+		   (jj LT envir_ptr->interest[kk].RssPrmAddInfo->num_pairs);
+	       jj++)
+	  {
+         pair= &envir_ptr->interest[kk].RssPrmAddInfo->pair[jj];
+ 
+         ESA_DIAG_printf (ESA_COMP_ACSCB, 0,
+			 "         %d : Kwd=%s Val=%s Vlen=%d Klen=%d Type=%d.",
+			  jj+ 1, pair->keyword, pair->value, pair->vallen, pair->keylen, pair->add_typ);
+	  }
+      ESA_DIAG_printf (ESA_COMP_ACSCB, 0, "       --------------------");
+   }
+   ESA_DIAG_printf (ESA_COMP_ACSCB, 0, "     ====================");
+cleanup:
+   ESA_DIAG_exit (ESA_COMP_ACSRSS, DIAG_COMMON, fn, ESA_RC_VOID);
+   return;
+}

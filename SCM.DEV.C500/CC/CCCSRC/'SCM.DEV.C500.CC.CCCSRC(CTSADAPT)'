@@ -1,0 +1,1087 @@
+/**********************************************************************
+ *
+ * C Source: ctsadapt.c
+ * Description: Data files adaptation to RSSPARM
+ *
+ *++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+ 
+/***********************************************
+ * Mod.ID  Who            When         Description
+ * =============================================
+ *         Shmuel Koller  Feb 2001     4 Changes to Common code WS0405
+ * -1- additions for OS/390 conditionally included by #ifdef MVS
+ * -2- increment counter of records changed in queue (bug)
+ * -3- removed handling of rsskwds (not needed on any platform)
+ * -4- split line automatically inserted by Continuus and truncated
+ *     to 72 chars upon xfer to mainframe source format, even that it
+ *     does not cause compilation error within #if defined (Unix)
+ * IMH001  Ian H.   17-Sep-03    Add support for CheckAndPrintVersion
+ * IMH002  Ian H.   19-Nov-03    WSAN101342 Thread-safe code (ERRNO)
+ * SAS2IBMN NuritY  28-Aug-2016  1. Compile with IBM XL C/C++ and change
+ *                                  all x'05' to ' '.
+ *                               2. Replace osdynalloc with dynalloc
+ *                                  and dynfree.
+ * BS10074  NuritY  16-Nov-2017  Use open type r+ instead of w+ when
+ *                               updating a member.
+ * IS10174  NuritY  15-Jan-2018  Dunamic EXECOUT support.
+ * BS10129  AvnerL  28-Dec-23    Recompile due to WS10078 ESAINIT
+ *++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++*/
+ 
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: ctsadapt.c %
+ * Instance        : %instance: 1 %
+ * Created by      : %created_by: ihoffma %
+ * Created on      : %date_created: Wed Nov 19 19:04:57 2003 %
+ * Current Version : %version: 4 %
+ * Last Modified by: %derived_by: ihoffma %
+ * Last Modified on: %date_modified: Wed Nov 19 19:04:57 2003 %
+ */
+ 
+#define THIS_IS_MAIN
+ 
+#include   "globs.h"
+ 
+#include   ERRNO       /* IMH002 */
+#define    ESA_ADAPT   "adapt.h"
+ 
+#include   ESA_INIT
+#include   ESA_CS_SINFO
+#include   ESA_PROC
+#include   ESA_RSS
+#include   ESA_CS_OS
+#include   ESA_OS_PROC
+#include   ESA_OS_CONSOLE
+#include   ESA_RSSF
+#include   ENC_API
+#include   ESA_ADAPT
+#include   ESA_OS_OFLI
+#include   ESA_VER
+ 
+/* SAS2IBMN #include OS                  */
+#include <dynit.h>                                         /* SAS2IBMN */
+ 
+static ESA_RC AdaptQueue (char            * from_rss_type,
+                          char            * from_rss,
+                          char            * to_rss,
+                          ENC_ERR_rec_typ * encryption_err);
+ 
+ 
+static ESA_RC cts_file_adapt (char  * FileName,
+                              int     RecFileType,
+                              int     MaxRecLen,
+                              char  * from_rss,
+                              char  * to_rss,
+                              char ** AllocSpace,
+                              int   * AllocSpaceLen);
+ 
+static ESA_RC cts_tbl_rows_add (char * tbl_space,
+                                int    tbl_row_len,
+                                int  * tbl_rows_num);
+ 
+static ESA_RC cts_tbl_rebuild  (char * tbl_name,
+                                char * from_rss,
+                                char * to_rss,
+                                int  * tbl_rows_rss_renamed_num,
+                                char * tbl_space,
+                                int    tbl_row_len,
+                                int    tbl_rows_num);
+ 
+/**************************************************************
+ * Procedure Name   : main
+ *
+ * Description      :
+ * Return Value     : ESA_RC
+ *                                                             *
+ **************************************************************/
+ 
+int main (int argc, char **argv)
+{
+  char                  fn[]="ctsadapt";
+  char                  failmsg [512];
+  ESA_RC                rc= ESA_OK, rc_save= ESA_OK;
+  int                   tbl_space_len;
+  char                * tbl_space= NULL;
+  RSS_typ               from_rss, to_rss;
+  ENC_BOOLEAN           encryption_active;
+  ENC_ERR_rec_typ       encryption_err;
+  RSS_typ               from_rss_type;
+  INTERCEPT_FILES_rec_typ OfliFiles;
+  ENVIRONMENT_rec_typ * envir_ptr;
+  __dyn_t               dynalc_parms;                      /* SAS2IBMN */
+  int                   dyna_rc;                           /* SAS2IBMN */
+  char                  oflrimg[] = "oflrimg";             /* SAS2IBMN */
+ 
+  rc= CG_prolog (ESA_ACSADAPT_PROC, argc, argv);
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  if (rc NE ESA_OK) {
+    sprintf (failmsg, PROLOG_PROC_INIT_ERROR,
+             CG_name (envir_ptr->p_main_name),
+             ESA_rc2str(rc));
+    fprintf (stderr,failmsg);
+    OS_CONSOLE_print (failmsg,
+                      OS_CONS_ROLLABLE_YES,
+                      OS_CONS_SEV_ERROR);
+ 
+    goto cleanup;
+  }
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON, fn);
+ 
+  if (ESA_DIAG_get_debug_level(ESA_COMP_ACSINTF) GT DIAG_BASIC)
+  {
+     int   LineComp,          *LinePtr;
+     char  FileComp[1025],    *FilePtr;
+     char  TimeStampComp[50], *TimeStampPtr;
+ 
+     LinePtr     = &LineComp;
+     FilePtr     = FileComp;
+     TimeStampPtr= TimeStampComp;
+  }
+ 
+/* IMH001 start */
+   rc = CheckAndPrintVersion (argc, argv);
+   if (rc EQ ESA_OK)
+       goto cleanup;
+ 
+   rc= ESA_OK;
+/* IMH001 end */
+ 
+  strcpy (from_rss, "");
+  strcpy (to_rss,   "");
+ 
+  if (argc == 3)
+  {
+     if (strlen (argv[1]) GT RSS_NAME_LEN)
+     {
+        CTSAMSG_print (ERR_CS_MSG_CHKSIZE,
+                       envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                       envir_ptr->msg_admin_param.ctsamsg_dest,
+                       fn, argv[1], sizeof (RSS_typ));
+        rc= ESA_ERR;
+        goto cleanup;
+     }
+     if (strlen (argv[2]) GT RSS_NAME_LEN)
+     {
+        CTSAMSG_print (ERR_CS_MSG_CHKSIZE,
+                       envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                       envir_ptr->msg_admin_param.ctsamsg_dest,
+                       fn, argv[2], sizeof (RSS_typ));
+        rc= ESA_ERR;
+        goto cleanup;
+     }
+     strcpy (from_rss, argv[1]);
+     strcpy (to_rss,   argv[2]);
+     ESA_DIAG_printf (ESA_COMP_ACSPROC, DIAG_COMMON,
+         "Confirmed rename RSS name %s to name %s.",from_rss, to_rss);
+     rc= rssprm_get_opt (to_rss, RSS_TYPE ,RSS_NAME_LEN,
+                         from_rss_type, OPT_TRUE, OPT_TRUE);
+     if (rc EQ ESA_OK)
+     {
+        CTSAMSG_print (ERR_CS_RSS_KWD_EXIST ,
+                       envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                       envir_ptr->msg_admin_param.ctsamsg_dest,
+                       RSS_TYPE, to_rss ,
+                       envir_ptr->file_rssparm, fn);
+        rc= ESA_WARN;
+        goto cleanup;
+     }
+     rc= rssprm_get (from_rss, RSS_TYPE ,RSS_NAME_LEN, from_rss_type);
+     if (rc NE ESA_OK)
+        goto cleanup;
+ 
+     CTSAMSG_print (MSG_RENAMING_RSS_STARTED,
+                    envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                    envir_ptr->msg_admin_param.ctsamsg_dest,
+                    from_rss_type, from_rss, to_rss);
+ 
+ 
+     rc = OS_Q_open (envir_ptr->file_queue,
+                     &envir_ptr->q_handle,
+                     &envir_ptr->msg_params);
+     if (rc NE ESA_OK) {
+        ESA_DIAG_printf (ESA_COMP_ACSPROC, DIAG_COMMON,
+                         "queue %s failed (rc=%d)",
+                         envir_ptr->file_queue, (int)rc);
+        goto cleanup;
+     }
+ 
+     if (envir_ptr->encr_int_act NE NOT_ACT_ENCR)
+     {
+        if (envir_ptr->encr_int_act EQ ACT_ENCR)
+           encryption_active = ENC_TRUE;
+        else
+           encryption_active = ENC_FALSE;
+ 
+        rc = ENC_init_intrn_key (envir_ptr->file_encrint,
+                                 encryption_active,
+                                 &envir_ptr->enc_internal_handle,
+                                 &encryption_err);
+        if (rc NE ESA_OK)
+          CS_encr_msg (&encryption_err);
+ 
+        ESA_DIAG_printf(ESA_COMP_ACSPROC, 15,
+            "Encryption initialization completed with return code:%s",
+             ESA_rc2str(rc));
+ 
+        if (rc NE ESA_OK)
+           goto cleanup;
+ 
+     }
+ 
+    /*------------  OFLRSS file adaptation */
+     rc= OS_OFLI_Build_FileNames (from_rss,
+                                  &OfliFiles,
+                                  &envir_ptr->msg_admin_param);
+     if (rc NE ESA_OK)
+        goto cleanup;
+ 
+ /*******************************************************************
+   Following dsname is set in ESAOFOS using SAS/C dsn: style
+   and fopened in ADAPT.C using "w" which causes SAS/C to create
+   dataset if it does not exits. To avoid this scenario, an SVC99
+   (dynalloc) allocate is issued to allocate dataset.
+   If dynalloc ALLOCate is successfull, dataset is deallocated using
+      dynalloc FREE and ctsadapt is done for this dataset.
+   Else (dynalloc allocate fails)- to avoid creation of such dataset
+   by SAS/C runtime, ctsadapt will bypass handling this dataset.
+   Note that for dynalloc ALLOC, the dsname starts at offset 4
+   following 'dsn:' prefix.
+*******************************************************************/
+   /* SAS2IBMN - start */
+     /* Replace osdynalloc with dynalloc and dynfree
+     if (osdynalloc(DYN_ALLOC,"ddn=oflrimg,dsn=?,disp=shr",NULL,
+                      OfliFiles.rss_init_result_file+4) NE 0)
+     goto postofli;
+     osdynalloc(DYN_FREE,"ddn=oflrimg,unallocate",NULL);
+     */
+ 
+     /*
+      *   Allocate the oflrimg file to make ure it exists.
+      */
+     dyna_rc = dyninit(&dynalc_parms);
+     if (dyna_rc NE 0)
+     {
+        CTSAMSG_print (ERR_INTERNAL2,
+                       envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                       envir_ptr->msg_admin_param.ctsamsg_dest,
+                       fn, NULL, "dyninit failed.",
+                       dyna_rc, __LINE__);
+        goto cleanup;
+     }
+ 
+     dynalc_parms.__ddname = oflrimg;
+     dynalc_parms.__dsname = OfliFiles.rss_init_result_file+4;
+     dynalc_parms.__status = __DISP_SHR;
+ 
+     dyna_rc = dynalloc(&dynalc_parms);
+     if (dyna_rc NE 0)   /* file does not exist, no need to process */
+     {
+        ESA_DIAG_printf (ESA_COMP_ACSPROC, DIAG_COMMON,
+         "Allocation for %s (%s) failed: rc = %d / %4X / %4X",
+          dynalc_parms.__ddname, dynalc_parms.__dsname,
+          dyna_rc, dynalc_parms.__errcode, dynalc_parms.__infocode);
+ 
+        goto postofli;
+     }
+ 
+     /*
+      *  If the file exists, free it, the adaptation process
+      *  will re-allocate,
+      */
+     dyna_rc = dyninit(&dynalc_parms);
+     if (dyna_rc NE 0)
+     {
+        CTSAMSG_print (ERR_INTERNAL2,
+                       envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                       envir_ptr->msg_admin_param.ctsamsg_dest,
+                       fn, NULL, "dyninit failed.",
+                       dyna_rc, __LINE__);
+        goto cleanup;
+     }
+ 
+     dynalc_parms.__ddname = oflrimg;
+     dyna_rc = dynfree(&dynalc_parms);
+     if (dyna_rc NE 0)   /* Free failed, just report the error */
+        ESA_DIAG_printf (ESA_COMP_ACSPROC, DIAG_COMMON,
+         "Free for %s failed: rc = %d / %4X / %4X",
+          dynalc_parms.__ddname, dynalc_parms.__dsname,
+          dyna_rc, dynalc_parms.__errcode, dynalc_parms.__infocode);
+   /* SAS2IBMN - end */
+ 
+     rc= cts_file_adapt (OfliFiles.rss_init_result_file,
+                         STRUC_OFLRSS_REC,
+                         RSS_NAME_LEN+ CHECKSUM_LEN+ 6,
+                         from_rss,
+                         to_rss,
+                         &tbl_space,
+                         &tbl_space_len);
+     if (rc NE ESA_OK)
+        rc_save= rc;
+     postofli:
+ 
+     /*------------  QUEUE file adaptation */
+ 
+     rc= AdaptQueue ((char *)from_rss_type,
+                     (char *)from_rss,
+                     (char *)to_rss,
+                     &encryption_err);
+     if (rc NE ESA_OK)
+        goto cleanup;
+ 
+     /*------------  RSSPARM file adaptation */
+ 
+     rc= cts_file_adapt (envir_ptr->file_rssparm,
+             STRUC_RSSPRM_REC,
+             RSSPRM_VALUE_LEN+ RSSPRM_NAME_LEN+ RSS_NAME_LEN+ 4,
+             from_rss,
+             to_rss,
+             &tbl_space,
+             &tbl_space_len);
+ 
+     if (rc NE ESA_OK)
+         rc_save= rc;
+  }
+ 
+  /*------------  RSSOFLI file adaptation */
+ 
+  rc= cts_file_adapt (envir_ptr->file_rssofli,
+                      STRUC_RSSTBL,
+                      sizeof(RSSTBL_rec_typ),
+                      from_rss,
+                      to_rss,
+                      &tbl_space,
+                      &tbl_space_len);
+  if (rc NE ESA_OK)
+     rc_save= rc;
+ 
+  /*------------  INTUSER file adaptation */
+ 
+  rc= cts_file_adapt (envir_ptr->file_intuser,
+                      STRUC_RSS_REC,
+                      sizeof(INTEREST_USER_rec_typ),
+                      from_rss,
+                      to_rss,
+                      &tbl_space,
+                      &tbl_space_len);
+  if (rc NE ESA_OK)
+     rc_save= rc;
+ 
+  /*------------  INTUG file adaptation */
+ 
+  rc= cts_file_adapt (envir_ptr->file_intug,
+                      STRUC_RSS_REC,
+                      sizeof(INTEREST_UG_rec_typ),
+                      from_rss,
+                      to_rss,
+                      &tbl_space,
+                      &tbl_space_len);
+  if (rc NE ESA_OK)
+     rc_save= rc;
+ 
+  /*------------  INTU2UG file adaptation */
+ 
+  rc= cts_file_adapt (envir_ptr->file_intu2ug,
+                      STRUC_RSS_REC,
+                      sizeof(INTEREST_UG_rec_typ),
+                      from_rss,
+                      to_rss,
+                      &tbl_space,
+                      &tbl_space_len);
+  if (rc NE ESA_OK)
+     rc_save= rc;
+ 
+  /*------------  INTOE file adaptation */
+ 
+  rc= cts_file_adapt (envir_ptr->file_intoe,
+                      STRUC_RSS_REC,
+                      sizeof(INTEREST_OE_rec_typ),
+                      from_rss,
+                      to_rss,
+                      &tbl_space,
+                      &tbl_space_len);
+  if (rc NE ESA_OK)
+     rc_save= rc;
+ 
+  /*------------  RSSADM file adaptation */
+ 
+  if (strlen(envir_ptr->file_administrators) NE 0)
+  {
+     rc= cts_file_adapt (envir_ptr->file_administrators,
+                         STRUC_RSS_REC,
+                         sizeof(ADMINISTRATOR_rec_typ),
+                         from_rss,
+                         to_rss,
+                         &tbl_space,
+                         &tbl_space_len);
+     if (rc NE ESA_OK)
+        rc_save= rc;
+  }
+  /*------------  RSSAPIPRM file adaptation */
+ 
+  rc= cts_file_adapt (envir_ptr->file_rssapi,
+                      STRUC_PRM_REC,
+                      sizeof(RSSAPI_PRM_rec_typ),
+                      from_rss,
+                      to_rss,
+                      &tbl_space,
+                      &tbl_space_len);
+  if (rc NE ESA_OK)
+     rc_save= rc;
+ 
+  cleanup:
+  if (rc EQ ESA_OK)
+      rc= rc_save;
+ 
+  if (tbl_space NE NULL)
+     CSA_free (&tbl_space);
+ 
+  if (envir_ptr->enc_internal_handle NE NULL)
+     ENC_term (&envir_ptr->enc_internal_handle);
+ 
+  if (envir_ptr->q_handle.file NE NULL)
+  {
+    ESA_DIAG_printf (ESA_COMP_ACSPROC, 15,
+                   "CS_term, about to enter OS_Q_close...");
+    OS_Q_close (&envir_ptr->q_handle);
+  }
+  CG_epilog (rc , 0);
+/*  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest, fn);*/
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON, fn, rc);
+  return (rc EQ ESA_OK) ? PLAT_OK_STAT : PLAT_FAIL_STAT;
+ 
+} /* main */
+ 
+ 
+ 
+static ESA_RC AdaptQueue (char            * from_rss_type,
+                          char            * from_rss,
+                          char            * to_rss,
+                          ENC_ERR_rec_typ * encryption_err)
+{
+  ESA_RC                rc= ESA_OK;
+  char                  fn[]="AdaptQueue";
+  void                * handle_log_evnt= NULL;
+  RSS_typ               rss_special;
+  int                   tbl_rows_rss_renamed_num= 0, tbl_rows_num= 0;
+  unsigned int          message_size;
+  MSG_typ             * msg_ptr= NULL,* new_msg_ptr=NULL,* msg_act_ptr;
+  int                   encryption_out_len;
+  void                * enc_handle= NULL;
+  RSS_MSG_HDR_rec_typ * msg_hdr, msg_hdr_space;
+  ENC_ENCR_ALGRTM       decr_flag= ENC_SMALLBUFF;
+ 
+  ENVIRONMENT_rec_typ * envir_ptr;
+  msg_hdr= &msg_hdr_space;
+ 
+  CS_get_envir_address (&envir_ptr);
+  ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON, fn);
+  ESA_DIAG_printf(ESA_COMP_ACSPROC, 15,
+     "from_rss_type=%s from_rss=%s to_rss=%s.",
+     from_rss_type, from_rss, to_rss);
+ 
+     ESA_DIAG_printf(ESA_COMP_ACSPROC, 15,
+                  "Start adaptation: tbl_name=%s.",
+                  envir_ptr->file_queue);
+     rc= CSA_alloc ((char **)&msg_ptr, 0, envir_ptr->max_msg_size,
+                 1, fn, "Msg. space");
+     if (rc NE ESA_OK)
+        goto cleanup;
+     rc= CSA_alloc ((char **)&new_msg_ptr, 0, envir_ptr->max_msg_size,
+                    1, fn, "New Msg. space");
+     if (rc NE ESA_OK)
+       goto cleanup;
+     rc= CSA_alloc ((char **)&envir_ptr->enc_ptr,
+                    0, envir_ptr->max_msg_size,
+                    1, fn, "Enc New Msg. space");
+     if (rc NE ESA_OK)
+       goto cleanup;
+     memset (rss_special, '\0', sizeof (RSS_typ));
+     memset (rss_special, '*', sizeof (RSS_typ)- 1);
+ 
+     CTSLogEvent (from_rss_type,
+                  from_rss,
+                  handle_log_evnt,
+                  ERR_UL_STRING,
+                  rss_special);
+ 
+     if (rc NE ESA_OK) {
+        ESA_DIAG_printf(ESA_COMP_ACSPROC, 15,
+            "FILE_NOTE_LINE: rss_queue_put failed %s", ESA_rc2str(rc));
+        goto cleanup;
+     }
+     for (tbl_rows_num= 0, memset (msg_ptr,
+                                   '\0', envir_ptr->max_msg_size);
+       rc EQ ESA_OK;
+       tbl_rows_num++)
+     {
+        NUM_MSGS_typ          len_from_rss, len_tmp;
+        char                  str[STRUCT_LEN+ 1];
+ 
+        len_tmp= sizeof (MH_NMBR_MSGS)+ sizeof(MH_TRANSACTION)- 2;
+ 
+        rc = OS_Q_get ((void *) msg_ptr,
+                 (int *) & message_size,
+                 (int)envir_ptr->max_msg_size,
+                 envir_ptr->q_wait,
+                 &envir_ptr->q_handle);
+        if (rc NE ESA_OK) {
+           ESA_DIAG_printf(ESA_COMP_ACSPROC, 15,
+                "OS_Q_get failed %s", ESA_rc2str(rc));
+           goto cleanup;
+        }
+        envir_ptr->msg_size= message_size;
+  msg_ptr[message_size]= '\0';
+  if (strstr (msg_ptr, rss_special))
+           break;
+ 
+        enc_handle = envir_ptr->enc_internal_handle;
+        ESA_DIAG_printf(ESA_COMP_ACSPROC, 15,
+           "Queue get ended with message size:%d retun code:%s",
+                       message_size, ESA_rc2str(rc));
+        memcpy ((char *)msg_hdr , (char *)msg_ptr ,
+                sizeof (RSS_MSG_HDR_rec_typ));
+        msg_act_ptr= msg_ptr+ sizeof (RSS_MSG_HDR_rec_typ);
+ 
+        if (envir_ptr->encr_int_act NE NOT_ACT_ENCR)
+        {
+           if (
+           (msg_hdr->mhcmrs EQ MH_ENCR_ON)
+                OR
+           (msg_hdr->mhcmrs EQ MH_ENCR_NEW)
+              )
+     {
+           if (msg_hdr->mhcmrs EQ MH_ENCR_ON)
+           decr_flag= ENC_DES;
+           else
+           decr_flag= ENC_TDES;
+             /*
+              DECRYPT the incomming message, save it in special buffer.
+             */
+             rc = ENC_decr(enc_handle,
+                    msg_ptr+sizeof (RSS_MSG_HDR_rec_typ),
+                    (int)(message_size-sizeof (RSS_MSG_HDR_rec_typ)),
+                    decr_flag, /*ENC_FALSE,*/
+                    envir_ptr->enc_ptr,
+                    &encryption_out_len,
+                    encryption_err);
+ 
+    ESA_DIAG_printf (ESA_COMP_ACSPROC, 15,
+               "Encryption %s completed with return code:%s.",
+         (decr_flag == ENC_DES) ? "ENC_DES" : "ENC_TDES",
+                    ESA_rc2str(rc));
+ 
+             if (rc NE ESA_OK) {
+                CS_encr_msg (encryption_err);
+                goto cleanup;
+    }
+ 
+             msg_act_ptr= envir_ptr->enc_ptr;
+             message_size=encryption_out_len+
+                          sizeof(RSS_MSG_HDR_rec_typ);
+             envir_ptr->msg_size= message_size;
+ 
+             ESA_DIAG_printf(ESA_COMP_ACSPROC, 15,
+                "After ENC_decr: message size %d encr_len %d ",
+                     message_size, encryption_out_len);
+           } /* END - message was encrypted */
+        } /* END - the encryption is active */
+        else
+        {
+           if (msg_hdr->mhcmrs EQ MH_ENCR_ON) {
+              rc = ESA_ERR;
+              CTSAMSG_print (ERR_CS_ENCRYPTED_MSG,
+                      envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                      envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+           goto cleanup;
+           }
+        }
+ 
+        memcpy (new_msg_ptr, msg_ptr, sizeof (RSS_MSG_HDR_rec_typ));
+        memcpy (new_msg_ptr+ sizeof (RSS_MSG_HDR_rec_typ),
+                msg_act_ptr, len_tmp);
+ 
+        memset (str, '\0', sizeof(str));
+        memcpy (str, msg_act_ptr+ len_tmp, STRUCT_LEN);
+ 
+       /* rc= CS_check_nmb (str, msg_act_ptr, RSS_NAME_LEN, C_RSS_NAME);
+        if (rc NE ESA_OK)
+           goto cleanup;*/
+ 
+        sscanf (str, "%x", &len_from_rss);
+        if (
+              (len_from_rss == strlen (from_rss))
+             AND
+              (memcmp (from_rss,
+                       msg_act_ptr+ len_tmp+ STRUCT_LEN,
+                       len_from_rss)== 0)
+           )
+        {
+           unsigned int len_to_rss;
+ 
+           len_to_rss= strlen (to_rss);
+           sprintf(new_msg_ptr+ sizeof (RSS_MSG_HDR_rec_typ)+ len_tmp,
+                   "%03X", len_to_rss);
+           memcpy(new_msg_ptr+ sizeof (RSS_MSG_HDR_rec_typ)+ len_tmp+
+                  STRUCT_LEN,
+                  to_rss, len_to_rss),
+           memcpy(new_msg_ptr+ sizeof (RSS_MSG_HDR_rec_typ)+ len_tmp+
+                  STRUCT_LEN+ len_to_rss,
+               msg_act_ptr+ len_tmp+ STRUCT_LEN+ len_from_rss,
+               message_size-      (len_tmp+ STRUCT_LEN+ len_from_rss));
+           message_size =message_size+ len_to_rss- len_from_rss;
+           tbl_rows_rss_renamed_num++;
+        }
+        else
+           memcpy (new_msg_ptr+ sizeof (RSS_MSG_HDR_rec_typ)+ len_tmp,
+                   (char *)msg_act_ptr+ len_tmp,
+                   message_size-       (len_tmp));
+ 
+        rc= rss_queue_put (&envir_ptr->q_handle,
+                           (MSG_typ *)new_msg_ptr,
+                           message_size);
+     }
+     rc= cts_tbl_msg (rc,
+                  envir_ptr->file_queue,
+                  tbl_rows_num,
+                  0,
+                  0,
+                  tbl_rows_rss_renamed_num);
+ 
+cleanup:
+   ESA_DIAG_printf(ESA_COMP_ACSPROC, 15,
+               "End adaptation: tbl_name=%s tbl_rows_num=%d rc=%d.",
+                  envir_ptr->file_queue,
+                  tbl_rows_num,
+                  (int)rc );
+  if (new_msg_ptr NE NULL)
+     CSA_free (&new_msg_ptr);
+  if (msg_ptr NE NULL)
+     CSA_free (&msg_ptr);
+  if (envir_ptr->enc_ptr NE NULL)
+     CSA_free (&envir_ptr->enc_ptr);
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON, fn, rc);
+  return (rc);
+}
+ 
+ 
+static ESA_RC cts_file_adapt (char  * FileName,
+                              int     RecFileType,
+                              int     MaxRecLen,
+                              char  * from_rss,
+                              char  * to_rss,
+                              char ** AllocSpace,
+                              int   * AllocSpaceLen)
+{
+  ESA_RC                rc= ESA_OK;
+  char                  fn[]="cts_file_adapt";
+  int                   tbl_rows_num=0, prev_tbl_rows_num=0;
+  int                   tbl_rows_removed= 0,tbl_rows_rss_renamed_num=0;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+  ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON, fn);
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSPROC, DIAG_COMMON,
+  "Start Adapt: FileName=%s MaxRecLen=%d RecFileType=%d AllocLen=%d.",
+                   FileName, MaxRecLen, RecFileType, * AllocSpaceLen);
+ 
+ 
+  if (*AllocSpace == NULL)
+  {
+     *AllocSpaceLen= envir_ptr->max_rss_num * sizeof(RSSTBL_rec_typ);
+     rc= CSA_alloc (AllocSpace,
+                 0,
+                 sizeof(RSSTBL_rec_typ),
+                 envir_ptr->max_rss_num,
+                 fn,
+                 "Table space for CTSADAPT");
+     if (rc NE ESA_OK)
+     {
+        CTSAMSG_print (ERR_CS_MALLOC,
+                   envir_ptr->ctsamsg_handle, NULL,
+                   envir_ptr->ctsamsg_dest,
+                   "Table space for CTSADAPT",
+                   *AllocSpaceLen,
+                   fn);
+        rc = ESA_ERR;
+        goto cleanup;
+     }
+  }
+ 
+  memset (* AllocSpace, '\0', * AllocSpaceLen);
+ 
+  rc= cts_tbl_load (RecFileType,
+                    FileName,
+                    AllocSpace,
+                    AllocSpaceLen,
+                    MaxRecLen,
+                    &tbl_rows_num,
+                    &tbl_rows_removed);
+ 
+  prev_tbl_rows_num= tbl_rows_num;
+ 
+  if ( (rc EQ ESA_OK) AND (RecFileType EQ STRUC_RSSTBL)  )
+      rc= cts_tbl_rows_add (*AllocSpace,
+                            MaxRecLen,
+                            &tbl_rows_num);
+  if (
+          (rc EQ ESA_OK)
+       AND
+          (tbl_rows_num NE 0)
+       AND
+          (
+           (tbl_rows_num NE prev_tbl_rows_num)
+          OR
+           (tbl_rows_removed NE 0)
+          OR
+           (strlen (from_rss) NE 0)
+        )
+     )
+      rc= cts_tbl_rebuild (FileName,
+                           from_rss,
+                           to_rss,
+                           &tbl_rows_rss_renamed_num,
+                           *AllocSpace,
+                           MaxRecLen,
+                           tbl_rows_num);
+  rc= cts_tbl_msg (rc,
+                   FileName,
+                   tbl_rows_num,
+                   tbl_rows_num - prev_tbl_rows_num,
+                   tbl_rows_removed,
+                   tbl_rows_rss_renamed_num);
+ 
+  if (rc NE ESA_OK)
+     goto cleanup;
+ 
+cleanup:
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON, fn, rc);
+  return (rc);
+}
+ 
+static ESA_RC cts_tbl_rows_add (char * tbl_space,
+                                int    tbl_row_len,
+                                int  * tbl_rows_num)
+{
+  ESA_RC                  rc= ESA_OK;
+  int                     ii= 0, jj= 0, kk= 0;
+  char                  * tbl_row_ptr;
+  RSS_typ                 rss_name;
+  RSSTBL_rec_typ          rsstbl_row;
+ 
+  TIME_typ                cur_time;
+  DATE_typ                cur_date;
+  char                    fn[]="cts_tbl_rows_add";
+  ENVIRONMENT_rec_typ   * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON, fn);
+ 
+  ESA_DIAG_printf(ESA_COMP_ACSPROC, 13,
+                  "Input: tbl_row_len=%d tbl_rows_num=%d.",
+                  tbl_row_len,
+                  *tbl_rows_num);
+ 
+  for (ii= 0, jj= 0; ii LT envir_ptr->max_rss_num; ii++)
+  {
+     for (kk= 0; kk LT (* tbl_rows_num); kk++)
+     {
+        tbl_row_ptr= tbl_space+ (tbl_row_len * kk);
+        memcpy (rss_name,
+                tbl_row_ptr,
+                sizeof (RSS_typ));
+        strtok (rss_name, WHITECHARS);
+ 
+        if (My_stricmp (rss_name,
+                    envir_ptr->interest[ii].rss) EQ 0)
+           break;
+     }
+     if (kk LT (* tbl_rows_num))
+        continue;
+ 
+     CS_get_cur_time (cur_date,
+                      cur_time);
+ 
+     memset ((char *)(&rsstbl_row),
+             ' ',
+             sizeof(RSSTBL_rec_typ));
+ 
+     memcpy ((char *)rsstbl_row.rss,
+             (char *)envir_ptr->interest[ii].rss,
+             strlen(envir_ptr->interest[ii].rss));
+ 
+     memcpy ((char *)rsstbl_row.intercept_next_date,
+             (char *)cur_date,
+             DATE_LEN);
+ 
+     memcpy ((char *)rsstbl_row.intercept_next_time,
+             (char *)cur_time,
+             TIME_LEN);
+ 
+     memcpy ((char *)rsstbl_row.intercept_end_date,
+             (char *)cur_date,
+             DATE_LEN);
+ 
+     memcpy ((char *)rsstbl_row.intercept_end_time,
+             (char *)cur_time,
+             TIME_LEN);
+ 
+     memcpy ((char *)rsstbl_row.sync_start_date,
+             (char *)cur_date,
+             DATE_LEN);
+ 
+     memcpy ((char *)rsstbl_row.sync_start_time,
+             (char *)cur_time,
+             TIME_LEN);
+ 
+     memset ((char *)rsstbl_row.intercept_till_date,
+             '0',
+             DATE_LEN);
+ 
+     memset ((char *)rsstbl_row.intercept_till_time,
+             '0',
+             TIME_LEN);
+ 
+     memset ((char *)rsstbl_row.log_last_update_date,
+             '0',
+             DATE_LEN);
+ 
+     memset ((char *)rsstbl_row.log_last_update_time,
+             '0',
+             TIME_LEN);
+ 
+     memset ((char *)rsstbl_row.log_last_recnum,
+             '0',
+             MAX_FIGURES_IN_LONG_INT);
+ 
+     memcpy ((char *)rsstbl_row.host,
+             (char *)envir_ptr->host_name,
+             strlen(envir_ptr->host_name));
+ 
+      rsstbl_row.dwnld_sync_method = 4;
+/*    rsstbl_row.dwnld_sync_method = M_DWNLD_SYNC_METHOD_UNDEFINED;*/
+      rsstbl_row.end_row= '\n';
+      rsstbl_row.end_string= '\0';
+ 
+      tbl_row_ptr= tbl_space+ (tbl_row_len * (* tbl_rows_num));
+ 
+      strcpy (tbl_row_ptr,
+              (char *)&rsstbl_row);
+ 
+      (*tbl_rows_num)++;
+      jj++;
+ 
+      ESA_DIAG_printf(ESA_COMP_ACSPROC, 16,
+                      "Added %d row %s len %d.",
+                      *tbl_rows_num,
+                      tbl_row_ptr,
+                      strlen (tbl_row_ptr));
+  }
+ 
+  if (rc NE ESA_OK)
+     CTSAMSG_print (ERR_CS_FUNCTION,
+                    envir_ptr->msg_admin_param.ctsamsg_handle,
+                    NULL,
+                    envir_ptr->msg_admin_param.ctsamsg_dest,
+                    fn);
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSPROC, 14,
+                   "added %d recordes. Now in table %d records",
+                   jj,
+                   *tbl_rows_num);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON, fn, rc);
+ 
+  return rc;
+ 
+}
+ 
+/**************************************************************
+ * Procedure Name   : cts_tbl_rebuild
+ *
+ * Description      :
+ * Return Value     : ESA_RC
+ *                                                             *
+ **************************************************************/
+ 
+static ESA_RC cts_tbl_rebuild  (char * tbl_name,
+                                char * from_rss,
+                                char * to_rss,
+                                int  * tbl_rows_rss_renamed_num,
+                                char * tbl_space,
+                                int    tbl_row_len,
+                                int    tbl_rows_num)
+{
+  ESA_RC                rc = ESA_OK;
+  FILE                * tbl_handle= NULL;
+  int                   ii= 0, SwOfliFile= FALSE;
+  char                * tbl_row_ptr;
+  char                  fn[]="cts_tbl_rebuild";
+  char RecLine[1024], * TokPtr1, *TokPtr2, *TokPtr3, *TokPtr;
+  char                  FromRss[RSS_NAME_LEN+2];
+  char                  ToRss[RSS_NAME_LEN+2];
+  unsigned long         diff= 0;
+  ENVIRONMENT_rec_typ * envir_ptr;
+  char                  dsnm[55]  = "";     /* Data set name  BS10074 */
+  char                * open_type;                         /* BS10074 */
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON, fn);
+ 
+  ESA_DIAG_printf(ESA_COMP_ACSPROC, DIAG_COMMON,
+                  "Input: tbl_name=%s tbl_row_len=%d tbl_rows_num=%d.",
+                  tbl_name,
+                  tbl_row_len,
+                  tbl_rows_num);
+  strcpy (FromRss, from_rss);
+  strcpy (ToRss,   to_rss);
+ 
+  (* tbl_rows_rss_renamed_num)= 0;
+ 
+  /* BS10074 - start */
+  /* Check if the file to be updated is a member in a library.        */
+  /* if it is, open with r+ instead of w+                             */
+   rc = OS_PROC_ddinfo (tbl_name, dsnm, 0,
+                        envir_ptr->msg_admin_param.ctsamsg_dest,
+                        envir_ptr->msg_admin_param.ctsamsg_handle,
+                        0);                              /* IS10174 */
+   if (rc EQ ESA_OK  AND  dsnm[strlen(dsnm)-1] EQ ')' )
+     open_type = FILE_OPEN_UPDATE_TEXT;
+   else
+     open_type = FILE_CREAT;
+  /* BS10074 - end   */
+  rc= CSA_open (tbl_name,
+                fn,
+                open_type,                                /* BS10074 */
+                &tbl_handle,
+                SCOPE_REMOTE);
+  /* BS10074    FILE_CREAT, */
+  if (rc NE ESA_OK)
+    goto cleanup;
+ 
+  /*
+   *   Write process table from the  buffer
+   */
+ 
+  for (ii= 0; ii LT tbl_rows_num; ii++)
+  {
+     tbl_row_ptr= tbl_space+ (tbl_row_len* ii);
+     if (
+           (*tbl_row_ptr NE SKIP_SIGN)
+          AND
+           (strspn(tbl_row_ptr,WILDWHITECHARS) NE strlen (tbl_row_ptr))
+        )
+     {
+       strcpy (RecLine, tbl_row_ptr);
+ 
+       TokPtr1= strtok (RecLine, WHITECHARS);
+       TokPtr2= strtok (NULL, WHITECHARS);
+       if (strcmp (tbl_name, envir_ptr->file_rssapi) == 0)
+       {
+          TokPtr3= strtok (NULL, WHITECHARS);
+          TokPtr = TokPtr2;
+       }
+       else
+       {
+          TokPtr3= TokPtr2;
+          TokPtr = TokPtr1;
+    if (TokPtr[strlen(TokPtr)- 1] == DB_FIELDS_SEPARATOR_CHAR) {
+     FromRss[strlen(FromRss)+ 1]= '\0';
+     FromRss[strlen(FromRss)]= DB_FIELDS_SEPARATOR_CHAR;
+     ToRss[strlen(ToRss)+ 1]= '\0';
+     ToRss[strlen(ToRss)]= DB_FIELDS_SEPARATOR_CHAR;
+     SwOfliFile= TRUE;
+    }
+    else
+       SwOfliFile= FALSE;
+       }
+       if ( (TokPtr1== NULL) || (TokPtr2== NULL) || (TokPtr3== NULL) )
+       {
+          rc= ESA_ERR;
+          goto cleanup;
+       }
+ 
+       ESA_DIAG_printf (ESA_COMP_ACSPROC, 16,
+                      "TokPtr1=%s TokPtr2=%s TokPtr3=%s.",
+                       TokPtr1,   TokPtr2,   TokPtr3);
+ 
+       rc= My_stricmp (FromRss, TokPtr);
+       if (rc == ESA_OK)
+       {
+          (*tbl_rows_rss_renamed_num)++;
+          memset (RecLine, ' ', sizeof (RecLine));
+          if (TokPtr == TokPtr1)
+          {
+             memcpy (RecLine, ToRss, strlen (ToRss));
+             if (TokPtr1+ strlen (ToRss) GE TokPtr2)
+                strcpy (TokPtr1+ strlen (ToRss)+ 1,
+                        tbl_row_ptr+ (TokPtr2- TokPtr1));
+             else {
+                if (SwOfliFile == TRUE)
+                   diff= strlen(FromRss)- strlen(ToRss);
+                strcpy (TokPtr2- diff,
+                   tbl_row_ptr+ (TokPtr2- TokPtr1));
+    }
+          }
+          else
+          {
+             memcpy (RecLine, tbl_row_ptr, (TokPtr2- (char *)RecLine));
+             memcpy (TokPtr2,
+                     ToRss, strlen (ToRss));
+             if (TokPtr2+ strlen (ToRss) GE TokPtr3)
+                strcpy (TokPtr2+ strlen (ToRss)+ 1,
+                        tbl_row_ptr+ (TokPtr3- TokPtr1));
+             else
+                strcpy (TokPtr3,
+                        tbl_row_ptr+ (TokPtr3- TokPtr1));
+ 
+          }
+          tbl_row_ptr= (char *)RecLine;
+       }
+     }
+     ESA_DIAG_printf (ESA_COMP_ACSPROC, 16,
+                      "Writed %d record: %s len %d.",
+                      ii+ 1,
+                      tbl_row_ptr,
+                      strlen (tbl_row_ptr));
+ 
+     rc= CSA_fputs (tbl_name,
+                    tbl_row_ptr,
+                    tbl_handle);
+     if (rc NE ESA_OK)
+        goto cleanup;
+  } /* for */
+ 
+  cleanup:
+ 
+  CSA_close (tbl_name,
+             fn);
+ 
+  if (rc NE ESA_OK)
+     CTSAMSG_print (ERR_CS_FUNCTION,
+                    envir_ptr->msg_admin_param.ctsamsg_handle,
+                    NULL,
+                    envir_ptr->msg_admin_param.ctsamsg_dest,
+                    fn);
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSPROC, 14,
+                   "rebuild %s file with %d records",
+                   tbl_name,
+                   ii);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON, fn, rc);
+ 
+  return rc;
+ 
+}
+ 

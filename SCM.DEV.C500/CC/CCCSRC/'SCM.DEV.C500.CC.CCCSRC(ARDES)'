@@ -1,0 +1,779 @@
+/**********************************************************************
+* Title:            ardes                                             *
+* File Name:        ardes.c                                           *
+* Author:           Algorithm Research                                *
+* Creation Date:    14-11-94                                          *
+* Description:      Algorithmic Research DES functions.               *
+* Assumptions and                                                     *
+*   Considerations:                                                   *
+* $Log:   L:/CRYPT/src/ardes.c_v  $
+ *
+ *    Rev 1.9   Aug 17 1998 10:40:16   ajk
+ * Fixed SCCSID for Unix 'what' command
+ *
+ *    Rev 1.8   Jan 21 1998 19:00:22   leonid_s
+ * 300-Beta with AS400 & VMS changes
+ *
+ *    Rev 1.7   Jul 24 1997 08:33:16   leonid_s
+ *     SCCSID("%Z%%M% \
+ *
+ *
+ *    Rev 1.6   Jul 23 1997 11:47:44   ajk
+ * SCCS id
+ *
+ *    Rev 1.5   Jul 23 1997 11:45:16   ajk
+ * SCCS id
+ *
+ *    Rev 1.4   Jul 23 1997 11:40:50   ajk
+ * SCCS id
+ *
+ *    Rev 1.3   Jul 21 1997 19:49:22   ajk
+ * Added $logs
+*
+**********************************************************************/
+/***********************************************************
+ * Mod.ID   Who      When            Description
+ * =========================================================
+ * IMH001   Ian H.   7th Oct. 2003   Win: Get CRYPT.dll version
+ * SAS2IBMN NuritY  07/11/16  Compile with IBM XL C/C++:
+ *                            1. Remove #if for __STDC__ and leave
+ *                               the code for the defined part.
+ *                               The code generated when not defined
+ *                               will be needed if we change the
+ *                               LANGLVL compiler option to be
+ *                               COMMONC. If this happens, we will
+ *                               look in the SAS/C source for needed
+ *                               code.
+ *
+ ***********************************************************/
+ 
+#include "globs.h"
+ 
+#include STDIO
+#include STDLIB
+#include STRING
+#include AR_DES
+#include AR_TBL
+ 
+#include MEMORY
+ 
+    SCCSID("@(#)ardes.c \
+$Revision:   1.9  $\
+$Date:   Aug 17 1998 10:40:16  $\
+$Author:   ajk  $")
+ 
+#if (!defined (LOWBYTEFIRST)) && (!defined (HIGHBYTEFIRST))
+#error LOWBYTEFIRST and HIGHBYTEFIRST - at least one must be defined
+#endif
+ 
+/* for MVS only */
+#define ITISC  "@CC@"     /* "@CC@" = "C" */
+#define ITISA  "@AA@"     /* "@AA@ = Assembler */
+ 
+#if defined (YOSEF)
+static const char *CorASM = ITISA;
+#else
+static const char *CorASM = ITISC;
+#endif /* YOSEF */
+ 
+ /* MVS */
+ 
+static void strfpbeg    (
+			 STRFP        *chn
+			);
+static void strfpcon    (
+			  UNSBYTE      *inbuf,
+			  int           len,
+			  int           last,
+			  STRFP        *chn,
+			  DWORD        *desr1,
+			  DWORD        *desr2
+			);
+static void ks          (
+			  UNSBYTE      *key,
+			  DWORD        *ksch,
+			  int           encdec
+			);
+static void des         (
+			  UNSBYTE      *arg,
+			  UNSBYTE      *res,
+			  DWORD        *ksch
+			);
+static void fp          (
+			  UNSBYTE      *inbuf,
+			  unsigned int  len,
+			  FPCHN        *c,
+			  DWORD        *desr
+			);
+ 
+/************ KS function  *********************/
+ 
+ 
+static void ks          (
+			  UNSBYTE  *key,
+			  DWORD    *ksch,
+			  int      ed)
+{
+  unsigned int i, round;
+  DWORD c, d, k1, k2;
+ 
+  if (ed == -1)
+    ksch += 30;
+  c = d = 0;
+  for (i=0; i<56; i+=2)
+    c = (c<<1) | (key[pc1[i]]&pc1[i+1] ? 1 : 0);
+  for (i=56; i<112; i+=2)
+    d = (d<<1) | (key[pc1[i]]&pc1[i+1] ? 1 : 0);
+ 
+  for (round=0; round<16; round++) {
+    c <<= ARshifts[round];
+    c = (c | (c>>28)) & 0x0FFFFFFF;
+    d <<= ARshifts[round];
+    d = (d | (d>>28)) & 0x0FFFFFFF;
+ 
+    k1 = k2 = 0;
+    for (i=0; i<48; i+=2) {
+      if (c & pc21[i])  k1 |= pc21[i+1];
+      if (d & pc22[i])  k2 |= pc22[i+1];
+    }
+ 
+    *ksch =   (k1 & 0xFF000000) | ((k1<<8) & 0xFF0000) |
+   ((k2>>16) & 0xFF00) | ((k2>>8) & 0xFF);
+    *(ksch+1) = ((k1<<8) & 0xFF000000) | ((k1<<16) & 0xFF0000) |
+   ((k2>>8) & 0xFF00) | (k2 & 0xFF);
+ 
+    ksch += 2*ed;
+  }
+} /* END - ks function */
+ 
+/* Added by Aviw 15-DEC-1994*/
+ 
+ 
+/****************  KSF  Function ******************/
+ 
+ 
+void ksf  (
+	    UNSBYTE  *key,
+	    DWORD    *ksch,
+	    int       ed)
+{
+/* for MVS only */
+   if (strcmp(CorASM , ITISA) == 0)
+      ctsaks (key , ksch , ed);
+   else
+ /* MVS */
+ 
+   ks (key , ksch , ed);
+}
+ 
+/**********  DES function *************************/
+ 
+static void des (
+		  UNSBYTE  *arg,
+		  UNSBYTE  *res,
+		  DWORD    *ksch)
+{
+DWORD bl1 , br1;      /* bl1 and br1 are not used. They */
+UNSBYTE *bl = (UNSBYTE *)&bl1, *br = (UNSBYTE *)&br1;  /* only
+				 ensure proper aligment */
+int i;
+DWORD l, r, *ksc;
+ 
+/*************** INITIAL PERMUTATION ***************************/
+  l = r = 0;
+  for (i=7; i>=0; i--) {
+    l = (l<<1) | ipldisp[arg[i]];
+    r = (r<<1) | iprdisp[arg[i]];
+  }
+ 
+/* rotate L and R */
+  l = (l>>1) | (l<<31);
+  r = (r>>1) | (r<<31);
+ 
+/* rounds */
+  for (ksc=ksch; ksc<(ksch+32); ksc+=4) {
+ 
+  register DWORD ll, rr, t;
+    ll = l; rr = r;
+    t = rr ^ *ksc;
+ 
+    ll ^= s7[((t    )   & 0xFC) >> 2 ];
+    ll ^= s5[((t >>  8) & 0xFC) >> 2 ];
+    ll ^= s3[((t >> 16) & 0xFC) >> 2 ];
+    ll ^= s1[((t >> 24) & 0xFC) >> 2 ];
+ 
+    t = ((rr<<4) | (rr>>28)) ^ *(ksc+1);
+    ll ^= s8[ ((t    )   & 0xFC) >> 2 ];
+    ll ^= s6[ ((t >>  8) & 0xFC) >> 2 ];
+    ll ^= s4[ ((t >> 16) & 0xFC) >> 2 ];
+    ll ^= s2[ ((t >> 24) & 0xFC) >> 2 ];
+ 
+    t = ll ^ *(ksc+2);
+    rr ^= s7[ ((t    )   & 0xFC) >> 2 ];
+    rr ^= s5[ ((t >>  8) & 0xFC) >> 2 ];
+    rr ^= s3[ ((t >> 16) & 0xFC) >> 2 ];
+    rr ^= s1[ ((t >> 24) & 0xFC) >> 2 ];
+ 
+    t = ((ll<<4) | (ll>>28)) ^ *(ksc+3);
+    rr ^= s8[ ((t    )   & 0xFC) >> 2 ];
+    rr ^= s6[ ((t >>  8) & 0xFC) >> 2 ];
+    rr ^= s4[ ((t >> 16) & 0xFC) >> 2 ];
+    rr ^= s2[ ((t >> 24) & 0xFC) >> 2 ];
+    r = rr; l = ll;
+  };
+ 
+/* rotate L and R */
+  l = (l<<1) | (l>>31);
+  r = (r<<1) | (r>>31);
+ 
+/**************** FINAL PERMUTATION ****************************/
+ 
+  bl1 = r;
+  br1 = l;
+  l = r = 0;
+ 
+  for (i=0; i<4; i++)
+  {
+    l = (l<<1) | ipildisp [br[i]];
+    r = (r<<1) | ipirdisp [br[i]];
+    l = (l<<1) | ipildisp [bl[i]];
+    r = (r<<1) | ipirdisp [bl[i]];
+  }
+ 
+  res[0] = ((UNSBYTE *) &l) [0];
+  res[1] = ((UNSBYTE *) &l) [1];
+  res[2] = ((UNSBYTE *) &l) [2];
+  res[3] = ((UNSBYTE *) &l) [3];
+  res[4] = ((UNSBYTE *) &r) [0];
+  res[5] = ((UNSBYTE *) &r) [1];
+  res[6] = ((UNSBYTE *) &r) [2];
+  res[7] = ((UNSBYTE *) &r) [3];
+ 
+} /* END - des function */
+ 
+ 
+/************   DESF   function **************/
+ 
+void desf  (
+	     UNSBYTE  *arg,
+	     UNSBYTE  *res ,
+	     DWORD    *ksch)
+{
+/* for MVS */
+   if (strcmp(CorASM , ITISA) == 0)
+      ctsades (arg , res , ksch);
+   else
+ /* MVS */
+ 
+   des (arg , res , ksch);
+}
+ 
+/**********************************************************************
+* Title:            Strenc
+* File Name:        strenc.c
+* Author:           Algorithm Research
+* Creation Date:    14-11-94
+* Description:
+* Assumptions and
+*   Considerations:
+**********************************************************************/
+ 
+/**********************************************************************
+* Mod.ID   Who     When     Description
+* ---------------------------------------------------------------------
+* AR001    A-R     14/11/94  Original version
+* AW002    AVIW    16/11/94  In both strdec & strenc
+*                            the equation/comparison
+*                            of cipher & t were replaced
+*                            by memcmp and memcpy.
+**********************************************************************/
+ 
+/*
+  Procedure to stream-encrypt a block of data.
+  The encryption is done in the following way:
+  I0 := R2; O0:= 0; (first time)
+  Repeat for i:=1 to n
+	 Oi := Ii xor Ii-1 xor DES(Oi-1 xor FH2, KEY);
+ 
+  Where R2 and FH2 are 8 byte numbers established at session start
+ 
+  Calling sequence:
+  void strenc(UNSBYTE *clear, UNSBYTE *cipher, unsigned int len,
+	      STRCHN *chn,    DWORD *desr,     int auth);
+ 
+  On Input:
+  clear  - cleartext  (segmented)
+  nbytes - length of input area in bytes
+  chain  - a structure containing the following:
+			  Prev(I) - 8 bytes
+			  Prev(O) - 8 bytes
+			  FH2     - 8 bytes
+			  LenTail - int
+  desr   - the des tables
+  auth   - if non zero, append 4 bytes authentication to enciphered
+		   message. The contents of the 4 bytes is:
+			 left 4 bytes of DES (O0,key);
+ 
+  On Output
+  cipher - ciphertext (segmented). Must have space for 4 more bytes
+		   if auth is nonzero.
+ 
+  Notes:
+   This function may be called with sequential portions of a
+   stream input. The encryption scheme is insensitive to different
+   blockings of the input
+ 
+   The first time the function is called (initialization of the
+   chaining procedure) the structure chain should contain:
+	   Prev(I) = R2  -       a session-level constant
+	   Prev(O) = 0
+	   FH2     = FH2 -       a session level constant
+	   LenTail = 0
+*/
+ 
+#define COPYDDW(a,b)  a[0]=b[0];a[1]=b[1];a[2]=b[2];a[3]=b[3];\
+		      a[4]=b[4];a[5]=b[5];a[6]=b[6];a[7]=b[7];
+#define XOR8(a,b)     a[0]^=b[0];a[1]^=b[1];a[2]^=b[2];a[3]^=b[3];\
+		      a[4]^=b[4];a[5]^=b[5];a[6]^=b[6];a[7]^=b[7];
+ 
+void strenc(
+	     UNSBYTE        *clear,
+	     UNSBYTE        *cipher,
+	     unsigned int len,
+	     STRCHN      *chn,
+	     DWORD       *desr,
+	     int          auth)
+{
+ 
+  int l;
+  UNSBYTE t[8];
+ 
+	if (len==0) return;
+	l = chn->lentail;
+	if (l > 0) {
+		while (l<8 && len>0) {
+/*
+			chn->i0[l]=*clear;
+			clear++;
+			chn->o0[l] ^= chn->i0[l];
+			*cipher = chn->o0[l];
+			l++;
+			cipher++;
+*/
+			*cipher++ = chn->o0[l] ^= chn->i0[l] =
+							      *clear++;
+			l++;
+			len--;
+		}
+ 
+		if (len == 0) goto authbld;
+	}
+ 
+	do {
+	XOR8(chn->o0,chn->fh2);
+		desf (chn->o0, chn->o0,desr); /* des - desf - AVIW */
+	XOR8(chn->o0,chn->i0);
+		if (len < 8) break;
+ 
+	COPYDDW(chn->i0,clear);
+	XOR8(chn->o0,chn->i0);
+	COPYDDW(cipher,chn->o0);
+		clear += 8;
+		cipher += 8;
+		len -= 8;
+	} while (len > 0);
+ 
+	l = 0;
+	while (len-- > 0) {
+		*cipher++ = chn->o0[l] ^= chn->i0[l] = *clear++;
+		l++;
+			}
+ 
+authbld:
+	chn->lentail = (WORD) l;
+	if (auth) {
+		desf (chn->o0, t,desr);   /* des - desf - AVIW */
+/*  The following two line wer removed/added by AVIW 16/11 */
+/*              DW cipher = DW t; */
+		memcpy ((char *)cipher , (char *)t , sizeof(DWORD));
+	}
+} /* END - strenc FUNCTION */
+ 
+/**********************************************************************
+* Title:            Strdec
+* File Name:        strdec.c
+* Author:           Algorithm Research
+* Creation Date:    14-11-94
+* Description:
+* Assumptions and
+*   Considerations:
+**********************************************************************/
+ 
+/**********************************************************************
+* Mod.ID   Who     When     Description
+* ---------------------------------------------------------------------
+* AR001    A-R     14/11/94  Original version
+* AV002    AVIW    15/11/94  The output result altered:
+*                            1 - success
+*                            0 - fail
+*
+**********************************************************************/
+ 
+/*
+  Procedure to stream-decrypt a block of data.
+  The decryption is done in the following way:
+  I0 := R2; O0:= 0; (first time)
+  Repeat for i:=1 to n
+	 Oi := Ii xor Ii-1 xor DES(Oi-1 xor FH2, KEY);
+ 
+  Where R2 and FH2 are 8 byte numbers established at session start
+ 
+  Calling sequence:
+  int  strdec(UNSBYTE *cipher, UNSBYTE *clear, UINT len, STRCHN *chn,
+					  DWORD *desr, int auth);
+ 
+  On Input:
+  cipher - ciphertext
+  nbytes - length of input area in bytes
+  chain  - a structure containing the following:
+			  Prev(I) - 8 bytes
+			  Prev(O) - 8 bytes
+			  FH2     - 8 bytes
+			  LenTail - int
+  desr   - the des tables
+  auth   - if non zero, verify 4 bytes authentication on enciphered
+		   message. The contents of the 4 bytes should be:
+			 left 4 bytes of DES (O0,key);
+ 
+  On Output
+  clear - cleartext. Must have space for 4 more bytes
+		   if auth is nonzero.
+ 
+  Return value:
+		0: authentication correct (or check not requested)
+	non-0: authentication failed
+  Notes:
+   This function may be called with sequential portions of a
+   stream input. The decryption scheme is insensitive to different
+   blockings of the input
+ 
+   The first time the function is called (initialization of the
+   chaining procedure) the structure chain should contain:
+	   Prev(I) = R2  -       a session-level constant
+	   Prev(O) = 0
+	   FH2     = FH2 -       a session level constant
+	   LenTail = 0
+*/
+ 
+int  strdec(
+	     UNSBYTE      *cipher,
+	     UNSBYTE      *clear,
+	     unsigned int  len,
+	     STRCHN       *chn,
+	     DWORD        *desr,
+	     int           auth)
+{
+ 
+  int l;
+  UNSBYTE t[8];
+ 
+	if (len==0) return 0;
+	l = chn->lentail;
+	if (l > 0) {
+		while (l<8 && len > 0) {
+			chn->i0[l] = chn->o0[l] ^ *cipher;
+			chn->o0[l] = *cipher++;
+			*clear++ = chn->i0[l];
+			l++;
+			len--;
+		}
+ 
+		if (len == 0) goto authbld;
+	}
+ 
+	do {
+	   XOR8(chn->o0,chn->fh2);
+	   desf (chn->o0, chn->o0, desr);   /* des - desf - AVIW */
+	   XOR8(chn->o0,chn->i0);
+	   if (len < 8) break;
+	   XOR8(chn->o0,cipher);
+	   memcpy((char *)chn->i0,(char *)chn->o0,8);
+	   memcpy((char *)chn->o0,(char *)cipher,8);
+	   memcpy((char *)clear,(char *)chn->i0,8);
+	   cipher += 8;
+	   clear += 8;
+	   len -= 8;
+	} while (len > 0);
+ 
+	l = 0;
+	while (len-- > 0) {
+		chn->i0[l] = chn->o0[l] ^ *cipher;
+		chn->o0[l] = *cipher++;
+		*clear++ = chn->i0[l];
+		l++;
+	}
+ 
+authbld:
+	chn->lentail = (WORD) l;
+	if (auth) {
+		desf (chn->o0, t, desr);  /* des - desf - AVIW */
+/* The next two lines were replaced by AVIW 16/10 */
+/*              return (DW cipher == DW t);  */
+		return (memcmp((char *)cipher,(char *)t,sizeof(DWORD))?
+			  0
+			:
+			  1);
+	}
+ 
+	else return 1;
+ 
+} /* END - strdec FUNCTION */
+ 
+ 
+/**********************************************************************
+* Title:            fp
+* File Name:        fp.c
+* Author:           Algorithm Research
+* Creation Date:    14-11-94
+* Description:
+* Assumptions and
+*   Considerations:
+**********************************************************************/
+ 
+/**********************************************************************
+* Mod.ID   Who     When     Description
+*----------------------------------------------------------------------
+* AR001    A-R     15/11/94  Original version
+* AV002    Aviw    17/12/95  Redefinition of varable "t" that will
+*                            temporary hold the value of c->c.c2 and
+*                            will be eventually copied to c->c.c1 -
+*                            BUG FIX of bug caused by cancelation of
+*                            definition to DWORD t.
+**********************************************************************/
+ 
+/*
+ Procedure to fingerprint a block of data.
+ The fingerprint is done in the following way:
+ C1 := 0; C2:= 0; (first time)
+ Repeat for i:=1 to n:
+     {T := Mi xor DES (Mi xor C1 xor C2 xor X'0123456789ABCDEF', key);
+      C1 := C2; C2:= T;}
+ Calling sequence:
+  void pascal (z)fp (void *inbuf, unsigned len ,FPCHN *c, void *desr);
+ On Input:
+ inp - input area
+ nbytes - length of input area in bytes
+ c1c2   - previous chaining values (8 bytes ea segmented). Should be 0
+ on a one-block call. If the ZFP entrypoint is called, c1c2 are zeroed.
+ desr - des key for fingerprint
+ On Output
+ c1c2 - fingerprint
+ Notes:
+  If Nbytes is not a multiple of 8 then the fingerprint
+ is done on an extension of the input buffer with zeros
+ up to a multiple of 8 bytes.
+*/
+ 
+static void fp (
+		UNSBYTE      *inbuf,
+		unsigned int  len,
+		FPCHN        *c,
+		DWORD        *desr)
+{
+/* DWORD t; */ /* removed by AVIW */
+UNSBYTE l[8];
+UNSBYTE t[8];  /* Added by Aviw 17/12/95 */
+int i;
+UNSBYTE str[9];
+ 
+  str[0] = 0x01;
+  str[1] = 0x23;
+  str[2] = 0x45;
+  str[3] = 0x67;
+  str[4] = 0x89;
+  str[5] = 0xab;
+  str[6] = 0xcd;
+  str[7] = 0xef;
+ 
+  while (len > 0)
+  {
+       if (!len)
+	   return;
+       if (len < 8)
+    {
+		memset((char *)l, 0, 8);
+		memcpy((char *)l, (char *)inbuf, len);
+		inbuf = l;
+		len = 8;
+    }
+ 
+    memcpy ((char *)t , (char *)c->c.c2 , 8); /*by Aviw 17/12/95 */
+ 
+       for ( i = 0 ; i < 8 ; i++ )
+    {
+	  c->c.c2[i] = inbuf[i] ^ c->c.c1[i] ^ str[i];
+	  c->c.c1[i] = c->c.c2[i];
+    }
+ 
+    memcpy ((char *)c->c.c1 , (char *)t , 8); /* by Aviw 17/12/95 */
+ 
+    desf (c->c.c2, c->c.c2, desr); /*des-desf - AVIW*/
+       for ( i = 0 ; i < 8 ; i++ )
+	  c->c.c2[i] ^= inbuf[i] ;
+    len -= 8;
+	inbuf += 8;
+  } /* END - while */
+} /* END - fp FUNCTION */
+ 
+/**********************************************************************
+* Title:            Strfpbeg
+* File Name:        strfpbeg.c
+* Author:           Algorithm Research
+* Creation Date:    14-11-94
+* Description:
+* Assumptions and
+*   Considerations:
+**********************************************************************/
+ 
+/**********************************************************************
+* Mod.ID   Who     When     Description
+*----------------------------------------------------------------------
+* AR001    A-R     14/11/94  Original version
+*
+**********************************************************************/
+ 
+/*-------------------------------------------------------------------*/
+static void strfpbeg (
+		      STRFP *chn)
+ 
+/* start a chain fingerprinting procedure by zeroing the chain struct*/
+ 
+{
+   memset ((char *)chn, 0, sizeof(STRFP));
+} /* END - strfpbeg FUNCTION */
+ 
+/**********************************************************************
+* Title:            Strfpcon
+* File Name:        strfpcon.c
+* Author:           Algorithm Research
+* Creation Date:    14-11-94
+* Description:
+* Assumptions and
+*   Considerations:
+**********************************************************************/
+ 
+/**********************************************************************
+* Mod.ID   Who     When     Description
+* ---------------------------------------------------------------------
+* AR001    A-R     14/11/94  Original version
+*
+**********************************************************************/
+ 
+#define min(a,b)        (((a) < (b)) ? (a) : (b))
+ 
+/*------------------------------------------------------------*/
+static void  strfpcon (
+		       UNSBYTE  *inbuf,
+		       int       len,
+		       int       last,
+		       STRFP    *chn,
+		       DWORD    *desr1,
+		       DWORD    *desr2)
+/* Continue a chain fingerprinting procedure
+   Parameters:
+	  inbuf .......... input data of whatever length
+	  len ............ its length (unsigned)
+	  last ........... 0: continue chaining
+					   1: this is the last block
+	  chn ............ the 2 chaining blocks, tail and lentail
+	  desr1 .......... first DES key procedure (for cc1)
+	  desr2 .......... second DES key procedure (for cc2). If
+			   desr2 is NULL then only desr1 will be
+			   processed.
+*/
+ 
+{
+   unsigned int  i;
+ 
+   /* Complete first partial block */
+ 
+   if (chn->lentail > 0) {
+	  i = min (len, (int)(8 - chn->lentail));
+	  memcpy ((char *)(chn->tail + chn->lentail), (char *)inbuf, i);
+	  chn->lentail  += (WORD) i;
+	  len -= i;
+	  inbuf += i;
+   if (chn->lentail == 8 || last) {
+		 fp (chn->tail, chn->lentail, &chn->cc1, desr1);
+		 if (desr2)
+			fp (chn->tail, chn->lentail, &chn->cc2, desr2);
+	  chn->lentail = 0;
+	  }
+   }
+   if (!len) return;
+ 
+   /* main part up to last partial block */
+ 
+   i = len;
+   if (!last) i &= ~7;
+   if (i) {
+	  fp (inbuf, i, &chn->cc1, desr1);
+	  if (desr2)
+		 fp (inbuf, i, &chn->cc2, desr2);
+	  inbuf += i;
+	  len -= i;
+   }
+ 
+  /* if needed create new tail */
+   if (len > 0) {
+	  memcpy ((char *)chn->tail, (char *)inbuf, (size_t)len);
+	  chn->lentail = (WORD) len;
+   }
+} /* END - strfpcon FUNCTION */
+ 
+/**********************************************************************
+* Title:            make_random
+* File Name:        rnd.c
+* Author:           Algorithm Research
+* Creation Date:    14-11-94
+* Description:
+* Assumptions and
+*   Considerations:
+**********************************************************************/
+ 
+/**********************************************************************
+* Mod.ID   Who     When     Description
+* ---------------------------------------------------------------------
+* AR001    A-R     14/11/94  Original version
+* AW002    AVIW    15/12/94  des0[132]  changed to des0[256]
+**********************************************************************/
+ 
+void make_random(
+		  UNSBYTE * weak,
+		  int       len ,
+		  UNSBYTE * random )
+{
+  STRFP chn;
+  UNSBYTE *buffer;
+  int   buf_len ;
+  /* Chnged by AVIW from [132] to [256] 15-DEC-1994*/
+  DWORD des0[64];
+ 
+  memset ((char *)des0 , 0 , sizeof(des0));
+  buf_len = len;
+  buffer = weak;
+  strfpbeg( &chn );
+  while ( buf_len > 256 )
+  {
+    strfpcon(buffer , 256 , 0 , &chn , des0 , NULL );
+    buf_len -= 256;
+    buffer  += 256;
+  }
+ 
+  strfpcon( buffer , buf_len , 1 , &chn , des0 , NULL );
+  memcpy( (char *)random , (char *)chn.cc1.c.c1 , 8 );
+  memcpy( (char *)(random + 8) , (char *)chn.cc1.c.c2 , 8 );
+  return;
+} /* END - make_random function */
+ 
+ 

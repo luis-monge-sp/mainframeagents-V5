@@ -1,0 +1,3827 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: esainit.c %
+ * Instance        : %instance: 1 %
+ * Created by      : %created_by: leonid_s %
+ * Created on      : %date_created: Sun Jul 25 15:06:00 2004 %
+ * Current Version : %version: 10.1.1 %
+ * Last Modified by: %derived_by: leonid_s %
+ * Last Modified on: %date_modified: Sun Feb 01 12:52:18 2004 %
+ */
+ 
+/*******************************************************************
+ * Mod.ID  Who      When         Description
+ * =============================================
+ * 796     Leonid   7/5/01       BSAN??????
+ * IMH001  Ian H.   17/9/03      Use SA_AGENT_VERSION instead of
+ *                               hard-coded version number
+ * IMH002  Ian H.   19-Nov-03    WSAN101342 Thread-safe code (ERRNO)
+ * IMH003  Ian H.   19-Jan-04    ISAN000948 apiver utility
+ * MD0001  Monika   20-May-2008  Ctsintrc utility
+ * 502839  AvnerL   25-Jun-2009  MF updates for 3.3.00
+ * SAS2IBMT SeligT  05-Sep-2016  SAS/C to IBM C Conversion Project
+ * SAS2IBMN NuritY  01/01/2017   SAS/C to IBM C Conversion:
+ *                               Remove signal processing because
+ *                               it depends on the HANDLE_ABENDS
+ *                               RSSPARM ALL_RSS parameter which
+ *                               is always N. If/when recovery is
+ *                               needed, the appropriate recovery
+ *                               services will have to be used.
+ *     "      "     05/02/2017   Change MSG_print_ptr to point
+ *                               directly to CTSAMGG_print_direct.
+ *                               This change is required because we
+ *                               have no way to pass the va_list
+ *                               arguments as parameters from
+ *                               CTSAMSG_print in CTSCSRV to
+ *                               MSG_printf.
+ * AC001   Arun     17-Jan-2017  CONELLIS#307-Queue full issue fix
+ * AC001   ArunC    12/04/2017   CIQ#6-MF acct aggr with conns
+ * BS10067 SeligT   25/09/2017   Change Batch Utility Message Hdr/Ftr:
+ *                               recompile only
+ * BS10076 SeligT   11/12/2017   Organize Connector Locking Functions
+ *                               and Structures
+ * WS10070 KailasP  16/04/18     Compile only due to change in
+ *                               SA_AGENT_VERSION.
+ * IS10182  NuritY  17/07/19     S0C4/S0C1 due 2 DIAG vsprintf
+ * WS10078KGKailasP 08/05/20     Support sync Role and Source
+ * WS10079K KailasP 31/12/20     Compile only due to change in
+ *                               SA_AGENT_VERSION.
+ * WS10080  KailasP 30/06/21     Support MSGSIZE Greater than 32K
+ * WS10082  MauriC  15/08/22     Merge ADDINFO routines
+ * WS10082N NuritY  18/10/23     Rtns to provide msgs handle & dest.
+ ********************************************************************/
+#define ESAINIT_C
+ 
+#include "globs.h"
+ 
+#include ERRNO    /* IMH002 */
+/* SAS2IBMN #include SIGNAL                              */
+#include STDARG
+ 
+/* WS10082 - APICODE has now few defs moved from CTS.CMAC which
+             are needed by ESAAPI and ESAADI, so move it here */
+#include   ESA_API_CODES
+#include   ESA_API
+#include ESA_ESAADI /* WS10082 */
+#include ESA_INIT
+#include ESA_RSSF
+#include ESA_RSS
+#include ESA_CS_OS
+#include ESA_OS_PROC
+#include ESA_OS_EVENT
+#include ESA_OS_CONSOLE
+#include ESA_CS_SINFO
+#include CTYPE
+#include ESA_MSG
+#include ESA_PROC
+#include ESA_OS_OFLI
+#include ESA_ESAOFLI
+#include ESA_ESAOFIO
+#include ESA_QUEUE_OS
+#include ESA_OS_MBX
+#include ESA_ESALIST
+#include ESA_VER
+ 
+#ifndef DIAG_FROM_CTSAMSG
+ #define DIAG_FROM_CTSAMSG "DIAG_FROM_CTSAMSG"
+#endif
+ 
+#define PROLOG_MAX_PARAMETERS_ERROR \
+ "SA-Agent %s: Number of parameters greater than %d. Return code:%s\n"
+#define  ARRAYELEM     20
+#define  DMP_LINE_LEN 100
+ENVIRONMENT_rec_typ        envir;
+static char                AgentVersion[RSS_VERS_LEN + 1];
+static char                ProgramName[PROGRAM_NAME_LEN+ 1];
+static char                ProgramMain[FUNC_NAME_LEN+ 1];
+static int                 min_free_disk_space = 0;
+static void              * save_diag_handle= NULL;
+static int                 addinfo_alloc_done = FALSE; /* ws10082 */
+ 
+static ESA_RC CG_add_cc_ADDINFO_rtns();                   /* WS10082N */
+ 
+/****************************************************
+ * Procedure Name: CG_prolog2
+ * Description   : main prolog - optional with main name
+ * Input         :
+ * Input/Output  :
+ * Return Value  : ESA_RC
+ * Comments      : This function is alternative way to call
+ *                 to prolog with main name intead with enum
+ ****************************************************/
+ 
+ESA_RC CG_prolog2 (char               * ProgName,
+				   char               * ProgMain,
+                   int                  argc_prm,
+                   char              ** argv_prm)
+{
+  ESA_RC   rc= ESA_OK;
+  int      argc_prm2;
+  char   * argv_prm2[ARRAYELEM+ 2];
+  char     failmsg [512];
+ 
+  if (argc_prm GT ARRAYELEM)
+  {
+     rc= ESA_ERR;
+     sprintf (failmsg, PROLOG_MAX_PARAMETERS_ERROR,
+              ProgName, ARRAYELEM, ESA_rc2str(rc));
+     printf (failmsg);
+     OS_CONSOLE_print (failmsg,
+                      OS_CONS_ROLLABLE_YES,
+                      OS_CONS_SEV_ERROR);
+	 goto cleanup;
+  }
+ 
+  for (argc_prm2= 0; argc_prm2 LT argc_prm ; argc_prm2++)
+      argv_prm2[argc_prm2]= argv_prm[argc_prm2];
+  argv_prm2[argc_prm2]= ProgName;
+  argc_prm2++;
+  argv_prm2[argc_prm2]= ProgMain;
+  argc_prm2++;
+ 
+  rc= CG_prolog (ESA_EXTERNAL, argc_prm2, argv_prm2);
+ 
+cleanup:
+  return (rc);
+ 
+}
+ 
+/****************************************************
+ * Procedure Name: CG_prolog
+ * Description   : main prolog
+ * Input         : main's name (an enum from globs.h)
+ * Input/Output  :
+ * Return Value  : ESA_RC
+ * Comments      :
+ ****************************************************/
+ 
+ESA_RC CG_prolog (ESA_MAIN_NAME_typ    p_main_name,
+                  int                  argc_prm,
+                  char              ** argv_prm)
+{
+  char                  fn[] ="CG_prolog";
+  short                 i=0, j=0, k=0, l=0, sw_port_in=0,sw_port_out=0;
+  short                 was_dest_private = 0, was_load_private=0;
+  short                 private_param = 0;
+  char                  line [132], rssprm_value[RSSPRM_VALUE_LEN+ 1];
+  char                  failmsg [512];
+  ESA_RC                rc= ESA_OK, rc_msgfiles= ESA_OK;
+  char                * keyword= NULL, * value= NULL;
+  char                * newline= NULL, * function= NULL;
+  FILE                * init_file= NULL;
+  char                * temp_ptr1= NULL, *temp_ptr2= NULL;
+  RESOURCE_typ          diag_file_1;
+  RESOURCE_typ          diag_file_2;
+  char                * diag_file_ptr_1 = NULL;
+  char                * diag_file_ptr_2 = NULL;
+  OS_pid_str_typ        pid;
+  int                   diag_inited= 0, msgfiles_num= 0;
+  RESOURCE_typ          init_file_name , msg_filename;
+  RESOURCE_typ          msgfiles[MAX_NUMBER_OF_MSGFILES];
+  unsigned long int     rssprm_num;
+  char                * stopptr;
+  int                   pid_number= 0;
+  char                  ddn_with[12]="";                  /* SAS2IBMT */
+  CLEAR_STRUCT(envir);
+ 
+  if (p_main_name EQ ESA_EXTERNAL)
+  {
+	 strncpy (ProgramMain,
+		      argv_prm[argc_prm- 1], FUNC_NAME_LEN);
+     strncpy (ProgramName,
+		      argv_prm[argc_prm- 2], PROGRAM_NAME_LEN);
+	 argc_prm -= 2;
+  }
+  else
+  {
+	 strncpy (ProgramMain,
+		      CG_main_name (p_main_name), FUNC_NAME_LEN);
+     strncpy (ProgramName,
+		      CG_name (p_main_name), PROGRAM_NAME_LEN);
+  }
+ 
+  envir.p_main_name = p_main_name;
+ 
+  strcpy (envir.all_rss, ALL_RSS);
+  /* BS10076 envir.q_wait= atoi(WAIT_QUEUE_VALUE);                   */
+  envir.q_wait= atoi(WAIT_QUEUE_TOTALC);                  /* BS10076 */
+ 
+  envir.argc= argc_prm;
+  envir.argv= argv_prm;
+ 
+  rc = OS_PROC_init (envir.p_main_name,
+                     &envir.os_proc_handle,
+                     argc_prm,
+                     argv_prm);
+  if (rc NE ESA_OK)
+  {
+    sprintf (failmsg, PROLOG_PROC_INIT_ERROR,
+             CG_name (envir.p_main_name),
+             ESA_rc2str(rc));
+ 
+    printf (failmsg);
+    OS_CONSOLE_print (failmsg,
+                      OS_CONS_ROLLABLE_YES,
+                      OS_CONS_SEV_ERROR);
+    goto cleanup;
+  }
+  envir.msg_admin_param.os_proc_handle= envir.os_proc_handle;
+ 
+  envir.intercept_rec= NULL;
+ 
+  /* CTSAMSG error destination initlalization */
+ 
+  envir.msg_dest=CTSAMSG_dest_table_alloc(6);
+  envir.msg_dest->num         = 3;
+  envir.msg_dest->max_gen     = CTSAMSG_MAX_GEN_VAL;
+  envir.msg_dest->max_lines   = CTSAMSG_MAX_LINES_VAL;
+  envir.msg_dest->max_interval= CTSAMSG_MAX_INTERVAL_VAL;
+ 
+  envir.msg_dest->dests[CTSAMSG_DEST_ERR].name= &envir.msg_err;
+  envir.msg_dest->dests[CTSAMSG_DEST_ERR].type= DEST_ERR;
+  envir.msg_dest->dests[CTSAMSG_DEST_ERR].active= FLAG_YES;
+  envir.msg_dest->dests[CTSAMSG_DEST_ERR].timestamp= TIMES_FULL;
+  envir.event_handle= NULL;
+  envir.msg_dest->dests[CTSAMSG_DEST_CNSL].name= NULL;
+  envir.msg_dest->dests[CTSAMSG_DEST_CNSL].type= DEST_CONSOLE;
+  envir.msg_dest->dests[CTSAMSG_DEST_CNSL].active= FLAG_NO;
+ 
+  envir.msg_dest->dests[CTSAMSG_DEST_CNSL].timestamp= TIMES_NONE;
+ 
+  envir.msg_dest->dests[CTSAMSG_DEST_CNSL2].name= NULL;
+  envir.msg_dest->dests[CTSAMSG_DEST_CNSL2].type= DEST_CONSOLE2;
+  envir.msg_dest->dests[CTSAMSG_DEST_CNSL2].active= FLAG_NO;
+ 
+  envir.msg_dest->dests[CTSAMSG_DEST_CNSL2].timestamp= TIMES_NONE;
+ 
+  envir.msg_dest->dests[3].name= &envir.msg_log_file_1;
+  envir.msg_dest->dests[4].name= &envir.msg_log_file_2;
+  envir.msg_dest->dests[5].name= &envir.msg_log_file_3;
+ 
+  envir.msg_admin_param.apiinit_handle = envir.apiinit_handle;
+  envir.msg_admin_param.ctsamsg_handle = &envir.msg_handle;
+  envir.msg_admin_param.ctsamsg_dest   = envir.msg_dest;
+  envir.ctsamsg_handle                 = &envir.msg_handle;
+  envir.ctsamsg_dest                   = envir.msg_dest;
+  envir.msg_params.ctsamsg_handle      = &envir.msg_handle;
+  envir.msg_params.ctsamsg_dest        = envir.msg_dest;
+  envir.login_mode= LOGOUT_MODE_LAST;
+  envir.min_serv= DEFAULT_MIN_SERV;
+  envir.max_serv= DEFAULT_MAX_SERV;
+  envir.in_port=  DEFAULT_IN_PORT;
+  envir.out_port= DEFAULT_OUT_PORT;
+  envir.aid= MH_MESSAGE_AID;
+  envir.addinfo_val_len= 0;
+  envir.keep_alive_flag=  DEFAULT_KEEP_ALIVE;
+  envir.keep_alive_interv =  DEFAULT_KA_INTERV;
+ 
+  envir.keep_alive_count = DEFAULT_KEEP_ALIVE_COUNT;
+  envir.keep_alive_interval = DEFAULT_KEEP_ALIVE_INTERVAL;
+  envir.keep_alive_time = DEFAULT_KEEP_ALIVE_TIME;
+  envir.write_to_queue = ESS_NOT_SIGN;       /* AC001-CONELLIS#307 */
+  envir.iiq_version= DEFAULT_IIQ_VERSION_VALUE; /* AC001 - CIQ#6 */
+ 
+  /*  load CONTROL/SA parameters */
+  strcpy (msg_filename, INIT_FILE_NAME);
+  rc = CS_os_file_name (msg_filename ,
+                        init_file_name) ;
+  if (rc NE ESA_OK) {
+       sprintf (failmsg, PROLOG_FILE_NAME_ERROR,
+                CG_name (envir.p_main_name),
+                INIT_FILE_NAME,
+                ESA_rc2str (rc));
+       printf (failmsg);
+       OS_CONSOLE_print (failmsg,
+                         OS_CONS_ROLLABLE_YES,
+                         OS_CONS_SEV_ERROR);
+       goto cleanup;
+    }
+ 
+  strcpy(ddn_with,"DD:");                                 /* SAS2IBMT */
+  strcat(ddn_with, init_file_name);                       /* SAS2IBMT */
+ 
+  /* SAS2IBMT init_file = fopen (init_file_name,"r");                */
+  init_file = fopen (ddn_with,"r");                       /* SAS2IBMT */
+ 
+  if (init_file EQ NULL) {
+    sprintf (failmsg, PROLOG_FILE_ERROR,
+             CG_name (envir.p_main_name),
+             init_file_name,
+             strerror(errno));
+ 
+    printf (failmsg);
+    OS_CONSOLE_print (failmsg,
+                      OS_CONS_ROLLABLE_YES,
+                      OS_CONS_SEV_ERROR);
+    rc= ESA_FATAL;
+    goto cleanup;
+  }
+ 
+ 
+  rc= CSA_alloc (&temp_ptr1,
+                 0,
+                 sizeof (line),
+                 MAX_NUMB_OF_LINES,
+                 fn,
+                 "Esainit params");
+ 
+  if (rc NE ESA_OK) {
+    sprintf (failmsg, PROLOG_MALLOC_ERROR,
+             CG_name (envir.p_main_name),
+             MAX_NUMB_OF_LINES);
+    printf (failmsg);
+    OS_CONSOLE_print (failmsg,
+                      OS_CONS_ROLLABLE_YES,
+                      OS_CONS_SEV_ERROR);
+    goto cleanup;
+  }
+ 
+  memset ((char *)temp_ptr1,
+          '\0',
+          sizeof (line)* MAX_NUMB_OF_LINES);
+  temp_ptr2= temp_ptr1;
+ 
+  fgets (line,
+         sizeof(line),
+         init_file);
+ 
+  /* read initialization file */
+  for (i= 0, j= 0, k= 0; feof(init_file) EQ 0; i++)
+  {
+    keyword  = NULL;
+    value    = NULL;
+    function = NULL;
+    newline  = NULL;
+ 
+    if (ferror(init_file)) {
+      sprintf (failmsg,
+               PROLOG_RECORD_ERROR,
+               CG_name (envir.p_main_name),
+               init_file_name,
+               i+ 1);
+      printf (failmsg);
+      OS_CONSOLE_print (failmsg,
+                        OS_CONS_ROLLABLE_YES,
+                        OS_CONS_SEV_ERROR);
+      rc= ESA_FATAL;
+      goto cleanup;
+    }
+ 
+    strcpy (temp_ptr2,
+            line);
+ 
+    if (line[0] EQ SKIP_LINE) { /* msg. line (beginnig with '*') */
+        goto next_line;
+    }
+    if (line NE NULL) {
+      newline = strchr(line,'\n');
+      if (newline NE NULL)
+        strcpy (newline,"\0");
+      if (line[0] EQ NULL_CHAR) {
+        goto next_line;
+      }
+    }
+ 
+    function = strtok (line,
+                       WHITECHARS);
+ 
+    if (function EQ NULL)    /* empty line */
+       goto next_line;
+ 
+    if (
+          (strcmp (function,
+                   CG_main_name(envir.p_main_name) ) EQ 0)
+         OR
+          (strcmp (function,
+                   FOR_EVERY_MAIN) EQ 0)
+       )
+    {
+ 
+      if (strcmp (function,
+                  CG_main_name(envir.p_main_name)) EQ 0)
+         private_param = 1;
+      else
+         private_param = 0;
+ 
+      keyword = strtok (NULL,
+                        WHITECHARS);
+ 
+      if (keyword EQ NULL) /* keyword not found */ {
+        sprintf (failmsg,
+                 PROLOG_KEY_ERROR,
+                 CG_name (envir.p_main_name),
+                 init_file_name,
+                 i+ 1);
+        printf (failmsg);
+        OS_CONSOLE_print (failmsg,
+                          OS_CONS_ROLLABLE_YES,
+                          OS_CONS_SEV_ERROR);
+        rc= ESA_FATAL;
+        goto cleanup;
+      }
+ 
+      value   = strtok(NULL ,
+                       WHITECHARS);
+ 
+      if (value EQ NULL ) /* value not found */ {
+        sprintf (failmsg,
+                 PROLOG_VALUE_ERROR,
+                 CG_name (envir.p_main_name),
+                 init_file_name,
+                 keyword,
+                 i+ 1);
+        printf (failmsg);
+        OS_CONSOLE_print (failmsg,
+                          OS_CONS_ROLLABLE_YES,
+                          OS_CONS_SEV_ERROR);
+ 
+        rc= ESA_FATAL;
+        goto cleanup;
+      }
+ 
+      rc= CG_prolog_kwrd(keyword ,
+                         value,
+                         private_param,
+                         &was_dest_private,
+                         &was_load_private,
+                         &msgfiles_num,
+                         msgfiles);
+ 
+      if (rc EQ ESA_SKIP)
+      {
+         rc_msgfiles= ESA_SKIP;
+         rc= ESA_OK;
+      }
+ 
+      if (rc NE ESA_OK) /* keyword not found */
+      {
+        sprintf (failmsg,
+                 PROLOG_UNDEFKEY_ERROR,
+                 CG_name (envir.p_main_name),
+                 init_file_name,
+                 keyword,
+                 i+ 1);
+        printf (failmsg);
+        OS_CONSOLE_print (failmsg,
+                          OS_CONS_ROLLABLE_YES,
+                          OS_CONS_SEV_ERROR);
+        goto cleanup;
+      }
+ 
+      if (strcmp (keyword, PORT) EQ 0)
+	  {
+		  sw_port_out= 1;
+		  sw_port_in= 1;
+	  }
+      if (strcmp (keyword, OUT_PORT) EQ 0)
+		  sw_port_out= 1;
+      if (strcmp (keyword, IN_PORT) EQ 0)
+		  sw_port_in= 1;
+    } /* if belong to this main */
+ 
+    j++;
+    if (j LT MAX_NUMB_OF_LINES)
+       temp_ptr2 += sizeof (line);
+    else
+    {
+      sprintf (failmsg,
+               PROLOG_NOT_SPACE_FOR_LINE,
+               CG_name (envir.p_main_name),
+               temp_ptr2);
+      printf (failmsg);
+      OS_CONSOLE_print (failmsg,
+                        OS_CONS_ROLLABLE_YES,
+                        OS_CONS_SEV_WARN);
+      k++;
+    }
+ 
+    next_line:
+ 
+    fgets (line,
+           sizeof(line),
+           init_file);
+  }
+ 
+  if (envir.max_mbx_size EQ 0)    /* AVIW 19/11/00 */
+	      envir.max_mbx_size = envir.max_msg_size + 1;
+ 
+ 
+  /* In CTSAPARM can be only one of port values */
+  if (
+	    (sw_port_out NE 0)
+       AND
+	    (sw_port_in  EQ 0)
+     )
+	 envir.in_port= envir.out_port+ 1;
+  else if (
+	    (sw_port_out EQ 0)
+       AND
+	    (sw_port_in  NE 0)
+     )
+	 envir.out_port= envir.in_port- 1;
+ 
+  /* ESA_diag initialization */
+ 
+  if (envir.diag_out_1[0] EQ '\0')
+    diag_file_ptr_1= NULL;
+  else
+  {
+    rc = CS_os_file_name (envir.diag_out_1,
+                          diag_file_1);
+ 
+    if (rc NE ESA_OK)
+    {
+       sprintf (failmsg,
+                PROLOG_FILE_NAME_ERROR,
+                CG_name (envir.p_main_name),
+                envir.diag_out_1,
+                ESA_rc2str (rc));
+       printf (failmsg);
+       OS_CONSOLE_print (failmsg,
+                         OS_CONS_ROLLABLE_YES,
+                         OS_CONS_SEV_ERROR);
+       goto cleanup;
+    }
+    diag_file_ptr_1 = diag_file_1;
+  }
+ 
+  if (envir.diag_out_2[0] EQ '\0')
+    diag_file_ptr_2= NULL;
+  else {
+    rc = CS_os_file_name (envir.diag_out_2,
+                          diag_file_2);
+    if (rc NE ESA_OK)
+    {
+       sprintf (failmsg,
+                PROLOG_FILE_NAME_ERROR,
+                CG_name (envir.p_main_name),
+                envir.diag_out_2,
+                ESA_rc2str(rc));
+       printf (failmsg);
+       OS_CONSOLE_print (failmsg,
+                         OS_CONS_ROLLABLE_YES,
+                         OS_CONS_SEV_ERROR);
+       goto cleanup;
+    }
+    diag_file_ptr_2 = diag_file_2;
+  }
+ 
+  strcpy (pid , "");
+  rc = OS_PROC_get_pid (pid, envir.os_proc_handle);
+  if (rc NE ESA_OK)
+  {
+    strcpy (pid , "???" );
+  }
+  if ( (envir.max_serv GT DEFAULT_MAX_SERV) AND (p_main_name EQ ESA_ACS_PROC) )
+  {
+	  if (argc_prm GT 4)
+    	 pid_number= (unsigned int) strtoul (argv_prm[4], &stopptr, 10);
+  }
+  ESA_DIAG_initializeEx (diag_file_ptr_1,
+                         diag_file_ptr_2,
+                         envir.diag_stamp,
+                         min_free_disk_space,
+						 pid_number,
+                         &envir.diag_handle);
+  diag_inited = 1;
+ 
+  envir.msg_admin_param.esadiag_handle = envir.diag_handle;
+ 
+  rc= DIAG_refresh ();
+ 
+  ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+ 
+  ESA_DIAG_printf (ESA_COMP_ESAINIT, DIAG_BASIC, "Parameters of the Main:");
+  for (l= 0; l LT argc_prm; l++)
+  {
+     ESA_DIAG_printf (ESA_COMP_ESAINIT, DIAG_BASIC, "   argv[%d]=%s.", l+ 1, argv_prm[l]);
+  }
+  ESA_DIAG_printf (ESA_COMP_ESAINIT, DIAG_DETAILES+ 1,
+       "CG_prolog - CTSAMSG tabel allocated at address = %p.", envir.msg_dest);
+  ESA_DIAG_printf (ESA_COMP_ESAINIT, DIAG_DETAILES+ 1,
+        "CG_prolog - DIAG handle allocated at address = %p.", envir.diag_handle);
+ 
+  temp_ptr2= temp_ptr1;
+  ESA_DIAG_printf (ESA_COMP_ESAINIT, DIAG_BASIC,
+     "*****> %s file: accepted %d records from all %d records:",
+       init_file_name, j , i);
+  if (ESA_DIAG_get_debug_level(ESA_COMP_ACSCB) GT DIAG_BASIC)
+  {
+     for (l= 0; l LT (j- k);l++)
+	 {
+        ESA_DIAG_printf (ESA_COMP_ACSCB, DIAG_BASIC,"   %d: ->%s<-", l, temp_ptr2);
+        temp_ptr2 += sizeof (line);
+	 }
+     ESA_DIAG_printf (ESA_COMP_ACSCB, DIAG_BASIC,
+        "   --------------------------------------");
+  }
+  /* CTSAMSG initialization */
+  ESA_DIAG_printf (ESA_COMP_ESAINIT, DIAG_BASIC,
+     "Current CS server with PID=%s and Server number = %d.", (char *)pid, pid_number);
+  rc = CTSAMSG_initialize ( &envir.msg_handle,
+                            envir.diag_handle);
+ 
+  if (rc NE ESA_OK)
+  {
+    ESA_DIAG_printf (ESA_COMP_ESAINIT, 0,
+       "!!!*****> Message Initialized failed with rc=%s (%d).",
+	   ESA_rc2str(rc), (int)rc);
+    goto cleanup;
+  }
+ 
+  /* CTSAMSG load error files */
+ 
+  for (i= 0, rc= ESA_OK; i LT msgfiles_num AND rc EQ ESA_OK; i++)
+  {
+     rc = CS_os_file_name (msgfiles[i] ,msg_filename) ;
+     if (rc NE ESA_OK)
+     {
+        sprintf (failmsg,
+                  PROLOG_FILE_NAME_ERROR,
+                  CG_name (envir.p_main_name),
+                  msgfiles[i],
+                  ESA_rc2str (rc));
+        printf (failmsg);
+        OS_CONSOLE_print (failmsg,
+                         OS_CONS_ROLLABLE_YES,
+                         OS_CONS_SEV_ERROR);
+        ESA_DIAG_printf (ESA_COMP_ESAINIT, 0,
+          "!!!*****> CS_os_file_name for %s failed with rc=%s (%d).",
+	      msgfiles[i], ESA_rc2str(rc), (int)rc);
+        goto cleanup;
+     }
+ 
+     rc= CTSAMSG_load (msg_filename,
+                      &envir.msg_handle,
+                      DUP_FAIL,
+                      FLAG_YES);
+ 
+     ESA_DIAG_printf (ESA_COMP_ESAINIT, DIAG_BASIC,
+        "*****> Loaded Message file %s with rc=%s (%d).",
+		msgfiles[i], ESA_rc2str(rc), (int)rc);
+  }
+  if (rc NE ESA_OK)
+  {
+     ESA_DIAG_printf (ESA_COMP_ESAINIT, 0,
+          "!!!*****> CTSAMSG_load for %s failed with rc=%s (%d).",
+	      msg_filename, ESA_rc2str(rc), (int)rc);
+     goto cleanup;
+  }
+  rc= CTSAMSG_initdest (envir.msg_dest,
+                        &envir.msg_handle);
+ 
+  ESA_DIAG_printf (ESA_COMP_ESAINIT, 19,
+      "CTSAMSG_initdest completed with rc=%d.", (int)rc);
+ 
+  if (rc NE ESA_OK)
+  {
+    ESA_DIAG_printf (ESA_COMP_ESAINIT, 0,
+       "!!!*****>CTSAMSG_initdest failed with rc=%s (%d).",
+	   ESA_rc2str(rc), (int)rc);
+    goto cleanup;
+  }
+  ESA_DIAG_printf (ESA_COMP_ESAINIT, DIAG_OS,
+	  "...-> OS_PROC_get_host_name: hndl=%p.",
+	  envir.os_proc_handle);
+  rc = OS_PROC_get_host_name (envir.host_name,
+	                          envir.os_proc_handle);
+  ESA_DIAG_printf (ESA_COMP_ESAINIT, DIAG_OS,
+     "...<- OS_PROC_get_host_name: rc=%d (%s) HostName=%.*s.",
+	  rc, (rc EQ ESA_OK) ? "OS==OK" : "OS##OK",
+	  sizeof(OS_host_name_typ), envir.host_name);
+ 
+  if (rc NE ESA_OK)
+  {
+    ESA_DIAG_printf (ESA_COMP_ESAINIT, 0,
+       "!!!*****>OS_PROC_get_host_name failed with rc=%s (%d).",
+	   ESA_rc2str(rc), (int)rc);
+    goto cleanup;
+  }
+  ESA_DIAG_printf (ESA_COMP_ESAINIT, DIAG_BASIC,
+     "*****> HostName of the process is %.*s.",
+	 sizeof(OS_host_name_typ), envir.host_name);
+ 
+  /* Check if any keyword is missing */
+  rc= CG_miss_keyword();
+  if (rc NE ESA_OK)
+    goto cleanup;
+ 
+  rc= rssprm_load ();
+  if (rc NE ESA_OK)
+  {
+     ESA_DIAG_printf (ESA_COMP_ESAINIT, 0,
+       "!!!*****>Load of RSSPARM failed with rc=%s (%d).",
+	   ESA_rc2str(rc), (int)rc);
+    goto cleanup;
+  }
+  envir.rss_num= envir.max_rss_num;
+ 
+  rc= CSA_alloc ((char **)&envir.startlst,
+                 STRUC_STARTLST_REC,
+                 sizeof (STARTLST_rec_typ),
+                 envir.max_rss_num + 1,
+                 fn,
+                 "Startlst");
+  if (rc NE ESA_OK)
+  {
+     ESA_DIAG_printf (ESA_COMP_ESAINIT, 0,
+       "!!!*****>CSA_alloc failed with rc=%s (%d).",
+	   ESA_rc2str(rc), (int)rc);
+     goto cleanup;
+  }
+  /* rssprm get external pointer */
+  envir.msg_admin_param.program_name= CG_name (envir.p_main_name);
+  envir.msg_admin_param.cs_func.rsslist_get_ptr    = &rsslist_get;
+  envir.msg_admin_param.cs_func.rssprm_get_ptr     = &rssprm_get;
+  envir.msg_admin_param.cs_func.rsskwd_typ_ptr     = &rsskwd_typ;
+  envir.msg_admin_param.cs_func.intercept_set_ptr  = &intercept_set;
+  envir.msg_admin_param.cs_func.rssprm_get_opt_ptr = &rssprm_get_opt;
+/*envir.msg_admin_param.cs_func.LOG_event_ptr      = &LOG_event;*/
+  /* SAS2IBMN - start */
+ 
+  /* envir.msg_admin_param.cs_func.MSG_printf_ptr     = &MSG_printf; */
+  envir.msg_admin_param.cs_func.MSG_printf_ptr     =
+                                               &CTSAMSG_print_direct;
+  /* SAS2IBMN - end   */
+  envir.msg_admin_param.cs_func.DIAG_printf_ptr    = &DIAG_printf;
+  envir.msg_admin_param.cs_func.DIAG_enter_ptr     = &DIAG_enter;
+  envir.msg_admin_param.cs_func.DIAG_exit_ptr      = &DIAG_exit;
+  envir.msg_admin_param.cs_func.DIAG_get_debug_level_ptr=
+                                               &DIAG_get_debug_level;
+ 
+  CG_add_cc_ADDINFO_rtns();  /* WS10082 - init ADDINFO_rtn ptrs */
+ 
+  /* Communication parameters */
+ 
+  /* work station lan id */
+  memcpy ((char *)envir.wslid, MH_MESSAGE_WSLID, sizeof(envir.wslid));
+  /* work station user id */
+  memcpy ((char *)envir.wsuid, MH_MESSAGE_WSUID, sizeof(envir.wsuid));
+  /* encryption */
+  envir.cmrs= BLANK;
+ 
+  /* CONTROL-SA version */
+  envir.initial_service= BLANK;
+  envir.read_alternatives = BLANK;
+ 
+  rc= rssprm_get (envir.all_rss,
+                  OFLI_VERBOSE ,
+                  1,
+                  rssprm_value);
+  if (
+        (rc EQ ESA_OK)
+       AND
+        (
+		   (envir.p_main_name EQ ESA_OFLI_PROC)
+		  OR
+		   (envir.p_main_name EQ ESA_ONLI_PROC)
+		)
+	   AND
+        (rssprm_value[0] NE CONSOLE_DEST)
+     )
+     envir.msg_dest->dests[CTSAMSG_DEST_CNSL].active= FLAG_NO;
+  else
+     envir.msg_dest->dests[CTSAMSG_DEST_CNSL].active= FLAG_YES;
+ 
+  rc= rssprm_get_opt (envir.all_rss,
+                      DIAG_FROM_CTSAMSG,
+                      1,
+                      rssprm_value,
+					  OPT_TRUE,
+					  OPT_TRUE);
+  if ( (rc EQ ESA_OK) AND (strlen (rssprm_value) EQ strlen (ESS_NOT_FLAG)) ) {
+     save_diag_handle= envir.msg_handle.diag_handle;
+     envir.msg_handle.diag_handle= NULL;
+     ESA_DIAG_printf (ESA_COMP_ESAINIT, DIAG_DETAILES+ 1,
+		"CG_prolog : save_diag_handle=%p envir.msg_handle.diag_handle=%p.",
+		save_diag_handle, envir.msg_handle.diag_handle);
+  }
+ 
+  rc= rssprm_get_opt (envir.all_rss,
+                      CTSAMSG_MAX_GEN_NAME,
+                      3,
+                      rssprm_value,
+					  OPT_TRUE,
+					  OPT_TRUE);
+  if (rc EQ ESA_OK) {
+     rssprm_num= strtoul (rssprm_value, &stopptr, 10);
+     if (*stopptr EQ '\0')
+        envir.msg_dest->max_gen= rssprm_num;
+     }
+ 
+  rc= rssprm_get_opt (envir.all_rss,
+                      CTSAMSG_MAX_LINES_NAME,
+                      9,
+                      rssprm_value,
+					  OPT_TRUE,
+					  OPT_TRUE);
+  if (rc EQ ESA_OK) {
+     rssprm_num= strtoul (rssprm_value, &stopptr, 10);
+     if (*stopptr EQ '\0')
+        envir.msg_dest->max_lines= rssprm_num;
+      }
+ 
+  rc= rssprm_get_opt (envir.all_rss,
+                      CTSAMSG_MAX_INTERVAL_NAME,
+                      3,
+                      rssprm_value,
+					  OPT_TRUE,
+					  OPT_TRUE);
+  if (rc EQ ESA_OK) {
+     rssprm_num= strtoul (rssprm_value, &stopptr, 10);
+     if (*stopptr EQ '\0')
+        envir.msg_dest->max_interval= rssprm_num* 24* 60* 60;
+      }
+ 
+  rc= rssprm_get_opt (envir.all_rss,
+                      WAIT_QUEUE,
+                      10,
+                      rssprm_value,
+					  OPT_TRUE,
+					  OPT_TRUE);
+  if (rc EQ ESA_OK) {
+     rssprm_num= strtoul (rssprm_value, &stopptr, 10);
+     if (*stopptr EQ '\0')
+        envir.q_wait= rssprm_num;
+      }
+ 
+  CTSAMSG_print (MSG_PROC_START ,
+                 envir.msg_admin_param.ctsamsg_handle, NULL,
+                 envir.msg_admin_param.ctsamsg_dest,
+                 CG_name(envir.p_main_name) ,
+                 CTSAgentVersion(),
+                 pid);
+ 
+  envir.msg_dest->dests[CTSAMSG_DEST_CNSL].active= FLAG_NO;
+ 
+ 
+cleanup:
+ 
+  if (init_file)
+    fclose (init_file);
+ 
+  CSA_free (&temp_ptr1);
+ 
+  if (diag_inited)
+  {
+     if (rc_msgfiles EQ ESA_SKIP)
+        ESA_DIAG_printf (ESA_COMP_ESAINIT, 0,
+           "*****>There are more then %d msgfiles!!!",
+           MAX_NUMBER_OF_MSGFILES);
+     ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, rc);
+  }
+  return rc;
+ 
+} /* CG_prolog */
+ 
+/****************************************************
+ * Procedure Name: CG_prolog_kwrd
+ * Description   : main prolog
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CG_prolog_kwrd (char         * keyword,
+                       char         * value,
+                       short          private_param,
+                       short        * was_dest_private,
+                       short        * was_load_private,
+                       int          * msgfiles_num,
+                       RESOURCE_typ * msgfiles)
+{
+  ESA_RC           rc= ESA_OK;
+  RESOURCE_typ     os_file_name, value_res;
+  unsigned int     i= 0;
+  int              ii= 0;
+  static int       sw_port= 0;
+ 
+ 
+  CLEAR (value_res);
+  CLEAR (os_file_name);
+  strncpy (value_res,
+           value,
+           MAX_RSS_RESOURCE_NAME_LEN);
+ 
+ 
+  /* ESA_DIAG section */
+  if      (strcmp (keyword, DIAG_OUT_1) EQ 0)
+    strcpy(envir.diag_out_1, value);
+  else if (strcmp (keyword, DIAG_OUT_2) EQ 0)
+    strcpy(envir.diag_out_2, value);
+ 
+  else if (strcmp (keyword, DIAG_STAMP) EQ 0)
+    strcpy(envir.diag_stamp, value);
+ 
+  /* ESA_CTSAMSG */
+ 
+  else if (strcmp (keyword, MSG_OUTPUT) EQ 0)
+  {
+     if (
+           (private_param NE 0)
+          AND
+           (*was_dest_private EQ 0)
+        )
+     {
+        *was_dest_private = 1;
+        envir.msg_dest->num = 3;
+     }
+     if (envir.msg_dest->num LT 6)
+     {
+       rc = CS_os_file_name(value_res, os_file_name);
+       if (rc NE ESA_OK)
+          goto cleanup;
+       ii = envir.msg_dest->num;
+       strcpy(envir.msg_dest->dests[ii].name, os_file_name);
+       envir.msg_dest->dests[ii].type= DEST_FILE_APPEND;
+       envir.msg_dest->dests[ii].active= FLAG_YES;
+       envir.msg_dest->dests[ii].timestamp= TIMES_FULL;
+       envir.msg_dest->num++;
+    }
+  }
+ 
+  else if (strcmp (keyword,MSG_LOAD) EQ 0){
+    if (
+          (*was_load_private EQ 0)
+         AND
+          (private_param NE 0)
+       )
+    {
+      *msgfiles_num = 0;
+      *was_load_private = 1;
+    }
+ 
+    if (*msgfiles_num LT MAX_NUMBER_OF_MSGFILES)
+    {
+       strcpy(msgfiles[*msgfiles_num], value);
+       (*msgfiles_num) ++;
+    }
+    else
+       rc= ESA_SKIP;
+  }
+ 
+  /* CTSA files   */
+  else if (strcmp (keyword, FILE_DOWNLOAD) EQ 0)  {
+    rc = CS_os_file_name(value_res, os_file_name);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    strcpy (envir.file_download, os_file_name);
+  }
+ 
+  else if (strcmp (keyword, FILE_RSSADM) EQ 0)  {
+    rc = CS_os_file_name(value_res, os_file_name);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    strcpy (envir.file_administrators, os_file_name);
+  }
+ 
+  else if (strcmp (keyword, FILE_RSSADMD) EQ 0)  {
+    rc = CS_os_file_name(value_res, os_file_name);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    strcpy (envir.file_dummyadmins, os_file_name);
+  }
+ 
+  else if (strcmp (keyword, FILE_RSSPARM) EQ 0)  {
+ 
+    rc = CS_os_file_name(value_res, os_file_name);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    strcpy (envir.file_rssparm, os_file_name);
+ 
+  }
+ 
+  else if (strcmp (keyword, FILE_RSSOFLI) EQ 0)  {
+    rc = CS_os_file_name(value_res, os_file_name);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    strcpy (envir.file_rssofli, os_file_name);
+  }
+ 
+  else if (strcmp (keyword, FILE_DIAGLVL) EQ 0)  {
+    rc = CS_os_file_name(value_res, os_file_name);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    strcpy (envir.file_diaglvl, os_file_name);
+  }
+ 
+  else if (strcmp (keyword, FILE_DIAGTXT) EQ 0) {
+    rc = CS_os_file_name(value_res, os_file_name);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    strcpy (envir.file_diagtxt, os_file_name);
+  }
+ 
+  else if (strcmp (keyword, FILE_RSSKWDS) EQ 0) {
+    rc = CS_os_file_name(value_res, os_file_name);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    strcpy (envir.file_rsskwds, os_file_name);
+  }
+ 
+  else if (strcmp (keyword, FILE_RSSAPI) EQ 0) {
+    rc = CS_os_file_name(value_res, os_file_name);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    strcpy (envir.file_rssapi, os_file_name);
+  }
+ 
+  else if (strcmp (keyword, FILE_INTUSER) EQ 0) {
+    rc = CS_os_file_name(value_res, os_file_name);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    strcpy (envir.file_intuser,os_file_name);
+  }
+ 
+  else if (strcmp (keyword, FILE_INTOE) EQ 0) {
+    rc = CS_os_file_name(value_res, os_file_name);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    strcpy (envir.file_intoe,os_file_name);
+  }
+ 
+  else if (strcmp (keyword, FILE_INTUG) EQ 0) {
+    rc = CS_os_file_name(value_res, os_file_name);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    strcpy (envir.file_intug,os_file_name);
+  }
+ 
+  else if (strcmp (keyword, FILE_INTU2UG) EQ 0) {
+    rc = CS_os_file_name(value_res, os_file_name);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    strcpy (envir.file_intu2ug, os_file_name);
+  }
+ 
+  /* CE FILES */
+  else if (strcmp (keyword, FILE_CMNTCPA) EQ 0) {
+    rc = CS_os_file_name(value_res, os_file_name);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    strcpy (envir.file_cmntcpa, os_file_name);
+  }
+  else if (strcmp (keyword, KEEP_ALIVE_FLAG) EQ 0) {
+    strncpy (&envir.keep_alive_flag,
+             value,
+             sizeof(envir.keep_alive_flag));
+  }
+ 
+ 
+  else if (strcmp (keyword, AGENT_EXE_PATH) EQ 0) {
+    rc = CS_os_file_name(value_res, os_file_name);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    strcpy (envir.agent_exe_path, os_file_name);
+ 
+  }
+/* Minimum requirement free disk space for diag message issue*/
+  else if (strcmp (keyword, MINIMUM_FREE_DISK_SPACE) EQ 0) {
+    i= strspn (value, POSITIVE_VALUE);
+    if (i NE strlen (value))
+       min_free_disk_space = 0;
+    else
+       min_free_disk_space = atoi(value);
+  }
+ 
+ 
+  /* Queue params */
+  else if (strcmp (keyword, FILE_QUEUE) EQ 0) {
+    rc = CS_os_file_name(value_res, os_file_name);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    strcpy (envir.file_queue, os_file_name);
+  }
+ 
+  else if (strcmp (keyword, PRINT_QUEUE) EQ 0) {
+    rc = CS_os_file_name(value_res, os_file_name);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    strcpy (envir.print_queue, os_file_name);
+  }
+ 
+  else if (strcmp (keyword, QUEUE_SIZE) EQ 0) {
+   i= strspn (value, POSITIVE_VALUE);
+   if (i NE strlen (value))
+     envir.queue_size= -1;
+   else
+     envir.queue_size= atoi(value);
+  }
+ 
+  /* Encryptions */
+  else if (strcmp (keyword, FILE_ENCRINT) EQ 0) {
+    rc = CS_os_file_name(value_res, os_file_name);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    strcpy (envir.file_encrint, os_file_name);
+  }
+ 
+  else if (strcmp (keyword, FILE_ENCREXT) EQ 0) {
+    rc = CS_os_file_name(value_res, os_file_name);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    strcpy (envir.file_encrext, os_file_name);
+  }
+ 
+  else if (strcmp (keyword, ENCR_INT_ACT) EQ 0) {
+    strncpy (&envir.encr_int_act,
+             value,
+             sizeof(envir.encr_int_act));
+  }
+ 
+  else if (strcmp (keyword, ENCR_EXT_ACT) EQ 0) {
+    strncpy (&envir.encr_ext_act,
+             value,
+             sizeof(envir.encr_ext_act));
+  }
+ 
+  /* authentication */
+  else if (strcmp (keyword, FILE_AGENTPWD) EQ 0) {
+    rc = CS_os_file_name(value_res, os_file_name);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    strcpy (envir.file_agentpwd, os_file_name);
+  }
+  /* communication */
+ 
+  else if (strcmp (keyword, ENV_DCID) EQ 0)
+    strncpy (envir.dcid,
+             value,
+             sizeof(envir.dcid));
+  else if (strcmp (keyword, MAX_MSG_SIZE) EQ 0) {
+   i= strspn (value, POSITIVE_VALUE);
+   if (i NE strlen (value))
+     envir.max_msg_size= 0;
+   else
+    envir.max_msg_size= atoi(value);
+  }
+ 
+  /* WS10080 Start */
+  else if (strcmp (keyword, ONE_MSG_SIZE) EQ 0) {
+   i= strspn (value, POSITIVE_VALUE);
+   if (i NE strlen (value))
+     envir.one_msg_size= 0;
+   else
+    envir.one_msg_size= atoi(value);
+  }
+  /* WS10080 End */
+ 
+  else if (strcmp (keyword, MAX_MBX_SIZE) EQ 0) {
+   i= strspn (value, POSITIVE_VALUE);
+   if (i NE strlen (value))
+     envir.max_mbx_size= 0;
+   else
+    envir.max_mbx_size= atoi(value);
+  }
+ 
+  else if (strcmp (keyword, KEEP_ALIVE_INTERV) EQ 0) {
+     i= strspn (value, POSITIVE_VALUE);
+     if (i EQ strlen (value))
+	 {
+        envir.keep_alive_interv = atoi(value);
+ 
+	 }
+  }
+ 
+  else if (strcmp (keyword, PORT) EQ 0) {
+     i= strspn (value, POSITIVE_VALUE);
+     if (i EQ strlen (value))
+	 {
+        envir.out_port= atoi(value);
+        envir.in_port= envir.out_port+ 1;
+	    sw_port= 1;
+	 }
+  }
+  else if (
+ 	         (strcmp (keyword, IN_PORT) EQ 0)
+            AND
+			 (sw_port EQ 0)
+		  )
+  {
+     i= strspn (value, POSITIVE_VALUE);
+     if (i EQ strlen (value))
+        envir.in_port= atoi(value);
+  }
+  else if (
+ 	         (strcmp (keyword, OUT_PORT) EQ 0)
+            AND
+			 (sw_port EQ 0)
+		  )
+  {
+     i= strspn (value, POSITIVE_VALUE);
+     if (i EQ strlen (value))
+        envir.out_port= atoi(value);
+  }
+ 
+  else if (strcmp (keyword, MIN_SERV) EQ 0) {
+   i= strspn (value, POSITIVE_VALUE);
+   if (i EQ strlen (value))
+      envir.min_serv= atoi(value);
+  }
+  else if (strcmp (keyword, MAX_SERV) EQ 0) {
+   i= strspn (value, POSITIVE_VALUE);
+   if (i EQ strlen (value))
+      envir.max_serv= atoi(value);
+  }
+ 
+  else if (strcmp (keyword,TCP_KEEP_ALIVE_COUNT ) EQ 0) {
+     i= strspn (value, POSITIVE_VALUE);
+     if (i NE strlen (value))
+        envir.keep_alive_count= 0;
+     else
+        envir.keep_alive_count= atoi(value);
+ 
+     ESA_DIAG_printf (ESA_COMP_ESAINIT, 5,
+        " envir.keep_alive_count = %d.",
+         envir.keep_alive_count);
+  }
+  else if (strcmp (keyword,TCP_KEEP_ALIVE_INTERVAL) EQ 0) {
+     i= strspn (value, POSITIVE_VALUE);
+     if (i NE strlen (value))
+        envir.keep_alive_interval= 0;
+     else
+        envir.keep_alive_interval= atoi(value);
+  }
+  else if (strcmp (keyword, TCP_KEEP_ALIVE_TIME) EQ 0) {
+     i= strspn (value, POSITIVE_VALUE);
+     if (i NE strlen (value))
+        envir.keep_alive_time= 0;
+     else
+        envir.keep_alive_time= atoi(value);
+  }
+ 
+  else if (strcmp (keyword, HOST_ID) EQ 0) {
+   strcpy(envir.host_name , value);
+  }
+  /* AC001 - CONELLIS#307 - Start */
+    else if (strcmp(keyword, WRITE_TO_QUEUE) EQ 0) {
+     strncpy(&envir.write_to_queue,
+      value,
+      sizeof(envir.write_to_queue));
+    }
+    /* AC001 - CONELLIS#307 - End */
+  else
+     rc = ESA_ERR; /* if keyword not found */
+ 
+ cleanup:
+ 
+  return rc;
+} /* CG_prolog_kwrd */
+ 
+/* WS10082 Start */
+/****************************************************
+ * Procedure Name: CG_add_cc_ADDINFO_rtns
+ * Description   : Add CC ADDINFO routine pointers to
+ *               : admin params CS func table
+ * Input         :
+ * Input/Output  :
+ * Return Value  : int RC
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+static ESA_RC CG_add_cc_ADDINFO_rtns()
+{
+ 
+  ESA_RC           rc= ESA_OK;
+  char             fn[]="CG_add_cc_ADDINFO_rtns";
+ 
+  ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr = NULL;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr =
+    (AD_FUNC_PTR_rec_typ *) malloc (sizeof(AD_FUNC_PTR_rec_typ));
+ 
+  if (envir.msg_admin_param.cs_func.ADDINFO_func_ptr EQ NULL) {
+ 
+     ESA_DIAG_printf (ESA_COMP_ESAINIT, DIAG_BASIC,
+     "!!!*****> Allocation for ADDINFO routine pointers failed");
+     addinfo_alloc_done = FALSE;
+     rc = ESA_ERR; /* if storage not allocated */
+     goto cleanup;
+ 
+  }
+ 
+  addinfo_alloc_done = TRUE;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->
+    ADDINFO_search_ptr = &ADDINFO_search;            /*adies01*/
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->
+    ADDINFO_insert_ptr = &ADDINFO_insert;            /*adies02*/
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->
+    ADDINFO_updval_ptr = &ADDINFO_updval;            /*adies03*/
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->
+    ADDINFO_dump_ptr       = &ADDINFO_dump;          /*adies04*/
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->
+    ADDINFO_alloc_ptr      = &ADDINFO_alloc;         /*adies05*/
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->
+    ADDINFO_free_ptr       = &ADDINFO_free;          /*adies06*/
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies07*/
+    ADDINFO_clear_value_ptr = &ADDINFO_clear_value;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->
+    ADDINFO_clear_ptr      = &ADDINFO_clear;         /*adies08*/
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->
+    ADDINFO_addval_ptr = &ADDINFO_addval;            /*adies09*/
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->
+    ADDINFO_delete_ptr = &ADDINFO_delete;            /*adies10*/
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies11*/
+    ADDINFO_dup_check_ptr = &ADDINFO_dup_check;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies12*/
+    ADDINFO_prefix_search_ptr = &ADDINFO_prefix_search;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies13*/
+    ADDINFO_insert_cond_ptr = &ADDINFO_insert_cond;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies14*/
+    ADDINFO_copy_ptr = &ADDINFO_copy;
+ 
+/*envir.msg_admin_param.cs_func.ADDINFO_func_ptr-> /@adies15@/WS10082K
+    ADDINFO_get_value_ptr = &ADDINFO_get_value;            *WS10082K*/
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies16*/
+    ADDINFO_strip_prefix_ptr = &ADDINFO_strip_prefix;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies17*/
+    ADDINFO_get_next_ptr = &ADDINFO_get_next;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies18*/
+    ADDINFO_copy_by_prefix_ptr = &ADDINFO_copy_by_prefix;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies19*/
+    ADDINFO_kdt_search_ptr = &ADDINFO_kdt_search;
+ 
+  /*WS10082A envir.msg_admin_param.cs_func.ADDINFO_func_ptr->*adies20*
+    ADDINFO_kdt_modify_ptr = &ADDINFO_kdt_modify; *WS10082A*/
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies21*/
+    ADDINFO_mkt_check_ptr = &ADDINFO_mkt_check;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies22*/
+    ADDINFO_rkt_check_ptr = &ADDINFO_rkt_check;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies23*/
+    ADDINFO_concat_ptr = &ADDINFO_concat;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies24*/
+    ADDINFO_list_search_ptr = &ADDINFO_list_search;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies25*/
+    ADDINFO_list_diff_ptr = &ADDINFO_list_diff;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies26*/
+    ADDINFO_list_getnextvalue_ptr =
+                               &ADDINFO_list_getnextvalue;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies27*/
+    ADDINFO_list_match_ptr = &ADDINFO_list_match;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies28*/
+    ADDINFO_convert_list_sep_ptr = &ADDINFO_convert_list_sep;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies29*/
+    ADDINFO_masupd_ptr = &ADDINFO_masupd;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies30*/
+    ADDINFO_expand_from_buffer_ptr =
+                               &ADDINFO_expand_from_buffer;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies31*/
+    ADDINFO_pack_to_buffer_ptr = &ADDINFO_pack_to_buffer;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies32*/
+    ADDINFO_insert_nonstr_ptr = &ADDINFO_insert_nonstr;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies33*/
+    ADDINFO_updval_nonstr_ptr = &ADDINFO_updval_nonstr;
+/*WS10082K***
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies35@/
+    ADDINFO_value_addval_ptr = &ADDINFO_value_addval; */
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies36*/
+    ADDINFO_split_by_prefix_ptr = &ADDINFO_split_by_prefix;
+ 
+  envir.msg_admin_param.cs_func.ADDINFO_func_ptr->   /*adies37*/
+    ADDINFO_count_by_prefix_ptr = &ADDINFO_count_by_prefix;
+ 
+ cleanup:
+ 
+  ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, rc);
+ 
+  return rc;
+} /* end of CG_add_cc_ADDINFO_rtns */
+/* WS10082 end */
+ 
+/****************************************************
+ * Procedure Name: CG_epilog
+ * Description   : main epilog
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+void CG_epilog (ESA_RC exit_rc , int exit_signal)
+{
+  OS_pid_str_typ    pid;
+  OS_sigstr_typ     signame;
+  ESA_RC            rc;
+  char              rssprm_value[RSSPRM_VALUE_LEN+ 1];
+  int               jj;
+  char              fn[]="CG_epilog";
+ 
+  ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+  /*--- Memory diagnostics treatment (end = ESA_EOF) ---*/
+  ESA_DIAG_memory_status (envir.diag_handle, fn, ESA_EOF);
+ 
+  ESA_DIAG_close_files ();
+ 
+  if (save_diag_handle)
+  {
+     envir.msg_handle.diag_handle= save_diag_handle;
+     ESA_DIAG_printf (ESA_COMP_ESAINIT, DIAG_DETAILES,
+		"CG_epilog : save_diag_handle=%p envir.msg_handle.diag_handle=%p.",
+		save_diag_handle, envir.msg_handle.diag_handle);
+  }
+ 
+  /* WS10082 start - free storage allocated for ADDINFO ptrs */
+  if (addinfo_alloc_done) {
+     free(envir.msg_admin_param.cs_func.ADDINFO_func_ptr);
+  }
+  /* WS10082 end   */
+ 
+  /* SAS2IBMT Signal processing was removed because it does not
+             provide enough information.  We get more information
+             from LE without a signal handler.
+  if (exit_signal NE 0)
+  {
+    ESA_DIAG_printf (ESA_COMP_ESAINIT, DIAG_OS,
+		"...-> OS_PROC_trslt_signal: hndl=%p ExitSignal=%.1x.",
+				  envir.os_proc_handle, exit_signal);
+    OS_PROC_trslt_signal (exit_signal,
+                          signame,
+                          envir.os_proc_handle);
+    ESA_DIAG_printf (ESA_COMP_ESAINIT, DIAG_OS,
+		"...<- OS_PROC_trslt_signal.");
+  }                                                                  */
+  rc= rssprm_get (envir.all_rss, OFLI_VERBOSE , 1, rssprm_value);
+  if (
+        (rc EQ ESA_OK) AND
+        (envir.p_main_name EQ ESA_OFLI_PROC) AND
+        (rssprm_value[0] NE CONSOLE_DEST)
+     )
+       envir.msg_dest->dests[CTSAMSG_DEST_CNSL].active= FLAG_NO;
+  else
+       envir.msg_dest->dests[CTSAMSG_DEST_CNSL].active= FLAG_YES;
+ 
+  strcpy (pid , "");
+  ESA_DIAG_printf (ESA_COMP_ESAINIT, DIAG_OS,
+				  "...-> OS_PROC_get_pid: hndl=%p.",
+				  envir.os_proc_handle);
+  rc = OS_PROC_get_pid (pid, envir.os_proc_handle);
+  ESA_DIAG_printf (ESA_COMP_ESAINIT, DIAG_OS,
+		     	"...<- OS_PROC_get_pid: rc=%d (%s) pid=%.*s.",
+			     rc, (rc EQ ESA_OK) ? "OS==OK" : "OS##OK",
+				 sizeof (OS_pid_str_typ), pid);
+ 
+  if (rc NE ESA_OK)
+    strcpy (pid , "???" );
+ 
+  for (jj= 0;
+       (jj LT envir.max_rss_num) AND (envir.interest);
+	   jj++)
+  {
+     if (envir.interest[jj].RssPrmAddInfo)
+        CSA_free ((char **)&envir.interest[jj].RssPrmAddInfo);
+  }
+  if (envir.intercept_rec NE NULL)
+     CSA_free ((char **)&envir.intercept_rec);
+  CSA_free ((char **)&envir.lock);
+  CSA_free ((char **)&envir.rssprm);
+  CSA_free ((char **)&envir.startlst);
+  CSA_free ((char **)&envir.interest);
+  CSA_free ((char **)&envir.rss_rec);
+  CSA_free_all();
+ 
+  if (exit_signal NE 0) {
+    CTSAMSG_print (MSG_PROC_EXIT_SIG ,
+                   envir.msg_admin_param.ctsamsg_handle, NULL,
+                   envir.msg_admin_param.ctsamsg_dest,
+                   CG_name(envir.p_main_name),
+                   CTSAgentVersion(),
+                   pid ,
+                   signame);
+  }
+  else
+    switch (exit_rc)  {
+      case ESA_OK :
+          CTSAMSG_print (MSG_PROC_END_OK ,
+                         envir.msg_admin_param.ctsamsg_handle, NULL,
+                         envir.msg_admin_param.ctsamsg_dest,
+                         CG_name(envir.p_main_name) ,
+                         CTSAgentVersion(),
+                         pid);
+          break;
+      case ESA_TERM_CTSA :
+          CTSAMSG_print (MSG_PROC_EXIT_RQST ,
+                         envir.msg_admin_param.ctsamsg_handle, NULL,
+                         envir.msg_admin_param.ctsamsg_dest,
+                         CG_name(envir.p_main_name) ,
+                         CTSAgentVersion(),
+                         pid);
+          break;
+      default :
+          CTSAMSG_print (MSG_PROC_EXIT_ERR ,
+                         envir.msg_admin_param.ctsamsg_handle, NULL,
+                         envir.msg_admin_param.ctsamsg_dest,
+                         CG_name(envir.p_main_name) ,
+                         CTSAgentVersion(),
+                         pid ,
+                         ESA_rc2str(exit_rc));
+          break;
+  }
+ 
+  CTSAMSG_termdest (envir.msg_dest, &envir.msg_handle);
+ 
+  CTSAMSG_free     (&envir.msg_handle);
+  if (envir.msg_dest NE NULL)
+     CTSAMSG_dest_table_free (envir.msg_dest);
+ 
+  ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, rc);
+ 
+  rc= OS_PROC_term (envir.p_main_name, &envir.os_proc_handle);
+ 
+  if (exit_signal NE 0)
+    OS_PROC_exit(exit_signal ,
+                 envir.p_main_name,
+                 envir.os_proc_handle);
+} /* CG_epilog */
+ 
+/****************************************************
+ * Procedure Name: CG_miss_keyword
+ * Description   : Check if any keyword is missing
+ * Input         :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CG_miss_keyword (void)
+{
+  char             fn[]="CG_miss_keyword";
+  ESA_RC           rc= ESA_OK;
+  RESOURCE_typ     miss_keyword, invalid_keyword;
+ 
+  ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+ 
+  CLEAR (miss_keyword);
+  CLEAR (invalid_keyword);
+ 
+/*  if (envir.file_administrators[0] EQ '\0')
+    strcpy (miss_keyword, FILE_RSSADM);
+  */
+ 
+  if (envir.file_rssparm[0] EQ '\0')
+    strcpy (miss_keyword, FILE_RSSPARM);
+ 
+  if (envir.file_rssofli[0] EQ '\0')
+    strcpy (miss_keyword, FILE_RSSOFLI);
+ 
+  if (envir.file_diaglvl[0] EQ '\0')
+    strcpy (miss_keyword, FILE_DIAGLVL);
+ 
+  if (envir.file_diagtxt[0] EQ '\0')
+    strcpy (miss_keyword, FILE_DIAGTXT);
+ 
+  if (envir.file_rsskwds[0] EQ '\0')
+    strcpy (miss_keyword, FILE_RSSKWDS);
+ 
+  if (envir.file_rssapi[0] EQ '\0')
+    strcpy (miss_keyword, FILE_RSSAPI);
+ 
+  if (envir.file_intuser[0] EQ '\0')
+    strcpy (miss_keyword, FILE_INTUSER);
+ 
+  if (envir.file_intug[0] EQ '\0')
+    strcpy (miss_keyword, FILE_INTUG);
+ 
+  if (envir.file_intoe[0] EQ '\0')
+    strcpy (miss_keyword, FILE_INTOE);
+ 
+  if (envir.file_intu2ug[0] EQ '\0')
+    strcpy (miss_keyword, FILE_INTU2UG);
+ 
+  if (envir.file_queue[0] EQ '\0')
+    strcpy (miss_keyword, FILE_QUEUE);
+ 
+  if (envir.encr_int_act EQ '\0')
+    strcpy (miss_keyword, ENCR_INT_ACT);
+  if (envir.encr_int_act NE '\0' AND
+      envir.encr_int_act NE ACT_ENCR AND
+      envir.encr_int_act NE NOT_ACT_ENCR AND
+      envir.encr_int_act NE DBG_ENCR)
+    strcpy (invalid_keyword, ENCR_INT_ACT);
+ 
+  if (envir.encr_ext_act EQ '\0')
+    strcpy (miss_keyword, ENCR_EXT_ACT);
+  if (envir.encr_ext_act NE '\0' AND
+      envir.encr_ext_act NE ACT_ENCR AND
+      envir.encr_ext_act NE NOT_ACT_ENCR AND
+      envir.encr_ext_act NE DBG_ENCR)
+    strcpy (invalid_keyword, ENCR_EXT_ACT);
+ 
+  if ((envir.file_encrint[0] EQ '\0') AND
+      (envir.encr_int_act NE NOT_ACT_ENCR))
+    strcpy (miss_keyword, FILE_ENCRINT);
+ 
+  if ((envir.file_encrext[0] EQ '\0') AND
+      (envir.encr_ext_act NE NOT_ACT_ENCR))
+    strcpy (miss_keyword, FILE_ENCREXT);
+ 
+  if (envir.dcid[0] EQ '\0')
+    strcpy (miss_keyword, ENV_DCID);
+ 
+  if (envir.max_msg_size EQ 0)
+    strcpy (miss_keyword, MAX_MSG_SIZE);
+/*  if (envir.max_msg_size EQ -1)
+    strcpy (invalid_keyword, MAX_MSG_SIZE);*/
+ 
+  if (miss_keyword[0] NE '\0') {
+    CTSAMSG_print (MSG_KWD_MISSING ,
+                   envir.msg_admin_param.ctsamsg_handle,
+                   NULL,
+                   envir.msg_admin_param.ctsamsg_dest ,
+                   miss_keyword, INIT_FILE_NAME);
+    rc= ESA_FATAL;
+    ESA_DIAG_printf (ESA_COMP_ESAINIT, DIAG_BASIC,
+     "!!!*****> %s: Missing mandatory keyword %s in %s. rc=%s (%d.",
+	 miss_keyword, INIT_FILE_NAME, ESA_rc2str(rc), (int)rc );
+ 
+  }
+  if (invalid_keyword[0] NE '\0') {
+    CTSAMSG_print (MSG_KWD_INVALID ,
+                   envir.msg_admin_param.ctsamsg_handle,
+                   NULL,
+                   envir.msg_admin_param.ctsamsg_dest ,
+                   invalid_keyword, INIT_FILE_NAME);
+    rc= ESA_FATAL;
+    ESA_DIAG_printf (ESA_COMP_ESAINIT, DIAG_BASIC,
+     "!!!*****> %s: Invalid value of the mandatory keyword %s in %s. rc=%s (%d.",
+	 invalid_keyword, INIT_FILE_NAME, ESA_rc2str(rc), (int)rc );
+  }
+ 
+  ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, rc);
+  return(rc);
+ 
+} /* CG_miss_keyword */
+ 
+/****************************************************
+ * Procedure Name: CG_main_name
+ * Description   : Get brief name of main
+ * Input         :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+const char * CG_main_name (ESA_MAIN_NAME_typ p_main_name)
+{
+  switch (p_main_name)  {
+    case ESA_ACE_PROC:
+        return (ESA_MAIN_CE);
+    case ESA_ACS_PROC:
+        return (ESA_MAIN_CS);
+    case ESA_ACD_PROC:
+        return (ESA_MAIN_CD);
+    case ESA_ONLI_PROC:
+        return (ESA_MAIN_ONLI);
+    case ESA_OFLI_PROC:
+        return (ESA_MAIN_OFLI);
+    case ESA_ACSDIAG_PROC:
+        return (ESA_MAIN_ACSDIAG);
+    case ESA_ACSPRC_PROC:
+        return (ESA_MAIN_ACSPRC);
+    case ESA_ACSADM_PROC:
+        return (ESA_MAIN_ACSADM);
+    case ESA_ACSALERT_PROC:
+        return (ESA_MAIN_ACSALERT);
+    case ESA_KGEN_PROC:
+        return (ESA_MAIN_KGEN);
+    case ESA_QCR_PROC:
+        return (ESA_MAIN_QCR);
+    case ESA_QPR_PROC:
+        return (ESA_MAIN_QPR);
+    case ESA_CTSC100_PROC:
+        return (ESA_MAIN_CTSC100);
+    case ESA_TEST_PROC:
+        return (ESA_MAIN_TEST);
+    case ESA_MBX_PROC:
+        return (ESA_MAIN_MBX);
+    case ESA_PWI_PROC:
+        return (ESA_MAIN_PWI);
+    case ESA_ACSADAPT_PROC:
+        return (ESA_MAIN_ACSADAPT);
+    case ESA_CTSHTDWN_PROC:
+        return (ESA_MAIN_CTSHTDWN);
+    case ESA_CTSCTRL_PROC:
+        return (ESA_MAIN_CTSCTRL);
+    case ESA_APIVER_PROC:               /* IMH003 */
+        return (ESA_MAIN_APIVER);
+    case ESA_CTSINTRC_PROC :
+         return (ESA_MAIN_CTSINTRC);
+    case ESA_EXTERNAL:
+        return (ProgramMain);
+    default:
+        return (ESA_MAIN_OTHER);
+  }
+} /* CG_main_name */
+ 
+/****************************************************
+ * Procedure Name: CG_name
+ * Description   : Get full name of main
+ * Input         :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+const char * CG_name (ESA_MAIN_NAME_typ p_main_name)
+{
+  switch (p_main_name) {
+    case ESA_ACE_PROC:
+        return (ESA_CE);
+    case ESA_ACS_PROC:
+        return (ESA_CS);
+    case ESA_ACD_PROC:
+        return (ESA_CD);
+    case ESA_ONLI_PROC:
+        return (ESA_ONLI);
+    case ESA_OFLI_PROC:
+        return (ESA_OFLI);
+    case ESA_ACSDIAG_PROC:
+        return (ESA_ACSDIAG);
+    case ESA_ACSPRC_PROC:
+        return (ESA_ACSPRC);
+    case ESA_ACSADM_PROC:
+        return (ESA_ACSADM);
+    case ESA_ACSALERT_PROC:
+        return (ESA_ACSALERT);
+    case ESA_KGEN_PROC:
+        return (ESA_KGEN);
+    case ESA_QCR_PROC:
+        return (ESA_QCR);
+    case ESA_QPR_PROC:
+        return (ESA_QPR);
+    case ESA_TEST_PROC:
+        return (ESA_TEST);
+    case ESA_CTSC100_PROC:
+        return (ESA_CTSC100);
+    case ESA_MBX_PROC:
+        return (ESA_MBX);
+    case ESA_PWI_PROC:
+        return (ESA_PWI);
+    case ESA_ACSADAPT_PROC:
+        return (ESA_ACSADAPT);
+    case ESA_CTSHTDWN_PROC:
+        return (ESA_CTSHTDWN);
+    case ESA_CTSCTRL_PROC:
+        return (ESA_CTSCTRL);
+    case ESA_APIVER_PROC:           /* IMH003 */
+        return (ESA_APIVER);
+	case ESA_CTSINTRC_PROC:              /*MD0001 */
+        return (ESA_CTSINTRC);
+    case ESA_EXTERNAL:
+        return (ProgramName);
+    default:
+        return (ESA_OTHER);
+  }
+} /* CG_name */
+ 
+ 
+/****************************************************
+ * Procedure Name: rsskwd_typ
+ * Description   : get keywords type for specific RSS - API keyword
+ * Input         : rss          - RSS name
+ *                 api          - API function code
+ *                 keyword      - keyword name
+ * Output        : keyword_type - TYPE_1A,TYPE_1B,TYPE_2A,TYPE_2B,
+ *                                or TYPE_AI_IGNORED
+ * Return Value  : ESA_RC
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC rsskwd_typ (RSS_typ              rss,
+                   int                  func_code,
+                   char               * keyword,
+                   ADDINFO_typ        * keyword_typ)
+{
+  char fn[]="rsskwd_typ";
+  int                  ii= 0, api= 0;
+  char                 str_api[ADINF_TYP_LEN+ 1];
+  char                 kwrd_str[MAX_RSS_ADDINFO_KWD_LEN+1];
+  RSSAPI_KWD_rec_ptr   kwd_ptr= NULL;
+  ESA_RC               rc= ESA_OK;
+  RSS_typ              rss_wrk, rss_type;
+  ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+  ESA_DIAG_printf (ESA_COMP_ESAINIT, 13,
+                  "rss %s keyword group %d keyword %s.",
+                   rss, func_code, keyword);
+ 
+  if ((func_code EQ FUNC_ADDUSER)  OR (func_code EQ FUNC_DELUSER) OR
+      (func_code EQ FUNC_UPDUSER)  OR (func_code EQ FUNC_REVUSER) OR
+      (func_code EQ FUNC_UPD_PASS) OR (func_code EQ FUNC_GTUSERS) OR
+      (func_code EQ FUNC_USERCONN))
+     api = FUNC_ADDUSER;
+  else if((func_code EQ FUNC_ADDUG) OR (func_code EQ FUNC_DELUG)  OR
+          (func_code EQ FUNC_UPDUG) OR (func_code EQ FUNC_GETUGS))
+     api = FUNC_ADDUG;
+  else if((func_code EQ FUNC_ADDU2UG) OR (func_code EQ FUNC_DELU2UG) OR
+          (func_code EQ FUNC_UPDU2UG) OR (func_code EQ FUNC_GTUG2UC))
+     api = FUNC_ADDU2UG;
+  else if((func_code EQ FUNC_ADDRES) OR (func_code EQ FUNC_DELRES) OR
+          (func_code EQ FUNC_UPDRES) OR (func_code EQ FUNC_GETRES))
+     api = FUNC_UPDRES;
+  else if((func_code EQ FUNC_ADDACE) OR (func_code EQ FUNC_DELACE) OR
+          (func_code EQ FUNC_UPDACE) OR (func_code EQ FUNC_GTRSACL))
+     api = FUNC_ADDACE;
+  else if((func_code EQ FUNC_STRSPRM) OR (func_code EQ FUNC_GTRSPRM))
+     api = FUNC_GTRSPRM;
+  else if((func_code EQ FUNC_ADDOE) OR (func_code EQ FUNC_DELOE) OR
+          (func_code EQ FUNC_UPDOE) OR (func_code EQ FUNC_GETOES))
+     api = FUNC_ADDOE;
+  else
+  {
+      CTSAMSG_print (ERR_CS_INV_KEYWORD_GROUP,
+                     envir.msg_admin_param.ctsamsg_handle, NULL,
+                     envir.msg_admin_param.ctsamsg_dest,
+                     func_code);
+      rc= ESA_ERR;
+      goto cleanup;
+  }
+ 
+  * keyword_typ= TYPE_AI_IGNORED;
+ 
+  rc= rssprm_get (rss, RSS_TYPE , RSS_NAME_LEN, rss_type);
+  if (rc NE ESA_OK)
+     goto cleanup;
+ 
+  sprintf (str_api, "%02d", api);
+ 
+  for (ii= 0; ii LT envir.kwd_num; ii++ ) {
+     kwd_ptr= envir.keywrds+ ii;
+     memset ((char *)rss_wrk, '0', sizeof (rss_wrk));
+     memcpy ((char *)rss_wrk, (char *)kwd_ptr->rss, RSS_NAME_LEN);
+     strtok (rss_wrk, WHITECHARS);
+     ESA_DIAG_printf (ESA_COMP_ESAINIT, 16,
+                  "Rss type %s Keyword %s.", rss_wrk, kwd_ptr);
+     if (My_stricmp (rss_type, rss_wrk) NE 0)
+        continue;
+ 
+     if (memcmp ((char *)str_api, (char *)kwd_ptr->api,
+                 ADINF_TYP_LEN) NE 0)
+        continue;
+ 
+     memset ((char *)kwrd_str, '0', sizeof (kwrd_str));
+     memcpy ((char *)kwrd_str, (char *)kwd_ptr->keyword,
+         MAX_RSS_ADDINFO_KWD_LEN);
+ 
+     strtok (kwrd_str, WHITECHARS);
+     if (strcmp (kwrd_str, keyword) NE 0)
+        continue;
+     if (
+         (kwd_ptr->keyword_type EQ KWD_FOR_ADDINFO_1A)
+             OR
+         (kwd_ptr->keyword_type EQ KWD_FOR_ADDINFO_1A_CHECK)
+         )
+        *keyword_typ = TYPE_1A;
+     else if (
+         (kwd_ptr->keyword_type EQ KWD_FOR_ADDINFO_1B)
+             OR
+         (kwd_ptr->keyword_type EQ KWD_FOR_ADDINFO_1B_CHECK)
+         )
+        *keyword_typ = TYPE_1B;
+     else if (
+         (kwd_ptr->keyword_type EQ KWD_FOR_ADDINFO_2A)
+             OR
+         (kwd_ptr->keyword_type EQ KWD_FOR_ADDINFO_2A_CHECK)
+         )
+        *keyword_typ = TYPE_2A;
+     else if (
+         (kwd_ptr->keyword_type EQ KWD_FOR_ADDINFO_2B)
+             OR
+         (kwd_ptr->keyword_type EQ KWD_FOR_ADDINFO_2B_CHECK)
+         )
+        *keyword_typ = TYPE_2B;
+     else
+        *keyword_typ = TYPE_AI_IGNORED;
+     break;
+  }
+ 
+  cleanup:
+  ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, rc);
+  return (rc);
+ 
+}  /* EOF rsskwd_type func */
+ 
+/*****************************************************************
+* Procedure Name: intercept_set
+* Description   : Accept request for interception
+* Input         : Interception type, interception object type,
+*                 oe, ug, user
+* Output        : None
+* Input/Output  : envir.num_intercept_rec, envir.intercept_record.
+* Return Value  : ESA_RC
+* Side Effects  :
+* Scope         :
+*****************************************************************/
+ 
+ESA_RC intercept_set (INTERCEPT_typ        type,
+                      INTERCEPT_obj_typ    obj_type,
+                      OE_typ               oe,
+                      USER_typ             user,
+                      UG_typ               ug)
+{
+   ESA_RC              rc = ESA_OK;
+   INTERCEPT_rec_typ   tmp_intercept_rec;
+   char                fn[] = "intercept_set";
+ 
+ 
+   ESA_DIAG_enter (ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, fn);
+ 
+   ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 13,
+                    "type %d obj.type %d oe %s ug %s user %s.",
+                    (int)type,
+                    (int)obj_type,
+                    oe,
+                    ug,
+                    user);
+ 
+   ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 15,
+     "Intercept rec: Pointer=%p ,alloc_num=%d , num=%d",
+                    envir.intercept_rec,
+                    envir.alloc_num_intercept_rec,
+                    envir.num_intercept_rec);
+ 
+   ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 15,
+                    "Before if 1");
+   if (
+       (type NE INTERCEPT_NONE)
+           AND
+       (type NE INTERCEPT_SUBTREE)
+           AND
+       (type NE INTERCEPT_SPECIFIC)
+           AND
+       (type NE INTERCEPT_FULL)
+       )
+   {
+      ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 15,
+                       "%d: Invalid type %d.",
+                       envir.num_intercept_rec,
+                       (int)type);
+      rc = ESA_ERR;
+   }
+ 
+   ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 15,
+                    "Before if 2");
+   if (
+       (obj_type NE INTERCEPT_CONTAINER)
+           AND
+       (obj_type NE INTERCEPT_USER)
+           AND
+       (obj_type NE INTERCEPT_GROUP)
+           AND
+       (obj_type NE INTERCEPT_CONNECTION)
+           AND
+       (obj_type NE INTERCEPT_ALL)
+           AND
+       (obj_type NE INTERCEPT_RSSPRM)
+      )
+   {
+      ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 15,
+                       "%d: Invalid obj_type %d.",
+                       envir.num_intercept_rec,
+                       (int)obj_type);
+      rc = ESA_ERR;
+   }
+ 
+   ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 15,
+                    "Before if 3");
+   if (
+       (obj_type EQ INTERCEPT_CONTAINER)
+           AND
+       (
+           (strlen (oe) EQ 0)
+               OR
+           (strlen (oe) GT sizeof (OE_typ))
+       )
+      )
+   {
+      ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 15,
+                       "%d: Empty container %s.",
+                       envir.num_intercept_rec,
+                       oe);
+      rc = ESA_ERR;
+   }
+ 
+   ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 15,
+                    "Before if 4");
+   if (
+        (
+          (obj_type EQ INTERCEPT_GROUP)
+         OR
+          (obj_type EQ INTERCEPT_CONNECTION)
+        )
+       AND
+        (
+          (strlen (ug) EQ 0)
+         OR
+          (strlen (ug) GT sizeof (UG_typ))
+        )
+     )
+   {
+      ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 15,
+                      "%d: Empty ug %s.",
+                      envir.num_intercept_rec,
+                      ug);
+      rc = ESA_ERR;
+   }
+ 
+   ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 15,
+                    "Before if 5");
+   if (
+        (
+          (obj_type EQ INTERCEPT_USER)
+         OR
+          (obj_type EQ INTERCEPT_CONNECTION)
+        )
+       AND
+        (
+          (strlen (user) EQ 0)
+         OR
+          (strlen (user) GT sizeof (USER_typ))
+        )
+      )
+   {
+      ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 15,
+                      "%d: Empty user %s.",
+                      envir.num_intercept_rec,
+                      user);
+      rc = ESA_ERR;
+   }
+ 
+   ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 15,
+                    "Before if 6");
+   if (rc NE ESA_OK)
+   {
+      CTSAMSG_print (ERR_INTERCEPT_REQ,
+                    envir.msg_admin_param.ctsamsg_handle, NULL,
+                    envir.msg_admin_param.ctsamsg_dest,
+                    (int)type, (int)obj_type, oe, ug, user);
+      goto cleanup;
+   }
+ 
+   /* OK. Inputs are kosher; proceed */
+   ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 15,
+                    "Before if 7");
+   if (envir.alloc_num_intercept_rec LE
+       envir.num_intercept_rec)
+   {
+      if (envir.alloc_num_intercept_rec EQ 0)
+         rc= CSA_alloc ((char **)&envir.intercept_rec,
+                       0,
+                       sizeof (INTERCEPT_rec_typ),
+                       ADD_NUM_INTERCEP_REC,
+                       fn,
+                       "Intercept records");
+      else
+        rc= CSA_realloc ((char **)&envir.intercept_rec,
+                         0,
+                         sizeof (INTERCEPT_rec_typ),
+                         envir.alloc_num_intercept_rec+
+                         ADD_NUM_INTERCEP_REC);
+      envir.alloc_num_intercept_rec +=
+          ADD_NUM_INTERCEP_REC;
+ 
+      if (rc NE ESA_OK)
+        goto cleanup;
+ 
+      ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 15,
+    "Intercept rec After alloc: num_alloc = %d, New pointer is: %p.",
+                       envir.alloc_num_intercept_rec,
+                       envir.intercept_rec);
+  }
+ 
+  tmp_intercept_rec.type     = type;
+  tmp_intercept_rec.obj_type = obj_type;
+ 
+  strcpy (tmp_intercept_rec.oe,   oe);
+  strcpy (tmp_intercept_rec.ug,   ug);
+  strcpy (tmp_intercept_rec.user, user);
+ 
+  memcpy ((char *)(envir.intercept_rec+ envir.num_intercept_rec),
+          (char *)&tmp_intercept_rec,
+          sizeof (INTERCEPT_rec_typ));
+ 
+  envir.num_intercept_rec++;
+ 
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 15,
+                   "Before exiting: Nun_intercept_rec = %d" ,
+                   envir.num_intercept_rec);
+ 
+cleanup:
+ 
+  ESA_DIAG_exit (ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, fn, rc);
+ 
+  return (rc);
+ 
+} /* intercept_set */
+ 
+ 
+/*****************************************************************
+* Procedure Name: CSupper
+* Description   : Convert string to Uppercase string
+* Input         : in_str,
+* Output        : out_str
+* Return Value  : ESA_RC
+* Side Effects  :
+* Scope         :
+*****************************************************************/
+ 
+void CSupper (char * in_str,
+              char * out_str)
+{
+   /* 502839 char fn[]="CSupper"; */
+ 
+   while (*in_str)  {
+      *out_str = toupper(*in_str);
+      in_str++;
+      out_str++;
+   }
+   *out_str = toupper(*in_str);
+}
+ 
+ 
+/*****************************************************************
+* Procedure Name: My_stricmp
+* Description   : Insencitive MString Compare
+* Input         : str1,
+*               : str2
+* Return Value  : ESA_RC
+* Side Effects  :
+* Scope         :
+*****************************************************************/
+ 
+ESA_RC My_stricmp (char * str1,
+                   char * str2)
+{
+ 
+ESA_RC       rc= ESA_WARN;
+char         char1, char2;
+unsigned int ii;
+/* 502839 char         fn[]="My_stricmp"; */
+ 
+ 
+   for (ii= 0; str1[ii] AND str2[ii]; ii++)
+   {
+      char1= toupper(str1[ii]);
+      char2= toupper(str2[ii]);
+      if (char1 NE char2)
+         break;
+   }
+   if (str1[ii] EQ str2[ii])
+      rc= ESA_OK;
+ 
+ 
+   return (rc);
+ 
+}
+ 
+ 
+/*****************************************************************
+* Procedure Name: My_memicmp
+* Description   : Insencitive Memory Compare
+* Input         : str1,
+*               : str2,
+*                 length
+* Return Value  : ESA_RC
+* Side Effects  :
+* Scope         :
+*****************************************************************/
+ 
+ESA_RC My_memicmp (char         * str1,
+                   char         * str2,
+                   unsigned int   length)
+{
+    ESA_RC       rc= ESA_WARN;
+    char         char1, char2;
+    unsigned int ii;
+    /* 502839 char         fn[]="My_memicmp"; */
+ 
+    for (ii= 0; ii LT length; ii++)
+    {
+        char1= toupper(str1[ii]);
+        char2= toupper(str2[ii]);
+        if (char1 NE char2)
+            break;
+    }
+    if (ii EQ length)
+        rc= ESA_OK;
+ 
+    return (rc);
+}
+/* SAS2IBMN - Remove this routine - not used anymore
+ **************************************************************
+* Procedure Name   : MSG_printf                               *
+* Description      : Issue a message to the requested         *
+*                    destinations                             *
+* Input            : 1) msgid   - msgid to be printed         *
+*                    2) ...     - arguments for message       *
+* Return Value     : ESA_RC                                   *
+* Comments         : The function process the arg list and    *
+*                    calls CTSAMSG_print                      *
+**************************************************************
+ 
+ESA_RC MSG_printf (const char * msgid ,... )
+{
+    va_list   arg_list;
+    ESA_RC    rc;
+ 
+    *
+    *   Call the real print function
+    *
+ 
+    va_start(arg_list, msgid);
+    rc = CTSAMSG_print_direct (msgid,
+                               envir.msg_admin_param.ctsamsg_handle,
+                               NULL,
+                               envir.msg_admin_param.ctsamsg_dest,
+                               arg_list);
+    va_end(arg_list);
+ 
+    return rc;
+ 
+}
+*/
+ 
+/****************************************************
+ * Procedure Name: DIAG_printf
+ * Description   : printf-like diagnostics
+ * Input         : Component, level, format, arguments
+ * Output        :
+ * Return Value  :
+ * Side Effects  : VARARGS is used
+ * Scope         : Global
+ * Re-entrant    : No
+ ****************************************************/
+ 
+void DIAG_printf (ESA_DIAG_COMP_typ    comp,
+                  ESA_DIAG_LEVEL_typ   level,
+   /* IS10182     const char         * format, ...)   */
+                  const char         * format,            /* IS10182 */
+                  va_list              arg_list)          /* IS10182 */
+ 
+{
+ 
+   /* IS10182 va_list arg_list;                                      */
+ 
+   /* IS10182 va_start (arg_list, format);                           */
+ 
+   ESA_DIAGLL_printf (comp,
+                      level,
+                      envir.diag_handle,
+                      format,
+                      arg_list);
+ 
+   /* IS10182 va_end (arg_list);                                     */
+ 
+}
+ 
+/****************************************************
+ * Procedure Name: DIAG_get_debug_level
+ * Description   : return diag level of a component
+ * Input         : Component
+ * Output        : None
+ * Return Value  : Level
+ * Re-entrant    : No
+ ****************************************************/
+ 
+ESA_DIAG_LEVEL_typ DIAG_get_debug_level (ESA_DIAG_COMP_typ comp)
+{
+   return (ESA_DIAG_get_debug_level (comp));
+ 
+}
+ 
+/****************************************************
+ * Procedure Name: DIAG_enter
+ * Description   : Push calling func name on stack, print message
+ * Input         : component, level, func name
+ * Output        :
+ * Return Value  :
+ * Side Effects  :
+ * Scope         : Global
+ * Re-entrant    : No
+ ****************************************************/
+ 
+void DIAG_enter (ESA_DIAG_COMP_typ    comp,
+                 ESA_DIAG_LEVEL_typ   level,
+                 const char         * funcname)
+ 
+{
+ 
+   ESA_DIAG_enter (comp, level,  funcname);
+ 
+   return;
+ 
+}
+ 
+ 
+/****************************************************
+ * Procedure Name: DIAG_exit
+ * Description   : Pop function stack, print message
+ * Input         : Component, level, function name, RC
+ * Output        :
+ * Return Value  :
+ * Side Effects  :
+ * Scope         : Global
+ * Re-entrant    : No
+ ****************************************************/
+ 
+void DIAG_exit (ESA_DIAG_COMP_typ   comp,
+                ESA_DIAG_LEVEL_typ  level,
+                const char        * funcname,
+                ESA_RC              rc_ret)
+ 
+{
+ 
+    ESA_DIAG_exit (comp, level, funcname, rc_ret);
+ 
+    return;
+ 
+}
+ 
+/****************************************************
+ * Procedure Name: DIAG_refresh
+ * Description   : Read levels from file, set debug level for
+ *                 all components
+ * Return Value  : ESA_RC
+ * Side Effects  : Static array is modified
+ * Scope         : Global
+ * Re-entrant    : No
+ ****************************************************/
+ 
+ESA_RC DIAG_refresh (void)
+ 
+{
+  ESA_RC  rc= ESA_OK;
+ 
+  rc= ESA_DIAG_set_debug_levels_file (envir.file_diaglvl,
+	                                  envir.p_main_name);
+ 
+  return (rc);
+ 
+}
+ 
+ 
+/****************************************************
+ * Procedure Name: CS_get_envir_address
+ * Description   : Get envir address
+ ****************************************************/
+ 
+void CS_get_envir_address (ENVIRONMENT_rec_typ ** envir_ptr)
+{
+    (* envir_ptr)= &envir;
+}
+ 
+char * CTSAgentVersion ()
+{
+   strcpy (AgentVersion, SA_AGENT_VERSION);
+   return ((char *)AgentVersion);
+}
+ 
+ 
+/*                 WS10082N - start
+ *   Provide msgs (handle) and dest addresses to CTSAMSG.  *
+ *   These routines are called by CTSAMSG_print_direct     *
+ *   when called with handle=0 or dest=CTSAMSG_FIND_DEST   */
+CTSAMSG_HANDLE_rec_typ     * CS_get_ctsamsg_handle()
+{
+   return (envir.ctsamsg_handle);
+}
+ 
+CTSAMSG_DEST_TABLE_rec_typ * CS_get_ctsamsg_dest()
+{
+   return (envir.ctsamsg_dest);
+}
+/*                 WS10082N - end                          */
+ 
+void CS_DIAG_USER_IN (unsigned int           comp,
+					  GET_USER_MODE          mode,
+                      OE_typ                 oe,
+                      short                  max_users,
+                      short                  num_users_in,
+                      USER_PARAMS_rec_typ  * user_params_in,
+                      void                 * handle,
+                      ADDINFO_rec_typ     ** addinfo)
+{
+   char ModeStr[30];
+   char fn[]="CS_DIAG_USER_IN";
+ 
+   ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+   if (ESA_DIAG_get_debug_level(comp) LT (int)DIAG_BASIC)
+		goto cleanup;
+   if (ESA_DIAG_get_debug_level(ESA_COMP_APIDRV) LT (int)DIAG_BASIC)
+		goto cleanup;
+   switch (mode)  {
+      case GET_ALL_USERS :
+         strcpy (ModeStr, "GET_ALL_USERS");
+         break;
+      case GET_MANY_USERS:
+         strcpy (ModeStr, "GET_MANY_USERS");
+         break;
+      case GET_WILD_USERS:
+         strcpy (ModeStr, "GET_WILD_USERS");
+         break;
+      case GET_SUBTREE_USERS:
+         strcpy (ModeStr, "GET_SUBTREE_USERS");
+         break;
+      case GET_FREE_HANDLE_USERS:
+         strcpy (ModeStr, "GET_FREE_HANDLE_USERS");
+         break;
+      default :
+         strcpy (ModeStr, "UNDEFINED!!!");
+         break;
+   }
+ 
+   ESA_DIAG_printf (comp, DIAG_BASIC,
+	  "     Mode=%s(%d) MaxUsrs=%d UsrsIn=%d Hdl=%p Oe=%s.",
+      ModeStr, mode, max_users, num_users_in, handle, oe);
+   CS_DIAG_USER (comp, num_users_in, user_params_in, addinfo, NULL, 0, FALSE);
+cleanup:
+   ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, ESA_RC_VOID);
+   return;
+}
+ 
+ 
+void CS_DIAG_USER_OUT (unsigned int           comp,
+					   OE_typ                 oe,
+                       short                  actual_num,
+                       HAVE_MORE_typ          have_more,
+                       USER_PARAMS_rec_typ  * user_params,
+                       OBJ_EXISTS_typ       * objs_exist,
+                       void                 * handle,
+                       ADDINFO_rec_typ     ** addinfo)
+{
+   char                  HaveStr[10];
+   char fn[]="CS_DIAG_USER_OUT";
+ 
+   ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+   if (ESA_DIAG_get_debug_level(comp) LT (int)DIAG_BASIC)
+		goto cleanup;
+   if (ESA_DIAG_get_debug_level(ESA_COMP_APIDRV) LT (int)DIAG_BASIC)
+		goto cleanup;
+   switch (have_more)  {
+      case NO_MORE :
+         strcpy (HaveStr, "NO_MORE");
+         break;
+      case HAVE_MORE:
+         strcpy (HaveStr, "HAVE_MORE");
+         break;
+      default :
+         strcpy (HaveStr, "UNDEFINED!!!");
+         break;
+   }
+ 
+   ESA_DIAG_printf (comp, DIAG_BASIC,
+	  "     ActNumber=%d Have=%s (%d) Hdl=%p Oe=%s.",
+      actual_num, HaveStr, have_more, handle, oe);
+   CS_DIAG_USER (comp, actual_num, user_params, addinfo, objs_exist,0, TRUE);
+cleanup:
+   ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, ESA_RC_VOID);
+   return;
+}
+ 
+void CS_DIAG_USER (unsigned int           comp,
+				   short                  num_users_in,
+				   USER_PARAMS_rec_typ  * user_params_in,
+                   ADDINFO_rec_typ     ** addinfo,
+                   OBJ_EXISTS_typ       * objs_exist,
+				   unsigned int           diag_level,
+				   int                    AddInfoFull)
+{
+ 
+   int                        kk=0;
+   char                       ObjStr[30], ActStr[30], PwdStr[30];
+   char                       UsrStr[30], AdmStr[30];
+   USER_PARAMS_rec_typ      * user;
+   ADDINFO_rec_typ          * AddInfo;
+   char fn[]="CS_DIAG_USER";
+ 
+   ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+   if (ESA_DIAG_get_debug_level(comp) LT (int)DIAG_BASIC)
+		goto cleanup;
+   if (ESA_DIAG_get_debug_level(ESA_COMP_APIDRV) LT (int)DIAG_BASIC)
+		goto cleanup;
+   strcpy (ObjStr, "");
+ 
+   for (kk= 0; kk LT num_users_in ; kk++)
+   {
+      user= &user_params_in[kk];
+      AddInfo= addinfo[kk];
+ 
+	  ESA_DIAG_printf (comp, DIAG_BASIC,
+	  "     %d user data:", kk+ 1);
+ 
+      if (objs_exist)
+	  {
+         switch (objs_exist[kk])  {
+            case OBJ_IGNORED:
+               strcpy (ObjStr, "OBJ_IGNORED");
+               break;
+            case OBJ_EXIST:
+               strcpy (ObjStr, "OBJ_EXIST");
+               break;
+            case OBJ_NOT_EXIST:
+               strcpy (ObjStr, "OBJ_NOT_EXIST");
+               break;
+            case OBJ_ERR:
+               strcpy (ObjStr, "OBJ_ERR");
+               break;
+            default :
+               strcpy (ObjStr, "UNDEFINED!!!");
+               break;
+		 }
+	  }
+ 
+      switch (user->def_ug_action)  {
+         case OLD_DEF_UG_ACT_IGNORED:
+            strcpy (ActStr, "OLD_DEF_UG_ACT_IGNORED");
+            break;
+         case OLD_DEF_UG_ACT_DROP:
+            strcpy (ActStr, "OLD_DEF_UG_ACT_DROP");
+            break;
+         case OLD_DEF_UG_ACT_KEEP:
+            strcpy (ActStr, "OLD_DEF_UG_ACT_KEEP");
+            break;
+         default :
+            strcpy (ActStr, "UNDEFINED!!!");
+            break;
+	  }
+ 
+      switch (user->passwd_life)  {
+         case PASS_LIFE_IGNORED:
+            strcpy (PwdStr, "PASS_LIFE_IGNORED");
+            break;
+         case PASS_LIFE_PERMANENT:
+            strcpy (PwdStr, "PASS_LIFE_PERMANENT");
+            break;
+         case PASS_LIFE_RESET:
+            strcpy (PwdStr, "PASS_LIFE_RESET");
+            break;
+         default :
+            strcpy (PwdStr, "UNDEFINED!!!");
+            break;
+	  }
+ 
+      switch (user->rev_status)  {
+         case USER_STAT_IGNORED:
+            strcpy (UsrStr, "USER_STAT_IGNORED");
+            break;
+         case USER_STAT_REVOKED:
+            strcpy (UsrStr, "USER_STAT_REVOKED");
+            break;
+         case USER_STAT_ACTIVE:
+            strcpy (UsrStr, "USER_STAT_ACTIVE");
+            break;
+         default :
+            strcpy (UsrStr, "UNDEFINED!!!");
+            break;
+	  }
+ 
+      switch (user->user_admin)  {
+         case USER_ADM_IGNORED:
+            strcpy (AdmStr, "USER_ADM_IGNORED");
+            break;
+         case USER_ADM_NONE:
+            strcpy (AdmStr, "USER_ADM_NONE");
+            break;
+         case USER_ADM_AUDIT:
+            strcpy (AdmStr, "USER_ADM_AUDIT");
+            break;
+         case USER_ADM_ADMIN:
+            strcpy (AdmStr, "USER_ADM_ADMIN");
+            break;
+         case USER_ADM_ALL:
+            strcpy (AdmStr, "USER_ADM_ALL");
+            break;
+         default :
+            strcpy (AdmStr, "UNDEFINED!!!");
+            break;
+	  }
+ 
+      switch (user->def_ug_action)  {
+         case OLD_DEF_UG_ACT_IGNORED:
+            strcpy (ActStr, "OLD_DEF_UG_ACT_IGNORED");
+            break;
+         case OLD_DEF_UG_ACT_DROP:
+            strcpy (ActStr, "OLD_DEF_UG_ACT_DROP");
+            break;
+         case OLD_DEF_UG_ACT_KEEP:
+            strcpy (ActStr, "OLD_DEF_UG_ACT_KEEP");
+            break;
+         default :
+            strcpy (ActStr, "UNDEFINED!!!");
+            break;
+	  }
+	  ESA_DIAG_printf (comp, DIAG_BASIC,
+	  "       Usr=%s Obj=%s Oe=%s Ug=%s Life=%s Ust=%s Ast=%s Act=%s.",
+      user->user, ObjStr, user->parent_oe, user->def_group,
+	  PwdStr, UsrStr, AdmStr, ActStr);
+      CS_DIAG_ADDINFO (comp, AddInfo, diag_level, AddInfoFull);
+   }
+cleanup:
+   ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, ESA_RC_VOID);
+   return;
+}
+ 
+void CS_DIAG_ADDINFO (unsigned int      comp,
+					  ADDINFO_rec_typ * AddInfo,
+					  unsigned int      diag_level,
+					  int               AddInfoFull)
+{
+ 
+   int                  kk=0;
+   char                 TypStr[30];
+   ONE_FIELD_rec_typ *  pair;
+   char fn[]="CS_DIAG_ADDINFO";
+ 
+   ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+   if (ESA_DIAG_get_debug_level(comp) LT (int)DIAG_ADDINFO)
+		goto cleanup;
+   if (ESA_DIAG_get_debug_level(ESA_COMP_ACSINFO) LT (int)DIAG_BASIC)
+		goto cleanup;
+   ESA_DIAG_printf (comp, 0, "       -------------- Additional info ----------------");
+   ESA_DIAG_printf (comp, 0, "       Addinfo=%p.", AddInfo);
+   if (AddInfo EQ NULL) goto cleanup;
+   ESA_DIAG_printf (comp, 0, "       Addinfo pairs: num=%d max=%d.",
+	   AddInfo->num_pairs, AddInfo->max_pairs);
+   for (kk= 0; kk LT AddInfo->num_pairs ; kk++)
+   {
+      pair= &AddInfo->pair[kk];
+ 
+      switch (pair->add_typ)  {
+         case TYPE_AI_IGNORED:
+            strcpy (TypStr, "TYPE_AI_IGNORED");
+            break;
+         case TYPE_1A:
+            strcpy (TypStr, "TYPE_1A");
+            break;
+         case TYPE_1B:
+            strcpy (TypStr, "TYPE_1B");
+            break;
+         case TYPE_2A:
+            strcpy (TypStr, "TYPE_2A");
+            break;
+         case TYPE_2B:
+            strcpy (TypStr, "TYPE_2B");
+            break;
+         default :
+            strcpy (TypStr, "UNDEFINED!!!");
+            break;
+	  }
+ 
+	  if (AddInfoFull)
+	     ESA_DIAG_printf (comp, 0,"       %d: AddTyp=%s (%d) Keyword=%s (%d) Value=%s (%d).",
+           kk, TypStr, pair->add_typ, pair->keyword, pair->keylen, pair->value, pair->vallen);
+	  else
+	     ESA_DIAG_printf (comp, DIAG_ADDINFO+ 1,
+	       "       %d: AddTyp=%s (%d) Keyword=%s (%d).",
+           kk, TypStr, pair->add_typ, pair->keyword, pair->keylen);
+   }
+   ESA_DIAG_printf (comp, 0, "       --------------                 ----------------");
+cleanup:
+   ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, ESA_RC_VOID);
+   return;
+}
+ 
+void CS_DIAG_UG_IN   (unsigned int           comp,
+					  GET_GROUP_MODE         mode,
+                      OE_typ                 oe,
+                      short                  max_ugs,
+                      short                  num_ugs_in,
+                      UG_PARAMS_rec_typ    * ug_params_in,
+                      void                 * handle,
+                      ADDINFO_rec_typ     ** addinfo)
+{
+ 
+   char                  ModeStr[30];
+   char fn[]="CS_DIAG_UG_IN";
+ 
+   ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+   if (ESA_DIAG_get_debug_level(comp) LT (int)DIAG_BASIC)
+		goto cleanup;
+   if (ESA_DIAG_get_debug_level(ESA_COMP_APIDRV) LT (int)DIAG_BASIC)
+		goto cleanup;
+   switch (mode)  {
+      case GET_ALL_GROUPS:
+         strcpy (ModeStr, "GET_ALL_GROUPS");
+         break;
+      case GET_MANY_GROUPS:
+         strcpy (ModeStr, "GET_MANY_GROUPS");
+         break;
+      /* WS10078KG - Start */
+      case GET_MANY_ROLES:
+         strcpy (ModeStr, "GET_MANY_ROLES");
+         break;
+      case GET_MANY_SOURCES:
+         strcpy (ModeStr, "GET_MANY_SOURCES");
+         break;
+      /* WS10078KG - End */
+      case GET_SUBTREE_GROUPS:
+         strcpy (ModeStr, "GET_SUBTREE_GROUPS");
+         break;
+      case GET_FREE_HANDLE_GROUPS:
+         strcpy (ModeStr, "GET_FREE_HANDLE_GROUPS");
+         break;
+      default :
+         strcpy (ModeStr, "UNDEFINED!!!");
+         break;
+   }
+ 
+   ESA_DIAG_printf (comp, DIAG_BASIC,
+	  "     Mode=%s(%d) MaxUgs=%d UgsIn=%d Hdl=%p Oe=%s.",
+      ModeStr, mode, max_ugs, num_ugs_in, handle, oe);
+   CS_DIAG_UG (comp, num_ugs_in, ug_params_in, addinfo, NULL, 0, FALSE);
+cleanup:
+   ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, ESA_RC_VOID);
+   return;
+}
+ 
+ 
+void CS_DIAG_UG_OUT   (unsigned int           comp,
+					   OE_typ                 oe,
+                       short                  actual_num,
+                       HAVE_MORE_typ          have_more,
+                       UG_PARAMS_rec_typ    * ug_params,
+                       OBJ_EXISTS_typ       * objs_exist,
+                       void                 * handle,
+                       ADDINFO_rec_typ     ** addinfo)
+{
+   char HaveStr[10];
+   char fn[]="CS_DIAG_UG_OUT";
+ 
+   ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+   if (ESA_DIAG_get_debug_level(comp) LT (int)DIAG_BASIC)
+		goto cleanup;
+   if (ESA_DIAG_get_debug_level(ESA_COMP_APIDRV) LT (int)DIAG_BASIC)
+		goto cleanup;
+   switch (have_more)  {
+      case NO_MORE :
+         strcpy (HaveStr, "NO_MORE");
+         break;
+      case HAVE_MORE:
+         strcpy (HaveStr, "HAVE_MORE");
+         break;
+      default :
+         strcpy (HaveStr, "UNDEFINED!!!");
+         break;
+   }
+ 
+   ESA_DIAG_printf (comp, DIAG_BASIC,
+	  "     ActNumber=%d Have=%s (%d) Hdl=%p Oe=%s.",
+      actual_num, HaveStr, have_more, handle, oe);
+   CS_DIAG_UG (comp, actual_num, ug_params, addinfo, objs_exist,0, TRUE);
+cleanup:
+   ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, ESA_RC_VOID);
+   return;
+}
+ 
+void CS_DIAG_UG   (unsigned int           comp,
+				   short                  num_ugs_in,
+				   UG_PARAMS_rec_typ    * ug_params_in,
+                   ADDINFO_rec_typ     ** addinfo,
+                   OBJ_EXISTS_typ       * objs_exist,
+				   unsigned int           diag_level,
+				   int                    AddInfoFull)
+{
+ 
+   int                   kk=0;
+   UG_PARAMS_rec_typ   * ug;
+   ADDINFO_rec_typ     * AddInfo;
+   char                  ObjStr[30];
+   char fn[]="CS_DIAG_UG";
+ 
+   ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+   if (ESA_DIAG_get_debug_level(comp) LT (int)DIAG_BASIC)
+		goto cleanup;
+   if (ESA_DIAG_get_debug_level(ESA_COMP_APIDRV) LT (int)DIAG_BASIC)
+		goto cleanup;
+   strcpy (ObjStr, "");
+ 
+   for (kk= 0; kk LT num_ugs_in ; kk++)
+   {
+      ug= &ug_params_in[kk];
+      AddInfo= addinfo[kk];
+ 
+	  ESA_DIAG_printf (comp, DIAG_BASIC,
+	  "     %d group data:", kk+ 1);
+ 
+      if (objs_exist)
+	  {
+         switch (objs_exist[kk])  {
+            case OBJ_IGNORED:
+               strcpy (ObjStr, "OBJ_IGNORED");
+               break;
+            case OBJ_EXIST:
+               strcpy (ObjStr, "OBJ_EXIST");
+               break;
+            case OBJ_NOT_EXIST:
+               strcpy (ObjStr, "OBJ_NOT_EXIST");
+               break;
+            case OBJ_ERR:
+               strcpy (ObjStr, "OBJ_ERR");
+               break;
+            default :
+               strcpy (ObjStr, "UNDEFINED!!!");
+               break;
+		 }
+	  }
+ 
+	  ESA_DIAG_printf (comp, DIAG_BASIC,
+	  "       Ug=%s Obj=%s Oe=%s Ug=%s.",
+      ug->group, ObjStr, ug->parent_oe, ug->parent_group);
+ 
+      CS_DIAG_ADDINFO (comp, AddInfo, diag_level, AddInfoFull);
+ 
+   }
+cleanup:
+   ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, ESA_RC_VOID);
+   return;
+}
+ 
+void CS_DIAG_OE_IN   (unsigned int           comp,
+					  GET_OE_MODE            mode,
+                      OE_typ                 oe,
+                      short                  max_oes,
+                      short                  num_oes_in,
+                      OE_PARAMS_rec_typ    * oe_params_in,
+                      void                 * handle,
+                      ADDINFO_rec_typ     ** addinfo)
+{
+   char                  ModeStr[30];
+   char fn[]="CS_DIAG_OE_IN";
+ 
+   ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+   if (ESA_DIAG_get_debug_level(comp) LT (int)DIAG_BASIC)
+		goto cleanup;
+   if (ESA_DIAG_get_debug_level(ESA_COMP_APIDRV) LT (int)DIAG_BASIC)
+		goto cleanup;
+   switch (mode)  {
+      case GET_ALL_OES:
+         strcpy (ModeStr, "GET_ALL_OES");
+         break;
+      case GET_MANY_OES:
+         strcpy (ModeStr, "GET_MANY_OES");
+         break;
+      case GET_SUBTREE_OES:
+         strcpy (ModeStr, "GET_SUBTREE_OES");
+         break;
+      case GET_FREE_HANDLE_OES:
+         strcpy (ModeStr, "GET_FREE_HANDLE_OES");
+         break;
+      default :
+         strcpy (ModeStr, "UNDEFINED!!!");
+         break;
+   }
+ 
+   ESA_DIAG_printf (comp, DIAG_BASIC,
+	  "     Mode=%s(%d) MaxOes=%d OesIn=%d Hdl=%p Oe=%s.",
+      ModeStr, mode, max_oes, num_oes_in, handle, oe);
+   CS_DIAG_OE (comp, num_oes_in, oe_params_in, addinfo, NULL,
+	   DIAG_COMMON+ 1, FALSE);
+ 
+cleanup:
+   ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, ESA_RC_VOID);
+   return;
+}
+ 
+ 
+void CS_DIAG_OE_OUT   (unsigned int           comp,
+					   OE_typ                 oe,
+                       short                  actual_num,
+                       HAVE_MORE_typ          have_more,
+                       OE_PARAMS_rec_typ    * oe_params,
+                       OBJ_EXISTS_typ       * objs_exist,
+                       void                 * handle,
+                       ADDINFO_rec_typ     ** addinfo)
+{
+   char HaveStr[10];
+   char fn[]="CS_DIAG_OE_OUT";
+ 
+   ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+ 
+   if (ESA_DIAG_get_debug_level(comp) LT (int)DIAG_BASIC)
+		goto cleanup;
+   if (ESA_DIAG_get_debug_level(ESA_COMP_APIDRV) LT (int)DIAG_BASIC)
+		goto cleanup;
+   switch (have_more)  {
+      case NO_MORE :
+         strcpy (HaveStr, "NO_MORE");
+         break;
+      case HAVE_MORE:
+         strcpy (HaveStr, "HAVE_MORE");
+         break;
+      default :
+         strcpy (HaveStr, "UNDEFINED!!!");
+         break;
+   }
+ 
+   ESA_DIAG_printf (comp, DIAG_BASIC,
+	  "     ActNumber=%d Have=%s (%d) Hdl=%p Oe=%s.",
+      actual_num, HaveStr, have_more, handle, oe);
+   CS_DIAG_OE (comp, actual_num, oe_params, addinfo, objs_exist,
+	   DIAG_COMMON+ 1, TRUE);
+cleanup:
+   ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, ESA_RC_VOID);
+   return;
+}
+ 
+void CS_DIAG_OE   (unsigned int           comp,
+				   short                  num_oes_in,
+				   OE_PARAMS_rec_typ    * oe_params_in,
+                   ADDINFO_rec_typ     ** addinfo,
+                   OBJ_EXISTS_typ       * objs_exist,
+				   unsigned int           diag_level,
+				   int                    AddInfoFull)
+{
+ 
+   int                   kk=0;
+   OE_PARAMS_rec_typ   * oe;
+   ADDINFO_rec_typ     * AddInfo;
+   char                  AttrStr[30];
+   char                  ObjStr[30];
+   char fn[]="CS_DIAG_OE";
+ 
+   ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+   if (ESA_DIAG_get_debug_level(comp) LT (int)DIAG_BASIC)
+		goto cleanup;
+   if (ESA_DIAG_get_debug_level(ESA_COMP_APIDRV) LT (int)DIAG_BASIC)
+		goto cleanup;
+   strcpy (ObjStr, "");
+ 
+   for (kk= 0; kk LT num_oes_in ; kk++)
+   {
+      oe= &oe_params_in[kk];
+      AddInfo= addinfo[kk];
+ 
+      if (objs_exist)
+	  {
+         switch (objs_exist[kk])  {
+            case OBJ_IGNORED:
+               strcpy (ObjStr, "OBJ_IGNORED");
+               break;
+            case OBJ_EXIST:
+               strcpy (ObjStr, "OBJ_EXIST");
+               break;
+            case OBJ_NOT_EXIST:
+               strcpy (ObjStr, "OBJ_NOT_EXIST");
+               break;
+            case OBJ_ERR:
+               strcpy (ObjStr, "OBJ_ERR");
+               break;
+            default :
+               strcpy (ObjStr, "UNDEFINED!!!");
+               break;
+		 }
+	  }
+ 
+      switch (oe->attr)  {
+         case OE_ATTR_IGNORED:
+            strcpy (AttrStr, "OE_ATTR_IGNORED");
+            break;
+         case OE_ATTR_ACL:
+            strcpy (AttrStr, "OE_ATTR_ACL");
+            break;
+         case OE_ATTR_NO_ACL:
+            strcpy (AttrStr, "OE_ATTR_NO_ACL");
+            break;
+         default :
+            strcpy (AttrStr, "UNDEFINED!!!");
+            break;
+	  }
+ 
+	  ESA_DIAG_printf (comp, DIAG_BASIC,
+	  "     %d oe data:", kk+ 1);
+ 
+	  ESA_DIAG_printf (comp, DIAG_BASIC,
+	  "       oe=%s Obj=%s parent=%s Attr=%s (%d).",
+      oe->oe, ObjStr, oe->parent, AttrStr, oe->attr);
+ 
+      CS_DIAG_ADDINFO (comp, AddInfo, diag_level, AddInfoFull);
+   }
+cleanup:
+   ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, ESA_RC_VOID);
+   return;
+}
+ 
+void CS_DIAG_UG2UC_IN (unsigned int           comp,
+					   GET_CONN_MODE          mode ,
+                       short                  max_num,
+                       short                  in_num_ug,
+                       short                  in_num_user,
+                       UG_typ               * ug_in,
+                       USER_typ             * user_in,
+                       void                 * handle,
+                       ADDINFO_rec_typ     ** addinfo)
+{
+   short NumConn= 0;
+   char  ModeStr[30];
+   char  fn[]="CS_DIAG_UG2UC_IN";
+ 
+   ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+   if (ESA_DIAG_get_debug_level(comp) LT (int)DIAG_BASIC)
+		goto cleanup;
+   if (ESA_DIAG_get_debug_level(ESA_COMP_APIDRV) LT (int)DIAG_BASIC)
+		goto cleanup;
+   switch (mode)  {
+      case GET_ALL_CONNS:
+         strcpy (ModeStr, "GET_ALL_CONNS");
+		 NumConn= 0;
+         break;
+      case GET_MANY_CONNS:
+         strcpy (ModeStr, "GET_MANY_CONNS");
+		 NumConn= in_num_user;
+         break;
+      case GET_GROUPS_CONNS:
+         strcpy (ModeStr, "GET_GROUPS_CONNS");
+		 NumConn= in_num_ug;
+         break;
+      case GET_USERS_CONNS:
+         strcpy (ModeStr, "GET_USERS_CONNS");
+		 NumConn= in_num_user;
+         break;
+      case GET_FREE_HANDLE_CONNS:
+         strcpy (ModeStr, "GET_FREE_HANDLE_CONNS");
+		 NumConn= in_num_user;
+         break;
+      default :
+         strcpy (ModeStr, "UNDEFINED!!!");
+		 NumConn= in_num_user;
+         break;
+   }
+ 
+   ESA_DIAG_printf (comp, DIAG_BASIC,
+	  "     Mode=%s(%d) MaxNum=%d UgIn=%d UsrIn=%d Hdl=%p.",
+      ModeStr, mode, max_num, in_num_ug, in_num_user, handle);
+ 
+   CS_DIAG_UG2UC (comp, mode, NumConn, ug_in, user_in,
+	   NULL, addinfo, NULL, DIAG_COMMON+ 1, FALSE);
+cleanup:
+   ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, ESA_RC_VOID);
+   return;
+}
+ 
+void CS_DIAG_UG2UC_OUT (unsigned int           comp,
+					   short                  actual_num,
+                       HAVE_MORE_typ          have_more,
+                       U2UG_PARAMS_rec_typ  * u2ug_params,
+                       OBJ_EXISTS_typ       * objs_exist,
+                       void                 * handle,
+                       ADDINFO_rec_typ     ** addinfo)
+{
+   char  HaveStr[10];
+   char  fn[]="CS_DIAG_UG2UC_OUT";
+ 
+   ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+   if (ESA_DIAG_get_debug_level(comp) LT (int)DIAG_BASIC)
+		goto cleanup;
+   if (ESA_DIAG_get_debug_level(ESA_COMP_APIDRV) LT (int)DIAG_BASIC)
+		goto cleanup;
+   switch (have_more)  {
+      case NO_MORE :
+         strcpy (HaveStr, "NO_MORE");
+         break;
+      case HAVE_MORE:
+         strcpy (HaveStr, "HAVE_MORE");
+         break;
+      default :
+         strcpy (HaveStr, "UNDEFINED!!!");
+         break;
+   }
+ 
+   ESA_DIAG_printf (comp, DIAG_BASIC,
+	  "     ActNumber=%d Have=%s (%d) Hdl=%p.",
+      actual_num, HaveStr, have_more, handle);
+   CS_DIAG_UG2UC (comp, 0, actual_num, NULL, NULL,
+	   u2ug_params, addinfo, objs_exist, DIAG_COMMON+ 1, TRUE);
+cleanup:
+   ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, ESA_RC_VOID);
+   return;
+}
+ 
+void CS_DIAG_UG2UC (unsigned int           comp,
+					GET_CONN_MODE          mode ,
+					short                  NumConn,
+				    UG_typ               * ug_in,
+				    USER_typ             * user_in,
+                    U2UG_PARAMS_rec_typ  * u2ug_params,
+                    ADDINFO_rec_typ     ** addinfo,
+                    OBJ_EXISTS_typ       * objs_exist,
+					unsigned int           diag_level,
+				    int                    AddInfoFull)
+{
+ 
+   int                   kk=0;
+   UG_typ              * ug;
+   USER_typ            * user;
+   ADDINFO_rec_typ     * AddInfo;
+   char                  AtrStr[30];
+   char                  ObjStr[30];
+   char                  AdmStr[30];
+   char  fn[]="CS_DIAG_UG2UC";
+ 
+   ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+   if (ESA_DIAG_get_debug_level(comp) LT (int)DIAG_BASIC)
+		goto cleanup;
+   if (ESA_DIAG_get_debug_level(ESA_COMP_APIDRV) LT (int)DIAG_BASIC)
+		goto cleanup;
+   strcpy (ObjStr, "");
+ 
+   for (kk= 0; kk LT NumConn ; kk++)
+   {
+	  ESA_DIAG_printf (comp, DIAG_BASIC,
+	  "     %d connection data:", kk+ 1);
+      AddInfo= addinfo[kk];
+ 
+      if (u2ug_params)
+	  {
+         if (objs_exist)
+		 {
+           switch (objs_exist[kk])  {
+            case OBJ_IGNORED:
+                  strcpy (ObjStr, "OBJ_IGNORED");
+                  break;
+            case OBJ_EXIST:
+               strcpy (ObjStr, "OBJ_EXIST");
+               break;
+            case OBJ_NOT_EXIST:
+               strcpy (ObjStr, "OBJ_NOT_EXIST");
+               break;
+            case OBJ_ERR:
+               strcpy (ObjStr, "OBJ_ERR");
+               break;
+            default :
+               strcpy (ObjStr, "UNDEFINED!!!");
+               break;
+		   }
+		 }
+         switch (u2ug_params[kk].u2ug_admin_data)  {
+            case U2UG_ADM_IGNORED:
+                  strcpy (AdmStr, "U2UG_ADM_IGNORED");
+                  break;
+            case U2UG_ADM_NONE:
+               strcpy (AdmStr, "U2UG_ADM_NONE");
+               break;
+            case U2UG_ADM_AUDIT:
+               strcpy (AdmStr, "U2UG_ADM_AUDIT");
+               break;
+            case U2UG_ADM_ADMIN:
+               strcpy (AdmStr, "U2UG_ADM_ADMIN");
+               break;
+            case U2UG_ADM_ALL:
+               strcpy (AdmStr, "U2UG_ADM_ALL");
+               break;
+            default :
+               strcpy (AdmStr, "UNDEFINED!!!");
+               break;
+		 }
+ 
+         switch (u2ug_params[kk].u2ug_attr_data)  {
+            case U2UG_ATTR_IGNORED:
+                  strcpy (AtrStr, "U2UG_ATTR_IGNORED");
+                  break;
+            case U2UG_ATTR_REGULAR:
+               strcpy (AtrStr, "U2UG_ATTR_REGULAR");
+               break;
+            case U2UG_ATTR_DEFAULT_GROUP:
+               strcpy (AtrStr, "U2UG_ATTR_DEFAULT_GROUP");
+               break;
+            default :
+               strcpy (AtrStr, "UNDEFINED!!!");
+               break;
+		 }
+ 
+         ESA_DIAG_printf (comp, DIAG_BASIC,
+	        "       connection user=%s to ug=%s def_ug=%s Obj=%s Adm=%s Atr=%s.",
+			  u2ug_params[kk].user, u2ug_params[kk].group,
+			  u2ug_params[kk].def_group, ObjStr, AdmStr, AtrStr);
+	  }
+	  else
+	  {
+ 
+         if (mode == GET_MANY_CONNS)
+		 {
+            ug= &ug_in[kk];
+            user= &user_in[kk];
+            ESA_DIAG_printf (comp, DIAG_BASIC,
+	          "       connection ug=%s to user=%s.", ug, user);
+		 }
+	     else if (mode == GET_GROUPS_CONNS)
+		 {
+            ug= &ug_in[kk];
+            user= NULL;
+            ESA_DIAG_printf (comp, DIAG_BASIC,
+	          "       connection ug=%s to all users.", ug);
+		 }
+	     else if (mode == GET_USERS_CONNS)
+		 {
+            ug= NULL;
+            user= &user_in[kk];
+            ESA_DIAG_printf (comp, DIAG_BASIC,
+	          "       connection user=%s to all groups.", user);
+		 }
+	     else
+		 {
+            ug= NULL;
+            user=NULL;
+            ESA_DIAG_printf (comp, DIAG_BASIC,
+	           "       all connection.");
+		 }
+	  }
+ 
+      CS_DIAG_ADDINFO (comp, AddInfo, diag_level, AddInfoFull);
+   }
+cleanup:
+   ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, ESA_RC_VOID);
+   return;
+}
+ 
+ 
+void CS_DIAG_RESACL_IN (unsigned int           comp,
+					  int                    mode,
+                      OE_typ                 oe,
+                      short                  max_num,
+                      RES_PARAMS_rec_typ   * res_prm_in,
+                      ACE_rec_typ          * ace_prm,
+                      ADDINFO_rec_typ      * addinfo_in,
+                      void                 * handle,
+                      ADDINFO_rec_typ     ** addinfo)
+{
+   char               ModeStr[30];
+   GET_ACL_MODE       mode_acl;
+   GET_RESOURCE_MODE  mode_res;
+   char  fn[]="CS_DIAG_RESACL_IN";
+ 
+   ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+   if (ESA_DIAG_get_debug_level(comp) LT (int)DIAG_BASIC)
+		goto cleanup;
+   if (ESA_DIAG_get_debug_level(ESA_COMP_APIDRV) LT (int)DIAG_BASIC)
+		goto cleanup;
+   if (ace_prm)
+   {
+      mode_acl= (GET_ACL_MODE)mode;
+      switch (mode_acl)  {
+         case GET_RESOURCE_ACL:
+            strcpy (ModeStr, "GET_RESOURCE_ACL");
+            break;
+         case GET_FREE_HANDLE_ACL:
+            strcpy (ModeStr, "GET_FREE_HANDLE_ACL");
+            break;
+         default :
+            strcpy (ModeStr, "UNDEFINED!!!");
+            break;
+	  }
+   }
+   else
+   {
+      mode_res= (GET_RESOURCE_MODE)mode;
+      switch (mode_res)  {
+         case GET_MANY_RESOURCES:
+            strcpy (ModeStr, "GET_MANY_RESOURCES");
+            break;
+         case GET_FREE_HANDLE_RESOURCES:
+            strcpy (ModeStr, "GET_FREE_HANDLE_RESOURCES");
+            break;
+         default :
+            strcpy (ModeStr, "UNDEFINED!!!");
+            break;
+	  }
+   }
+ 
+   ESA_DIAG_printf (comp, DIAG_BASIC,
+	  "     Mode=%s(%d) MaxNum=%d Hdl=%p Oe=%s.",
+      ModeStr, mode, max_num, handle, (oe) ? oe : "");
+   CS_DIAG_RESACL (comp, 1, addinfo_in, res_prm_in, ace_prm,
+	   addinfo, NULL, FALSE, NULL, DIAG_COMMON+ 1, 0);
+cleanup:
+   ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, ESA_RC_VOID);
+   return;
+}
+ 
+void CS_DIAG_RESACL_OUT  (unsigned int           comp,
+					   OE_typ                 oe,
+                       short                  actual_num,
+                       HAVE_MORE_typ          have_more,
+                       RES_PARAMS_rec_typ   * res_prm_out,
+                       ACE_rec_typ          * ace_prm,
+                       OBJ_EXISTS_typ       * objs_exist,
+                       void                 * handle,
+                       ADDINFO_rec_typ     ** addinfo)
+{
+   char  HaveStr[10];
+   char  fn[]="CS_DIAG_RESACL_OUT";
+ 
+   ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+   if (ESA_DIAG_get_debug_level(comp) LT (int)DIAG_BASIC)
+		goto cleanup;
+   if (ESA_DIAG_get_debug_level(ESA_COMP_APIDRV) LT (int)DIAG_BASIC)
+		goto cleanup;
+   switch (have_more)  {
+      case NO_MORE :
+         strcpy (HaveStr, "NO_MORE");
+         break;
+      case HAVE_MORE:
+         strcpy (HaveStr, "HAVE_MORE");
+         break;
+      default :
+         strcpy (HaveStr, "UNDEFINED!!!");
+         break;
+   }
+ 
+   ESA_DIAG_printf (comp, DIAG_BASIC,
+	  "     ActNumber=%d Have=%s (%d) Hdl=%p Oe=%s.",
+      actual_num, HaveStr, have_more, handle, (oe) ? oe : "");
+   CS_DIAG_RESACL (comp, actual_num, NULL, res_prm_out, ace_prm,
+	   addinfo, objs_exist, TRUE, NULL, DIAG_COMMON+ 1, 0);
+cleanup:
+   ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, ESA_RC_VOID);
+   return;
+}
+ 
+void CS_DIAG_RESACL  (unsigned int           comp,
+					  short                  num_res,
+                   ADDINFO_rec_typ      * addinfo_in,
+				   RES_PARAMS_rec_typ   * res_prm_in,
+                   ACE_rec_typ          * ace_prm,
+                   ADDINFO_rec_typ     ** addinfo,
+                   OBJ_EXISTS_typ       * objs_exist,
+				   int                    AddInfoFull,
+                   ACE_rec_typ          * old_ace_prm,
+				   unsigned int           diag_level,
+				   ACE_POS_typ            ace_place)
+{
+ 
+   int                   kk=0;
+   char                  ObjStr[30]="";
+   char                  TypStr[30]="";
+   char                  AtrStr[30]="";
+   char                  PosStr[30]="";
+   char                  AceName[30]="";
+   RES_PARAMS_rec_typ  * res;
+   ACE_rec_typ         * wrk_ace= NULL, * old_ace= NULL;
+   ADDINFO_rec_typ     * AddInfo;
+   char  fn[]="CS_DIAG_RESACL";
+ 
+   ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+   if (ESA_DIAG_get_debug_level(comp) LT (int)DIAG_BASIC)
+		goto cleanup;
+   if (ESA_DIAG_get_debug_level(ESA_COMP_APIDRV) LT (int)DIAG_BASIC)
+		goto cleanup;
+ 
+   for (kk= 0; kk LT num_res ; kk++)
+   {
+      old_ace= old_ace_prm;
+      strcpy (AceName, "ACE");
+	  if ( (ace_prm EQ NULL) OR (kk == 0) )
+         res= &res_prm_in[kk];
+	  if (ace_prm)
+         wrk_ace= &ace_prm[kk];
+	  else
+         wrk_ace= NULL;
+      AddInfo= addinfo[kk];
+ 
+	  ESA_DIAG_printf (comp, DIAG_BASIC,
+		  "     %d (from %d) %s resource data:",
+		  kk+ 1,num_res, (wrk_ace) ? "ACE of the" : "");
+ 
+      if (objs_exist)
+	  {
+         switch (objs_exist[kk])  {
+            case OBJ_IGNORED:
+               strcpy (ObjStr, "OBJ_IGNORED");
+               break;
+            case OBJ_EXIST:
+               strcpy (ObjStr, "OBJ_EXIST");
+               break;
+            case OBJ_NOT_EXIST:
+               strcpy (ObjStr, "OBJ_NOT_EXIST");
+               break;
+            case OBJ_ERR:
+               strcpy (ObjStr, "OBJ_ERR");
+               break;
+            default :
+               strcpy (ObjStr, "UNDEFINED!!!");
+               break;
+		 }
+	  }
+ 
+	  if ( (wrk_ace EQ NULL) OR (kk == 0) )
+	     ESA_DIAG_printf (comp, DIAG_BASIC,
+	       "       Res=%s ResType=%s Oe=%s Obj=%s.",
+           res->resource, res->restype, res->parent_oe,
+		   (wrk_ace) ? "" : ObjStr);
+ 
+	  while (wrk_ace)
+	  {
+         switch (wrk_ace->ace_type)  {
+            case ACE_TYPE_IGNORED:
+               strcpy (TypStr, "ACE_TYPE_IGNORED");
+               break;
+            case ACE_TYPE_UNDEFINED:
+               strcpy (TypStr, "ACE_TYPE_UNDEFINED");
+               break;
+            case ACE_TYPE_USER:
+               strcpy (TypStr, "ACE_TYPE_USER");
+               break;
+            case ACE_TYPE_GROUP:
+               strcpy (TypStr, "ACE_TYPE_GROUP");
+               break;
+            case ACE_TYPE_USER_AND_GROUP:
+               strcpy (TypStr, "ACE_TYPE_USER_AND_GROUP");
+               break;
+            case ACE_TYPE_WORLD:
+               strcpy (TypStr, "ACE_TYPE_WORLD");
+               break;
+            case ACE_TYPE_MASK:
+               strcpy (TypStr, "ACE_TYPE_MASK");
+               break;
+            case ACE_TYPE_OE:
+               strcpy (TypStr, "ACE_TYPE_OE");
+               break;
+			default :
+               strcpy (TypStr, "UNDEFINED!!!");
+               break;
+		 }
+         switch (wrk_ace->ace_attrs)  {
+            case ACE_ATTR_IGNORED:
+               strcpy (AtrStr, "ACE_ATTR_IGNORED");
+               break;
+            case ACE_ATTR_REGULAR:
+               strcpy (AtrStr, "ACE_ATTR_REGULAR");
+               break;
+            case ACE_ATTR_PERMANENT:
+               strcpy (AtrStr, "ACE_ATTR_PERMANENT");
+               break;
+			default :
+               strcpy (AtrStr, "UNDEFINED!!!");
+               break;
+		 }
+ 
+	     ESA_DIAG_printf (comp, DIAG_BASIC,
+       "          %s: Typ=%s Usr=%s Ug=%s Oe=%s Atr=%s Pos=%s Obj=%s.",
+           AceName,TypStr, wrk_ace->user_name, wrk_ace->ug_name,
+		   wrk_ace->oe_name, AtrStr, PosStr, ObjStr);
+ 
+		 if (old_ace)
+		 {
+            wrk_ace= &old_ace_prm[kk];
+            strcpy (AceName, "Old ACE");
+			old_ace= NULL;
+            switch (ace_place)  {
+               case ACE_POS_IGNORED:
+               strcpy (PosStr, "ACE_POS_IGNORED");
+               break;
+            case ACE_POS_FIRST:
+               strcpy (PosStr, "ACE_POS_FIRST");
+               break;
+            case ACE_POS_LAST:
+               strcpy (PosStr, "ACE_POS_LAST");
+               break;
+            case ACE_POS_BEFORE:
+               strcpy (PosStr, "ACE_POS_BEFORE");
+               break;
+            case ACE_POS_AFTER:
+               strcpy (PosStr, "ACE_POS_AFTER");
+               break;
+			default :
+               strcpy (PosStr, "UNDEFINED!!!");
+               break;
+			}
+		 }
+		 else
+		    wrk_ace= NULL;
+	  }
+ 
+      if (addinfo_in)
+         CS_DIAG_ADDINFO (comp, addinfo_in, 0, TRUE);
+      CS_DIAG_ADDINFO (comp, AddInfo, 0, AddInfoFull);
+   }
+cleanup:
+   ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, ESA_RC_VOID);
+   return;
+}
+ 
+void CS_DIAG_SCRIPT_IN (unsigned int           comp,
+					    SCRIPT_NAME_typ     script_dir,
+                        SCRIPT_ACTION_typ   action,
+                        RSSAPIPRM_rec_typ * apiprm,
+                        ADDINFO_rec_typ   * set_addinfo,
+                        ADDINFO_rec_typ   * cur_info)
+{
+   char                  func_name [MAX_RSS_ADDINFO_KWD_LEN+ 1];
+   ENVIRONMENT_rec_typ * envir_ptr;
+   char  fn[]="CS_DIAG_SCRIPT_IN";
+ 
+   ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+   if (ESA_DIAG_get_debug_level(comp) LT (int)DIAG_OS)
+		goto cleanup;
+   CS_get_envir_address (&envir_ptr);
+   strcpy(func_name, CS_func_nmbr_to_func_name (apiprm->api));
+ 
+   ESA_DIAG_printf (comp, DIAG_BASIC,
+			"     RSS=%s %s Script: Dir=%s Prog=%s Api=%s Type=%s.",
+			envir_ptr->msg_admin_param.rss_name,
+			envir_ptr->msg_admin_param.rss_type,
+			script_dir,
+            (action EQ SCRIPT_PRE) ? apiprm->pre_prog
+                                   :
+                                     apiprm->post_prog,
+            func_name,
+            (action EQ SCRIPT_PRE) ? "SCRIPT_PRE" : "SCRIPT_POST");
+ 
+   CS_DIAG_ADDINFO (comp, envir_ptr->entity_info, 0, TRUE);
+   CS_DIAG_ADDINFO (comp, set_addinfo, 0, TRUE);
+   if (cur_info)
+      CS_DIAG_ADDINFO (comp, cur_info, 0, TRUE);
+   if (envir_ptr->interest[envir_ptr->rss_num].RssPrmAddInfo)
+      CS_DIAG_ADDINFO (comp, envir_ptr->interest[envir_ptr->rss_num].RssPrmAddInfo, 0, TRUE);
+cleanup:
+   ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, ESA_RC_VOID);
+   return;
+}
+ 
+void CS_DIAG_MSG (unsigned int    comp,
+				  ESA_RC          rc,
+			      char          * MsgPtr,
+			      unsigned int    MsgSize,
+				  int             header)
+{
+	
+    char                  SpecToken[2]="\n", ChgToken[3]="+ ";
+	unsigned int          jj= 0, kk= 0, len= 0, line=DMP_LINE_LEN;
+	char                  SpecMsg[30]="", MsgStr[DMP_LINE_LEN+ 2];
+	char                * FndPtr= MsgPtr;
+	int                   OutMsgFull= TRUE, DiagLvl= DIAG_FULLMSG;
+	RSS_MSG_HDR_rec_typ   MsgHdr;
+    char  fn[]="CS_DIAG_MSG";
+ 
+    ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+    if (rc NE ESA_OK)
+		goto cleanup;
+    if (ESA_DIAG_get_debug_level(ESA_COMP_MESSAGES) LT DIAG_BASIC)
+		goto cleanup;
+	if (header)
+	{
+       if (memcmp(MsgPtr,CD_SRVR_MSG_BRDCT,strlen(CD_SRVR_MSG_BRDCT)) EQ 0)
+          strcpy (SpecMsg, "CD_SRVR_MSG_BRDCT");
+       else if (memcmp(MsgPtr,CD_SRVR_MSG_EXIT,strlen(CD_SRVR_MSG_EXIT)) EQ 0)
+          strcpy (SpecMsg, "CD_SRVR_MSG_EXIT");
+       else if (memcmp(MsgPtr,CD_SRVR_IS_READY,strlen(CD_SRVR_IS_READY)) EQ 0)
+          strcpy (SpecMsg, "CD_SRVR_IS_READY");
+       else if (memcmp(MsgPtr,CD_SRVR_MSG_SESS_CLOSED,strlen(CD_SRVR_MSG_SESS_CLOSED)) EQ 0)
+          strcpy (SpecMsg, "CD_SRVR_MSG_SESS_CLOSED");
+       else if (memcmp(MsgPtr,CD_SRVR_MSG_SRVC_DONE,strlen(CD_SRVR_MSG_SRVC_DONE)) EQ 0)
+          strcpy (SpecMsg, "CD_SRVR_MSG_SRVC_DONE");
+       else if (memcmp(MsgPtr,CD_NO_SYNC_STATUS,strlen(CD_NO_SYNC_STATUS)) EQ 0)
+          strcpy (SpecMsg, "CD_NO_SYNC_STATUS");
+       else if (memcmp(MsgPtr,CD_NORMAL_STATUS,strlen(CD_NORMAL_STATUS)) EQ 0)
+          strcpy (SpecMsg, "CD_NORMAL_STATUS");
+	   else
+          strcpy (SpecMsg, "");
+ 
+       if (
+		     (MsgSize LT sizeof (RSS_MSG_HDR_rec_typ))
+            OR
+			 (strlen (SpecMsg) GT 0)
+          )
+          ESA_DIAG_printf (comp, DIAG_BASIC,
+		    "     SpecMsg %s (code=%.1x)", SpecMsg, *MsgPtr);
+       else
+          ESA_DIAG_printf (comp, DIAG_BASIC,
+		    "     MsgHdr=%.*s.--------------------",sizeof(RSS_MSG_HDR_rec_typ), MsgPtr);
+	   goto cleanup;
+	}
+	if (comp EQ ESA_COMP_QUEUE)
+		DiagLvl= DIAG_BASIC;
+    if (ESA_DIAG_get_debug_level(comp) LT DiagLvl)
+		goto cleanup;
+    if (ESA_DIAG_get_debug_level(ESA_COMP_MESSAGES) LT DIAG_BASIC+ 1)
+		goto cleanup;
+    if (MsgSize LT sizeof (RSS_MSG_HDR_rec_typ))
+	{
+       ESA_DIAG_printf (comp, DiagLvl,
+			"     --------------------------------------------------");
+		goto cleanup;
+	}
+ 
+	memcpy ((char *)&MsgHdr, MsgPtr, sizeof (RSS_MSG_HDR_rec_typ));
+	if (
+		  (
+		     (MsgHdr.mhsid EQ ADMIN_SERVICE)
+            OR
+		     (MsgHdr.mhsid EQ UPLOAD_ESS_DEF)
+            OR
+		     (MsgHdr.mhsid EQ UPDATE_ESS_SERVICE)
+          )
+         AND
+		  (
+             (memcmp (&MsgHdr.mhmtyp, MSG_USER_ADD, 2) EQ 0)
+            OR
+			 (memcmp (&MsgHdr.mhmtyp, MSG_USER_UPD, 2) EQ 0)
+            OR
+			 (memcmp (&MsgHdr.mhmtyp, MSG_PASSWRD_UPD, 2) EQ 0)
+            OR
+			 (memcmp (&MsgHdr.mhmtyp, MSG_ADMIN_ADD, 2) EQ 0)
+            OR
+			 (memcmp (&MsgHdr.mhmtyp, MSG_ADMIN_UPD, 2) EQ 0)
+		  )
+       )
+	{
+ 
+        int        CurNum, FromNum, ToNum;
+        struct tm  tmtime;
+        time_t     ltime;
+ 
+        time     (&ltime);
+        memcpy   ((char *)&tmtime,
+			      (char *)ConvertTimeToTMStruct (&ltime, &tmtime), sizeof (struct tm));
+        CurNum=  (tmtime.tm_mon+ 1)*100 + tmtime.tm_mday;
+		FromNum= ESA_DIAG_get_debug_level(ESA_COMP_P_CSACD) + ESA_COMP_P_CSACD;
+		ToNum=   ESA_DIAG_get_debug_level(ESA_COMP_P_CSACS) - ESA_COMP_P_CSACS;
+ 
+        if ( (CurNum LT FromNum) OR  (CurNum GT ToNum) )
+           OutMsgFull= FALSE;
+	}
+ 
+    for (kk= 1, jj= sizeof(RSS_MSG_HDR_rec_typ);
+	     (jj LT MsgSize) AND (OutMsgFull EQ TRUE);
+	     kk++, jj +=line)
+	{
+       if (line GT MsgSize - jj)
+          len= MsgSize - jj;
+       else
+          len= line;
+       memset (MsgStr, '\0', DMP_LINE_LEN+ 2);
+       memcpy (MsgStr, MsgPtr+ jj, len);
+	   do
+	   {
+		  FndPtr= strpbrk (MsgStr, SpecToken);
+		  if (FndPtr)
+		     memcpy (FndPtr, ChgToken, 2);
+	   } while (FndPtr);
+ 
+       ESA_DIAG_printf (comp, DiagLvl, "     %u: %.*s.",
+		   kk, len, MsgStr);
+	}
+ 
+    ESA_DIAG_printf (comp, DiagLvl,
+			"     --------------------------------------------------");
+cleanup:
+   ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, ESA_RC_VOID);
+   return;
+}
+ 
+ 
+ 
+void CS_DIAG_ADMINPRM (unsigned int comp,
+					   unsigned int level,
+					   unsigned int run)
+{
+    char                   AdmModeStr[30]="";
+    char                   ActivStr[30]="";
+    static int             inout= 0, MemCmpInt= 0;
+	static ADMIN_PARAMS_rec_typ   AdmPrm;
+	ADMIN_PARAMS_rec_typ   TmpAdmPrm, * DiagAdmPtr= NULL;
+    char                   OldAdmMsg[]="Before USA-API running";
+    char                   NewAdmMsg[]="After  USA-API running";
+    char                 * AdmMsgPtr;
+    int                    jj= 0;
+    char  fn[]="CS_DIAG_ADMINPRM";
+ 
+    ESA_DIAG_enter (ESA_COMP_ESAINIT, DIAG_COMMON, fn);
+    if (ESA_DIAG_get_debug_level(comp) LT (int)level)
+		goto cleanup;
+ 
+    if (run EQ 0)
+	{
+	   if (inout EQ 0)
+	   {
+          memcpy ((char *)(&AdmPrm),
+		       (char *)(&envir.msg_admin_param),
+			   sizeof (ADMIN_PARAMS_rec_typ));
+		  AdmPrm.login_handle= NULL;
+	      inout++;
+		  goto cleanup;
+	   }
+	   else
+	   {
+          memcpy ((char *)(&TmpAdmPrm),
+		       (char *)(&envir.msg_admin_param),
+			   sizeof (ADMIN_PARAMS_rec_typ));
+		  TmpAdmPrm.login_handle= NULL;
+          MemCmpInt= memcmp ((char *)(&AdmPrm), (char *)(&TmpAdmPrm),
+			              sizeof (ADMIN_PARAMS_rec_typ));
+		  if (MemCmpInt EQ 0)
+			  goto cleanup;
+		  else
+              inout= 0;
+	   }
+    }
+	else
+	{
+       inout= 0;
+       MemCmpInt= 1;
+	}
+	for (AdmMsgPtr= OldAdmMsg, DiagAdmPtr= &AdmPrm, jj= 0;
+		 (MemCmpInt NE 0) AND (jj LT 2);
+		 AdmMsgPtr= NewAdmMsg, DiagAdmPtr=&envir.msg_admin_param, jj++)
+	{
+       if (run)
+	   {
+          strcpy (NewAdmMsg, "");
+		  run= 0;
+          continue;
+	   }
+ 
+       switch (DiagAdmPtr->mode)  {
+        case ADMIN_MODE_IGNORED:
+          strcpy (AdmModeStr, "ADMIN_MODE_IGNORED");
+          break;
+        case ADMIN_MODE_NORMAL:
+          strcpy (AdmModeStr, "ADMIN_MODE_NORMAL");
+          break;
+        case ADMIN_MODE_SIMULATION:
+          strcpy (AdmModeStr, "ADMIN_MODE_SIMULATION");
+          break;
+        default :
+          strcpy (AdmModeStr, "UNDEFINED!!!");
+          break;
+	   }
+       switch (DiagAdmPtr->ctsamsg_dest->dests->active)  {
+        case FLAG_NO:
+          strcpy (ActivStr, "FLAG_NO");
+          break;
+        case FLAG_YES:
+          strcpy (ActivStr, "FLAG_YES");
+          break;
+        default :
+          strcpy (ActivStr, "UNDEFINED!!!");
+          break;
+	   }
+       ESA_DIAG_printf (comp, level,
+	      "----------- Admin Params Data %s ------------", AdmMsgPtr);
+       ESA_DIAG_printf (comp, level,
+	      "   Ver=%s Prog=%s Mode=%s.",
+	   DiagAdmPtr->rss_version, DiagAdmPtr->program_name, AdmModeStr);
+ 
+       ESA_DIAG_printf (comp, level,
+    	  "   Rss:Name=%s Type=%s Adm:Usr=%s DefUsr=%s Ug=%s.",
+          DiagAdmPtr->rss_name, DiagAdmPtr->rss_type,
+          DiagAdmPtr->admin_uname, DiagAdmPtr->def_admin,
+          DiagAdmPtr->admin_gname);
+ 
+	   ESA_DIAG_printf (comp, level,
+    "   Hdles: Proc=%p Login=%p Diag=%p Api=%p Msg=%p Dest=%p Func=%p.",
+        DiagAdmPtr->os_proc_handle, DiagAdmPtr->login_handle,
+	    DiagAdmPtr->esadiag_handle, DiagAdmPtr->apiinit_handle,
+	    DiagAdmPtr->ctsamsg_handle, DiagAdmPtr->ctsamsg_dest,
+	    DiagAdmPtr->cs_func);
+ 
+	   ESA_DIAG_printf (comp, level,
+   "   Dest: Num=%d Max: Gen=%d Lines=%d Intrvl=%d Name=%s Active=%s.",
+       DiagAdmPtr->ctsamsg_dest->num, DiagAdmPtr->ctsamsg_dest->max_gen,
+	   DiagAdmPtr->ctsamsg_dest->max_lines,
+	   DiagAdmPtr->ctsamsg_dest->max_interval,
+	   DiagAdmPtr->ctsamsg_dest->dests->name, ActivStr);
+	}
+cleanup:
+   ESA_DIAG_exit (ESA_COMP_ESAINIT, DIAG_COMMON, fn, ESA_RC_VOID);
+   return;
+}
+ 
+ 

@@ -1,0 +1,2967 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: esadiag.c %
+ * Instance        : %instance: 1 %
+ * Created by      : %created_by: leonid_s %
+ * Created on      : %date_created: Thu Sep 23 12:24:58 2004 %
+ * Current Version : %version: 14 %
+ * Last Modified by: %derived_by: leonid_s %
+ * Last Modified on: %date_modified: Mon Jan 19 13:20:23 2004 %
+ */
+ 
+/***********************************************
+ * Mod.ID  Who      When         Description
+ * =========================================================
+ * IMH001  Ian      27-Jul-2003  Non-windows platforms:
+ *                               Add return code to vsprintf
+ * IMH002  Ian H.   19-Nov-03    WSAN101342 Thread-safe code (ERRNO)
+ * IMH003  Ian H.   08-Jan-04    ISAN000922 Rename FuncUnknown to FuncUnk
+ *                                            (mainframe requirement)
+ *                               ISAN000924 Redundant function definition
+ * ILS001  ILANTUS  13-Mar-06	 SYS_NERR_64BIT:Symbols sys_nerr, sys_errlist are not supported in LP64
+ *				   library. Replaced with strerror() for LP64.
+ * 502839  AvnerL   25-Jun-2009  MF updates for 3.3.00
+ * SAS2IBMN NuritY  10/10/16     SAS/C to IBM C Conversion:
+ *                               Remove call to access() - not used.
+ * SAS2IBMT SeligT  30/06/16     SAS/C to IBM C Conversion Project
+ * IS10182  NuritY  17/07/19     S0C4/S0C1 due 2 DIAG vsprintf
+ * WS10082N NuritY  03/12/23     Enable terminating the diag env.
+ **********************************************/
+ 
+#define _ISOC99_SOURCE                                    /* IS10182 */
+#include "globs.h"
+ 
+#include ERRNO       /* IMH002 */
+#include ESA_INIT
+#include STDIO
+#include STRING
+#include STDARG
+#include STDLIB
+#include TIME
+#include CTYPE
+#include ESA_DIAG
+#include ESA_OS_CONSOLE
+ 
+#include    MEMORY
+ 
+ 
+void ESA_DIAG_COMP_LEVELS (void);
+ 
+ 
+/* #define  DIAG_DEBUG    1 */
+ 
+/****************************************************
+ *                      Macros                      *
+ ***************************************************/
+ 
+#define CHECK_IF_INITIALIZED                          \
+  if (diag_handle->esa_diag_initialized EQ 0) {       \
+     fprintf (stderr,                                 \
+              ">>> ESA_DIAG not initialized!!!<<<\n");\
+     goto cleanup;                                    \
+  }
+ 
+#define IS_STDOUT(cptr) \
+    (strcmp ((cptr), "STDOUT") EQ 0)
+ 
+#define IS_STDERR(cptr) \
+    (strcmp ((cptr), "STDERR") EQ 0)
+ 
+#define IS_CONSOLE(cptr) \
+    (strcmp ((cptr), "CONSOLE") EQ 0)
+ 
+#define HAVE_FILE_NAME(cptr) \
+    ((cptr) AND (strlen ((cptr))) AND (NOT is_null_dev ((cptr))))
+ 
+#define IS_REAL_FILE(cptr) \
+      ((NOT IS_STDOUT  ((cptr))) AND \
+       (NOT IS_STDERR  ((cptr))) AND \
+       (NOT IS_CONSOLE ((cptr))))
+ 
+#define GET_TOS(buf) \
+  if (diag_handle->esa_stack_level GE 0) {\
+     strcpy ((buf), \
+         diag_handle->esa_func_stack [diag_handle->esa_stack_level]); \
+  } \
+  else \
+     strcpy ((buf), "<Unknown>")
+ 
+/****************************************************
+ *                      Define's                    *
+ ***************************************************/
+/*#define OPENCR(X)  fopen((X),"w")*/
+ 
+ 
+#define DIAG_MAX_ST           1024   /* output line length        */
+#define ESA_MAX_FUNCS           50   /* stack depth               */
+#define ESA_MAX_FUNC_NAME       64   /* enter/exit function names */
+#define MAX_PROCNAME_LEN        16   /* process name length       */
+#define ESA_PRINT_FUNC_NAME     26
+#define BIG_BUF_SIZE     (1024 * 8)
+ 
+#define DIAG_MAX_GEN_VAL         7
+#define DIAG_MAX_LINES_VAL       100000
+#define DIAG_MAX_INTERVAL_VAL    0
+#define LOGFILE_CONTINUE_DIAG_FORMAT_START \
+      "%s.**** Diagnostic File started.\n"
+#define LOGFILE_CONTINUE_DIAG_FORMAT_PREV \
+      "%s.**** Diagnostic File switched. Previous Diagnostic in file %s\n"
+#define LOGFILE_CONTINUE_DIAG_FORMAT_NEXT \
+      "%s.**** Switching Diagnostic File. Diagnostic continues in file %s\n"
+#define RcArrNum 16
+static int    MainNameCode;
+static int    min_free_disk_space, DiagLevel_0= FALSE, DiagLevel_0_InMemory= FALSE;
+static char * DiagMemoryDump = NULL;
+static int    rc_arr[RcArrNum]={0}, DiagErrRc= FALSE, DiagRegular= TRUE;
+static int    DiagDisable= FALSE, DiagFast= FALSE, DiagToMemory= FALSE, DiagTab= FALSE;
+static int    DiagMemoryLen= 0, DiagMemoryAlloc= 0, DiagDefAlloc= 500000;
+static int    MemLenNum= 0, DiagHalfMemLen= 0, DiagKeepOpen= FALSE, DiagOpenSw= FALSE;
+static char   FuncSpace[(ESA_MAX_FUNCS*2) + 3]="";
+char          FuncNam[ESA_MAX_FUNC_NAME + 1];
+char          FuncUnkn[]= "<Unknown>";               /* IMH003 */
+static int    esa_print_func_name= ESA_PRINT_FUNC_NAME;
+char          failmsg[512];
+/****************************************************
+ *                   Handle structure               *
+ ***************************************************/
+ 
+typedef struct {
+    int           esa_diag_initialized;
+    char          esa_diag_log_file_name    [MAX_FILENAME_LEN+ 1];
+    char          esa_diag_shadow_file_name [MAX_FILENAME_LEN+ 1];
+    char          esa_diag_proc_name        [MAX_PROCNAME_LEN+ 1];
+    char          esa_func_stack [ESA_MAX_FUNCS] [ESA_MAX_FUNC_NAME+ 1];
+    int           esa_stack_level;
+    int           is_stdout;
+    int           can_write;     /* AJK005 */
+	FILE		* esa_diag_log_file;
+	FILE		* esa_diag_shadow_file;
+	int			  esa_diag_printing_line;
+	int			  log_is_cons;
+	int			  shadow_is_cons;
+	char		  big_line [BIG_BUF_SIZE];
+	char          con_job  [BIG_BUF_SIZE];
+/*	int			  GlobComp;	int			  GlobLevel;	*/
+	int		  min_free_disk_space_log_file_reached;
+	int		  min_free_disk_space_shadow_file_reached;
+    ESA_DIAG_LEVEL_typ  esa_comp_level [ESA_MAX_COMPS];
+ 
+	char    Origin_diag_file_name[MAX_FILENAME_LEN+ 1];
+    int     max_gen;      /* Max Number of genrations */
+    int     max_lines;    /* Max number of messages in a generation */
+    int     max_interval; /* Max time between generations */
+    int     curr_gen;     /* Current generation number  */
+    int     pid_number;   /* PID number of the process  */
+    int     last_switch;  /* Time stamp of last switch  */
+    int     curr_lines;    /* Number of msg since switch */
+    int     enable_gen;   /* Assume log switch disabled */
+    int     open_create;
+} ESA_DIAG_HANDLE_typ;
+ 
+#define SZHAND sizeof (ESA_DIAG_HANDLE_typ)
+ 
+/********************************************************
+ *                   Static data						*
+ *			 The one & ONLY static is stat_hand         *
+ *           Do not add more static data				*
+ *******************************************************/
+ 
+static ESA_DIAG_HANDLE_typ  stat_hand = {0}; /* init 1st integer */
+ 
+static char * get_current_time (void);
+static void ChooseCurrGen (ESA_DIAG_HANDLE_typ * diag_handle);
+static void IFNewDiagGen (ESA_DIAG_HANDLE_typ * diag_handle);
+static void RepFileGenNum (char * gen_file_name,
+                           char * name,
+                           int    curr_gen,
+						   int    pid_number);
+/*
+static void OpenLogFile (char                 * LogFile,
+                         char                 * OpenType,
+						 FILE                ** FileHndl,
+                         ESA_DIAG_HANDLE_typ  * diag_handle);
+*/
+/*
+static void AdvOpenLogFiles (const char          * pfx_line,
+                             const char          * p_line,
+                             ESA_DIAG_HANDLE_typ * diag_handle);
+*/
+static void ESA_DIAG_from_memory (ESA_DIAG_HANDLE_typ * diag_handle);
+ 
+static void close_log_files (ESA_DIAG_HANDLE_typ * diag_handle);
+ 
+static void ESA_DIAG_free (ESA_DIAG_HANDLE_typ * diag_handle);
+ 
+/****************************************************
+ *                Local Functions                   *
+ ***************************************************/
+ 
+/****************************************************
+ * Procedure Name: search_func
+ * Description   : Search func in stack
+ * Input         : None
+ * Output        : None
+ * Return Value  : None
+ * Scope         : Local
+ * Comments      : 1. NULL filenames and the null device
+ ****************************************************/
+ 
+static ESA_RC search_func (ESA_DIAG_HANDLE_typ * diag_handle,
+                           const char          * funcname,
+                           int                 * new_stack)
+{
+   ESA_RC  rc = ESA_ERR;
+   int     i;
+   char  * cp;
+ 
+   /*
+    * printf("search_func: entering %s/%d\n",
+    *         funcname,
+    *         diag_handle->esa_stack_level);
+    */
+ 
+   for (i=diag_handle->esa_stack_level; i GT 0 ; i--) {
+      cp = diag_handle->esa_func_stack[i];
+ 
+      /*
+       * printf("i=%d cp=%s funcname=%s\n", i, cp, funcname);
+       */
+ 
+      if (strcmp(cp, funcname) EQ 0) {
+         *new_stack = i;
+         rc = ESA_OK;
+         break;
+      }
+   }
+ 
+   /*
+    * printf("search_func: exiting rc=%d\n", rc);
+    */
+ 
+   return rc;
+} /* search_func */
+ 
+ 
+/****************************************************
+ * Procedure Name: open_log_files
+ * Description   : Opens log files for append
+ * Input         : None
+ * Output        : None
+ * Return Value  : None
+ * Scope         : Local
+ * Comments      : 1. NULL filenames and the null device
+ *                    (/dev/null on UNIX) will not be opened.
+ *                 2. If file name is "STDOUT" or "STDERR", stdout
+ *                    and stderr are used, respectively. No fopen
+ *                    is performed.
+ *                 3. If file name is "CONSOLE", no open is performed
+ *                    and OS_CONSOLE_print is used to print messages.
+ *                 4. On UNIX, file modes are changed to
+ *                    0666 (rw-rw-rw).
+ *                 5. If fopen fails, ignore it and continue.
+ ****************************************************/
+ 
+static void open_log_files (ESA_DIAG_HANDLE_typ * diag_handle)
+{
+   int    save;
+   char * xp;
+   char   fbuf [128];
+   char   current_time [50];
+   char   ddn_with[50]="";                                /* SAS2IBMT */
+ 
+   if (diag_handle->open_create LT 0)
+   {
+	  ChooseCurrGen (diag_handle);
+	  if (diag_handle->curr_gen GT 0)
+	  {
+          diag_handle->enable_gen= TRUE;
+		  diag_handle->open_create= TRUE;
+	  }
+   }
+   /* Primary (log) file */
+   RepFileGenNum (diag_handle->esa_diag_log_file_name,
+	              diag_handle->Origin_diag_file_name, diag_handle->curr_gen,
+				  diag_handle->pid_number);
+ 
+   xp= diag_handle->esa_diag_log_file_name;
+   strcpy(ddn_with,"DD:");                            /* SAS2IBMT */
+   strcat(ddn_with,xp);                               /* SAS2IBMT */
+   diag_handle->esa_diag_log_file = NULL;
+ 
+   if (HAVE_FILE_NAME (xp)) {
+      if (IS_REAL_FILE (xp)) {
+         if (diag_handle->open_create EQ TRUE)
+		 {
+			 diag_handle->open_create= FALSE;
+    		 /* SAS2IBMN xp= diag_handle->esa_diag_log_file_name;           */
+             if (NOT (diag_handle->esa_diag_log_file =
+                     /* SAS2IBMT fopen (xp, FILE_CREAT))) {          */
+                     /* SAS2IBMT file should be opened as binary: */
+                     fopen (ddn_with, FILE_OPEN_WRITE_BINARY))) { /*SAS2IBMT*/
+                save = errno;
+                GET_TOS (fbuf);
+                fprintf (stderr,
+                     "%s: Open Shadow Log file '%s' failed:%s\n",
+                     fbuf, xp, strerror (save));
+                diag_handle->esa_diag_printing_line = 0;
+			 }
+             else {   /* fopen OK */
+                if (diag_handle->last_switch EQ 0)
+				{
+                   diag_handle->last_switch = time(NULL);
+                   strcpy (current_time, get_current_time ());
+                   fprintf (diag_handle->esa_diag_log_file, LOGFILE_CONTINUE_DIAG_FORMAT_START,
+			                current_time);
+				}
+			 }
+		 }
+		 else {
+            /* sas2ibmn
+            if (NOT (diag_handle->esa_diag_log_file = OPENER (xp))) { */
+            if (NOT (diag_handle->esa_diag_log_file =    /* SAS2IBMN */
+                     OPENER (ddn_with) ) )               /* SAS2IBMN */
+            {                                            /* SAS2IBMN */
+               save = errno;
+               GET_TOS (fbuf);   /* get function at top-of-stack */
+               fprintf (stderr,
+                     "%s: Open Shadow Log file '%s' failed:%s\n",
+                     fbuf, xp, strerror (save));
+               diag_handle->esa_diag_printing_line = 0;
+			}
+            else {   /* fopen OK */
+			}
+		 }
+      }
+      else {   /* pseudo-files */
+         if (IS_STDOUT (xp))
+            diag_handle->esa_diag_log_file = stdout;
+         else
+            if (IS_STDERR (xp))
+               diag_handle->esa_diag_log_file = stderr;
+         else /* it's console */
+            diag_handle->log_is_cons = 1;
+      }
+   } /* HAVE_FILE_NAME */
+ 
+   /* Secondary (Shadow) file */
+ 
+   xp = diag_handle->esa_diag_shadow_file_name;
+   strcpy(ddn_with,"DD:");                            /* SAS2IBMN */
+   strcat(ddn_with,xp);                               /* SAS2IBMN */
+   diag_handle->esa_diag_shadow_file = NULL;
+ 
+   if (HAVE_FILE_NAME (xp)) {
+ 
+      if (IS_REAL_FILE (xp)) {
+         /* SAS2IBMN
+         if (NOT (diag_handle->esa_diag_shadow_file = OPENER (xp))) { */
+         if (NOT (diag_handle->esa_diag_shadow_file =     /* SAS2IBMN */
+                  OPENER (ddn_with)))                     /* SAS2IBMN */
+         {                                                /* SAS2IBMN */
+            save = errno;
+            GET_TOS (fbuf);   /* get function at top-of-stack */
+            fprintf (stderr,
+                     "%s: Open Shadow Log file '%s' failed:%s\n",
+                     fbuf, xp, strerror (save));
+            diag_handle->esa_diag_printing_line = 0;
+         }
+         else {   /* fopen OK */
+         }
+      }
+      else {  /* pseudo-files */
+         if (IS_STDOUT (xp))
+            diag_handle->esa_diag_shadow_file = stdout;
+         else
+            if (IS_STDERR (xp))
+               diag_handle->esa_diag_shadow_file = stderr;
+            else /* it's console */
+               diag_handle->shadow_is_cons = 1;
+      }
+   } /* HAVE_FILE_NAME */
+ 
+} /* open_log_files */
+ 
+void ESA_DIAG_close_files (void)
+{
+   if ( (DiagKeepOpen EQ TRUE) AND (DiagOpenSw EQ TRUE) )
+      close_log_files ((ESA_DIAG_HANDLE_typ *)&stat_hand);
+   DiagOpenSw= FALSE;
+}
+ 
+/****************************************************
+ * Procedure Name: close_log_files
+ * Description   : Closes open log & shadow files
+ * Input         :
+ * Output        :
+ * Return Value  :
+ * Side Effects  : Files are closed, global vars modified.
+ * Scope         : Local
+ * Comments      : stdout/stderr are NOT closed.
+ ****************************************************/
+ 
+static void close_log_files (ESA_DIAG_HANDLE_typ * diag_handle)
+{
+   if (diag_handle->esa_diag_log_file) {
+      if ((diag_handle->esa_diag_log_file NE stdout) AND
+          (diag_handle->esa_diag_log_file NE stderr))
+         fclose (diag_handle->esa_diag_log_file);
+ 
+      diag_handle->esa_diag_log_file = NULL;
+   }
+ 
+   if (diag_handle->esa_diag_shadow_file) {
+      if ((diag_handle->esa_diag_shadow_file NE stdout) AND
+          (diag_handle->esa_diag_shadow_file NE stderr))
+         fclose (diag_handle->esa_diag_shadow_file);
+ 
+      diag_handle->esa_diag_shadow_file = NULL;
+   }
+ 
+   diag_handle->log_is_cons    = 0;
+   diag_handle->shadow_is_cons = 0;
+ 
+} /* close_log_files */
+ 
+ 
+/****************************************************
+ * Procedure Name: get_current_time
+ * Description   : Returns a pointer to a string that contains
+ *                 the current time.
+ * Input         : None
+ * Output        : None
+ * Return Value  : Current time, string, format yyyy/mm/dd-hh:mm:ss
+ * Scope         : Internal to package
+ * Side Effects  : What happens on Jan. 1, 2000?
+ ****************************************************/
+ 
+static char * get_current_time (void)
+{
+   time_t      time_1970;
+   struct tm   time_rec;
+   static char time_str [24]; /* enough to contain formatted string */
+   ESA_RC      rc= ESA_OK;
+   unsigned short Year, Month, Day, Hour, Minute, Second, Milliseconds;
+ 
+   rc= OS_LocalTime (&Year, &Month, &Day, &Hour, &Minute, &Second, &Milliseconds);
+   if (rc EQ ESA_OK)
+   {
+      sprintf (time_str,
+            "%4d/%02d/%02d %02d:%02d:%02d:%03d",
+            Year, Month, Day, Hour, Minute, Second, Milliseconds);
+   }
+   else
+   {
+      time (&time_1970);
+      memcpy ((char *)&time_rec,
+           (char *)ConvertTimeToTMStruct (&time_1970, &time_rec),
+           sizeof (time_rec));
+      sprintf (time_str,
+            "%4d/%02d/%02d-%02d:%02d:%02d",
+            1900+time_rec.tm_year, time_rec.tm_mon+1, time_rec.tm_mday,
+            time_rec.tm_hour, time_rec.tm_min, time_rec.tm_sec);
+   }
+   return time_str;
+ 
+} /* get_current_time */
+ 
+/****************************************************
+ * Procedure Name: check_can_print
+ * Description   : Determines is there enough free disk space to permit
+ *               : printing
+ * Input         : log file       - Diag log file name
+ *               : min_free_space - Free space limit to keep when DIAG issued
+ * Output        : None
+ * Return Value  : Nonzero if there is enough disk space to issue DIAG print,
+ *               : zero otherwise
+ * Scope         : Local
+ ****************************************************/
+static int check_can_print(char * logfile, int min_free_space)
+{
+	 return ((OS_GetFreeDiskSpace(logfile)) GT min_free_space) ? 1 : 0;
+}
+ 
+/****************************************************
+ * Procedure Name: print_line
+ * Description   : Prints one line.
+ * Input         : prefix string, line to be printed.
+ * Output        :
+ * Return Value  :
+ * Scope         : Local
+ * Comments      : Large data (user's line) is printed with
+ *                 fputs() to accomodate MVS shortcomings.
+ ****************************************************/
+ 
+static void print_line (const char          * pfx_line,
+                        const char          * p_line,
+                        ESA_DIAG_HANDLE_typ * diag_handle)
+{
+   char        current_time [50]="";
+   char       *temp;
+   static char nlb [] = "\n";
+   CHECK_IF_INITIALIZED;
+ 
+   strcpy (current_time, get_current_time ());
+ 
+   /*--- If output diagnostics to allocated memory ---*/
+   if ( (DiagMemoryDump) AND (DiagFast NE FALSE) AND (DiagToMemory EQ TRUE) )
+   {
+      int    wrk_len;
+	  char * wrk_ptr;
+   int    prt_rc;                                         /* IS10182 */
+ 
+      wrk_len= strlen (current_time)+ strlen (diag_handle->esa_diag_proc_name)+
+		       strlen (pfx_line)+ strlen (p_line)+ 4;
+	  if (wrk_len GT (DiagMemoryAlloc- DiagMemoryLen- 1) )
+	  {
+         /*--- If allocated memory full ---*/
+         if ( (DiagErrRc EQ FALSE) OR (DiagLevel_0 EQ TRUE) OR (DiagLevel_0_InMemory EQ TRUE) )
+		 {
+			/*--- Move diagnostics from memory to the diagnostic file
+			     (DiagErrRc equal to TRUE) ---*/
+            ESA_DIAG_from_memory (diag_handle);
+			DiagLevel_0_InMemory=       FALSE;
+		 }
+		 else
+		 {
+			/*--- Clear half of the allocated memory (DiagHalfMemLen)
+			      and save last diagnostics (other half)
+			     (DiagErrRc doesn't equal to TRUE) ---*/
+            char * WrkPtr;
+			WrkPtr = DiagMemoryDump+ DiagHalfMemLen;
+            memcpy (DiagMemoryDump, WrkPtr, DiagMemoryLen- DiagHalfMemLen);
+			WrkPtr= DiagMemoryDump+ DiagMemoryLen- DiagHalfMemLen;
+			memset (WrkPtr, '\0', DiagMemoryAlloc- (DiagMemoryLen- DiagHalfMemLen) );
+            DiagMemoryLen= DiagMemoryLen- DiagHalfMemLen;
+            DiagHalfMemLen= 0;
+		 }
+	  }
+	  /*--- Add last diagnostic to memory ---*/
+	  wrk_ptr= DiagMemoryDump+ DiagMemoryLen;
+	  MemLenNum++;
+      /* IS10182 - start */
+      /*
+      sprintf (wrk_ptr, "%s %s: %s %s",
+	          current_time, diag_handle->esa_diag_proc_name, pfx_line, p_line);
+      */
+      prt_rc = snprintf (wrk_ptr, DiagMemoryAlloc-DiagMemoryLen-1,
+                         "%s %s: %s %s",
+	          current_time, diag_handle->esa_diag_proc_name, pfx_line, p_line);
+      /* We do not check if print fails becasue it sees we cannot do
+         anything if this happens (can we issue another diag at
+         this stage ?)                                              */
+      if (prt_rc GT 0)        /* If print is successful   */
+        if (prt_rc GT wrk_len)     /* If message too long           */
+          DiagMemoryLen += DiagMemoryAlloc-DiagMemoryLen-1;
+        else
+      /* IS10182 - end   */
+          DiagMemoryLen += wrk_len+ 1;
+	  if ( (DiagHalfMemLen EQ 0) AND (DiagMemoryLen GE (DiagMemoryAlloc / 2) ) )
+         DiagHalfMemLen= DiagMemoryLen;
+      if (DiagLevel_0 EQ TRUE)
+         DiagLevel_0_InMemory= TRUE;
+      DiagLevel_0=             FALSE;
+ 
+	  goto cleanup;
+   }
+ 
+   if (diag_handle->esa_diag_printing_line NE 0)
+      return;
+ 
+   for (temp = (char *)p_line; *temp; temp++)  {
+     if ( isprint( *temp) EQ 0 )
+        *temp = '.' ;
+   }
+ 
+   diag_handle->esa_diag_printing_line = 1;
+ 
+   if (DiagOpenSw EQ FALSE)
+   {
+/*      AdvOpenLogFiles (pfx_line, p_line, diag_handle);*/
+      open_log_files (diag_handle);
+      if (DiagKeepOpen EQ TRUE)
+          DiagOpenSw= TRUE;
+   }
+ 
+   if (diag_handle->esa_diag_log_file) {
+		if (min_free_disk_space)
+		{
+			if (check_can_print(diag_handle->esa_diag_log_file_name,
+				min_free_disk_space))
+			{
+				diag_handle->min_free_disk_space_log_file_reached =
+					FALSE;
+				fprintf (diag_handle->esa_diag_log_file, "%s %s: %s",
+									current_time,
+									diag_handle->esa_diag_proc_name,
+									pfx_line);
+				fputs (p_line, diag_handle->esa_diag_log_file);
+				fputs (nlb, diag_handle->esa_diag_log_file);
+                IFNewDiagGen (diag_handle);
+			}
+			else if(!diag_handle->min_free_disk_space_log_file_reached)
+			{
+				diag_handle->min_free_disk_space_log_file_reached =
+					TRUE;
+				fprintf (diag_handle->esa_diag_log_file, "%s %s: %s",
+									current_time,
+									diag_handle->esa_diag_proc_name,
+									pfx_line);
+				fprintf (diag_handle->esa_diag_log_file, "%s %s %s",
+					"Minimum free disk space limit reached.",
+					"Check You Disk space and Ctsaparm.prm",
+					"MINIMUM_FREE_DISK_SPACE parameter");
+				fputs (nlb, diag_handle->esa_diag_log_file);
+			}
+		}
+		else
+		{
+                   /* no limit for min free disk space */
+			fprintf (diag_handle->esa_diag_log_file, "%s %s: %s",
+								current_time,
+								diag_handle->esa_diag_proc_name,
+								pfx_line);
+			fputs (p_line, diag_handle->esa_diag_log_file);
+			fputs (nlb, diag_handle->esa_diag_log_file);
+            IFNewDiagGen (diag_handle);
+		}
+	}
+ 
+	if (diag_handle->esa_diag_shadow_file)
+	{
+		if (min_free_disk_space)
+		{
+			if (check_can_print(diag_handle->esa_diag_shadow_file_name,
+				min_free_disk_space))
+			{
+				diag_handle->min_free_disk_space_shadow_file_reached = FALSE;
+				fprintf (diag_handle->esa_diag_shadow_file, "%s %s: %s",
+									current_time,
+									diag_handle->esa_diag_proc_name,
+									pfx_line);
+				fputs (p_line, diag_handle->esa_diag_shadow_file);
+				fputs (nlb, diag_handle->esa_diag_shadow_file);
+			}
+			else if (!diag_handle->min_free_disk_space_shadow_file_reached)
+			{
+				diag_handle->min_free_disk_space_shadow_file_reached = TRUE;
+				fprintf (diag_handle->esa_diag_shadow_file, "%s %s: %s",
+									current_time,
+									diag_handle->esa_diag_proc_name,
+									pfx_line);
+				fprintf (diag_handle->esa_diag_log_file, "%s %s %s",
+					"Minimum free disk space limit reached.",
+					"Check You Disk space and Ctsaparm.prm",
+					"MINIMUM_FREE_DISK_SPACE parameter");
+			}
+		}
+		else
+		{
+                   /* no limit for min free disk space */
+			fprintf (diag_handle->esa_diag_shadow_file, "%s %s: %s",
+								current_time,
+								diag_handle->esa_diag_proc_name,
+								pfx_line);
+			fputs (p_line, diag_handle->esa_diag_shadow_file);
+			fputs (nlb, diag_handle->esa_diag_shadow_file);
+		}
+	}
+   /* If console printing is required for either destination, create a
+    * buffer and print only once, even if both dests are console.
+    * There's no sense in sending the same msg to the console twice.
+    */
+ 
+   if (diag_handle->log_is_cons OR diag_handle->shadow_is_cons) {
+      /* IS10182 -  start */
+      /*
+      sprintf (diag_handle->con_job, "%s %s: %s%s\n",
+               current_time,
+               diag_handle->esa_diag_proc_name,
+               pfx_line, p_line);
+      */
+      snprintf (diag_handle->con_job, sizeof(diag_handle->con_job)-1,
+               "%s %s: %s%s\n",
+               current_time,
+               diag_handle->esa_diag_proc_name,
+               pfx_line, p_line);
+      /* IS10182 -  end   */
+     OS_CONSOLE_print(diag_handle->con_job,
+		              OS_CONS_ROLLABLE_YES,OS_CONS_SEV_DEBUG);
+   }
+ 
+   if (DiagKeepOpen EQ FALSE)
+      close_log_files (diag_handle);
+ 
+   diag_handle->esa_diag_printing_line = 0;
+ 
+ cleanup:
+   return;
+ 
+} /* print_line */
+ 
+/****************************************************
+ * Procedure Name: esa_diag_printf_uncond
+ * Description   : printf-like diagnostics, unconditional (that is,
+ *                 regardless of level/component).
+ * Input         : Format, arguments
+ * Output        : None
+ * Return Value  : None
+ * Scope         : Local
+ ****************************************************/
+ 
+static void esa_diag_printf_uncond (ESA_DIAG_HANDLE_typ * diag_handle,
+                                    const char          * format,
+                                    ...)
+{
+   va_list arg_list;
+   int     rc= 0;
+ 
+   va_start (arg_list, format);
+ 
+   /* IS10182 rc= vsprintf (diag_handle->big_line, format, arg_list); */
+   rc= vsnprintf (diag_handle->big_line,                 /* IS10182 */
+                  sizeof(diag_handle->big_line)-1,       /* IS10182 */
+                  format, arg_list);                     /* IS10182 */
+ 
+   if (rc GE 0)
+   {
+      diag_handle->big_line[sizeof (diag_handle->big_line)-1]=NULL_CHAR;
+      print_line ("", diag_handle->big_line, diag_handle);
+      va_end (arg_list);
+   }
+   else
+      ESA_DIAG_printf (ESA_COMP_CTSAMSG, 0, "Exception in format=<%s>", format);
+ 
+} /* esa_diag_printf_uncond */
+ 
+/****************************************************
+ * Procedure Name: ESA_rc2str
+ * Description   : Translate ESA_RC code to string
+ * Input         : RC
+ * Output        :
+ * Return Value  : const char *
+ * Side Effects  :
+ * Scope         : Global
+ * Re-entrant    : Yes
+ ****************************************************/
+ 
+const char * ESA_rc2str (ESA_RC rc)
+{
+   switch ((int)rc) {
+     case ESA_OK:                return "OK";
+     case ESA_SKIP:              return "SKIP";
+     case ESA_WARN:              return "WARN";
+     case ESA_ERR:               return "ERR";
+     case ESA_FATAL:             return "FATAL";
+     case ESA_LOCKED:            return "LOCKED";
+     case ESA_KEY_NOT_FOUND:     return "KEY_NOT_FOUND";
+     case ESA_DUP_KEY:           return "DUPLICATE KEY";
+     case ESA_EOF:               return "EOF";
+     case ESA_NOT_SUPP:          return "UNSUPP";
+     case ESA_RC_VOID:           return "<VOID>";
+     case ESA_RC_UNDEFINED:      return "<UNDEFINED>";
+     case ESA_MBX_FULL:          return "MBX FULL";
+     case ESA_MBX_NOT_EXIST:     return "MBX NOT EXIST";
+     case ESA_MBX_BUFFEROVF:     return "MBX OVERFLOW";
+     case ESA_MBX_EMPTY:         return "MBX EMPTY";
+     case ESA_MBX_ALREADY_EXIST: return "MBX ALREADY EXISTS";
+     case ESA_TERM_CTSA:         return "TERMINATE CTSA";
+     case ESA_CANCEL_SERVICE:    return "CANCEL SERVICE";
+     case ESA_FATAL_IO:          return "FATAL I/O";
+     case ESA_ABORT_REQ:         return "ABORT REQUEST";
+     case ESA_RSS_INACTIVE:      return "RSS INACTIVE";
+     case ESA_UNKNWNERR:         return "UNKNOWN ERROR";
+     case ESA_DB_DUPLIC:         return "DUPLICATE DB KEY";
+     case ESA_PROC_NOTEXIST:     return "PROCESS NOTEXIST";
+     case ESA_PROC_EXIST:        return "PROCESS EXIST";
+     default:                    return "<UNKNOWN RC!!>";
+   }
+} /* ESA_rc2str */
+ 
+/****************************************************
+ *                Global Functions                  *
+ ***************************************************/
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAGR_initialize
+ * Description   : Calls to ESA_DIAGR_initializeEx
+ *
+ ****************************************************/
+void ESA_DIAGR_initialize (const char  * log_file_name,
+                           const char  * shadow_file_name,
+                           const char  * procname,
+                           void       ** handle)
+{
+   ESA_DIAGR_initializeEx(log_file_name, shadow_file_name, procname,
+	   min_free_disk_space, 0, handle);
+}
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAGR_initializeEx
+ * Description   : Initializes the ESA_DIAG module.
+ * Input         : log_file_name    - Name of log file.
+ *                 shadow_file_name - Name of shadow file.
+ *                 procname         - Name of program.
+ * output        : handle
+ * Return Value  : None
+ * Side Effects  : Global variables are set.
+ * Scope         : Global
+ * Re-entrant    : Yes
+ * Comments      : 1. The special strings "STDOUT" and "STDERR",
+ *                    if supplied in log_file_name and/or
+ *                    shadow_file_name, will use these predefined
+ *                    streams.
+ *                 2. If the file == NULL DEVICE, no file is open.
+ *                    See platform.h for the meaning of NULL DEVICE.
+ ****************************************************/
+ 
+void ESA_DIAGR_initializeEx (const char  * log_file_name,
+                             const char  * shadow_file_name,
+                             const char  * procname,
+                             int           min_free_space,
+							 int           pid_number,
+                             void       ** handle)
+{
+   ESA_DIAG_HANDLE_typ * diag_handle = (ESA_DIAG_HANDLE_typ *)*handle;
+ 
+   /* If handle is non-NULL, check whether the area has been init.
+    * already or if it's empty and needs initialization.
+    * Otherwise, the area must be first allocated and then initialized
+    */
+ 
+   if (diag_handle) {
+      if (diag_handle->esa_diag_initialized NE 0) {
+ 
+         /* If already initialized, a new stack for the functions is
+          * necessary, therefore all the data will be copied except for
+          * the stack.
+          */
+         diag_handle = (ESA_DIAG_HANDLE_typ *) malloc (SZHAND);
+         memcpy ((char *)diag_handle, (char *)*handle, SZHAND);
+         diag_handle->esa_stack_level = -1;
+         memset ((char *)diag_handle->esa_func_stack, '\0',
+                                    ESA_MAX_FUNCS * ESA_MAX_FUNC_NAME);
+		 diag_handle->pid_number= pid_number;
+         *handle = (void *) diag_handle;
+         return;
+         }
+      }
+   else {
+      diag_handle = (ESA_DIAG_HANDLE_typ *) malloc (SZHAND);
+      *handle = (void *) diag_handle;
+      CLEAR_STRUCT (*diag_handle);
+      }
+ 
+   if (log_file_name) {
+      strcpy (diag_handle->Origin_diag_file_name, log_file_name);
+      strcpy (diag_handle->esa_diag_log_file_name, log_file_name);
+	  diag_handle->open_create= -1;
+      if (IS_STDOUT (log_file_name))
+         diag_handle->is_stdout = TRUE;
+   }
+   else
+      diag_handle->esa_diag_log_file_name[0] = NULL_CHAR;
+ 
+   if (shadow_file_name) {
+      strcpy (diag_handle->esa_diag_shadow_file_name,shadow_file_name);
+      if (IS_STDOUT (shadow_file_name))
+         diag_handle->is_stdout = TRUE;
+   }
+   else
+      diag_handle->esa_diag_shadow_file_name[0] = NULL_CHAR;
+ 
+   min_free_disk_space = min_free_space;
+   diag_handle->min_free_disk_space_log_file_reached = FALSE;
+   diag_handle->min_free_disk_space_shadow_file_reached = FALSE;
+   strcpy (diag_handle->esa_diag_proc_name,
+           (procname) ? procname : "<UNKNOWN>");
+ 
+   strcpy (diag_handle->esa_func_stack [0], "<None>");
+ 
+   diag_handle->esa_diag_initialized =  1;
+   diag_handle->esa_stack_level      = -1;
+   diag_handle->pid_number= pid_number;
+ 
+   /* Fill comp levels array with -1 */
+ 
+   memset ((char *)diag_handle->esa_comp_level, -1,
+           ESA_MAX_COMPS * sizeof (ESA_DIAG_LEVEL_typ));
+ 
+   diag_handle->can_write = 1;     /* assume diag files are writable */
+ 
+} /* ESA_DIAGR_initializeEx */
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAG_initialize
+ * Description   : Calls ESA_DIAG_initializeEx
+ ****************************************************/
+ 
+void ESA_DIAG_initialize (const char  * log_file_name,
+                          const char  * shadow_file_name,
+                          const char  * procname,
+                          void       ** handle)
+{
+   ESA_DIAG_initializeEx (log_file_name, shadow_file_name,
+                            procname, min_free_disk_space, 0, handle);
+}
+/****************************************************
+ * Procedure Name: ESA_DIAG_initializeEx
+ * Description   : Initializes the ESA_DIAG module.
+ * Input         : log_file_name    - Name of log file.
+ *                 shadow_file_name - Name of shadow file.
+ *                 procname         - Name of program.
+ *                 min_free_space   -
+ *						Free space limit to keep when DIAG issued
+ * output        : handle
+ * Return Value  : None
+ * Side Effects  : Global variables are set.
+ * Scope         : Global
+ * Re-entrant    : No.
+ * Comments      : 1. The special strings "STDOUT" and "STDERR",
+ *                    if supplied in log_file_name and/or
+ *                    shadow_file_name, will use these predefined
+ *                    streams.
+ *                 2. If the file == NULL DEVICE, no file is open.
+ *                    See platform.h for the meaning of NULL DEVICE.
+ ****************************************************/
+ 
+void ESA_DIAG_initializeEx (const char  * log_file_name,
+                            const char  * shadow_file_name,
+                            const char  * procname,
+                            int           min_free_space,
+							int           pid_number,
+                            void       ** handle)
+{
+   ESA_DIAG_HANDLE_typ * handy = (ESA_DIAG_HANDLE_typ *)*handle;
+ 
+   /* If handle is non-NULL, copy data from it to static area */
+ 
+   if (handy)
+      memcpy ((char *)&stat_hand, (char *)handy, sizeof (stat_hand));
+   else {
+      *handle = (void *)&stat_hand;
+      ESA_DIAGR_initializeEx (log_file_name, shadow_file_name,
+                              procname, min_free_space, pid_number, handle);
+      }
+ 
+ 
+} /* ESA_DIAG_initializeEx */
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAGR_terminate
+ * Description   : Terminates the ESA_DIAG module.
+ * Input         : handle
+ * output        : None
+ * Return Value  : None
+ * Scope         : Global
+ * Re-entrant    : Yes
+ ****************************************************/
+ 
+void ESA_DIAGR_terminate (void * handle)
+{
+   static const char   func [] = "ESA_DIAGR_terminate";
+   ESA_DIAG_HANDLE_typ * diag_handle = (ESA_DIAG_HANDLE_typ *)handle;
+ 
+   if (diag_handle EQ NULL) {
+      fprintf (stderr, "%s: No memory to free, NULL pointer passed",
+               func);
+   }
+   /* WS10082N - start */
+   else
+   {
+     /* If asked to terminate the diag environment handled by the
+      * static handle, just close the files (if needed) and mark the
+      * handle as uninitialzied so that the next initialize request
+      * will intialize it again.
+      *
+      * This is required for stand-alone programs (like CTSCVAR and
+      * CTSCGRO) that are loaded once but used many times by diffetent
+      * tasks. These programs call the diag initialzie routine each
+      * time they are called. On the first call the static handle is
+      * initialzied. On the second call, the diag initilziation routine
+      * allocates a new handle because the static handle is already
+      * initialzied. This new handle was not used for writing diags and
+      * was not freed.
+      * I didn't want to chanegt eh way the initialization routine
+      * works because I don't know who will be effected by such change.
+      * The solution was to add support to "terminate" the static handle
+      * so that subsequent initialization calls will initialize it.  */
+     if (diag_handle EQ &stat_hand)
+     {
+       ESA_DIAG_close_files();
+       diag_handle->esa_diag_initialized  = FALSE;
+     }
+     else
+   /* WS10082N - end  */
+       free (diag_handle);
+   }                                                      /* WS10082N */
+ 
+} /* ESA_DIAG_terminate */
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAGR_set_debug_levels
+ * Description   : Set debug level for all components
+ * Input         : Array of levels
+ * Output        :
+ * Return Value  :
+ * Side Effects  : Static array is modified
+ * Scope         : Global
+ * Re-entrant    : Yes
+ ****************************************************/
+ 
+void ESA_DIAGR_set_debug_levels (void                * handle,
+                                 ESA_DIAG_LEVEL_typ  * level_array )
+{
+   int  k;
+   ESA_DIAG_HANDLE_typ * diag_handle = (ESA_DIAG_HANDLE_typ *)handle;
+ 
+   for (k = 0; k LT ESA_MAX_COMPS; k++)
+      diag_handle->esa_comp_level [k] = level_array [k];
+ 
+} /* ESA_DIAGR_set_debug_levels */
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAG_set_debug_levels
+ * Description   : Set debug level for all components
+ * Input         : Array of levels
+ * Output        :
+ * Return Value  :
+ * Side Effects  : Static array is modified
+ * Scope         : Global
+ * Re-entrant    : No
+ ****************************************************/
+ 
+void ESA_DIAG_set_debug_levels (ESA_DIAG_LEVEL_typ * level_array)
+{
+   ESA_DIAGR_set_debug_levels ( (void *)&stat_hand, level_array );
+} /* ESA_DIAG_set_debug_levels */
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAGR_set_debug_levels_file
+ * Description   : Read levels from file, set debug level for
+ *                 all components
+ * Input         : File name
+ * Output        :
+ * Return Value  : ESA_RC
+ * Side Effects  : Static array is modified
+ * Scope         : Global
+ * Re-entrant    : Yes
+ ****************************************************/
+ 
+ESA_RC ESA_DIAGR_set_debug_levels_file (void              * handle,
+                                        const char        * fname,
+										int                 MainName)
+{
+   ESA_MAIN_NAME_typ     p_main_name= MainName;
+   ESA_RC                rc= ESA_OK;
+   int                   kk= 0;
+   FILE                * fdi;
+   ESA_DIAG_LEVEL_typ    temp [ESA_MAX_COMPS];
+   ESA_DIAG_HANDLE_typ * diag_handle = (ESA_DIAG_HANDLE_typ *)handle;
+   static const char     func [] = "ESA_DIAGR_set_debug_levels_file";
+   char                  MainPgm[20]="Uknown";
+   int                   dmp_int, wrk_int, pgm_int=0, rc1= 0, rc2= 0, rc3= 0, rc4= 0;
+   char                  NewFileName[MAX_FILENAME_LEN+ 1];
+   char                  ddn_with[50]="";                 /* SAS2IBMT */
+ 
+   /*--- Memory diagnostics treatment (end = ESA_EOF) ---*/
+   ESA_DIAG_memory_status (handle, fname, ESA_EOF);
+ 
+   strcpy(ddn_with,"DD:");                                /* SAS2IBMT */
+   strcat(ddn_with, fname);                               /* SAS2IBMT */
+   /* strcpy(ddn_with,"//'");                                SAS2IBMT */
+   /* strcat(ddn_with, fname);                               SAS2IBMT */
+   /* strcat(ddn_with,"'");                                  SAS2IBMT */
+ 
+   /* SAS2IBMT fdi = fopen (fname, "r");                             */
+   fdi = fopen (ddn_with, "r");                           /* SAS2IBMT */
+ 
+   if (NOT fdi) {
+      fprintf (stderr, "%s: open file %s failed: ", func, fname);
+      perror ("fopen");
+      rc=ESA_ERR;
+	  goto cleanup;
+   }
+ 
+   /* Read file into temp array */
+ 
+   kk= fread (temp,
+              sizeof (ESA_DIAG_LEVEL_typ),
+              ESA_MAX_COMPS, fdi);
+ 
+   fclose (fdi);
+ 
+   if (kk EQ ESA_MAX_COMPS) {
+      memcpy ((char *)diag_handle->esa_comp_level,
+                  (char *)temp, sizeof (temp));
+      ESA_DIAG_COMP_LEVELS ();
+   }
+   else {
+      fprintf (stderr, "%s: error - read %d levels, expected %d\n",
+               func, kk, ESA_MAX_COMPS);
+      rc= ESA_ERR;
+	  goto cleanup;
+   }
+/*--- New Oportunities for diagnostics */
+/*-------------------------------------*/
+   RepFileGenNum (NewFileName, diag_handle->esa_diag_log_file_name,
+	              diag_handle->curr_gen, diag_handle->pid_number);
+   if (strcmp (NewFileName, diag_handle->Origin_diag_file_name) NE 0)
+   {
+      if (diag_handle->esa_comp_level[ESA_COMP_MAX_GEN_VAL] EQ 0)
+    	  diag_handle->max_gen= DIAG_MAX_GEN_VAL;
+      else
+	      diag_handle->max_gen= diag_handle->esa_comp_level[ESA_COMP_MAX_GEN_VAL];
+      if (diag_handle->esa_comp_level[ESA_COMP_MAX_LINES_VAL] EQ 0)
+          diag_handle->max_lines= DIAG_MAX_LINES_VAL;
+      else
+          diag_handle->max_lines= diag_handle->esa_comp_level[ESA_COMP_MAX_LINES_VAL];
+      if (diag_handle->esa_comp_level[ESA_COMP_MAX_INTERVAL_VAL] EQ 0)
+          diag_handle->max_interval= DIAG_MAX_INTERVAL_VAL;
+      else
+	     diag_handle->max_interval= diag_handle->esa_comp_level[ESA_COMP_MAX_INTERVAL_VAL];
+   }
+  /*--- Output diagnostics to memory only for CD, CS CE and Offl.Interceptor ---*/
+   ESA_DIAG_free (diag_handle);
+   kk= 0;
+/*   if (     (p_main_name NE ESA_OFLI_PROC) AND (p_main_name NE ESA_ACE_PROC)
+	    AND (p_main_name NE ESA_ACD_PROC)  AND (p_main_name NE ESA_ACS_PROC) )
+      goto cleanup;*/
+   MainNameCode= (int)p_main_name;
+  /*--- If Diagnostic level in ESA_COMP_ACSDMP less than 10000 ,
+         regular diagnotics output (without memory allocation) ---*/
+   dmp_int= diag_handle->esa_comp_level[ESA_COMP_ACSDMP];
+   /*if (dmp_int LT 10000)
+      goto cleanup;*/
+ 
+  /*--- Check if Output diagnostics only when Return Code willnot equal to OK ---*/
+   /*--- 1-st digit in ESA_COMP_ACSDMP : Output diagnostics when
+     rc=ESA_TERM_CTSA      (1,3,5 or 7)
+     rc=ESA_CANCEL_SERVICE (2,3,6 or 7)
+     rc=ESA_ABORT_REQ      (4,5,6 or 7)
+     rc=ESA_DB_DUPLIC      (9) ---*/
+   rc1= dmp_int % 10;
+   if (
+	    (rc1 EQ 1) OR (rc1 EQ 3) OR (rc1 EQ 5) OR (rc1 EQ 7) OR
+        (diag_handle->esa_comp_level[ESA_COMP_ESA_TERM_CTSA] GT 0)
+  	  )
+   {
+      rc_arr[kk]= ESA_TERM_CTSA;
+	  kk++;
+   }
+   if ( (rc1 EQ 2) OR (rc1 EQ 3) OR (rc1 EQ 6) OR (rc1 EQ 7) OR
+        (diag_handle->esa_comp_level[ESA_COMP_ESA_CANCEL_SERVICE] GT 0)
+      )
+   {
+      rc_arr[kk]= ESA_CANCEL_SERVICE;
+	  kk++;
+   }
+   if ( (rc1 EQ 4) OR (rc1 EQ 5) OR (rc1 EQ 6) OR (rc1 EQ 7) OR
+        (diag_handle->esa_comp_level[ESA_COMP_ESA_ABORT_REQ] GT 0)
+      )
+   {
+      rc_arr[kk]= ESA_ABORT_REQ;
+	  kk++;
+   }
+   if ( (rc1 EQ 9) OR (diag_handle->esa_comp_level[ESA_COMP_ESA_DB_DUPLIC] GT 0) )
+ 
+   {
+      rc_arr[kk]= ESA_DB_DUPLIC;
+	  kk++;
+   }
+ 
+   /*--- 2(second) digit in ESA_COMP_ACSDMP : Output diagnostics when
+     rc=ESA_MBX_FULL       (1,3,5 or 7)
+     rc=ESA_MBX_NOT_EXIST  (2,3,6 or 7)
+     rc=ESA_MBX_BUFFEROVF  (4,5,6 or 7)
+     rc=ESA_PROC_NOTEXIST  (9) ---*/
+   rc2= (dmp_int / 10) % 10;
+   if ( (rc2 EQ 1) OR (rc2 EQ 3) OR (rc2 EQ 5) OR (rc2 EQ 7) OR
+        (diag_handle->esa_comp_level[ESA_COMP_ESA_MBX_FULL] GT 0)
+      )
+   {
+      rc_arr[kk]= ESA_MBX_FULL;
+	  kk++;
+   }
+   if ( (rc2 EQ 2) OR (rc2 EQ 3) OR (rc2 EQ 6) OR (rc2 EQ 7) OR
+        (diag_handle->esa_comp_level[ESA_COMP_ESA_MBX_NOT_EXIST] GT 0)
+      )
+   {
+      rc_arr[kk]= ESA_MBX_NOT_EXIST;
+	  kk++;
+   }
+   if ( (rc2 EQ 4) OR (rc2 EQ 5) OR (rc2 EQ 6) OR (rc2 EQ 7) OR
+        (diag_handle->esa_comp_level[ESA_COMP_ESA_MBX_BUFFEROVF] GT 0)
+      )
+   {
+      rc_arr[kk]= ESA_MBX_BUFFEROVF;
+	  kk++;
+   }
+   if ( (rc2 EQ 9) OR (diag_handle->esa_comp_level[ESA_COMP_ESA_PROC_NOTEXIST] GT 0) )
+   {
+      rc_arr[kk]= ESA_PROC_NOTEXIST;
+	  kk++;
+   }
+ 
+   /*--- 3-th digit in ESA_COMP_ACSDMP : Output diagnostics when
+     rc=ESA_ERR            (1,3,5 or 7)
+     rc=ESA_FATAL          (2,3,6 or 7)
+     rc=ESA_FATAL_IO       (4,5,6 or 7)
+     rc=ESA_UNKNWNERR      (9) ---*/
+   rc3= (dmp_int / 100) % 10;
+   if ( (rc3 EQ 1) OR (rc3 EQ 3) OR (rc3 EQ 5) OR (rc3 EQ 7) OR
+        (diag_handle->esa_comp_level[ESA_COMP_ESA_ERR] GT 0)
+      )
+   {
+      rc_arr[kk]= ESA_ERR;
+	  kk++;
+   }
+   if ( (rc3 EQ 2) OR (rc3 EQ 3) OR (rc3 EQ 6) OR (rc3 EQ 7) OR
+        (diag_handle->esa_comp_level[ESA_COMP_ESA_FATAL] GT 0)
+      )
+   {
+      rc_arr[kk]= ESA_FATAL;
+	  kk++;
+   }
+   if ( (rc3 EQ 4) OR (rc3 EQ 5) OR (rc3 EQ 6) OR (rc3 EQ 7) OR
+        (diag_handle->esa_comp_level[ESA_COMP_ESA_FATAL_IO] GT 0)
+      )
+   {
+      rc_arr[kk]= ESA_FATAL_IO;
+	  kk++;
+   }
+   if ( (rc3 EQ 9) OR (diag_handle->esa_comp_level[ESA_COMP_ESA_UNKNWNERR] GT 0) )
+   {
+      rc_arr[kk]= ESA_UNKNWNERR;
+	  kk++;
+   }
+ 
+   /*--- 4-th digit in ESA_COMP_ACSDMP : Output diagnostics when
+     rc=ESA_RSS_INACTIVE   (1,3,5 or 7)
+     rc=ESA_LOCKED         (2,3,6 or 7)
+     rc=ESA_DUP_KEY        (4,5,6 or 7)
+     rc=ESA_PROC_EXIST     (9) ---*/
+   rc4= (dmp_int / 1000) % 10;
+   if ( (rc4 EQ 1) OR (rc4 EQ 3) OR (rc4 EQ 5) OR (rc4 EQ 7) OR
+        (diag_handle->esa_comp_level[ESA_COMP_ESA_RSS_INACTIVE] GT 0)
+      )
+   {
+      rc_arr[kk]= ESA_WARN;
+	  kk++;
+   }
+   if ( (rc4 EQ 2) OR (rc4 EQ 3) OR (rc4 EQ 6) OR (rc4 EQ 7) OR
+        (diag_handle->esa_comp_level[ESA_COMP_ESA_LOCKED] GT 0)
+      )
+   {
+      rc_arr[kk]= ESA_LOCKED;
+	  kk++;
+   }
+   if ( (rc4 EQ 4) OR (rc4 EQ 5) OR (rc4 EQ 6) OR (rc4 EQ 7) OR
+        (diag_handle->esa_comp_level[ESA_COMP_ESA_DUP_KEY] GT 0)
+      )
+   {
+      rc_arr[kk]= ESA_DUP_KEY;
+	  kk++;
+   }
+   if ( (rc4 EQ 9) OR (diag_handle->esa_comp_level[ESA_COMP_ESA_PROC_EXIST] GT 0) )
+   {
+      rc_arr[kk]= ESA_PROC_EXIST;
+	  kk++;
+   }
+   if (kk)
+      DiagErrRc= TRUE;
+ 
+   /*--- 5,6,7 and 8-th digit in ESA_COMP_ACSDMP ---*/
+   pgm_int= (dmp_int / 10000) % 10;
+   if (p_main_name EQ ESA_OFLI_PROC)
+   {
+      /*--- 5 digit in ESA_COMP_ACSDMP is only for Offline Interceptor ---*/
+      strcpy (MainPgm, ESA_OFLI);
+      pgm_int= MAX (pgm_int, diag_handle->esa_comp_level[ESA_COMP_OFLI]);
+   }
+   else
+   {
+	  pgm_int= (dmp_int / 100000) % 10;
+      if (p_main_name EQ ESA_ACE_PROC)
+	  {
+      /*--- 6 digit in ESA_COMP_ACSDMP is only for CE ---*/
+         strcpy (MainPgm, ESA_CE);
+         pgm_int= MAX (pgm_int, diag_handle->esa_comp_level[ESA_COMP_CE]);
+	  }
+	  else
+	  {
+         pgm_int= (dmp_int / 1000000) % 10;
+         if (p_main_name EQ ESA_ACD_PROC)
+		 {
+      /*--- 7 digit in ESA_COMP_ACSDMP is only for CD ---*/
+            strcpy (MainPgm, ESA_CD);
+            pgm_int= MAX (pgm_int, diag_handle->esa_comp_level[ESA_COMP_CD]);
+		 }
+		 else
+		 {
+            pgm_int= (dmp_int / 10000000) % 10;
+            if (p_main_name EQ ESA_ACS_PROC)
+			{
+      /*--- 8 digit in ESA_COMP_ACSDMP is only for CS ---*/
+               strcpy (MainPgm, ESA_CS);
+               pgm_int= MAX (pgm_int, diag_handle->esa_comp_level[ESA_COMP_CS]);
+			}
+		 }
+	  }
+   }
+      /* Enable diagnostics when EQ to 0 for current process by default.---*/
+   if (pgm_int EQ 1)
+      /* Disable diagnostics when EQ to 1 for current process.---*/
+      DiagDisable= TRUE;
+   else
+   {
+      /* Set diagnostics level to 'pgm_int' (greater than 1) for current process
+		     for all Common Code components ---*/
+      for (kk= ESA_COMP_CTSAMSG; kk LE ESA_COMP_P_CSACS; kk++)
+	  {
+		  if ( (kk EQ ESA_COMP_ACSDMP) OR (kk EQ ESA_COMP_ESAOSCS) )
+			  continue;
+		  if (diag_handle->esa_comp_level[kk] EQ 0)
+             diag_handle->esa_comp_level[kk]= pgm_int;
+	  }
+	  if (diag_handle->esa_comp_level[ESA_COMP_RSS_INTERCEPT] EQ 0)
+         diag_handle->esa_comp_level[ESA_COMP_RSS_INTERCEPT]= pgm_int;
+      for (kk= ESA_COMP_CE_MBX; kk LE ESA_COMP_QUEUE; kk++)
+	  {
+		  if (diag_handle->esa_comp_level[kk] EQ 0)
+             diag_handle->esa_comp_level[kk]= pgm_int;
+	  }
+ 
+ 
+      if (pgm_int EQ 0)
+          pgm_int= DIAG_BASIC;
+	  if (diag_handle->esa_comp_level[ESA_COMP_OSES] EQ 0)
+	      diag_handle->esa_comp_level[ESA_COMP_OSES]= pgm_int;
+	  if (diag_handle->esa_comp_level[ESA_COMP_MORE] EQ 0)
+	      diag_handle->esa_comp_level[ESA_COMP_MORE]= pgm_int;
+	  if (diag_handle->esa_comp_level[ESA_COMP_DETAILES] EQ 0)
+	      diag_handle->esa_comp_level[ESA_COMP_DETAILES]= pgm_int;
+	  if (diag_handle->esa_comp_level[ESA_COMP_MESSAGES] EQ 0)
+	      diag_handle->esa_comp_level[ESA_COMP_MESSAGES]= pgm_int+ 1;
+	  if (diag_handle->esa_comp_level[ESA_COMP_ENTER_EXIT] EQ 0)
+	      diag_handle->esa_comp_level[ESA_COMP_ENTER_EXIT]= pgm_int;
+   }
+   if (diag_handle->esa_comp_level[ESA_COMP_DIAG_PARAMETERS] GT 0)
+	  esa_print_func_name=
+         MIN (diag_handle->esa_comp_level[ESA_COMP_DIAG_PARAMETERS],
+              ESA_MAX_FUNC_NAME);
+   ESA_DIAG_COMP_LEVELS ();
+ 
+   /*--- 9-th digit in ESA_COMP_ACSDMP for output diagnostics to memory
+         if greater then 0 ---*/
+   wrk_int= (dmp_int / 100000000) % 10;
+   if ( (wrk_int NE 0) OR (diag_handle->esa_comp_level[ESA_COMP_DIAG_TO_MEMORY] GT 0) )
+   {
+      DiagFast= MAX (wrk_int, diag_handle->esa_comp_level[ESA_COMP_DIAG_TO_MEMORY]);
+	  kk= TRUE;
+   }
+   else
+      kk= FALSE;
+ 
+   /*--- Memory allocation to (1000000 * 9-th digit) bytes ---*/
+   if ( (DiagMemoryDump EQ NULL) AND (DiagFast NE FALSE) AND (DiagDisable EQ FALSE) )
+   {
+      DiagMemoryDump= (char *)malloc (DiagDefAlloc * DiagFast);
+	  if (DiagMemoryDump)
+	  {
+		 DiagMemoryLen= 0;
+		 DiagMemoryAlloc = DiagDefAlloc * DiagFast;
+	  }
+   }
+ 
+   wrk_int= (dmp_int / 1000000000) % 10;
+   if (
+	     (wrk_int EQ 1)
+		OR
+		 (wrk_int EQ 3)
+		OR
+		 (diag_handle->esa_comp_level[ESA_COMP_DIAG_KEEP_OPEN] GT 0)
+      )
+      DiagKeepOpen= TRUE;
+   else
+      DiagKeepOpen= FALSE;
+ 
+   if (DiagOpenSw EQ TRUE)
+      close_log_files (diag_handle);
+   DiagOpenSw= FALSE;
+ 
+   if (
+	     (wrk_int EQ 2)
+		OR
+		 (wrk_int EQ 3)
+		OR
+		 (diag_handle->esa_comp_level[ESA_COMP_DIAG_TAB] GT 0)
+      )
+      DiagTab= TRUE;
+   else
+      DiagTab= FALSE;
+ 
+   if (diag_handle->esa_comp_level[ESA_COMP_ACSCB] GE DIAG_BASIC- 1)
+   {
+      esa_diag_printf_uncond (diag_handle,
+	    "<> %s: Fast=%d Disable=%d ErrRc=%d Regular=%d KeepOpen= %d ToMem=%d/%d %s=%d <>",
+	    func, DiagFast, DiagDisable, DiagErrRc, DiagRegular, DiagKeepOpen,
+		DiagToMemory, kk, MainPgm, pgm_int);
+      esa_diag_printf_uncond (diag_handle,
+	   "<> %s: DefAlloc=%d Mem:Ptr=%p Alloc=%d Len=%d NumRec=%d HalfMemLen=%d OpenSw=%d Tab=%d<>",
+		func, DiagDefAlloc, DiagMemoryDump, DiagMemoryAlloc, DiagMemoryLen,
+		MemLenNum, DiagHalfMemLen, DiagOpenSw, DiagTab);
+      esa_diag_printf_uncond (diag_handle,
+	    "<> %s: rc: %d %d %d %d (%d %d %d %d %d %d %d %d %d %d %d %d %d %d %d %d) <>",
+	    func, rc1, rc2, rc3, rc4,
+	    rc_arr[0],rc_arr[1],rc_arr[2], rc_arr[3], rc_arr[4], rc_arr[5], rc_arr[6], rc_arr[7],
+		rc_arr[8],rc_arr[9],rc_arr[10],rc_arr[11],rc_arr[12],rc_arr[13],rc_arr[14],rc_arr[15]);
+   }
+cleanup:
+ 
+   return (rc);
+ 
+} /* ESA_DIAGR_set_debug_levels_file */
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAG_set_debug_levels_file
+ * Description   : Read levels from file, set debug level for
+ *                 all components
+ * Input         : File name
+ * Output        :
+ * Return Value  : ESA_RC
+ * Side Effects  : Static array is modified
+ * Scope         : Global
+ * Re-entrant    : No
+ ****************************************************/
+ 
+ESA_RC ESA_DIAG_set_debug_levels_file (const char        * fname,
+									   int                 p_main_name)
+{
+   return ESA_DIAGR_set_debug_levels_file ( (void *)&stat_hand, fname, p_main_name);
+} /* ESA_DIAG_set_debug_levels_file */
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAGLL_printf
+ * Description   : printf-like diagnostics
+ * Input         : Component, level, format, arguments
+ * Output        :
+ * Return Value  :
+ * Side Effects  : VARARGS is used
+ * Scope         : Global
+ ****************************************************/
+ 
+void ESA_DIAGLL_printf (ESA_DIAG_COMP_typ    comp,
+                        ESA_DIAG_LEVEL_typ   level,
+                        void               * handle,
+                        const char         * format,
+                        va_list              arg_list)
+{
+   char                  esa_pfx_line [DIAG_MAX_ST];
+   int                   rc= 0, i;
+   ESA_DIAG_HANDLE_typ * diag_handle = (ESA_DIAG_HANDLE_typ *)handle;
+   ESA_DIAG_LEVEL_typ    DiagLvl;
+ 
+   if (level EQ 0)
+	   DiagLevel_0= TRUE;
+ 
+   if (diag_handle->esa_comp_level [comp] GT 100)
+      DiagLvl = diag_handle->esa_comp_level [comp]  % 100;
+   else
+      DiagLvl = diag_handle->esa_comp_level [comp];
+ 
+   if (
+         (diag_handle->esa_comp_level[ESA_COMP_ACSDMP] GE 10000)
+        AND
+		 (
+	        (
+	           (comp GE ESA_COMP_CTSAMSG)
+              AND
+	           (comp LE ESA_COMP_P_CSACS)
+		      AND
+	           (comp NE ESA_COMP_ACSDMP)
+              AND
+			   (comp NE ESA_COMP_ESAOSCS)
+            )
+           OR
+		    (comp EQ ESA_COMP_RSS_INTERCEPT)
+           OR
+		    (
+		       (comp GE ESA_COMP_CE_MBX)
+              AND
+		       (comp LE ESA_COMP_QUEUE)
+            )
+         )
+      )
+   {
+      if (level EQ DIAG_OS)
+         DiagLvl= ESA_DIAG_get_debug_level(ESA_COMP_OSES);
+      if (level EQ DIAG_MSGHDR)
+         DiagLvl= ESA_DIAG_get_debug_level(ESA_COMP_MESSAGES);
+      if (level EQ DIAG_DETAILES)
+         DiagLvl= ESA_DIAG_get_debug_level(ESA_COMP_DETAILES);
+      if (level EQ DIAG_MORE)
+         DiagLvl= ESA_DIAG_get_debug_level(ESA_COMP_MORE);
+   }
+/*
+   diag_handle->GlobComp = comp;
+   diag_handle->GlobLevel =level;
+*/
+   if ( (level LE DiagLvl) AND (DiagDisable EQ FALSE) ) {
+ 
+/* copy the function name, and pad with dots (.) characters if needed */
+      if (diag_handle->esa_stack_level LT 0)
+         strncpy (FuncNam, FuncUnkn, strlen (FuncUnkn));
+      else
+         strncpy (FuncNam, diag_handle->esa_func_stack[diag_handle->esa_stack_level],
+                  ESA_MAX_FUNC_NAME);
+      for (i = strlen(FuncNam); i < esa_print_func_name; i++)
+          FuncNam[i] = '.';
+      FuncNam[i] = '\0';
+ 
+   /* IS10182 - start */
+   /*
+	  sprintf(esa_pfx_line, "%03d-%02d-%02d %s: %s",
+              comp, level, diag_handle->esa_comp_level [comp], FuncNam, FuncSpace);
+ 
+			  rc= vsprintf (diag_handle->big_line, format, arg_list);
+   */
+ 
+	  snprintf(esa_pfx_line, sizeof(esa_pfx_line)-1,
+              "%03d-%02d-%02d %s: %s",
+              comp, level, diag_handle->esa_comp_level [comp], FuncNam, FuncSpace);
+ 
+			  rc= vsnprintf (diag_handle->big_line,
+                   sizeof(diag_handle->big_line)-1,
+                   format, arg_list);
+   /* IS10182 - end   */
+ 
+      if (rc GT 0)
+	  {
+         /* IS10182 - remove the following command because
+                      we used vsnprintf with buffer length so there
+                      should be no overflow
+                      we also don't need to put the terminator because
+                      vsnprinf does it.
+         if (strlen (diag_handle->big_line) GE BIG_BUF_SIZE)
+		   {
+    	    DiagLevel_0= TRUE;
+		    print_line (esa_pfx_line,
+			          "!!!!! Following Diagnostic can be case for Exception. !!!!!!."
+					  ,diag_handle);
+		   }
+         diag_handle->big_line[sizeof(diag_handle->big_line)-1]=NULL_CHAR;
+         */
+ 
+         print_line (esa_pfx_line, diag_handle->big_line, diag_handle);
+ 
+	  }
+      else
+         ESA_DIAG_printf (comp, 0, "Exception in format=<%s>", format);
+   }
+} /* ESA_DIAGLL_printf */
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAGR_printf
+ * Description   : printf-like diagnostics
+ * Input         : Component, level, format, arguments
+ * Output        :
+ * Return Value  :
+ * Side Effects  : VARARGS is used
+ * Scope         : Global
+ * Re-entrant    : Yes
+ ****************************************************/
+ 
+void ESA_DIAGR_printf (void               * handle,
+                       ESA_DIAG_COMP_typ    comp,
+                       ESA_DIAG_LEVEL_typ   level,
+                       const char         * format, ...)
+{
+   va_list arg_list;
+ 
+   va_start (arg_list, format);
+   ESA_DIAGLL_printf (comp, level, handle, format, arg_list);
+   va_end (arg_list);
+ 
+} /* ESA_DIAGR_printf */
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAG_printf
+ * Description   : printf-like diagnostics
+ * Input         : Component, level, format, arguments
+ * Output        :
+ * Return Value  :
+ * Side Effects  : VARARGS is used
+ * Scope         : Global
+ * Re-entrant    : No
+ ****************************************************/
+ 
+void ESA_DIAG_printf (ESA_DIAG_COMP_typ    comp,
+                      ESA_DIAG_LEVEL_typ   level,
+                      const char         * format, ...)
+{
+   va_list arg_list;
+	
+   va_start (arg_list, format);
+   ESA_DIAGLL_printf (comp, level, (void *)&stat_hand, format,
+                      arg_list);
+   va_end (arg_list);
+ 
+} /* ESA_DIAG_printf */
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAGR_enter
+ * Description   : Push calling func name on stack, print message
+ * Input         : component, level, func name
+ * Output        :
+ * Return Value  :
+ * Side Effects  :
+ * Scope         : Global
+ * Re-entrant    : Yes
+ ****************************************************/
+ 
+void ESA_DIAGR_enter (void               * handle,
+                      ESA_DIAG_COMP_typ    comp,
+                      ESA_DIAG_LEVEL_typ   level,
+                      const char         * funcname)
+{
+   ESA_DIAG_HANDLE_typ * diag_handle = (ESA_DIAG_HANDLE_typ *)handle;
+   ESA_DIAG_LEVEL_typ  DiagLvl, EnterLvl;
+   int i;
+ 
+   if (diag_handle->esa_comp_level [comp] GT 100)
+      DiagLvl = diag_handle->esa_comp_level [comp]  % 100;
+   else
+      DiagLvl = diag_handle->esa_comp_level [comp];
+   if (diag_handle->esa_comp_level [ESA_COMP_ENTER_EXIT] GT 100)
+      EnterLvl= diag_handle->esa_comp_level [ESA_COMP_ENTER_EXIT]  % 100;
+   else
+      EnterLvl= diag_handle->esa_comp_level [ESA_COMP_ENTER_EXIT];
+ 
+   if (EnterLvl EQ 1)
+      EnterLvl= DiagLvl+ 1; /* Don't output any enter/exit diag */
+   else if (
+	          ( (EnterLvl EQ DIAG_COMMON) AND (level EQ DIAG_COMMON) )
+			 OR
+	          (  (EnterLvl EQ DIAG_COMMON+ 1)
+			    AND ( (level EQ DIAG_COMMON) OR (level EQ DIAG_COMMON+ 1) )
+              )
+		   )		
+      EnterLvl= DiagLvl;    /* Output common code enter/exit diag */
+   else
+      EnterLvl= level;      /* As usual */
+ 
+ 
+#ifndef  DIAG_DEBUG
+   if ( (EnterLvl LE DiagLvl) AND (DiagDisable EQ FALSE) ) {
+#endif
+ 
+ 
+#ifdef  DIAG_DEBUG
+      printf("--->Entering %s stack=%d/%d comp=%d lvl=%d/%d\n",
+             funcname,
+             diag_handle->esa_stack_level, ESA_MAX_FUNCS,
+             comp, level, diag_handle->esa_comp_level[comp]);
+#endif
+/* copy the function name, and pad with dots (.) characters if needed */
+      if (diag_handle->esa_stack_level LT 0)
+         strncpy (FuncNam, FuncUnkn, strlen (FuncUnkn));
+      else
+         strncpy (FuncNam, diag_handle->esa_func_stack[diag_handle->esa_stack_level],
+                  ESA_MAX_FUNC_NAME);
+      for (i = strlen(FuncNam); i < esa_print_func_name; i++)
+          FuncNam[i] = '.';
+      FuncNam[i] = '\0';
+ 
+	  if ( (DiagTab EQ TRUE) AND (strlen (FuncSpace) LT ESA_MAX_FUNCS*2) )
+   	     strcat (FuncSpace, "  ");
+ 
+      esa_diag_printf_uncond (diag_handle, "%03d-%02d-%02d %s: %s>>> Entering %s...",
+           comp, level, diag_handle->esa_comp_level[comp], FuncNam, FuncSpace, funcname);
+ 
+#ifndef  DIAG_DEBUG
+   }
+#endif
+ 
+   if (diag_handle->esa_stack_level LT (ESA_MAX_FUNCS - 1) ) {
+      diag_handle->esa_stack_level++;
+      strncpy
+          (diag_handle->esa_func_stack [diag_handle->esa_stack_level],
+           funcname, ESA_MAX_FUNC_NAME);
+   }
+ 
+} /* ESA_DIAGR_enter */
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAG_enter
+ * Description   : Push calling func name on stack, print message
+ * Input         : component, level, func name
+ * Output        :
+ * Return Value  :
+ * Side Effects  :
+ * Scope         : Global
+ * Re-entrant    : No
+ ****************************************************/
+ 
+void ESA_DIAG_enter (ESA_DIAG_COMP_typ    comp,
+                     ESA_DIAG_LEVEL_typ   level,
+                     const char         * funcname)
+{
+	 ESA_DIAGR_enter ((void *)&stat_hand, comp, level, funcname);
+	 return;
+} /* ESA_DIAG_enter */
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAGR_exit
+ * Description   : Pop function stack, print message
+ * Input         : Component, level, function name, RC
+ * Output        :
+ * Return Value  :
+ * Side Effects  :
+ * Scope         : Global
+ * Re-entrant    : Yes
+ ****************************************************/
+ 
+void ESA_DIAGR_exit (void               * handle,
+                     ESA_DIAG_COMP_typ    comp,
+                     ESA_DIAG_LEVEL_typ   level,
+                     const char         * funcname,
+                     ESA_RC               rc_ret)
+{
+   ESA_DIAGR_exitEx (handle, comp, level, funcname, rc_ret, 0, 0, "");
+   return;
+}
+ 
+void ESA_DIAGR_exitEx (void               * handle,
+                       ESA_DIAG_COMP_typ    comp,
+                       ESA_DIAG_LEVEL_typ   level,
+                       const char         * funcname,
+                       ESA_RC               rc_ret,
+                       ESA_RC               rc_func,
+                       int                  line,
+                       char               * source)
+{
+   int                   entering_to_print = 0;
+   int                   new_stack;
+   int                   i;
+   char                * cp;
+#ifdef  DIAG_DEBUG
+   char                * cp1;
+   char                  cpt[]="EMPTY STACK";
+#endif
+   ESA_DIAG_HANDLE_typ * diag_handle = (ESA_DIAG_HANDLE_typ *)handle;
+   ESA_DIAG_LEVEL_typ    DiagLvl, ExitLvl;
+ 
+   if (diag_handle->esa_comp_level [comp] GT 100)
+      DiagLvl = diag_handle->esa_comp_level [comp]  % 100;
+   else
+      DiagLvl = diag_handle->esa_comp_level [comp];
+   if (diag_handle->esa_comp_level [ESA_COMP_ENTER_EXIT] GT 100)
+      ExitLvl= diag_handle->esa_comp_level [ESA_COMP_ENTER_EXIT]  % 100;
+   else
+      ExitLvl= diag_handle->esa_comp_level [ESA_COMP_ENTER_EXIT];
+ 
+   if (ExitLvl EQ 1)
+      ExitLvl= DiagLvl+ 1; /* Don't output any enter/exit diag */
+   else if (
+	          ( (ExitLvl EQ DIAG_COMMON) AND (level EQ DIAG_COMMON) )
+			 OR
+	          (  (ExitLvl EQ DIAG_COMMON+ 1)
+			    AND ( (level EQ DIAG_COMMON) OR (level EQ DIAG_COMMON+ 1) )
+              )
+		   )		
+      ExitLvl= DiagLvl;    /* Output common code enter/exit diag */
+   else
+      ExitLvl= level;      /* As usual */
+ 
+   ESA_DIAG_print_stack (handle, funcname, FALSE, comp);
+ 
+   /*--- Change Diagnotic status (output to memory OR file) ---*/
+   if (
+/*	     (line)
+        AND*/
+		 ( (level EQ DIAG_COMMON) OR (level EQ DIAG_COMMON+ 1) )
+        AND
+		 (DiagErrRc NE FALSE)
+		AND
+		 (DiagDisable EQ FALSE)
+		AND
+	     (DiagFast GT 0)
+		AND
+		 (DiagToMemory EQ TRUE)
+		AND
+		 (rc_ret NE ESA_OK)
+		AND
+		 (rc_ret NE ESA_WARN)
+		AND
+		 (rc_ret NE ESA_KEY_NOT_FOUND)
+		AND
+		 (rc_ret NE ESA_MBX_EMPTY)
+		AND
+		 (rc_ret NE ESA_TERM_CTSA)
+		AND
+		 (rc_ret NE ESA_NOT_SUPP)
+		AND
+		 (rc_ret NE ESA_RC_VOID)
+		AND
+		 (rc_ret NE ESA_SKIP)
+		AND
+		 (rc_ret NE ESA_EOF)
+	  )
+      ESA_DIAG_memory_status (handle, funcname, rc_ret);
+ 
+ 
+#ifdef  DIAG_DEBUG
+  if (diag_handle->esa_stack_level LT 0)
+     cp1 = cpt;
+  else
+     cp1 = diag_handle->esa_func_stack[diag_handle->esa_stack_level];
+ 
+  printf("<---Exiting  %s/%s stack=%d/%d comp=%d lvl=%d/%d\n",
+         funcname, cp1,
+         diag_handle->esa_stack_level, ESA_MAX_FUNCS,
+         comp, level, diag_handle->esa_comp_level[comp]);
+#endif
+ 
+#ifndef  DIAG_DEBUG
+  if ( (ExitLvl LE DiagLvl) AND (DiagDisable EQ FALSE) ) {
+#endif
+     entering_to_print = 1;
+     if (diag_handle->esa_stack_level LT 0) {
+        if (line)
+           esa_diag_printf_uncond (diag_handle,
+             ">>> %s: Exiting while stack is EMPTY. RC=%s (%d) RF=%d line=%d <<<",
+             funcname, ESA_rc2str (rc_ret), (int)rc_ret, rc_func, line);
+		else
+           esa_diag_printf_uncond (diag_handle,
+             ">>> %s: Exiting while stack is EMPTY. RC=%s (%d) <<<",
+             funcname, ESA_rc2str (rc_ret), (int)rc_ret);
+     }
+     else {
+        cp=diag_handle->esa_func_stack [diag_handle->esa_stack_level];
+ 
+        if (strcmp (cp, funcname) NE 0) {
+           if (search_func (diag_handle, funcname, &new_stack)
+               EQ ESA_OK ) {
+            for (i=diag_handle->esa_stack_level; i GT new_stack; i--) {
+               cp = diag_handle->esa_func_stack[i];
+               if (line)
+                  esa_diag_printf_uncond (diag_handle,
+">> %s: Exiting; DIAG_EXIT not found for function '%s'; RC=%s (%d) RF=%d line=%d <<",
+                     funcname, cp, ESA_rc2str (rc_ret), (int)rc_ret, rc_func, line);
+			   else
+                  esa_diag_printf_uncond (diag_handle,
+">> %s: Exiting; DIAG_EXIT not found for function '%s'; RC=%s (%d) <<",
+                     funcname, cp, ESA_rc2str (rc_ret), (int)rc_ret);
+            }
+            diag_handle->esa_stack_level = new_stack;
+           }
+           else {
+              diag_handle->esa_stack_level++;  /* for further -- */
+			  if (line)
+                 esa_diag_printf_uncond (diag_handle,
+ ">>> %s: Exiting; Corresponding DIAG_ENTER not found; RC=%s (%d) RF=%d line=%d <<<",
+                     funcname, ESA_rc2str (rc_ret), (int)rc_ret, rc_func, line);
+			  else
+                 esa_diag_printf_uncond (diag_handle,
+ ">>> %s: Exiting; Corresponding DIAG_ENTER not found; RC=%s (%d) <<<",
+                     funcname, ESA_rc2str (rc_ret), (int)rc_ret);
+ 
+           }
+        }
+        else
+		{
+           strncpy (FuncNam, funcname, ESA_MAX_FUNC_NAME);
+           for (i = strlen(FuncNam); i < esa_print_func_name; i++)
+               FuncNam[i] = '.';
+           FuncNam[i] = '\0';
+		   if (line)
+              esa_diag_printf_uncond(diag_handle,
+                "%03d-%02d-%02d %s: %s<<< Exiting; RC=%s (%d) RF=%d line=%d",
+                comp, level, diag_handle->esa_comp_level[comp],
+                FuncNam, FuncSpace, ESA_rc2str (rc_ret), (int)rc_ret, rc_func, line);
+           else
+              esa_diag_printf_uncond(diag_handle,
+                "%03d-%02d-%02d %s: %s<<< Exiting; RC=%s (%d)",
+                comp, level, diag_handle->esa_comp_level[comp],
+                FuncNam, FuncSpace, ESA_rc2str (rc_ret), (int)rc_ret);
+           if ( (DiagTab EQ TRUE) AND (strlen (FuncSpace) GE 2) )
+              FuncSpace[strlen (FuncSpace)- 2]= '\0';
+ 
+		}
+     }
+#ifndef  DIAG_DEBUG
+  }
+#endif
+ 
+  if ( entering_to_print EQ 0 ) {
+     if (diag_handle->esa_stack_level LT 0) {
+        if (line)
+           esa_diag_printf_uncond (diag_handle,
+             ">>> %s: Exiting while stack is EMPTY. RC=%s (%d) RF=%d line=%d <<<",
+             funcname, ESA_rc2str (rc_ret), (int)rc_ret, rc_func, line);
+		else
+           esa_diag_printf_uncond (diag_handle,
+             ">>> %s: Exiting while stack is EMPTY. RC=%s (%d) <<<",
+             funcname, ESA_rc2str (rc_ret), (int)rc_ret);
+     }
+     else {
+        cp=diag_handle->esa_func_stack [diag_handle->esa_stack_level];
+        if (strcmp (cp, funcname) NE 0) {
+           if (search_func(diag_handle, funcname, &new_stack)
+               EQ ESA_OK ) {
+             for(i=diag_handle->esa_stack_level; i GT new_stack; i--) {
+                cp = diag_handle->esa_func_stack[i];
+				if (line)
+                   esa_diag_printf_uncond (diag_handle,
+">> %s: Exiting; DIAG_EXIT not found for function '%s'; RC=%s (%d) RF=%d line=%d <<",
+                      funcname, cp, ESA_rc2str (rc_ret), (int)rc_ret, rc_func, line);
+				else
+                   esa_diag_printf_uncond (diag_handle,
+">> %s: Exiting; DIAG_EXIT not found for function '%s'; RC=%s (%d) <<",
+                      funcname, cp, ESA_rc2str (rc_ret), (int)rc_ret);
+             }
+             diag_handle->esa_stack_level = new_stack;
+           }
+           else {
+              diag_handle->esa_stack_level++;  /* for further -- */
+			  if (line)
+                 esa_diag_printf_uncond (diag_handle,
+">>> %s: Exiting; Corresponding DIAG_ENTER not found; RC=%s (%d) RF=%d line=%d <<<",
+                     funcname, ESA_rc2str (rc_ret), (int)rc_ret, rc_func, line);
+			  else
+                 esa_diag_printf_uncond (diag_handle,
+">>> %s: Exiting; Corresponding DIAG_ENTER not found; RC=%s (%d) <<<",
+                     funcname, ESA_rc2str (rc_ret), (int)rc_ret);
+           }
+        }
+     }
+  }
+ 
+  if (diag_handle->esa_stack_level GE 0)
+     diag_handle->esa_stack_level--;
+ 
+} /* ESA_DIAGR_exit */
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAG_exit
+ * Description   : Pop function stack, print message
+ * Input         : Component, level, function name, RC
+ * Output        :
+ * Return Value  :
+ * Side Effects  :
+ * Scope         : Global
+ * Re-entrant    : No
+ ****************************************************/
+ 
+void ESA_DIAG_exitEx (ESA_DIAG_COMP_typ   comp,
+                    ESA_DIAG_LEVEL_typ  level,
+                    const char        * funcname,
+                    ESA_RC              rc_ret,
+                    ESA_RC              rc_func,
+					int                 line,
+					char              * source)
+{
+   ESA_DIAGR_exitEx ((void *)&stat_hand, comp, level, funcname, rc_ret, rc_func, line, source);
+} /* ESA_DIAG_exitEx */
+ 
+ 
+void ESA_DIAG_exit (ESA_DIAG_COMP_typ   comp,
+                    ESA_DIAG_LEVEL_typ  level,
+                    const char        * funcname,
+                    ESA_RC              rc_ret)
+{
+   ESA_DIAGR_exit ( (void *)&stat_hand, comp, level,funcname, rc_ret);
+} /* ESA_DIAG_exit */
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAGR_get_debug_level
+ * Description   : return diag level of a component
+ * Input         : Component
+ * Output        :
+ * Return Value  : level
+ * Side Effects  :
+ * Scope         : Global
+ * Re-entrant    : Yes
+ ****************************************************/
+ 
+ESA_DIAG_LEVEL_typ ESA_DIAGR_get_debug_level (
+                 void              * handle,
+                 ESA_DIAG_COMP_typ   comp)
+{
+   ESA_DIAG_HANDLE_typ * diag_handle = (ESA_DIAG_HANDLE_typ *)handle;
+ 
+   return diag_handle->esa_comp_level [comp];
+} /* ESA_DIAGR_get_debug_level */
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAG_get_debug_level
+ * Description   : return diag level of a component
+ * Input         : Component
+ * Output        :
+ * Return Value  : level
+ * Side Effects  :
+ * Scope         : Global
+ * Re-entrant    : No
+ ****************************************************/
+ 
+ESA_DIAG_LEVEL_typ ESA_DIAG_get_debug_level (ESA_DIAG_COMP_typ comp)
+{
+   return ESA_DIAGR_get_debug_level ( (void *)&stat_hand, comp );
+} /* ESA_DIAG_get_debug_level */
+ 
+/****************************************************
+ * A macro to check file writability
+ ***************************************************/
+ 
+#define CHK_OP_CLOSE(X,RC,BUF)               \
+   {                                         \
+     fdx = OPENER ((X));                     \
+     if (fdx) {                              \
+        fclose (fdx);                        \
+        (RC) = ESA_OK;                       \
+     }                                       \
+     else {                                  \
+        (RC) = ESA_ERR;                      \
+        if ((BUF)) {                         \
+           strcpy ((BUF), (X));              \
+           strcat ((BUF), ": ");             \
+           strcat ((BUF), strerror (errno)); \
+        }                                    \
+     }                                       \
+   }
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAG_check
+ * Description   : Check whether log files can be opened
+ * Input         : None
+ * Output        : buffer - string with reason of failure (strerror)
+ * Return Value  : ESA_RC
+ * Side Effects  : If access() is N/A, files are opened & closed.
+ * Scope         : Global
+ * Comments      : 1. Uses access(), if available, else fopen().
+ *                 2. NULL filenames, the null device
+ *                    (/dev/null on UNIX) and stdout/stderr are assumed
+ *                    to be writable.
+ *                 3. If buffer is NULL, it's ignored.
+ * Re-entrant    : Yes
+ ****************************************************/
+ 
+ESA_RC ESA_DIAGR_check (void * handle,
+                        char * errbuf )
+{
+   char   * xp;
+   FILE   * fdx;
+   ESA_RC   rc1 = ESA_OK, rc2 = ESA_OK;
+   int      k, need_write;
+   ESA_DIAG_HANDLE_typ * diag_handle = (ESA_DIAG_HANDLE_typ *)handle;
+   char   ddn_with[50]="";                                /* SAS2IBMN */
+ 
+   /* If all diag levels are 0 or -1, no need to check writability,
+    * since no write will ever take place
+    */
+ 
+   for (k = 0, need_write = 0; k LT ESA_MAX_COMPS; k++)
+      if (diag_handle->esa_comp_level [k] GT 0) {
+         need_write = 1;
+         break;
+      }
+ 
+   if (need_write EQ 0)
+      goto cleanup;                  /* and return ESA_OK */
+ 
+   if (errbuf)
+      *errbuf = NULL_CHAR;
+ 
+   xp = diag_handle->esa_diag_log_file_name;
+ 
+   if ((HAVE_FILE_NAME (xp)) AND (IS_REAL_FILE (xp))) {
+   /* SAS2IBMN -
+    * Remove the code below because HAVE_ACCESS_FUNCTION is
+    * not defined for MVS,
+#ifdef HAVE_ACCESS_FUNCTION
+      k = access (xp, W_OK);
+      if (k EQ 0)
+         rc1 = ESA_OK;            * exists & writable *
+      else
+         CHK_OP_CLOSE (xp, rc1, errbuf);  * not exist, try to open *
+#else
+      CHK_OP_CLOSE (xp, rc1, errbuf);
+    */
+      strcpy(ddn_with,"DD:");                            /* SAS2IBMN */
+      strcat(ddn_with,xp);                               /* SAS2IBMN */
+      CHK_OP_CLOSE (ddn_with, rc1, errbuf);              /* SAS2IBMN */
+/* SAS2IBMN  #endif  */
+   } /* HAVE_FILE_NAME */
+   /* else rc1 = ESA_OK - done in initialization */
+ 
+   xp = diag_handle->esa_diag_shadow_file_name;
+ 
+   if ((HAVE_FILE_NAME (xp)) AND (IS_REAL_FILE (xp))) {
+   /* SAS2IBMN -
+    * Remove the code below because HAVE_ACCESS_FUNCTION is
+    * not defined for MVS,
+#ifdef HAVE_ACCESS_FUNCTION
+      k = access (xp, W_OK);
+      if (k EQ 0)
+         rc2 = ESA_OK;            * exists & writable *
+      else
+         CHK_OP_CLOSE (xp, rc2, errbuf);  * not exist, try to open *
+#else
+      CHK_OP_CLOSE (xp, rc2, errbuf);
+    */
+      strcpy(ddn_with,"DD:");                            /* SAS2IBMN */
+      strcat(ddn_with,xp);                               /* SAS2IBMN */
+      CHK_OP_CLOSE (ddn_with, rc1, errbuf);              /* SAS2IBMN */
+/* SAS2IBMN #endif */
+   } /* HAVE_FILE_NAME */
+   /* else rc2 = ESA_OK - done in initialization */
+ 
+  cleanup:
+   return ((rc1 EQ ESA_OK) AND (rc2 EQ ESA_OK)) ? ESA_OK : ESA_ERR;
+ 
+} /* ESA_DIAGR_check */
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAG_check
+ * Description   : Check whether log files can be opened
+ * Input         : None
+ * Output        : buffer - string with reason of failure (strerror)
+ * Return Value  : ESA_RC
+ * Side Effects  : If access() is N/A, files are opened & closed.
+ * Scope         : Global
+ * Comments      : 1. Uses access(), if available, else fopen().
+ *                 2. NULL filenames, the null device
+ *                    (/dev/null on UNIX) and stdout/stderr are assumed
+ *                    to be writable.
+ *                 3. If buffer is NULL, it's ignored.
+ * Re-entrant    : No
+ ****************************************************/
+ 
+ESA_RC ESA_DIAG_check (char * errbuf)
+{
+   return ESA_DIAGR_check ( (void *)&stat_hand, errbuf );
+} /* ESA_DIAG_check */
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAG_activate
+ * Description   : Set the 'can_write' flag in diag structure
+ * Input/Output  : None
+ * Return Value  : None
+ * Side Effects  : Flag in static structure is set
+ * Scope         : Global
+ * Re-entrant    : No
+ ****************************************************/
+ 
+void ESA_DIAG_activate (void)
+{
+   ESA_DIAGR_activate ((void *)&stat_hand);
+} /* ESA_DIAG_activate */
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAG_deactivate
+ * Description   : Clear the 'can_write' flag in diag structure
+ * Input/Output  : None
+ * Return Value  : None
+ * Side Effects  : Flag in static structure is cleared
+ * Scope         : Global
+ * Re-entrant    : No
+ ****************************************************/
+ 
+void ESA_DIAG_deactivate (void)
+{
+   ESA_DIAGR_deactivate ((void *)&stat_hand);
+} /* ESA_DIAG_deactivate */
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAGR_activate
+ * Description   : Set the 'can_write' flag in diag structure
+ * Input/Output  : handle
+ * Return Value  : None
+ * Side Effects  : Flag is set
+ * Scope         : Global
+ * Re-entrant    : Yes
+ ****************************************************/
+ 
+void ESA_DIAGR_activate (void * handle)
+{
+   ESA_DIAG_HANDLE_typ * diag_handle = (ESA_DIAG_HANDLE_typ *)handle;
+ 
+   diag_handle->can_write = 1;
+} /* ESA_DIAGR_activate */
+ 
+/****************************************************
+ * Procedure Name: ESA_DIAGR_deactivate
+ * Description   : Clear the 'can_write' flag in diag structure
+ * Input/Output  : Handle
+ * Return Value  : None
+ * Side Effects  : Flag is cleared
+ * Scope         : Global
+ * Re-entrant    : No
+ ****************************************************/
+ 
+void ESA_DIAGR_deactivate (void * handle)
+{
+   ESA_DIAG_HANDLE_typ * diag_handle = (ESA_DIAG_HANDLE_typ *)handle;
+ 
+   diag_handle->can_write = 0;
+} /* ESA_DIAGR_deactivate */
+ 
+ 
+void ESA_DIAG_COMP_LEVELS (void)
+{
+   int  jj= 0, kk= 0, ll= 0;
+   char CompStr[84]="", ElemStr[20]="";
+ 
+   for (jj= 0; jj LT ESA_MAX_COMPS; jj++)
+   {
+      if (stat_hand.esa_comp_level [jj] NE 0)
+	  {
+         if (kk == 0)
+		 {
+            ESA_DIAG_printf (ESA_COMP_ACSCB, DIAG_BASIC- 1,
+		"***** ------------- Diagnostics  Levels ------------- *****");
+            ESA_DIAG_printf (ESA_COMP_ACSCB, DIAG_BASIC- 1,
+		"(Code LvlN) (Code LvlN) (Code LvlN) (Code LvlN) (Code LvlN)");
+            kk++;
+			ll= jj;
+		 }
+		 sprintf (ElemStr, "(%03d - %03d) ",
+			      jj, stat_hand.esa_comp_level [jj]);
+		 if (strlen (CompStr) GE sizeof(CompStr)- strlen(ElemStr)- 1)
+		 {
+            ESA_DIAG_printf (ESA_COMP_ACSCB, DIAG_BASIC- 1, "%s", CompStr);
+			memset (CompStr, '\0', sizeof(CompStr));
+		 }
+		 strcat (CompStr, ElemStr);
+	  }
+   }
+   if (strlen (CompStr))
+         ESA_DIAG_printf (ESA_COMP_ACSCB, DIAG_BASIC- 1, "%s", CompStr);
+ 
+   if (kk)
+      ESA_DIAG_printf (ESA_COMP_ACSCB, DIAG_BASIC- 1,
+      "***** ----------------------------------------------- *****");
+}
+/*
+static void AdvOpenLogFiles (const char          * pfx_line,
+                             const char          * p_line,
+                             ESA_DIAG_HANDLE_typ * diag_handle)
+{
+	char         OpenA[]="a";
+	char         RowSpace[MAX_RSS_ADDINFO_VAL_LEN+ 1];
+    int          save, AddNumber= 1000000;
+    char         fbuf [128]="";
+	static int   SaveDiagLevel;
+	static int   SaveStatistLevel;
+    static int   SkipDiag= FALSE;
+ 
+    if (
+		  (stat_hand.esa_comp_level [ESA_MAX_COMPS- 1] GT 0)
+         AND
+		  (strlen (diag_handle->esa_diag_shadow_file_name) GT 0)
+       )
+	{
+ 
+       if (diag_handle->GlobComp EQ ESA_MAX_COMPS- 2)
+          SaveDiagLevel += diag_handle->GlobLevel;
+ 
+       else if (diag_handle->GlobComp EQ ESA_MAX_COMPS- 3)
+	   {
+         if (SaveStatistLevel EQ 0)
+          SaveStatistLevel= ESA_DIAG_get_debug_level(ESA_MAX_COMPS- 3);
+         else
+		 {
+            SaveDiagLevel= SaveStatistLevel;
+			SaveStatistLevel= 0;
+			SkipDiag= FALSE;
+		 }
+	   }
+ 
+       else if (
+		          (SaveStatistLevel)
+                 AND
+                  (
+	     		     (diag_handle->GlobComp EQ ESA_MAX_COMPS- 4)
+                    OR
+	     		     (diag_handle->GlobComp EQ ESA_MAX_COMPS- 5)
+                    OR
+	     		     (diag_handle->GlobComp EQ ESA_MAX_COMPS- 6)
+                    OR
+	     		     (diag_handle->GlobComp EQ ESA_MAX_COMPS- 7)
+                  )
+               )
+       {
+        save=ESA_DIAG_get_debug_level(diag_handle->GlobComp)-AddNumber;
+           if (diag_handle->GlobLevel LT save)
+		      SkipDiag= TRUE;
+		   else if (diag_handle->GlobLevel GT save+ SaveStatistLevel)
+              SkipDiag= TRUE;
+		   else
+              SkipDiag= FALSE;
+	   }
+ 
+	   else if (diag_handle->GlobComp EQ ESA_MAX_COMPS- 1)
+	   {
+		  if (1 LT diag_handle->GlobLevel + SaveDiagLevel)
+          {
+             OpenLogFile (diag_handle->esa_diag_log_file_name,
+                 FILE_OPEN_FOR_READ, &diag_handle->esa_diag_log_file,
+				 diag_handle);
+             OpenLogFile (diag_handle->esa_diag_shadow_file_name,
+                 OpenA, &diag_handle->esa_diag_shadow_file,
+				 diag_handle);
+             for (;
+ diag_handle->esa_diag_shadow_file AND diag_handle->esa_diag_log_file ;)
+			 {
+                fgets(RowSpace, MAX_RSS_ADDINFO_VAL_LEN+ 1,
+                    diag_handle->esa_diag_log_file);
+                if (feof(diag_handle->esa_diag_log_file) NE 0)
+                   break;
+                if (ferror(diag_handle->esa_diag_log_file))
+				{
+                   save = errno;
+                   GET_TOS (fbuf);
+                   fprintf (stderr,
+                     "%s: Read Log File '%s' failed:%s\n",
+                     fbuf, diag_handle->esa_diag_log_file_name,
+					 strerror (save));
+                   diag_handle->esa_diag_printing_line = 0;
+                   break;
+				}
+                if ((fputs(RowSpace,
+					       diag_handle->esa_diag_shadow_file)) EQ EOF)
+				{
+                   save = errno;
+                   GET_TOS (fbuf);
+                   fprintf (stderr,
+                     "%s: Append Log File '%s' failed:%s\n",
+                     fbuf, diag_handle->esa_diag_shadow_file_name,
+					 strerror (save));
+                   diag_handle->esa_diag_printing_line = 0;
+                   break;
+				}
+			 }
+             close_log_files (diag_handle);
+		     SaveDiagLevel= 0;
+		     SkipDiag= FALSE;
+		  }
+          OpenLogFile (diag_handle->esa_diag_log_file_name,
+                        FILE_CREAT, &diag_handle->esa_diag_log_file,
+						diag_handle);
+	   }
+ 
+       if (SkipDiag EQ FALSE)
+          OpenLogFile (diag_handle->esa_diag_log_file_name,
+                       OpenA, &diag_handle->esa_diag_log_file,
+					   diag_handle);
+ 
+	}
+    else
+	   open_log_files (diag_handle);
+ 
+    diag_handle->GlobComp= 0;
+	diag_handle->GlobLevel=0;
+	return;
+ 
+}
+ 
+ 
+static void OpenLogFile (char                 * LogFile,
+                         char                 * OpenType,
+						 FILE                ** FileHndl,
+                         ESA_DIAG_HANDLE_typ  * diag_handle)
+{
+    int    save;
+    char   fbuf [128];
+ 
+    *FileHndl          = NULL;
+ 
+    if (HAVE_FILE_NAME (LogFile))
+	{
+       if (IS_REAL_FILE (LogFile))
+	   {
+          if (NOT(*FileHndl= fopen (LogFile, OpenType)))
+		  {
+             save = errno;
+             GET_TOS (fbuf);
+             fprintf (stderr,
+                     "%s: Open Log File '%s' failed:%s\n",
+                     fbuf, LogFile, strerror (save));
+             diag_handle->esa_diag_printing_line = 0;
+		  }
+          else
+		  {   /
+		  }
+	   }
+	}
+}
+*/
+/****************************************************
+ * Procedure Name: ESA_DIAG_get_diag_info
+ * Description   : Get Diag & Shadow file name and the diag level array
+ * Input         :
+ * Output        :
+ * Return Value  :
+ * Side Effects  :
+ * Scope         : Global
+ * Re-entrant    :
+ ****************************************************/
+void ESA_DIAGR_get_diag_info (void * handle,
+							char * diag_file_name_buffer,
+							size_t diag_file_name_buffer_size,
+							char * diag_shadow_file_name_buffer,
+							size_t diag_shadow_file_name_buffer_size,
+						    ESA_DIAG_LEVEL_typ * levels_array,
+							size_t levels_array_size)
+{
+  int i = 0;
+  int stop = levels_array_size / sizeof(ESA_DIAG_LEVEL_typ);
+  ESA_DIAG_HANDLE_typ * handy = (!handle) ? &stat_hand
+	                                 : (ESA_DIAG_HANDLE_typ *)handle;
+  if(diag_file_name_buffer)
+	strncpy(diag_file_name_buffer,
+			handy->esa_diag_log_file_name,
+			diag_file_name_buffer_size);
+  if(diag_shadow_file_name_buffer)
+	strncpy(diag_shadow_file_name_buffer,
+			handy->esa_diag_shadow_file_name,
+			diag_shadow_file_name_buffer_size);
+  if(levels_array)
+	  for(; i < stop; i++)
+		levels_array[i] = handy->esa_comp_level[i];
+}
+/****************************************************
+ * Procedure Name: ESA_DIAG_get_file_name_size
+ * Description   : Retrive the diag file name buffer size
+ * Input         :
+ * Output        : size_t * file_name_size
+ * Return Value  :
+ * Side Effects  :
+ * Scope         : Global
+ * Re-entrant    :
+ ****************************************************/
+ESA_RC ESA_DIAG_get_shdw_fname_size (size_t * file_name_size)
+{
+	if(!file_name_size)
+		return ESA_ERR;
+	*file_name_size = sizeof(stat_hand.esa_diag_shadow_file_name);
+	return  ESA_OK;
+}
+/****************************************************
+ * Procedure Name: ESA_DIAG_get_file_name_size
+ * Description   : Retrive the diag file name buffer size
+ * Input         :
+ * Output        : size_t * file_name_size
+ * Return Value  :
+ * Side Effects  :
+ * Scope         : Global
+ * Re-entrant    :
+ ****************************************************/
+ESA_RC ESA_DIAG_get_file_name_size(size_t * file_name_size)
+{
+	if(!file_name_size)
+		return ESA_ERR;
+	*file_name_size = sizeof(stat_hand.esa_diag_log_file_name);
+	return  ESA_OK;
+}
+/****************************************************
+ * Procedure Name: ESA_DIAG_get_lvls_arr_size
+ * Description   : Retrive the diag levels array size
+ * Input         :
+ * Output        : size_t * array_size
+ * Return Value  :
+ * Side Effects  :
+ * Scope         : Global
+ * Re-entrant    :
+ ****************************************************/
+ESA_RC ESA_DIAG_get_lvls_arr_size (size_t * array_size)
+{
+	if(!array_size)
+		return ESA_ERR;	
+	*array_size = sizeof(stat_hand.esa_comp_level);
+	return  ESA_OK;
+}
+ 
+void ESA_DIAG_print_stack (void               * handle,
+						   const char         * funcname,
+                           int                  always,
+                           ESA_DIAG_LEVEL_typ   comp)
+{
+   ESA_DIAG_LEVEL_typ    DiagStack;
+   int                   ALWAYS= 1;
+   static char           LastStackFunc [ESA_MAX_FUNC_NAME];
+   ESA_DIAG_HANDLE_typ * diag_handle = (ESA_DIAG_HANDLE_typ *)handle;
+   int                   cur_status= DiagToMemory;
+ 
+   if (always)
+      DiagStack= ALWAYS;
+   else
+   {
+      DiagStack= (diag_handle->esa_comp_level [comp]               / 100) % 10;
+/*      if (DiagStack EQ 0)
+         DiagStack= (diag_handle->esa_comp_level [ESA_COMP_ACSDMP] / 100) % 10;*/
+   }
+   if (DiagStack)
+   {
+	 int  ii;
+	 char fstack [ESA_MAX_FUNCS* (ESA_MAX_FUNC_NAME+2)]="";
+ 
+	 for (ii= 0; ii LT diag_handle->esa_stack_level; ii++)
+	 {
+	    if (ii GT 0)
+ 	       strcat (fstack, "->");
+ 	    strcat (fstack, stat_hand.esa_func_stack [ii]);
+	 }
+	 if (
+		   (DiagStack EQ ALWAYS)
+          OR
+		   (
+		      (diag_handle->esa_stack_level GT 0)
+             AND
+              (strcmp (LastStackFunc,
+			           stat_hand.esa_func_stack [diag_handle->esa_stack_level- 1]) NE 0)
+           )
+          OR
+           (diag_handle->esa_stack_level EQ 0)
+        )
+	 {
+        DiagToMemory= FALSE;
+        esa_diag_printf_uncond (diag_handle, ">>> %s's stack: %s <<<", funcname, fstack);
+        DiagToMemory= cur_status;
+	 }
+	 if (diag_handle->esa_stack_level > 0)
+        strcpy (LastStackFunc,
+		        stat_hand.esa_func_stack [diag_handle->esa_stack_level- 1]);
+   }
+ 
+   return;
+}
+ 
+ 
+ 
+void ESA_DIAG_memory_status (void       * handle,
+						     const char * funcname,
+			                 ESA_RC       rc_ret)
+{
+   int                   kk= 0;
+   ESA_DIAG_HANDLE_typ * diag_handle = (ESA_DIAG_HANDLE_typ *)handle;
+   int cur_status= DiagToMemory;
+   char fn[]="ESA_DIAG_memory_status";
+ 
+/***************************************
+       if (cur_status EQ TRUE)
+		   DiagToMemory= FALSE;
+            esa_diag_printf_uncond (diag_handle,
+"<???>fun=%s ret=%d DIAG:Fast=%d Disable=%d ToMemory=%d Regular=%d ErrRc=%d<???>",
+funcname, rc_ret, DiagFast,DiagDisable, cur_status, DiagRegular, DiagErrRc);
+       if (cur_status EQ TRUE)
+	 	  DiagToMemory= TRUE;
+***************************************/
+   /*--- Memory diagnostics treatment.
+         the funcion can be called from
+		  - ESA_DIAG_exit in this case rc_ret not equal to ESA_OK and ESA_EOF
+		  - CG_epilog with 'rc_ret' equal to ESA_EOF
+		                                    at end of the process
+		  - ESA_DIAG_set_debug_levels with 'rc_ret' equal to ESA_EOF
+		                                    when diagnostics file changed
+		  - main CTSOFLI with 'rc_ret' equal to ESA_OK
+		                                    after attach to USA-API
+		  - main CE with 'rc_ret' equal to ESA_OK
+		                                    after connection with ESS
+		  - CS_start_service (CS and CD) with 'rc_ret' equal to ESA_OK
+		                                    after starting new transaction)   ---*/
+ 
+   if ( (DiagFast NE FALSE) AND (DiagDisable EQ FALSE) )
+   {
+      /*--- When Diagnostics are Available for the (DiagDisable equal to FALSE)
+         and treatment diagnostics in memory (DiagFast doesn't equal to FALSE) ---*/
+	  if (DiagRegular EQ TRUE)
+	  {
+		 /*--- First call to the function. (DiagRegular equal to TRUE)
+		      (From start of the process, diagnostics are regular) ---*/
+		 if (rc_ret EQ ESA_OK)
+		 {
+			/*--- Start output diagnostics to memeory ---*/
+            esa_diag_printf_uncond (diag_handle,
+               "<_____FIRST STOP regular DIAG> %s: from %s <>", fn, funcname);
+            DiagToMemory= TRUE;
+	        DiagRegular= FALSE;
+		 }
+		 goto cleanup;
+	  }
+ 
+      if (DiagToMemory EQ FALSE)
+	  {
+         /*--- When diagnostics output to the diagnostic file
+		       (DiagToMemory equal to FALSE)---*/
+		 if (rc_ret EQ ESA_OK)
+		 {
+			/*--- Start output diagnostics to memeory ---*/
+            esa_diag_printf_uncond (diag_handle,
+              "<_____STOP regular DIAG> %s: from %s <>", fn, funcname);
+            DiagToMemory= TRUE;
+		 }
+		 goto cleanup;
+	  }
+ 
+ 
+      for (kk= 0; kk LT RcArrNum; kk++)
+	  {
+         /*--- Check if Return Code (rc_ret) is in error list 'rc_arr[]' ---*/
+         if (rc_arr[kk] EQ ESA_OK)
+			continue;
+         if (rc_arr[kk] EQ rc_ret)
+		    break;
+	  }
+ 
+      if (DiagToMemory EQ TRUE)
+	  {
+         /*--- When diagnostics output to the memory ---*/
+		 if (
+			   ( (rc_ret EQ ESA_OK) AND (DiagErrRc EQ FALSE) )
+			  OR
+			   (rc_ret EQ ESA_EOF)
+			  OR
+			   (rc_ret EQ ESA_MBX_EMPTY)
+		    )
+		 {
+            /*--- Continue output diagnostics to memory
+		          after Move diagnostics from memory to the diagnostic file
+			      (DiagErrRc equal to FALSE) ---*/
+            DiagToMemory= FALSE;
+            esa_diag_printf_uncond (diag_handle,
+               "<_____go to output DIAG from memory> %s: from %s <>", fn, funcname);
+			DiagToMemory= TRUE;
+		 }
+		 if ( (rc_ret EQ ESA_OK) AND (DiagErrRc EQ TRUE) )
+		 {
+            /*--- Continue output diagnostics to memory
+			      after clear diagnostics from memory
+			      (DiagErrRc equal to TRUE) ---*/
+            DiagToMemory= FALSE;
+            esa_diag_printf_uncond (diag_handle,
+               "<_____CLEAR DIAG from memory> %s: from %s <>", fn, funcname);
+			DiagToMemory= TRUE;
+			memset (DiagMemoryDump, '\0', DiagMemoryAlloc);
+			DiagMemoryLen= 0;
+			goto cleanup;
+		 }
+         else if ( (rc_ret NE ESA_OK)  AND (rc_ret NE ESA_MBX_EMPTY) AND
+			       (rc_ret NE ESA_EOF) AND (kk GE RcArrNum) )
+            /*--- Continue output diagnostics to memory
+			      in case when RC douesn't match error list 'rc_arr[]'
+			      (DiagErrRc equal to TRUE) ---*/
+			goto cleanup;
+         else if ( (rc_ret NE ESA_OK)  AND  (rc_ret NE ESA_MBX_EMPTY) AND
+			       (rc_ret NE ESA_EOF) AND (kk LT RcArrNum) )
+		 {
+            /*--- Start output diagnostics to the diagnostic file
+			      after Move diagnostics from memory to the diagnostic file
+			      in case when RC matches error list rc_arr[]
+			      (DiagErrRc equal to TRUE) ---*/
+            DiagToMemory= FALSE;
+            esa_diag_printf_uncond (diag_handle,
+               "<_____START regular DIAG by ERROR> %s: rc=%d from %s <>",fn, rc_ret, funcname);
+		 }
+	  }
+ 
+	  /*--- Move diagnostics from memory to diagnostic file ---*/
+      if (DiagMemoryDump)
+         ESA_DIAG_from_memory (diag_handle);
+ 
+   }
+cleanup:
+ 
+   if (rc_ret EQ ESA_MBX_EMPTY)
+      DiagToMemory= FALSE;
+   if (rc_ret EQ ESA_EOF)
+	  /*--- At end of the process OR if diagnostics changed,
+	        clear allocated memory for diagnostics ---*/
+      ESA_DIAG_free (diag_handle);
+   if (cur_status NE DiagToMemory)
+	  /*--- If changed memory diagnostic status (DiagToMemory)
+	           print function that initiate this change ---*/
+      ESA_DIAG_print_stack (handle, funcname, TRUE, 0);
+/***************************************
+       cur_status= DiagToMemory;
+       if (cur_status EQ TRUE)
+		   DiagToMemory= FALSE;
+            esa_diag_printf_uncond (diag_handle,
+"<???>fun=%s ret=%d DIAG:Fast=%d Disable=%d ToMemory=%d Regular=%d ErrRc=%d kk=%d<???>",
+funcname, rc_ret, DiagFast,DiagDisable, DiagToMemory, DiagRegular, DiagErrRc, kk);
+       if (cur_status EQ TRUE)
+	 	  DiagToMemory= TRUE;
+***************************************/
+ 
+   return;
+}
+ 
+static void ESA_DIAG_from_memory (ESA_DIAG_HANDLE_typ * diag_handle)
+{
+   char   mnlb [] = "\n";
+   char * wrk_line;
+   /* 502839 char   fn[]="ESA_DIAG_from_memory"; */
+   int    wrk_len, jj;
+ 
+   /*--- Move diagnostics from memory to the diagnostic file ---*/
+ 
+   diag_handle->esa_diag_printing_line = 1;
+   if (DiagOpenSw EQ FALSE)
+   {
+/*      AdvOpenLogFiles ("", "", diag_handle);*/
+      open_log_files (diag_handle);
+      if (DiagKeepOpen EQ TRUE)
+          DiagOpenSw= TRUE;
+   }
+   fprintf (diag_handle->esa_diag_log_file, "%s %s: %s", "", "", "");
+   fputs ("=========================>>>\n", diag_handle->esa_diag_log_file);
+   for (wrk_line= DiagMemoryDump, wrk_len= 0, jj= 0;
+        (wrk_len LT DiagMemoryLen) AND (jj LT MemLenNum) ;
+		wrk_line += strlen (wrk_line)+ 1, wrk_len += strlen (wrk_line)+ 1, jj++)
+	{
+	  if (strlen (wrk_line) EQ 0)	
+         continue;
+      fprintf (diag_handle->esa_diag_log_file, "%s %s: %s", "", "", "");
+      fputs ((const char *)wrk_line, diag_handle->esa_diag_log_file);
+      fputs (mnlb, diag_handle->esa_diag_log_file);
+      IFNewDiagGen (diag_handle);
+	}
+   fprintf (diag_handle->esa_diag_log_file, "%s %s: %s", "", "", "");
+   fputs ("<<<========================\n", diag_handle->esa_diag_log_file);
+   if (DiagKeepOpen EQ FALSE)
+      close_log_files (diag_handle);
+   diag_handle->esa_diag_printing_line = 0;
+   DiagMemoryLen= 0;
+   DiagHalfMemLen= 0;
+   MemLenNum= 0;
+}
+ 
+static void ESA_DIAG_free (ESA_DIAG_HANDLE_typ * diag_handle)
+{
+   int kk;
+   if (DiagMemoryDump)
+   {
+      /*if (DiagErrRc EQ FALSE)*/
+      /*--- Move diagnostics from memory to the diagnostic file
+			     (DiagErrRc equal to TRUE) ---*/
+         ESA_DIAG_from_memory (diag_handle);
+      free (DiagMemoryDump);
+   }
+   DiagTab         = FALSE;
+   DiagFast        = FALSE;
+   DiagErrRc       = FALSE;
+   DiagOpenSw      = FALSE;
+   DiagDisable     = FALSE;
+   DiagRegular     = TRUE;
+   DiagKeepOpen    = FALSE;
+   DiagToMemory    = FALSE;
+   DiagMemoryDump  = NULL;
+   MemLenNum       = 0;
+   DiagMemoryLen   = 0;
+   DiagHalfMemLen  = 0;
+   DiagMemoryAlloc = 0;
+   for (kk= 0; kk LT RcArrNum; kk++)
+       rc_arr[kk]= 0;
+}
+ 
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : RepFileGenNum                            *
+*                                                             *
+* Description      : Replace generation variable              *
+*                                                             *
+* Input            :  2) name           -  original file name *
+*                  :  3) curr_gen       -  generation number  *
+*                                                             *
+* Output           :  1) gen_file_name  - Updated file name   *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+**************************************************************/
+ 
+static void RepFileGenNum (char * gen_file_name,
+                           char * name,
+                           int    curr_gen,
+						   int    pid_number)
+{
+        int i, l;
+        char * p, *t;
+        char gen_str[10]="";
+        char pid_num_str[10]="";
+ 
+#define CTSAMSG_GEN_NUM  "##G##"
+#define CTSAMSG_GEN_NUM1 "##G1##"
+#define CTSAMSG_GEN_NUM2 "##G2##"
+#define CTSAMSG_GEN_NUM3 "##G3##"
+ 
+        /*** Locate generation variable in file name ***/
+ 
+ 
+        if ( (p = strstr( name, CTSAMSG_GEN_NUM )) NE NULL ) {
+                i = strlen(CTSAMSG_GEN_NUM);
+                if ( (curr_gen LT 1) OR (curr_gen GT 999)  )
+                  strcpy(gen_str, "0" );
+                else
+                  sprintf ( gen_str, "%d", curr_gen );
+        }
+        else if ( (p = strstr( name, CTSAMSG_GEN_NUM1 )) NE NULL ) {
+                i = strlen( CTSAMSG_GEN_NUM1 );
+                if ( (curr_gen LT 1) OR (curr_gen GT 9)  )
+                  strcpy(gen_str, "0" );
+                else
+                  sprintf ( gen_str, "%01d", curr_gen );
+        }
+        else if ( (p = strstr( name, CTSAMSG_GEN_NUM2 )) NE NULL ) {
+                i = strlen( CTSAMSG_GEN_NUM2 );
+                if ( (curr_gen LT 1) OR (curr_gen GT 99)  )
+                  strcpy(gen_str, "0" );
+                else
+                  sprintf ( gen_str, "%02d", curr_gen );
+        }
+        else if ( (p = strstr( name, CTSAMSG_GEN_NUM3)) NE NULL ) {
+                i = strlen( CTSAMSG_GEN_NUM3 );
+                if ( (curr_gen LT 1) OR (curr_gen GT 999)  )
+                  strcpy(gen_str, "0" );
+                else
+                  sprintf ( gen_str, "%03d", curr_gen );
+        }
+ 
+        /*** If generation variables found, build new file name ***/
+        sprintf (pid_num_str, "%d", pid_number);
+ 
+        if (p) {
+           t = p + i;
+           l = p - name;
+           memcpy( gen_file_name, name, l );
+           gen_file_name[l] = '\0';
+		   if (pid_number GT 0)
+              strcat( gen_file_name, pid_num_str );
+           strcat( gen_file_name, gen_str );
+           strcat( gen_file_name, t );
+        }
+ 
+        /*** Otherwise, leave file name asis ***/
+ 
+        else
+           strcpy( gen_file_name, name );
+ 
+        /*** Done ***/
+ 
+        return;
+ 
+}
+ 
+static void IFNewDiagGen (ESA_DIAG_HANDLE_typ * diag_handle)
+{
+  if ( (diag_handle->enable_gen ) AND  (diag_handle->max_gen GT 1) ) {
+     char     OldFileName[MAX_FILENAME_LEN+ 1];
+     char     NewFileName[MAX_FILENAME_LEN+ 1];
+     time_t   curr_time;
+     char     current_time [50];
+ 
+     strcpy (current_time, get_current_time ());
+	 strcpy (OldFileName, diag_handle->esa_diag_log_file_name);
+     curr_time = time(NULL);
+     diag_handle->curr_lines++;
+ 
+     if (
+		   (
+		     (diag_handle->curr_lines GE diag_handle->max_lines) AND (diag_handle->max_lines)
+		   )
+		  OR
+           (
+		      (diag_handle->max_interval)
+		     AND
+			  (diag_handle->last_switch + diag_handle->max_interval LE curr_time)
+           )
+        ) {
+ 
+        /* Start the new log file generation */
+ 
+        (diag_handle->curr_gen)++;
+        if (diag_handle->curr_gen GT diag_handle->max_gen)
+			diag_handle->curr_gen = 1;
+ 
+        diag_handle->last_switch = curr_time;
+        diag_handle->curr_lines = 0;
+        RepFileGenNum (NewFileName, diag_handle->Origin_diag_file_name,
+			           diag_handle->curr_gen, diag_handle->pid_number);
+        fprintf (diag_handle->esa_diag_log_file, LOGFILE_CONTINUE_DIAG_FORMAT_NEXT,
+			     current_time, NewFileName);
+        /* Close the current log file */
+        close_log_files (diag_handle);
+        /* Open the file */
+        diag_handle->open_create= TRUE;
+        open_log_files (diag_handle);
+        if (DiagKeepOpen EQ TRUE)
+           DiagOpenSw= TRUE;
+        fprintf(diag_handle->esa_diag_log_file,LOGFILE_CONTINUE_DIAG_FORMAT_PREV,
+			    current_time, OldFileName);
+     } /* Log Switch performed */
+ 
+  }  /* Log file switch enabled */
+}
+ 
+static void ChooseCurrGen (ESA_DIAG_HANDLE_typ * diag_handle)
+{
+   char     NewFileName[MAX_FILENAME_LEN+ 1];
+   char     current_time [20]= "";
+   char     row [BIG_BUF_SIZE];
+   FILE   * file_handle= NULL;
+   int      ii;
+   char     ddn_with[50]="";                              /* SAS2IBMT */
+ 
+   diag_handle->curr_gen= -1;
+   for (ii= 1; ii LE diag_handle->max_gen; ii++)
+   {
+      RepFileGenNum (NewFileName, diag_handle->Origin_diag_file_name, ii,
+		             diag_handle->pid_number);
+      if (strcmp (NewFileName, diag_handle->Origin_diag_file_name) EQ 0)
+         goto cleanup;
+	  if (diag_handle->curr_gen EQ -1)
+		  diag_handle->curr_gen= 0;
+    strcpy(ddn_with,"DD:");                               /* SAS2IBMT */
+    strcat(ddn_with, NewFileName);                        /* SAS2IBMT */
+    /* strcpy(ddn_with,"//'");                               SAS2IBMT */
+    /* strcat(ddn_with, NewFileName);                        SAS2IBMT */
+    /* strcat(ddn_with,"'");                                 SAS2IBMT */
+    ESA_DIAG_printf(0, 0,                                 /* SAS2IBMT */
+        "ESADIAG: About to fopen %s", NewFileName);
+      /* SAS2IBMT
+      if (NOT (file_handle= fopen (NewFileName, FILE_OPEN_FOR_READ)))*/
+      if (NOT (file_handle= fopen (ddn_with, FILE_OPEN_FOR_READ))) /* SAS2IBMT */
+         goto cleanup;
+      fgets(row, BIG_BUF_SIZE, file_handle);
+      if (feof (file_handle) NE 0)
+         goto cleanup;
+      if (ferror (file_handle))
+         goto cleanup;
+      if (memcmp (current_time, row, sizeof (current_time)) LE 0)
+          memcpy (current_time, row, sizeof (current_time));
+	  else
+         goto cleanup;
+	  fclose (file_handle);
+      diag_handle->curr_gen= ii;
+   }
+cleanup:
+   if (ii GT diag_handle->max_gen)
+      diag_handle->curr_gen= 1;
+   else
+      diag_handle->curr_gen++;
+   if (file_handle)
+	  fclose (file_handle);
+ 
+   return;
+ 
+}
+ 
+ 
+struct tm * ConvertTimeToTMStruct (time_t * int_clock, struct tm * tm_clock)
+{
+ 
+   memcpy(tm_clock, localtime(int_clock), sizeof(struct tm));
+ 
+   return tm_clock;
+}

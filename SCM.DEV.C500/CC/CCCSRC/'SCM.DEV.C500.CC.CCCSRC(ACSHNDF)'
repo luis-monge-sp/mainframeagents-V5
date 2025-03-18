@@ -1,0 +1,225 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: acshndf.c %
+ * Instance        : %instance: 1 %
+ * Created by      : %created_by: leonid_s %
+ * Created on      : %date_created: Wed May 14 14:32:35 2003 %
+ * Current Version : %version: 5 %
+ * Last Modified by: %derived_by: leonid_s %
+ * Last Modified on: %date_modified: Wed May 14 14:32:35 2003 %
+ */
+ 
+/***********************************************
+ * Mod.ID   Who      When         Description
+ * =============================================
+ * SAS2IBMA AvnerL   21-Dec-16    SAS/C to IBM C Conversion Project
+ * WS10080  KailasP  28-Jul-21    Support MSGSIZE Greater than 32K
+ * WS10082A AvnerL   20-Oct-23    ADDINFO new approach
+ **********************************************/
+ 
+#include "globs.h"
+ 
+ 
+#include ESA_MSG
+#include ESA_CHKSUM
+#include ESA_CS_DBPKG
+#include ESA_CS_SINFO
+#include ESA_CS_OS
+#include ESA_RSSF
+ 
+/****************************************************
+ * Procedure Name: CS_ess_initial_service
+ * Description   : Conversation with ESS to start CD (CS)
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_ess_initial_service (MSG_typ             * msg_ptr,
+                               RSS_MSG_HDR_rec_typ * msg_hdr_cd)
+{
+  char fn[]="CS_ess_initial_service";
+  ESA_RC                    rc;
+  RSS_MSG_HDR_rec_typ       msg_hdr;
+  RSS_MSG_HDR_rec_typ       msg_hdr_sav;
+  CSFLAG                    current_srv;
+  int                       ii;
+  ENVIRONMENT_rec_typ     * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSHNDF, DIAG_COMMON, fn);
+ 
+  /* WS10080 Start - We want to save iiq_version for interceptions */
+  envir_ptr->iiq_ver_interceptor = envir_ptr->iiq_version;
+  ESA_DIAG_printf (ESA_COMP_ACSHNDF, 9 ,
+        "Set envir_ptr->iiq_ver_interceptor %d",
+         envir_ptr->iiq_ver_interceptor);
+  /* WS10080 End */
+ 
+  memcpy ((char *)&msg_hdr_sav,(char *)msg_hdr_cd,
+	      sizeof( RSS_MSG_HDR_rec_typ));
+  rc = ESA_OK;
+  current_srv = CSON;
+ 
+  envir_ptr->read_alternatives = BLANK; /* No queue read */
+ 
+  while (current_srv EQ CSON) {
+ 
+    CLEAR(msg_ptr);
+ 
+    rc= CS_get_next_msg (msg_ptr , &msg_hdr);
+ 
+    if (rc NE ESA_OK )
+      goto cleanup;
+ 
+    memcpy ((char *)&msg_hdr_sav,(char *)&msg_hdr,
+		    sizeof( RSS_MSG_HDR_rec_typ));
+/*
+  MODIFIED by AVIW 22/5/96
+ 
+    if (memcmp (envir_ptr->dcid,
+                msg_hdr.mhcid, sizeof(envir_ptr->dcid)) NE 0)
+    {
+      CTSAMSG_print (ERR_CS_INVALID_DCID,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn,
+                     msg_hdr.mhcid[0], msg_hdr.mhcid[1],
+                     envir_ptr->dcid[0], envir_ptr->dcid[1]);
+      rc = ESA_FATAL;
+      goto cleanup;
+ 
+    }
+ */
+ 
+   memcpy (envir_ptr->dcid , msg_hdr.mhcid , sizeof(envir_ptr->dcid));
+ 
+    if (COND(MSG_PLATFORM_DETAIL))
+      rc=CS_platform_detailes (&msg_hdr);
+ 
+    /* End of service indicator */
+    else if (COND(END_OF_SERVICE))
+      current_srv = CSOFF;
+ 
+    /* undefined service */
+    else {
+      CTSAMSG_print (ERR_CS_UNDEF_MSG_TYP,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn,
+                     &msg_hdr.mhmtyp);
+      rc = ESA_FATAL;
+      goto cleanup;
+    }
+ 
+    /* close CS */
+    if (rc EQ ESA_TERM_CTSA)
+      current_srv = CSOFF;
+ 
+    /* error occurred */
+    else if (rc NE ESA_OK) {
+      goto cleanup;
+    }
+ 
+    /* last message indication the same as end of service*/
+    else if (msg_hdr.mhltl EQ MH_MESSAGE_LAST)
+      current_srv = CSOFF;
+ 
+  }
+ 
+  cleanup:
+  if (rc EQ ESA_OK)
+  {
+    envir_ptr->initial_service= INIT_SERVICE_SENDED;
+    for (ii= 0; ii LT envir_ptr->max_rss_num; ii++) {
+        envir_ptr->interest[ii].rss_status= RSS_UP;
+	}
+    memset (envir_ptr->rss_status_date, '\0', DATE_LEN);
+    memset (envir_ptr->rss_status_time, '\0', TIME_LEN);
+  }
+  ESA_DIAG_printf (ESA_COMP_ACSHNDF, 14,
+        "envir_ptr->initial_service %c.",
+         envir_ptr->initial_service);
+ 
+  if (rc EQ ESA_CANCEL_SERVICE)
+    CTSAMSG_print (ERR_CS_SERVICE_CANCEL,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   fn);
+ 
+  if ((rc NE ESA_OK) AND
+      (rc NE ESA_TERM_CTSA)AND
+      (rc NE ESA_CANCEL_SERVICE))
+    CTSAMSG_print (ERR_CS_SERVICE,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   fn, envir_ptr->msg_ptr);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSHNDF, DIAG_COMMON, fn, rc);
+ 
+  return(rc);
+}
+ 
+/****************************************************
+ * Procedure Name: CS_platform_detailes
+ * Description   : Get version , max. message size, keyword's checksum
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_platform_detailes (RSS_MSG_HDR_rec_typ * msg_hdr)
+{
+  char fn[]="CS_platform_detailes";
+  /*WS10082A ADDINFO_rec_typ         addinfo;                      */
+  ADDINFO_rec_typ       * addinfo;                       /*WS10082A*/
+  ESA_RC                  rc= ESA_OK;
+  PLATFORM_DETAIL_rec_typ plat_detail;
+  char                    kwrd_checksum[CHECKSUM_LEN+ 1];
+  ENVIRONMENT_rec_typ   * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSHNDF, DIAG_COMMON, fn);
+ 
+  CLEAR_STRUCT(plat_detail);
+  strcpy (plat_detail.version, CTSAgentVersion());
+  plat_detail.max_msg_size= envir_ptr->max_msg_size;
+  keywords_checksum (plat_detail.kwds_checksum);
+ 
+  /*** WS10082A replace addinfo variable with dynamic allocation ***/
+  rc = CSA_alloc ((char **)&addinfo,
+            STRUC_ADDINFO,
+            1,
+            1,
+            fn,
+            "addinfo");
+  if (rc NE ESA_OK)
+    goto cleanup;
+  rc= CS_snd_rss_msg (msg_hdr, envir_ptr->msg_admin_param.rss_name,
+                      FUNC_PLATFORM_DETAIL,
+                      (char *)&plat_detail, addinfo);  /*WS10082A*/
+  /*WS10082A          (char *)&plat_detail, &addinfo);           */
+ 
+  if (rc EQ ESA_OK) {
+    CLEAR  (kwrd_checksum);
+    memcpy (kwrd_checksum, (char *)plat_detail.kwds_checksum,
+		    CHECKSUM_LEN);
+    ESA_DIAG_printf (ESA_COMP_ACSHNDF, 15,
+        "Handshake reply: Version %s. Max msg size %d. KWD's chksum %s",
+         CTSAgentVersion(), envir_ptr->max_msg_size, kwrd_checksum);
+  }
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+ 
+  cleanup:                                                /*WS10082A*/
+  CSA_free ((char **)&addinfo);                           /*WS10082A*/
+  ESA_DIAG_exit (ESA_COMP_ACSHNDF, DIAG_COMMON, fn, rc);
+  return(rc);
+}

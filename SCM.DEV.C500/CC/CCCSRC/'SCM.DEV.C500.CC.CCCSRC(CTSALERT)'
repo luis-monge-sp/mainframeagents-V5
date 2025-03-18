@@ -1,0 +1,755 @@
+/**************************************************************
+* $Author:   leonid_s  $
+* $Workfile:   CTSALERT.C  $
+* $Revision:   1.22  $
+* $Log:   //eagle1/versions/300/utils/src/CTSALERT.C_v  $
+ *
+ *    Rev 1.22   Aug 31 1998 18:39:04   leonid_s
+ * Shorted long lines
+ *
+ *    Rev 1.21   Aug 17 1998 11:52:26   ajk
+ * Fixed SCCSID for Unix 'what' command
+ *
+ *    Rev 1.20   Aug 04 1998 14:45:32   leonid_s
+ *
+ *
+ *    Rev 1.19   Jul 26 1998 13:29:20   leonid_s
+ *
+ *    Rev 1.18   Jun 09 1998 16:35:40   leonid_s
+ *
+ *    Rev 1.17   Jun 07 1998 16:11:54   leonid_s
+ * For as400: added define SKIP_ARGV
+ *
+ *    Rev 1.16   Apr 20 1998 14:23:18   leonid_s
+ *
+ *
+ *    Rev 1.15   Apr 19 1998 10:52:22   leonid_s
+ *
+ *
+ *    Rev 1.14   Apr 16 1998 11:48:12   ajk
+ * removed TABs
+ *
+ *    Rev 1.13   Apr 16 1998 10:19:34   leonid_s
+ *
+ *    Rev 1.12   Apr 13 1998 10:56:22   leonid_s
+ *
+ *    Rev 1.8   Apr 09 1998 15:26:00   leonid_s
+ *
+ *    Rev 1.7   Apr 09 1998 13:30:40   ajk
+ * cleanup, better messages
+ *
+ *    Rev 1.6   Apr 09 1998 11:35:18   ajk
+ * removed TABs
+ *
+ *    Rev 1.5   Apr 09 1998 10:21:00   leonid_s
+ *
+ *
+ *    Rev 1.4   Apr 07 1998 10:16:26   leonid_s
+ *
+ *    Rev 1.3   Apr 06 1998 07:50:40   leonid_s
+ *
+ *    Rev 1.2   Apr 05 1998 13:13:06   leonid_s
+ *
+ *
+ *    Rev 1.1   Mar 15 1998 16:33:26   leonid_s
+ *
+ *    Rev 1.0   Mar 10 1998 16:10:20   leonid_s
+ * Initial revision.
+**************************************************************/
+ 
+/********************************************************************
+* Mod.ID  Who            When         Description
+* ===================================================================
+* IMH001  Ian H.   17/9/03      Add support for CheckAndPrintVersion
+* IMH002  Ian H.   19/11/03     Thread-safe code (ERRNO)
+* SAS2IBMT SeligT  30/06/16     SAS/C to IBM C Conversion Project
+* BS10129  AvnerL  28-Dec-23    Recompile due to WS10078 ESAINIT
+********************************************************************/
+ 
+#define MSG_KWRD     "MSG"
+#define IN_KWRD      "IN"
+ 
+#define RSS_KWRD     "RSS"
+#define SEV_KWRD     "SEV"
+#define PID_KWRD     "PID"
+#define HOST_KWRD    "HOST"
+#define PROCESS_KWRD "PROC"
+#define DATE_KWRD    "DATE"
+#define TIME_KWRD    "TIME"
+#define QUIET_KWRD   "QUIET"
+ 
+#define EQUAL_SIGN   '='
+#define SKIP_SIGN    '*'
+#define NEW_LINE_STR "\n"
+#define SKIP_ARGV    "?"
+ 
+#define THIS_IS_MAIN
+ 
+#include   "globs.h"
+ 
+#include   ERRNO
+#include   ESA_INIT
+#include   ESA_CS_SINFO
+#include   ESA_PROC
+#include   ESA_RSS
+#include   ESA_CS_OS
+#include   ESA_OS_PROC
+#include   ESA_OS_CONSOLE
+#include   ESA_RSSF
+#include   CTYPE
+#include   ESA_VER
+ 
+ 
+    SCCSID("@(#) ctsalert.c \
+$Revision:   1.22  $\
+$Date:   Aug 31 1998 18:39:04  $\
+$Author:   leonid_s  $")
+ 
+ 
+ 
+typedef struct S_LOGALERT_PARAMS {
+    RSS_typ                  rss_type;
+    RSS_typ                  rss_name;
+    DATE_STR_typ             date_buffer;
+    TIME_STR_typ             time_buffer;
+    OS_host_name_typ         host_name;
+    OS_pid_str_typ           pid;
+    RESOURCE_typ             process;
+    SEVERITY_typ             severity;
+    LOGENT_typ               alert;
+    OPTION_typ               quiet;
+} LOGALERT_PARAMS_rec_typ, * LOGALERT_PARAMS_rec_ptr;
+ 
+/**************************************************************
+ * Procedure Name   : default_data
+ * input/output     : logalert
+ * Description      : Overflow 'empty' Severety & RSS name values
+ *                    by default values
+ **************************************************************/
+ 
+static void default_data (LOGALERT_PARAMS_rec_typ * logalert)
+{
+   ENVIRONMENT_rec_typ   * envir_ptr;
+ 
+   CS_get_envir_address (&envir_ptr);
+ 
+   ESA_DIAG_printf (ESA_COMP_RSALERT, 3,
+                    "default_data: rss_name=%s quet=%d severity=%d.",
+                     logalert->rss_name,
+                     (int)logalert->quiet,
+                     (int)logalert->severity);
+   if (logalert->quiet EQ OPT_UNDEFINED)
+       logalert->quiet= OPT_FALSE;
+   if (logalert->severity EQ UNDEFINED)
+       logalert->severity= REGULARALERT;
+   if (strlen (logalert->rss_name) EQ 0)
+   {
+      strcpy (logalert->rss_name, envir_ptr->interest[0].rss);
+      strcpy (logalert->rss_type, envir_ptr->interest[0].rss_type);
+   }
+   ESA_DIAG_printf (ESA_COMP_RSALERT, 4,
+                    "default_data: rss_name=%s quet=%d severity=%d.",
+                     logalert->rss_name,
+                     (int)logalert->quiet,
+                     (int)logalert->severity);
+}
+ 
+/**************************************************************
+ * Procedure Name   : overwrite_data
+ * Input            : logalert
+ * input/output     : logalert_in
+ * Description      : Overwrite values from parmetres
+ *                    of the logalert_in by values of the
+ *                    identical not empty parameters of the logevent
+ **************************************************************/
+ 
+static void overwrite_data (LOGALERT_PARAMS_rec_typ * logalert,
+                            LOGALERT_PARAMS_rec_typ * logalert_in)
+{
+   ESA_DIAG_printf (ESA_COMP_RSALERT, 2,
+   "overwrite :r=%s-%s d=%s-%s hst=%s pid=%s prc=%s sev=%d alrt=%s.",
+                   logalert->rss_type,    logalert->rss_name,
+                   logalert->date_buffer, logalert->time_buffer,
+                   logalert->host_name,   logalert->pid,
+                   logalert->process,(int)logalert->severity,
+                   logalert->alert);
+   ESA_DIAG_printf (ESA_COMP_RSALERT, 2,
+   "overwrite-in:r=%s-%s d=%s-%s hst=%s pid=%s prc=%s sev=%d alrt=%s.",
+                   logalert_in->rss_type,    logalert_in->rss_name,
+                   logalert_in->date_buffer, logalert_in->time_buffer,
+                   logalert_in->host_name,   logalert_in->pid,
+                   logalert_in->process,(int)logalert_in->severity,
+                   logalert_in->alert);
+   if (strlen (logalert->rss_name) NE 0) {
+      strcpy (logalert_in->rss_name, logalert->rss_name);
+      strcpy (logalert_in->rss_type, logalert->rss_type);
+   }
+   if (strlen (logalert->alert) NE 0)
+      strcpy (logalert_in->alert, logalert->alert);
+   if (strlen (logalert->pid) NE 0)
+      strcpy (logalert_in->pid, logalert->pid);
+   if (strlen (logalert->host_name) NE 0)
+      strcpy (logalert_in->host_name, logalert->host_name);
+   if (strlen (logalert->process) NE 0)
+      strcpy (logalert_in->process, logalert->process);
+   if (strlen (logalert->date_buffer) NE 0)
+      strcpy (logalert_in->date_buffer, logalert->date_buffer);
+   if (strlen (logalert->time_buffer) NE 0)
+      strcpy (logalert_in->time_buffer, logalert->time_buffer);
+   if (logalert->severity NE UNDEFINED)
+      logalert_in->severity= logalert->severity;
+   if (logalert->quiet NE OPT_UNDEFINED)
+      logalert_in->quiet= logalert->quiet;
+   ESA_DIAG_printf (ESA_COMP_RSALERT, 2,
+   "overwrite-in:r=%s-%s d=%s-%s hst=%s pid=%s prc=%s sev=%d alrt=%s.",
+                   logalert_in->rss_type,    logalert_in->rss_name,
+                   logalert_in->date_buffer, logalert_in->time_buffer,
+                   logalert_in->host_name,   logalert_in->pid,
+                   logalert_in->process,(int)logalert_in->severity,
+                   logalert_in->alert);
+}
+ 
+/**************************************************************
+ * Procedure Name   : accept_data
+ * Description      : Accept & check data
+ * Return Value     : ESA_RC
+ **************************************************************/
+ 
+static ESA_RC accept_data (LOGALERT_PARAMS_rec_typ * logalert,
+                           CTSAMSG_PARAMS_rec_typ  * msg_param,
+                           char                    * prm_full,
+                           RESOURCE_typ              file_name)
+{
+  char                    fn[]="accept_data";
+  char                  * prm_value, * endprm_full;
+  char                    upercase_prm_name[10];
+  char                    prm_full_lcl [LOGENT_LEN+ 11];
+  unsigned int            jj, sev_code, max_length= 0, prm_length;
+  ESA_RC                  rc= ESA_OK;
+  ENVIRONMENT_rec_typ   * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+ 
+  ESA_DIAG_enter (ESA_COMP_RSALERT, DIAG_COMMON, fn);
+ 
+  ESA_DIAG_printf (ESA_COMP_RSALERT, 2,
+ "r=%s-%s d=%s-%s hst=%s pid=%s prc=%s sev=%d alrt=%s prm=%s fle=%s.",
+                   logalert->rss_type, logalert->rss_name,
+                   logalert->date_buffer, logalert->time_buffer,
+                   logalert->host_name, logalert->pid,
+                   logalert->process, (int)logalert->severity,
+                   logalert->alert, prm_full,
+                   (file_name EQ NULL) ? "NULL" : file_name);
+ 
+  strcpy (prm_full_lcl, prm_full);
+ 
+  prm_value= strchr (prm_full_lcl, EQUAL_SIGN);
+  if (prm_value NE NULL) {
+     *prm_value= '\0';
+     prm_value++;
+     while (*prm_value EQ ' ')
+        prm_value++;
+     /*  strtok (prm_value, WHITECHARS);*/
+     ESA_DIAG_printf (ESA_COMP_RSALERT, 2,
+                      "prm_value=%s.", prm_value);
+  }
+ 
+  strtok (prm_full_lcl,  WHITECHARS);
+ 
+  ESA_DIAG_printf (ESA_COMP_RSALERT, 2,
+                   "keyword=%s.", prm_full_lcl);
+ 
+  for (jj= 0; jj LE strlen (prm_full_lcl); jj++)
+      upercase_prm_name[jj]= (char)toupper((int)prm_full_lcl[jj]);
+ 
+  ESA_DIAG_printf (ESA_COMP_RSALERT, 2,
+                   "Uppercase keyword=%s.", upercase_prm_name);
+ 
+  if (strcmp (upercase_prm_name, QUIET_KWRD) EQ 0)
+     logalert->quiet= OPT_TRUE;
+  else
+  {
+     if (prm_value EQ NULL) {
+        rc = ESA_ERR;
+        CTSAMSG_print (ERR_KEYWORD_SEPARATOR,
+                       envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                       envir_ptr->msg_admin_param.ctsamsg_dest,
+                       EQUAL_SIGN,
+                       prm_full_lcl);
+        goto exit_point;
+     }
+ 
+     prm_length= strlen (prm_value);
+     while (
+		      (prm_length GT 0)
+			 AND
+			  (prm_value[prm_length- 1] EQ ' ')
+           )
+	 {
+        prm_length--;
+        prm_value[prm_length]= '\0';
+        ESA_DIAG_printf (ESA_COMP_RSALERT, 2,
+                      "Don't ready prm_value=%s.", prm_value);
+	 }
+	 if (strcmp (prm_value, SKIP_ARGV) EQ 0)
+        goto exit_point;
+     ESA_DIAG_printf (ESA_COMP_RSALERT, 2,
+                     "Ready prm_value=%s.", prm_value);
+ 
+     if (strcmp (upercase_prm_name, RSS_KWRD) EQ 0) {
+        max_length= RSS_NAME_LEN;
+        prm_length= strlen (prm_value);
+ 
+        if (prm_length GT max_length)
+           goto exit_point;
+ 
+        rc= rssprm_get (prm_value,
+                        RSS_TYPE,
+                        RSS_NAME_LEN,
+                        logalert->rss_type);
+        if (rc NE ESA_OK)
+           goto exit_point;
+ 
+        strcpy (logalert->rss_name, prm_value);
+     }
+     else if (strcmp (upercase_prm_name, SEV_KWRD) EQ 0) {
+        max_length= 1;
+        prm_length= strlen (prm_value);
+ 
+        if (strlen (prm_value) GT max_length)
+           goto exit_point;
+ 
+        sev_code= strtoul (prm_value, &endprm_full, 10);
+ 
+        if (*endprm_full NE '\0')
+        {
+           CTSAMSG_print (MSG_KWD_VALUE_INVALID,
+                          envir_ptr->msg_admin_param.ctsamsg_handle,
+                          NULL,
+                          envir_ptr->msg_admin_param.ctsamsg_dest,
+                          prm_value,
+                          upercase_prm_name);
+           rc= ESA_ERR;
+           goto exit_point;
+        }
+ 
+        if ((sev_code NE LOGEVENT)
+            AND
+            (sev_code NE REGULARALERT)
+            AND
+            (sev_code NE URGENTALERT)
+            AND
+            (sev_code NE VERYURGENTALERT)
+            )
+        {
+           rc = ESA_ERR;
+           CTSAMSG_print (MSG_KWD_VALUE_INVALID,
+                          envir_ptr->msg_admin_param.ctsamsg_handle,
+                          NULL,
+                          envir_ptr->msg_admin_param.ctsamsg_dest,
+                          prm_value,
+                          upercase_prm_name);
+           goto exit_point;
+        }
+        logalert->severity= sev_code;
+     }
+     else if (strcmp (upercase_prm_name, IN_KWRD) EQ 0) {
+        if (file_name EQ NULL) {
+           rc = ESA_ERR;
+           CTSAMSG_print (MSG_KWD_VALUE_INVALID,
+                          envir_ptr->msg_admin_param.ctsamsg_handle,
+                          NULL,
+                          envir_ptr->msg_admin_param.ctsamsg_dest,
+                          "",
+                          upercase_prm_name);
+           goto exit_point;
+        }
+        max_length= MAX_RSS_RESOURCE_NAME_LEN;
+        prm_length= strlen (prm_value);
+ 
+        if (strlen (prm_value) GT max_length)
+           goto exit_point;
+ 
+        strcpy (file_name, prm_value);
+     }
+     else if (strcmp (upercase_prm_name, MSG_KWRD) EQ 0) {
+        max_length= LOGENT_LEN;
+        prm_length= strlen (prm_value) + strlen(logalert->alert)+ 1;
+        if (strlen (prm_value) GT max_length)
+           goto exit_point;
+        if (strlen (logalert->alert) NE 0)
+           strcat (logalert->alert, NEW_LINE_STR);
+        strcat (logalert->alert, prm_value);
+     }
+     else if (strcmp (upercase_prm_name, PID_KWRD) EQ 0) {
+        max_length= sizeof (OS_pid_str_typ);
+        prm_length= strlen (prm_value);
+        if (strlen (prm_value) GE max_length)
+           goto exit_point;
+        strcpy (logalert->pid, prm_value);
+     }
+     else if (strcmp (upercase_prm_name, HOST_KWRD) EQ 0) {
+        max_length= sizeof (OS_pid_str_typ);
+        prm_length= strlen (prm_value);
+        if (strlen (prm_value) GE max_length)
+           goto exit_point;
+        strcpy (logalert->host_name, prm_value);
+     }
+     else if (strcmp (upercase_prm_name, PROCESS_KWRD) EQ 0) {
+        if (strlen (prm_value) GE sizeof (RESOURCE_typ))
+			goto exit_point;
+        strcpy (logalert->process, prm_value);
+     }
+     else if (strcmp (upercase_prm_name, DATE_KWRD) EQ 0) {
+        max_length= sizeof (DATE_STR_typ);
+        prm_length= strlen (prm_value);
+        if (strlen (prm_value) GE max_length)
+           goto exit_point;
+        strcpy (logalert->date_buffer, prm_value);
+     }
+     else if (strcmp (upercase_prm_name, TIME_KWRD) EQ 0) {
+        max_length= sizeof (TIME_STR_typ);
+        prm_length= strlen (prm_value);
+        if (strlen (prm_value) GE max_length)
+           goto exit_point;
+        strcpy (logalert->time_buffer, prm_value);
+     }
+     else {
+        rc = ESA_ERR;
+        CTSAMSG_print (ERR_ADI_KEYWORD_NOSUPP,
+                       envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                       envir_ptr->msg_admin_param.ctsamsg_dest,
+                       upercase_prm_name);
+        goto exit_point;
+     }
+  }
+ 
+exit_point:
+  if (rc EQ ESA_OK)
+  {
+     if (prm_value NE NULL)
+     {
+        if (
+            (strlen (prm_value) GT max_length)
+                AND
+            (max_length NE 0)
+            )
+        {
+           rc = ESA_ERR;
+           CTSAMSG_print (ERR_CS_MSG_CHKSIZE,
+                          envir_ptr->msg_admin_param.ctsamsg_handle,
+                          NULL,
+                          envir_ptr->msg_admin_param.ctsamsg_dest,
+                          fn,
+                          upercase_prm_name,
+                          strlen (prm_value),
+                          max_length);
+        }
+     }
+  }
+ 
+  ESA_DIAG_exit (ESA_COMP_RSALERT, DIAG_COMMON, fn, rc);
+ 
+  return(rc);
+ 
+} /* accept_data */
+ 
+/**************************************************************
+ * Procedure Name   : main
+ * Description      : Alert maintanence
+ * Return Value     : ESA_RC
+ **************************************************************/
+ 
+int main (int argc, char **argv)
+{
+  FILE                    * file_hndl=NULL;
+  char                      fn[]="ctsalert";
+  char                      prm_full [LOGENT_LEN+ 11];
+  ESA_RC                    rc= ESA_OK;
+  int                       ii;
+  RESOURCE_typ              file_name;
+  LOGALERT_PARAMS_rec_typ   logalert;
+  LOGALERT_PARAMS_rec_typ   logalert_in;
+  ENVIRONMENT_rec_typ   * envir_ptr;
+  char                      ddn_with[50]="";              /* SAS2IBMT */
+ 
+  rc= CG_prolog (ESA_ACSALERT_PROC, argc, argv);
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  if (rc NE ESA_OK) {
+    sprintf (prm_full, PROLOG_PROC_INIT_ERROR,
+             CG_name (envir_ptr->p_main_name),
+             ESA_rc2str(rc));
+ 
+    fprintf (stderr,prm_full);
+ 
+    OS_CONSOLE_print (prm_full,
+                      OS_CONS_ROLLABLE_YES,
+                      OS_CONS_SEV_ERROR);
+ 
+    goto exit_point;
+  }
+ 
+  envir_ptr->msg_dest->dests[CTSAMSG_DEST_CNSL].active= FLAG_YES;
+ 
+  ESA_DIAG_enter (ESA_COMP_RSALERT, DIAG_COMMON, fn);
+  ESA_DIAG_printf (ESA_COMP_RSALERT, 6,
+                   "argc=%d.", argc);
+ 
+/* IMH001 start */
+ 
+   rc = CheckAndPrintVersion (argc, argv);
+   if (rc EQ ESA_OK)
+       goto exit_point;
+ 
+    rc = ESA_OK;
+/* IMH001 end */
+ 
+  CLEAR_STRUCT (logalert);
+  CLEAR_STRUCT (logalert_in);
+ 
+  file_name  [0]= '\0';
+  logalert.severity   =  UNDEFINED;
+  logalert.quiet      =  OPT_UNDEFINED;
+  logalert_in.severity=  UNDEFINED;
+  logalert_in.quiet   =  OPT_UNDEFINED;
+ 
+  if (argc LE 1) {
+printf ("SA-Agent Alert/Log Event Generation utility\n");
+printf ("Usage:\n");
+printf ("To send an alert/log event from the command line, specify\n");
+printf ("all or some of the following parameters:\n");
+printf (" ctsalert MSG=<msg> [RSS=<rss> SEV=<sev> <PROC>=<proc>\n");
+printf ("          HOST=<host> PID=<pid> DATE=<date> TIME=<time>]\n");
+printf ("          [QUIET]\n");
+printf ("\nwhere:\n");
+printf ("  msg : Message text\n");
+printf ("  rss : RSS name\n");
+printf ("  sev : Severity. Valid values are 0-3\n");
+printf ("          0 - Log-Event message\n");
+printf ("          1 - Regular Alert message\n");
+printf ("          2 - Urgent Alert message\n");
+printf ("          3 - Highly Urgent Alert message\n");
+printf ("  proc: Process name\n");
+printf ("  host: Host name\n");
+printf ("  pid : Process Identification\n");
+printf ("  date: Date specified as yyyy/mm/dd\n");
+printf ("  time: Time specified as hh:mm:ss\n");
+printf ("\n");
+printf ("  QUIET: do not issue any error messages\n");
+printf ("\n");
+printf ("Note: MSG is mandatory\n");
+printf ("\n");
+printf ("To send alerts or log-events from a file,\n");
+printf ("   use the parameter IN=<File name>\n");
+printf ("Note: Parameters specified in the command line\n");
+printf ("      will override parameters in the file\n");
+printf ("\n");
+printf ("Defaults SEV: 1\n");
+printf ("         RSS: The first RSS from the RSSPARAMS file\n");
+     goto exit_point;
+  }
+ 
+  for (ii= 1; ii LT argc; ii++) {
+     ESA_DIAG_printf (ESA_COMP_RSALERT, 6,
+                      "ii=%d parameter=%s.", ii, argv[ii]);
+     if (strlen (argv[ii]) GE sizeof (prm_full)) {
+        rc = ESA_ERR;
+        CTSAMSG_print (ERR_CS_MSG_CHKSIZE,
+                       envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                       envir_ptr->msg_admin_param.ctsamsg_dest,
+                       fn,
+                       argv[ii],
+                       strlen (argv[ii]),
+                       sizeof (prm_full));
+        goto exit_point;
+     }
+     strcpy (prm_full, argv[ii]);
+ 
+     rc= accept_data (&logalert,
+                      &envir_ptr->msg_params,
+                      prm_full,
+                      file_name);
+     if (rc NE ESA_OK)
+        goto exit_point;
+  }
+ 
+  rc = OS_Q_open (envir_ptr->file_queue,
+                  &envir_ptr->q_handle,
+                  &envir_ptr->msg_params);
+  if (rc NE ESA_OK)
+     goto exit_point;
+ 
+  if (strlen (file_name) NE 0)
+  {
+     strcpy(ddn_with,"DD:");                              /* SAS2IBMT */
+     strcat(ddn_with, file_name);                         /* SAS2IBMT */
+     /* strcpy(ddn_with,"//'");                              SAS2IBMT */
+     /* strcat(ddn_with, file_name);                         SAS2IBMT */
+     /* strcat(ddn_with,"'");                                SAS2IBMT */
+     ESA_DIAG_printf(ESA_COMP_RSALERT, 0,                 /* SAS2IBMT */
+         "CTSALERT: About to fopen %s", file_name);
+     /* SAS2IBMT file_hndl = fopen(file_name, "r");                  */
+     file_hndl = fopen(ddn_with, "r");                    /* SAS2IBMT */
+     if (file_hndl EQ NULL)
+     {
+        CTSAMSG_print (ERR_FILE,
+                       envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                       envir_ptr->msg_admin_param.ctsamsg_dest,
+                       "OPEN ", "r",
+                       file_name, strerror(errno));
+        rc= ESA_FATAL;
+        goto exit_point;
+     }
+ 
+     CLEAR_STRUCT (logalert_in);
+     logalert_in.severity=  UNDEFINED;
+     logalert_in.quiet   =  OPT_UNDEFINED;
+ 
+     for (ii= 1; ; ii++)
+     {
+        fgets(prm_full, sizeof(prm_full), file_hndl);
+ 
+        if (feof (file_hndl) NE 0)
+        {
+           if (
+               (strlen (logalert.alert) NE 0)
+                   OR
+               (strlen (logalert_in.alert) NE 0)
+               )
+           {
+              overwrite_data (&logalert,
+                              &logalert_in);
+              default_data (&logalert_in);
+              rc= RSLogAlert (logalert_in.rss_type,
+                              logalert_in.rss_name,
+                              &envir_ptr->q_handle,
+                              &envir_ptr->msg_params,
+                              logalert_in.date_buffer,
+                              logalert_in.time_buffer,
+                              logalert_in.host_name,
+                              logalert_in.pid,
+                              logalert_in.process,
+                              logalert_in.severity,
+                              logalert_in.quiet,
+                              logalert_in.alert);
+              CLEAR_STRUCT (logalert_in);
+              logalert_in.severity=  UNDEFINED;
+              logalert_in.quiet   =  OPT_UNDEFINED;
+           }
+           else
+           {
+              rc = ESA_ERR;
+              CTSAMSG_print (ERR_ADI_MANDATORY_MISS,
+                             envir_ptr->msg_admin_param.ctsamsg_handle,
+                             NULL,
+                             envir_ptr->msg_admin_param.ctsamsg_dest,
+                             MSG_KWRD);
+           }
+           goto exit_point;
+        }
+ 
+        if (ferror (file_hndl))
+        {
+           CTSAMSG_print (ERR_FILE,
+                          envir_ptr->msg_admin_param.ctsamsg_handle,
+                          NULL,
+                          envir_ptr->msg_admin_param.ctsamsg_dest,
+                          "read",fn, file_name, strerror(errno));
+           rc= ESA_ERR;
+           goto exit_point;
+        } /* if I/O error */
+ 
+        ESA_DIAG_printf (ESA_COMP_RSALERT, 5,
+                         "Readed %d record: %s", ii, prm_full);
+ 
+        if (*prm_full EQ NULL_CHAR OR
+            *prm_full EQ SKIP_SIGN) {
+           ESA_DIAG_printf (ESA_COMP_RSALERT, 5,
+                            "Skipped %d record" , ii);
+           continue;
+        }
+        if (prm_full[strlen (prm_full)- 1] EQ '\n')
+           prm_full[strlen (prm_full)- 1]= '\0';
+ 
+        rc= accept_data (&logalert_in,
+                         &envir_ptr->msg_params,
+                         prm_full,
+                         NULL);
+        if (rc EQ ESA_OK)
+           continue;
+        if (rc EQ ESA_EOF)
+        {
+           overwrite_data (&logalert,
+                           &logalert_in);
+           default_data (&logalert_in);
+           rc= RSLogAlert (logalert_in.rss_type,
+                           logalert_in.rss_name,
+                           &envir_ptr->q_handle,
+                           &envir_ptr->msg_params,
+                           logalert_in.date_buffer,
+                           logalert_in.time_buffer,
+                           logalert_in.host_name,
+                           logalert_in.pid,
+                           logalert_in.process,
+                           logalert_in.severity,
+                           logalert_in.quiet,
+                           logalert_in.alert);
+           if (rc NE ESA_OK)
+              goto exit_point;
+ 
+           CLEAR_STRUCT (logalert_in);
+           logalert_in.severity=  UNDEFINED;
+           logalert_in.quiet   =  OPT_UNDEFINED;
+ 
+           rc= accept_data (&logalert_in,
+                            &envir_ptr->msg_params,
+                            prm_full,
+                            NULL);
+        }
+ 
+        if (rc NE ESA_OK)
+           goto exit_point;
+     }
+  }
+  else {
+     if (strlen (logalert.alert) NE 0)
+     {
+        default_data (&logalert);
+        rc= RSLogAlert (logalert.rss_type,
+                        logalert.rss_name,
+                        &envir_ptr->q_handle,
+                        &envir_ptr->msg_params,
+                        logalert.date_buffer,
+                        logalert.time_buffer,
+                        logalert.host_name,
+                        logalert.pid,
+                        logalert.process,
+                        logalert.severity,
+                        logalert.quiet,
+                        logalert.alert);
+     }
+     else
+     {
+        rc = ESA_ERR;
+        CTSAMSG_print (ERR_ADI_MANDATORY_MISS,
+                       envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                       envir_ptr->msg_admin_param.ctsamsg_dest,
+                       MSG_KWRD);
+     }
+  }
+ 
+ exit_point:
+ 
+  if (file_hndl) {
+     fclose (file_hndl);
+  }
+  envir_ptr->msg_dest->dests[CTSAMSG_DEST_CNSL].active= FLAG_NO;
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON, fn, rc);
+  CG_epilog (rc , 0);
+ 
+  return (rc EQ ESA_OK) ? PLAT_OK_STAT : PLAT_FAIL_STAT;
+ 
+} /* main */

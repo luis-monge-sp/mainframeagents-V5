@@ -1,0 +1,1835 @@
+/****************************************************
+ * Title           : API Test program.
+ * File Name       : batlist.c
+ * Author          : AJK
+ * Creation Date   : 11-May-94
+ * Description     : All list API functions
+ * Assumptions and
+ *   Considerations:
+ *
+ * Mod.ID  Who     When         Description
+ * -----------------------------------------------
+ * AJK001  Amir    29-Apr-1999  Netscape support
+ ****************************************************/
+ 
+/****************************************************
+ * $Author:   amir  $
+ * $Revision:   1.8  $
+ * $Log:   /mnt/eagle1/300/TEST/src/batlist.c_v  $
+ *
+ *    Rev 1.8   29 Apr 1999 18:15:22   amir
+ * Netscape again
+ *
+ *    Rev 1.6   Aug 17 1998 11:52:16   ajk
+ * Fixed SCCSID for Unix 'what' command
+ *
+ *    Rev 1.5   Jul 24 1997 11:36:44   leonid_s
+ * No change.
+ *
+ *    Rev 1.4   Jul 23 1997 16:14:48   ajk
+ * long lines shortened
+ *
+ *    Rev 1.3   Jul 23 1997 16:08:04   ajk
+ * Parent UG needed
+ *
+ *    Rev 1.2   Jul 15 1997 14:31:58   leonid_s
+ *****************************************************/
+/**********************************************************************
+ * Mod.ID  Who      When         Description
+ ======================================================================
+ * SAS2IBMT SeligT  19/02/17     SAS/C to IBM C Conversion Project and
+ *                               re-design / re-write of BATxxxx rtns
+ * BS10062  SeligT  29/08/17     Handle storage allocation errors
+ * IS10157  SeligT  17/09/17     Allocate Several Arrays Correctly
+ **********************************************************************/
+ 
+#include "globs.h"
+ 
+#include STDIO
+#include STDLIB
+#include STRING
+#include ESA_API
+#include ESA_CS_OS
+ 
+#include "batutls.h"
+#include "esaofl.h"
+ 
+/****************************************************
+ ***************************************************/
+ 
+static ESA_RC  rc1;  /* for API_PROLOG */
+ 
+static char dot    [] = ".";
+static char arrows [] = "----> ";
+ 
+/****************************************************
+ * Procedure Name: listuser_rtn
+ * Description   : Process the :LISTUSER request.
+ *               : Some details:
+ *               :
+ *               : We call the rpl_addinfo_loop routine to process
+ *               : the RPL and addinfo lines.  When we return from the
+ *               : routine (if there was no error) we prepare and call
+ *               : the USA-API.  Then we leave this routine and we go
+ *               : back up to req_rtn and we go back up to the main
+ *               : loop.
+ * Input         : array of request details
+ * Output        : none
+ * Input/Output  :
+ * Return Value  : ESA_OK or ESA_FATAL
+ * Side Effects  :
+ * Scope         : Internal To API Test Program
+ ***************************************************/
+ 
+   ESA_RC listuser_rtn (void) {
+   ESA_RC               rc = ESA_OK;
+   short                actual     = 0;
+   short                n_users    = MAX_USERS;
+   short                nv_users   = 1;
+   short                n_users_in=0, n_users_out=0;
+   int                  limit;
+   int                  total      = 0;
+   int                  first_time = 1;
+   unsigned long        size;
+   int                  k;
+   void               * handle = (void *)NULL;
+   char               * char_ptr;
+   char                 get_conn;
+   HAVE_MORE_typ        have_more;
+   USER_PARAMS_rec_typ  user_params_in_all[1];
+   USER_PARAMS_rec_ptr  user_params_in    = NULL;
+   USER_PARAMS_rec_ptr  user_params_out   = NULL;
+   ADDINFO_rec_ptr     *addinfo_ptr_array = NULL;
+   OBJ_EXISTS_typ      *objs_exist_array  = NULL;
+   GET_USER_MODE        mode;
+   OE_typ               oe;
+   static char          func [] = "BATLIST_listuser_rtn";
+ 
+   ESA_DIAG_enter(ESA_COMP_BATCH, 1, func);
+ 
+   printf (":LISTUSER:\n");
+ 
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                   "about to call rpl_addinfo_loop routine");
+ 
+   rc = rpl_addinfo_loop();
+ 
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                   "rc from rpl_addinfo_loop routine = %d", rc);
+ 
+   if (rc EQ ESA_FATAL) return rc;
+ 
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                   "addinfo_keyword_encountered = %d",
+                   addinfo_keyword_encountered);
+   if (addinfo_keyword_encountered EQ 0)
+      /* then loop through the keyword table looking for a USER-related
+         keyword.  For each one found, we add an entry to the out_kwd
+         array and update out_i.                                     */
+   /* get_rss_keywords((int) USER_API_KEYWORDS); */
+      get_rss_keywords((int) FUNC_ADDUSER);
+ 
+   if (strcmp (req->get_conn, "Y") EQ 0)
+      get_conn = 'Y';
+   else
+      get_conn = 'N';
+ 
+   /* At this point, these fields are set or not set:
+      - filter_userid_groupid_encountered = 1 if FILTER.USERID was
+        specified.
+      - filter_userid_groupid_encountered = 0 if FILTER.USERID was not
+        specified. This means that we will process the :LISTUSER as if
+        FILTER.USERID=* was specified. This is the default.
+      - req->num_users_in contains the number of userids specified in...
+      - req->users_in [n] contains the actual userids specified on the
+        FILTER.USERID line. This could be *, userid, many userids,
+        or userid* mask.                                             */
+ 
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+       "filter_us_gr_en = %d, num_users_in = %d, users_in[0] = %s",
+       filter_userid_groupid_encountered, req->num_users_in,
+       req->users_in[0]);
+ 
+   if ((filter_userid_groupid_encountered EQ 0) OR
+       ((req->num_users_in EQ 1) AND
+        (strcmp (req->users_in[0],"*") EQ 0)))  goto listuser_all;
+ 
+   if ((req->num_users_in EQ 1) AND
+       (strchr (req->users_in[0], '*') NE NULL)) goto listuser_wild;
+   else goto listuser_many;
+ 
+   listuser_all:  /* processing a :LISTUSER - FILTER.USERID=* request */
+ 
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                   "Processing a :LISTUSER - FILTER.USERID=* request");
+ 
+   size = n_users * sizeof (USER_PARAMS_rec_typ);
+   user_params_out = (USER_PARAMS_rec_ptr)malloc (size);
+ 
+   if (NOT user_params_out)
+      /* * * * BS10062 start * * * */
+      {
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      printf ("Memory allocation failed for USER_PARAMS_rec_typ 1, size %d\n",
+              size);
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      rc = ESA_FATAL;
+      /* * * * BS10062 end * * * */
+      goto cleanupa;
+      }
+ 
+   size = n_users * sizeof (ADDINFO_rec_ptr);
+   addinfo_ptr_array = (ADDINFO_rec_ptr *)malloc (size);
+ 
+   if (NOT addinfo_ptr_array)
+      /* * * * BS10062 start * * * */
+      {
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      printf ("Memory allocation failed for ADDINFO_rec_ptr 1, size %d\n",
+              size);
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      rc = ESA_FATAL;
+      /* * * * BS10062 end * * * */
+      goto cleanupa;
+      }
+ 
+   size = n_users * sizeof (OBJ_EXISTS_typ);
+   objs_exist_array = (OBJ_EXISTS_typ *)malloc (size);
+ 
+   if (NOT objs_exist_array)
+      /* * * * BS10062 start * * * */
+      {
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      printf ("Memory allocation failed for OBJ_EXISTS_typ 1, size %d\n",
+              size);
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      rc = ESA_FATAL;
+      /* * * * BS10062 end * * * */
+      goto cleanupa;
+      }
+ 
+   nv_users = 0;
+ 
+   /* Get the list of addinfo keywords, create an array of pointers
+    * to n_users addinfo arrays, filled with the keywords.
+    */
+ 
+   rc = utl_get_addinfo (n_users, &addinfo_ptr_array);
+ 
+   if (rc NE ESA_OK)
+      goto cleanupa;
+ 
+   /* Calculate size of each addinfo struct */
+ 
+   size = sizeof (ADDINFO_rec_typ) +
+       (addinfo_ptr_array[0]->num_pairs-1) *
+       sizeof (ONE_FIELD_rec_typ);
+ 
+   /* Duplicate the keywords from first record to all others */
+ 
+   for (k = 1; k LT n_users; k++)
+      memcpy ((char *)addinfo_ptr_array[k],
+              (char *)addinfo_ptr_array[0], size);
+ 
+   have_more = HAVE_MORE;
+ 
+   while (have_more EQ HAVE_MORE) {
+ 
+      /* Clear values in all addinfo and user structs */
+ 
+      nuke_addinfo_values (addinfo_ptr_array, n_users);
+      nuke_user_details   (user_params_out,   n_users);
+ 
+      API_PROLOG;
+ 
+      ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                      "About to call gtusers_ptr (:LISTUSER) function") ;
+ 
+      rc = (*func_struct.gtusers_ptr) (GET_ALL_USERS,
+                                       oe,
+                                       MAX_USERS, &actual,
+                                       &have_more, &handle,
+                                       nv_users, user_params_in_all,
+                                       user_params_out,
+                                       addinfo_ptr_array,
+                                       objs_exist_array,
+                                       admin_ptr, err_ptr,
+                                       get_conn);
+ 
+      API_EPILOG;
+ 
+      if (rc EQ ESA_OK) {
+         total += actual;
+ 
+         for (k = 0; k LT actual; k++) {
+            if (first_time) {
+               printf ("User List\n=========\n");
+               first_time = 0;
+            }
+            if (objs_exist_array[k] EQ OBJ_EXIST) {
+               printf ("User: %s\n", user_params_out[k].user);
+#if defined (NEED_SHOW_PARENT_OE)    /* AJK001 */
+               printf (
+               "  Parent OE: %s\n", user_params_out[k].parent_oe);
+#endif
+               printf (
+               "  Group    : %s\n  Password : %s\n  Status   : %s\n",
+               user_params_out[k].def_group,
+               user_params_out[k].passwd,
+               (user_params_out[k].rev_status EQ USER_STAT_REVOKED) ?
+               "Suspended" : "Normal");
+ 
+               printf ("  Authority: %s\n",
+                    user_auth_2_str (user_params_out[k].user_admin));
+               printf ("  Password\n     status: %s\n",
+                    pwd_stat_2_str (user_params_out[k].passwd_life));
+ 
+               utl_dump_addinfo (addinfo_ptr_array[k]);
+            }
+            else
+               printf (">> Warning: User '%s' not found <<\n",
+                       user_params_out[k].user);
+         } /* for */
+      } /* if (rc EQ ESA_OK) */
+      else {
+         printf ("Error detected while processing :LISTUSER function\n");
+         utl_request_details();
+         CK_RC(rc, ":LISTUSER");
+         PR_MSG(rc);
+         CLEAN_ERR;
+         break;         /* abort on first error */
+      }
+   } /* while */
+ 
+   printf ("\n*** Total number of users found: %d ***\n", total);
+ 
+   cleanupa:
+ 
+   if (handle)
+      free (handle);
+ 
+   if (user_params_out)
+      free (user_params_out);
+ 
+   if (objs_exist_array)
+      free (objs_exist_array);
+ 
+   if (addinfo_ptr_array) {
+      for (k = 0; k LT n_users; k++) {
+         if (addinfo_ptr_array[k])
+            free (addinfo_ptr_array[k]);
+      }
+      free (addinfo_ptr_array);
+   }
+ 
+   ESA_DIAG_exit(ESA_COMP_BATCH, 1, func, rc);
+ 
+   return rc;  /* return to caller */
+ 
+ 
+   listuser_wild: /* processing a :LISTUSER
+                                  FILTER.USERID=userid* request      */
+   mode = GET_WILD_USERS;
+   char_ptr = strchr (req->users_in[0], '*');
+   *char_ptr = NULL_CHAR ;
+ 
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+       "Processing a :LISTUSER - FILTER.USERID=userid* request");
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+       "req->users_in[0] = %s", req->users_in[0]);
+   goto listuser_common;
+ 
+   listuser_many: /* processing a :LISTUSER
+                                  FILTER.USERID=userid or
+                                  FILTER.USERID=(user1,user2,user3)
+                                                        request      */
+   mode = GET_MANY_USERS;
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+       "Processing a :LISTUSER - FILTER.USERID=userid... request");
+ 
+   listuser_common:
+ 
+   /* Get all requested users, put in array */
+   rc = obtain_users (&user_params_in, &n_users_in);
+ 
+   if (rc NE ESA_OK)
+      goto cleanup;
+ 
+   /* Now that we know how many users we're talking about,
+    * let's hit malloc...
+    */
+ 
+   if (mode EQ GET_MANY_USERS)
+      n_users_out = n_users_in;
+   else
+      n_users_out = MAX_USERS;
+ 
+   /* 1. Array of n_users_out for output user names */
+ 
+   size = n_users_out * sizeof (USER_PARAMS_rec_typ);
+   user_params_out = (USER_PARAMS_rec_ptr)malloc (size);
+ 
+   if (NOT user_params_out)
+      /* * * * BS10062 start * * * */
+      {
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      printf ("Memory allocation failed for USER_PARAMS_rec_typ 2, size %d\n",
+              size);
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      rc = ESA_FATAL;
+      /* * * * BS10062 end * * * */
+      goto cleanup;
+      }
+ 
+   /* 2. Array of ADDINFO structures - NEW!! NOT DONE IN CTST!! */
+ 
+   size = n_users_out * sizeof (ADDINFO_rec_ptr);
+   addinfo_ptr_array = (ADDINFO_rec_ptr *)malloc (size);
+ 
+   if (NOT addinfo_ptr_array)
+      /* * * * BS10062 start * * * */
+      {
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      printf ("Memory allocation failed for ADDINFO_rec_ptr 2, size %d\n",
+              size);
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      rc = ESA_FATAL;
+      /* * * * BS10062 end * * * */
+      goto cleanup;
+      }
+ 
+   /* 2. Array for obj_exist indicators */
+ 
+   size = n_users_out * sizeof (OBJ_EXISTS_typ);
+   objs_exist_array = (OBJ_EXISTS_typ *)malloc (size);
+ 
+   if (NOT objs_exist_array)
+      /* * * * BS10062 start * * * */
+      {
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      printf ("Memory allocation failed for OBJ_EXISTS_typ 2, size %d\n",
+              size);
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      rc = ESA_FATAL;
+      /* * * * BS10062 end * * * */
+      goto cleanup;
+      }
+ 
+   /* 3. n_users arrays of addinfo, each filled with
+    * user-supplied keywords
+    */
+ 
+   rc = utl_get_addinfo (n_users_out, &addinfo_ptr_array);
+ 
+   if (rc NE ESA_OK)
+      goto cleanup;
+ 
+   /* All set. Hit API */
+ 
+   total     = 0;
+   have_more = HAVE_MORE;
+ 
+   while (have_more EQ HAVE_MORE) {
+ 
+      /* Clear values in all addinfo and user structs */
+ 
+      nuke_addinfo_values (addinfo_ptr_array, n_users_out);
+      nuke_user_details   (user_params_out,   n_users_out);
+ 
+      API_PROLOG;
+ 
+      ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                      "About to call gtusers_ptr (:LISTUSER) function") ;
+ 
+      rc = (*func_struct.gtusers_ptr) (mode, oe, n_users_out, &actual,
+                                       &have_more, &handle,
+                                       n_users_in, user_params_in,
+                                       user_params_out,
+                                       addinfo_ptr_array,
+                                       objs_exist_array,
+                                       admin_ptr, err_ptr,
+                                       get_conn);
+ 
+      API_EPILOG;
+ 
+      if (rc NE ESA_OK) {
+         printf ("Error detected while processing :LISTUSER function\n");
+         utl_request_details();
+         CK_RC(rc, ":LISTUSER");
+         PR_MSG(rc);
+         CLEAN_ERR;
+         break;         /* abort on first error */
+      }
+      else {
+         if (first_time) {
+            printf ("User List\n=========\n");
+            first_time = 0;
+         }
+ 
+         limit = actual;
+ 
+         for (k = 0; k LT limit; k++) {
+            if (objs_exist_array[k] EQ OBJ_EXIST) {
+               printf ("User: %s\n", user_params_out[k].user);
+#if defined (NEED_SHOW_PARENT_OE)    /* AJK001 */
+               printf (
+               "  Parent OE: %s\n", user_params_out[k].parent_oe);
+#endif
+               printf (
+               "  Group    : %s\n  Password : %s\n  Status   : %s\n",
+               user_params_out[k].def_group,
+               user_params_out[k].passwd,
+               (user_params_out[k].rev_status EQ USER_STAT_REVOKED) ?
+                   "Suspended" : "Normal");
+               printf ("  Authority: %s\n",
+                  user_auth_2_str (user_params_out[k].user_admin));
+               printf ("  Password\n     status: %s\n",
+                  pwd_stat_2_str (user_params_out[k].passwd_life));
+ 
+               utl_dump_addinfo (addinfo_ptr_array[k]);
+            }
+            else
+               printf (">> Warning: User '%s' not found <<\n",
+                       user_params_out[k].user);
+         } /* for */
+      } /* if (rc EQ ESA_OK) */
+      total += actual;
+   } /* while */
+ 
+   printf ("\n*** Total number of users found: %d ***\n", total);
+ 
+   cleanup:
+ 
+   if (handle)
+      free (handle);
+ 
+   if (user_params_in)
+      free (user_params_in);
+ 
+   if (user_params_out)
+      free (user_params_out);
+ 
+   if (objs_exist_array)
+      free (objs_exist_array);
+ 
+   if (addinfo_ptr_array) {
+      ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                      "addinfo_ptr_array=%#X n_users_out=%d",
+                      addinfo_ptr_array, n_users_out);
+      for (k = 0; k LT n_users_out; k++) {
+         ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                         "About to free addinfo_ptr_array[%d]=%#X",
+                         k, addinfo_ptr_array[k]);
+         if (addinfo_ptr_array[k]) {
+            free (addinfo_ptr_array[k]);
+         }
+      }
+      free (addinfo_ptr_array);
+      ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                      "just freed complete addinfo_ptr_array");
+   }
+ 
+   ESA_DIAG_exit(ESA_COMP_BATCH, 1, func, rc);
+ 
+   return rc;  /* return to caller */
+ 
+   } /* listuser_rtn */
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+static void get_rss_keywords (int apicode)
+{
+   int                     i;
+   ENVIRONMENT_rec_typ   * envir_ptr;
+   static char         func [] = "BATLIST_get_rss_keywords";
+ 
+   ESA_DIAG_enter(ESA_COMP_BATCH, 1, func);
+ 
+   /* several instructions were copied from ESAOFSF and TSTSCR */
+ 
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                   "arrived in get_rss_keywords");
+ 
+   CS_get_envir_address (&envir_ptr);
+ 
+   out_i = 0;
+ 
+   for (i = 0; i LT envir_ptr->kwd_num; i++) {
+      ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                      "kwd_num = %d / i = %d", envir_ptr->kwd_num, i);
+      if (atoi(envir_ptr->keywrds[i].api) EQ apicode) {
+         ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                         "out_i = %d / keyword = %s",
+                         out_i, envir_ptr->keywrds[i].keyword);
+         strcpy(out_kwd[out_i], envir_ptr->keywrds[i].keyword);
+         ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                         "out_kwd and out_i after copy = %s %d",
+                         out_kwd[out_i], out_i);
+         ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                         "Copying keyword %s into out_kwd[%d]",
+                         envir_ptr->keywrds[i].keyword, out_i);
+         out_i++;
+      }
+   }
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                   "leaving get_rss_keywords");
+ 
+   ESA_DIAG_exit(ESA_COMP_BATCH, 1, func, ESA_OK);
+ 
+   return;
+ 
+} /* get_rss_keywords */
+ 
+ 
+ 
+ 
+/****************************************************
+ * Procedure Name: listgroup_rtn
+ * Description   : Process the :LISTGROUP request.
+ *               : Some details:
+ *               :
+ *               : We call the rpl_addinfo_loop routine to process
+ *               : the RPL and addinfo lines.  When we return from the
+ *               : routine (if there was no error) we prepare and call
+ *               : the USA-API.  Then we leave this routine and we go
+ *               : back up to req_rtn and we go back up to the main
+ *               : loop.
+ * Input         : array of request details
+ * Output        : none
+ * Input/Output  :
+ * Return Value  : ESA_OK or ESA_FATAL
+ * Side Effects  :
+ * Scope         : Internal To API Test Program
+ ***************************************************/
+ 
+   ESA_RC listgroup_rtn (void) {
+   ESA_RC              rc = ESA_OK;
+   short               actual     = 0;
+   short               n_groups   = MAX_GROUPS;
+   short               nv_groups  = 1;
+   short               n_groups_in  = 0;
+   short               n_groups_out = 0;
+   int                 total      = 0;
+   int                 first_time = 1;
+   int                 k;
+   unsigned long       size;
+   void              * handle = (void *)NULL;
+   HAVE_MORE_typ       have_more;
+   UG_PARAMS_rec_typ   ug_params_in_all[1];
+   UG_PARAMS_rec_ptr   ug_params_in      = NULL;
+   UG_PARAMS_rec_ptr   ug_params_out     = NULL;
+   ADDINFO_rec_ptr   * addinfo_ptr_array = NULL;
+   OBJ_EXISTS_typ    * objs_exist_array  = NULL;
+   GET_GROUP_MODE      mode;
+   OE_typ              oe;
+   static char         func [] = "BATLIST_listgroup_rtn";
+ 
+   ESA_DIAG_enter(ESA_COMP_BATCH, 1, func);
+ 
+   printf (":LISTGROUP:\n");
+ 
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                   "about to call rpl_addinfo_loop routine");
+ 
+   rc = rpl_addinfo_loop();
+ 
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                   "rc from rpl_addinfo_loop routine = %d", rc);
+ 
+   if (rc EQ ESA_FATAL) return rc;
+ 
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                   "addinfo_keyword_encountered = %d",
+                   addinfo_keyword_encountered);
+   if (addinfo_keyword_encountered EQ 0)
+      /* then loop through the keyword table looking for a GROUP-related
+         keyword.  For each one found, we add an entry to the out_kwd
+         array and update out_i.                                     */
+   /* get_rss_keywords((int) GROUP_API_KEYWORDS); */
+      get_rss_keywords((int) FUNC_ADDUG);
+ 
+   /* At this point, these fields are set or not set:
+      - filter_userid_groupid_encountered = 1 if FILTER.GROUPID was
+        specified.
+      - filter_userid_groupid_encountered = 0 if FILTER.GROUPID was not
+        specified. This means that we will process the :LISTGROUP as if
+        FILTER.GROUPID=* was specified. This is the default.
+      - req->num_groups_in contains the number of groupids specified
+        in...
+      - req->groups_in [n] contains the actual groupids specified on
+        the FILTER.GROUPID line. This could be *, groupid, many
+        groupids, or groupid* mask.                                  */
+ 
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+       "filter_us_gr_en = %d, num_groups_in = %d, groups_in[0] = %s",
+       filter_userid_groupid_encountered, req->num_groups_in,
+       req->groups_in[0]);
+ 
+   if ((filter_userid_groupid_encountered EQ 0) OR
+       ((req->num_groups_in EQ 1) AND
+        (strcmp (req->groups_in[0],"*") EQ 0)))  goto listgroup_all;
+   else goto listgroup_many;
+ 
+   listgroup_all: /* processing a :LISTGROUP - FILTER.GROUPID=* request */
+ 
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+       "Processing a :LISTGROUP - FILTER.GROUPID=* request");
+ 
+   /* Hit malloc for all output arrays */
+ 
+   size = n_groups * sizeof (UG_PARAMS_rec_typ);
+   ug_params_out = (UG_PARAMS_rec_ptr)malloc (size);
+ 
+   if (NOT ug_params_out)
+      /* * * * BS10062 start * * * */
+      {
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      printf ("Memory allocation failed for UG_PARAMS_rec_typ 3, size %d\n",
+              size);
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      rc = ESA_FATAL;
+      /* * * * BS10062 end * * * */
+      goto cleanupa;
+      }
+ 
+   size = n_groups * sizeof (ADDINFO_rec_ptr);
+   addinfo_ptr_array = (ADDINFO_rec_ptr *)malloc (size);
+ 
+   if (NOT addinfo_ptr_array)
+      /* * * * BS10062 start * * * */
+      {
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      printf ("Memory allocation failed for ADDINFO_rec_ptr 3, size %d\n",
+              size);
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      rc = ESA_FATAL;
+      /* * * * BS10062 end * * * */
+      goto cleanupa;
+      }
+ 
+   size = n_groups * sizeof (OBJ_EXISTS_typ);
+   objs_exist_array = (OBJ_EXISTS_typ *)malloc (size);
+ 
+   if (NOT objs_exist_array)
+      /* * * * BS10062 start * * * */
+      {
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      printf ("Memory allocation failed for OBJ_EXISTS_typ 3, size %d\n",
+              size);
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      rc = ESA_FATAL;
+      /* * * * BS10062 end * * * */
+      goto cleanupa;
+      }
+ 
+   nv_groups = 0;
+ 
+   /* Get the list of addinfo keywords, create an array of pointers
+    * to n_groups addinfo arrays, filled with the keywords.
+    */
+ 
+   rc = utl_get_addinfo (n_groups, &addinfo_ptr_array);
+ 
+   if (rc NE ESA_OK)
+      goto cleanupa;
+ 
+   /* Calculate size of each addinfo struct */
+ 
+   size = sizeof (ADDINFO_rec_typ) +
+       (addinfo_ptr_array[0]->num_pairs-1) *
+        sizeof (ONE_FIELD_rec_typ);
+ 
+   /* Duplicate the keywords from first record to all others */
+ 
+   for (k = 1; k LT n_groups; k++)
+      memcpy ((char *)addinfo_ptr_array[k],
+              (char *)addinfo_ptr_array[0], size);
+ 
+   have_more = HAVE_MORE;
+ 
+   while (have_more EQ HAVE_MORE) {
+ 
+      /* Clear values in all addinfo and ug structs */
+ 
+      nuke_addinfo_values (addinfo_ptr_array, n_groups);
+      nuke_ug_details     (ug_params_out,     n_groups);
+ 
+      API_PROLOG;
+ 
+      ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                      "About to call getugs_ptr (:LISTGROUP) function");
+ 
+      rc = (*func_struct.getugs_ptr) (GET_ALL_GROUPS, oe,
+                                      MAX_GROUPS, &actual,
+                                      &have_more, &handle,
+                                      nv_groups,
+                                      ug_params_in_all,
+                                      ug_params_out,
+                                      addinfo_ptr_array,
+                                      objs_exist_array,
+                                      admin_ptr, err_ptr);
+      API_EPILOG;
+ 
+      if (rc EQ ESA_OK) {
+         total += actual;
+ 
+         for (k = 0; k LT actual; k++) {
+            if (first_time) {
+               printf ("Group List\n==========\n");
+               first_time = 0;
+            }
+            if (objs_exist_array[k] EQ OBJ_EXIST) {
+               printf ("Group: %s\n", ug_params_out[k].group);
+#ifdef UG_OPS_NEED_PARENT_UG
+               printf (" Parent group: %s\n",
+                       ug_params_out[k].parent_group);
+#endif
+#if defined (NEED_SHOW_PARENT_OE)    /* AJK001 */
+               printf (
+               "  Parent OE: %s\n", ug_params_out[k].parent_oe);
+#endif
+               utl_dump_addinfo (addinfo_ptr_array[k]);
+            }
+            else
+               printf (">> Warning: Group '%s' not found <<\n",
+                       ug_params_out[k].group);
+         } /* for */
+      } /* if (rc EQ ESA_OK) */
+      else {
+         printf ("Error detected while processing :LISTGROUP function\n");
+         utl_request_details();
+         CK_RC(rc, ":LISTGROUP");
+         PR_MSG(rc);
+         CLEAN_ERR;
+         break;         /* abort on first error */
+      }
+   } /* while */
+ 
+   printf ("\n*** Total number of groups found: %d ***\n", total);
+ 
+   cleanupa:
+ 
+   if (handle)
+      free (handle);
+ 
+   if (ug_params_out)
+      free (ug_params_out);
+ 
+   if (objs_exist_array)
+      free (objs_exist_array);
+ 
+   if (addinfo_ptr_array) {
+      for (k = 0; k LT n_groups; k++) {
+         if (addinfo_ptr_array[k])
+            free (addinfo_ptr_array[k]);
+      }
+      free (addinfo_ptr_array);
+   }
+ 
+   ESA_DIAG_exit(ESA_COMP_BATCH, 1, func, rc);
+ 
+   return rc;  /* return to caller */
+ 
+ 
+   listgroup_many: /* processing a :LISTGROUP
+                                  FILTER.GROUPID=groupid or
+                                  FILTER.GROUPID=(grp1,grp2,grp3)
+                                                        request      */
+   mode = GET_MANY_GROUPS;
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+       "Processing a :LISTGROUP - FILTER.GROUPID=groupid... request");
+ 
+   /* Get all requested groups, put in array */
+   rc = obtain_groups (&ug_params_in, &n_groups_in);
+ 
+   if (rc NE ESA_OK)
+      goto cleanup;
+ 
+   if ( mode EQ GET_MANY_GROUPS )
+      n_groups_out = n_groups_in;
+ 
+ 
+   /* Now that we know how many groups we're talking about,
+    * let's hit malloc...
+    */
+ 
+   /* 1. Array of n_groups for output group names */
+ 
+   size = n_groups_out * sizeof (UG_PARAMS_rec_typ);
+   ug_params_out = (UG_PARAMS_rec_ptr)malloc (size);
+ 
+   if (NOT ug_params_out)
+      /* * * * BS10062 start * * * */
+      {
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      printf ("Memory allocation failed for UG_PARAMS_rec_typ 4, size %d\n",
+              size);
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      rc = ESA_FATAL;
+      /* * * * BS10062 end * * * */
+      goto cleanup;
+      }
+ 
+   /* 2. Array of ADDINFO structures - NEW!! NOT DONE IN CTST!! */
+ 
+   size = n_groups_out * sizeof (ADDINFO_rec_ptr);
+   addinfo_ptr_array = (ADDINFO_rec_ptr *)malloc (size);
+ 
+   if (NOT addinfo_ptr_array)
+      /* * * * BS10062 start * * * */
+      {
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      printf ("Memory allocation failed for ADDINFO_rec_ptr 4, size %d\n",
+              size);
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      rc = ESA_FATAL;
+      /* * * * BS10062 end * * * */
+      goto cleanup;
+      }
+ 
+   /* 2. Array for obj_exist indicators */
+ 
+   size = n_groups_out * sizeof (OBJ_EXISTS_typ);
+   objs_exist_array = (OBJ_EXISTS_typ *)malloc (size);
+ 
+   if (NOT objs_exist_array)
+      /* * * * BS10062 start * * * */
+      {
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      printf ("Memory allocation failed for OBJ_EXISTS_typ 4, size %d\n",
+              size);
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      rc = ESA_FATAL;
+      /* * * * BS10062 end * * * */
+      goto cleanup;
+      }
+ 
+   /* 3. n_groups arrays of addinfo, each filled with
+    * user-supplied keywords
+    */
+ 
+   rc = utl_get_addinfo (n_groups_out, &addinfo_ptr_array);
+ 
+   if (rc NE ESA_OK)
+      goto cleanup;
+ 
+   /* All set. Hit API */
+ 
+   API_PROLOG;
+ 
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                   "About to call getugs_ptr (:LISTGROUP) function");
+ 
+   rc = (*func_struct.getugs_ptr) (mode, oe, n_groups_out, &actual,
+                                   &have_more, &handle,
+                                   n_groups_in, ug_params_in,
+                                   ug_params_out,
+                                   addinfo_ptr_array,
+                                   objs_exist_array, admin_ptr,
+                                   err_ptr);
+ 
+   API_EPILOG;
+ 
+   if (rc NE ESA_OK) {
+      CK_RC(rc, ":LISTGROUP");
+      PR_MSG(rc);
+      CLEAN_ERR;
+   }
+   else {
+      printf ("Group List\n==========\n");
+      for (k = 0; k LT actual; k++) {
+         if (objs_exist_array[k] EQ OBJ_EXIST) {
+            printf ("Group: %s\n", ug_params_out[k].group);
+#ifdef UG_OPS_NEED_PARENT_UG
+            printf (" Parent group: %s\n",
+                    ug_params_out[k].parent_group);
+#endif
+#if defined (NEED_SHOW_PARENT_OE)    /* AJK001 */
+            printf ( "  Parent OE: %s\n", ug_params_out[k].parent_oe);
+#endif
+            utl_dump_addinfo (addinfo_ptr_array[k]);
+         }
+         else
+            printf (">> Warning: Group '%s' not found <<\n",
+                    ug_params_out[k].group);
+      }
+   }
+ 
+   cleanup:
+ 
+   if (handle)
+      free (handle);
+ 
+   if (ug_params_in)
+      free (ug_params_in);
+ 
+   if (ug_params_out)
+      free (ug_params_out);
+ 
+   if (objs_exist_array)
+      free (objs_exist_array);
+ 
+   if (addinfo_ptr_array) {
+      ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                      "addinfo_ptr_array=%#X n_groups_out=%d",
+                      addinfo_ptr_array, n_groups_out);
+      for (k = 0; k LT n_groups_out; k++) {
+         ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                         "About to free addinfo_ptr_array[%d]=%#X",
+                         k, addinfo_ptr_array[k]);
+         if (addinfo_ptr_array[k])
+            free (addinfo_ptr_array[k]);
+      }
+      free (addinfo_ptr_array);
+      ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                      "just freed complete addinfo_ptr_array");
+   }
+ 
+   ESA_DIAG_exit(ESA_COMP_BATCH, 1, func, rc);
+ 
+   return rc;  /* return to caller */
+ 
+   } /* listgroup_rtn */
+ 
+ 
+ 
+/****************************************************
+ * Procedure Name: listconn_rtn
+ * Description   : Process the :LISTCONN request.
+ *               : Some details:
+ *               :
+ *               : We call the rpl_addinfo_loop routine to process
+ *               : the RPL and addinfo lines.  When we return from the
+ *               : routine (if there was no error) we prepare and call
+ *               : the USA-API.  Then we leave this routine and we go
+ *               : back up to req_rtn and we go back up to the main
+ *               : loop.
+ * Input         : array of request details
+ * Output        : none
+ * Input/Output  :
+ * Return Value  : ESA_OK or ESA_FATAL
+ * Side Effects  :
+ * Scope         : Internal To API Test Program
+ ***************************************************/
+/*     menu_printf ("\nUser to User-Group List Menu\n");
+       menu_printf (  "============================\n");
+       menu_printf ("Select function:\n");
+       menu_printf ("1. All users of all groups\n");
+                                                 tst_list_u2ug_aa
+       menu_printf ("2. All users of some groups\n");
+                                                 tst_list_u2ug_sa
+       menu_printf ("3. Specific group-user pairs\n");
+                                                 tst_list_u2ug_pairs
+       menu_printf ("4. All groups of some users\n");
+                                                 tst_list_u2ug_users  */
+ 
+   ESA_RC listconn_rtn (void) {
+   ESA_RC               rc         = ESA_OK;
+   short                actual     = 0;
+   int                  first_time = 1;
+   int                  total      = 0;
+   short                u_in;
+   short                g_in;
+   int                  k;
+   void               * handle = (void *)NULL;
+   HAVE_MORE_typ        have_more;
+   USER_typ             users_in[1];
+   USER_typ             prev_user;
+   UG_typ               prev_group;
+   ADDINFO_rec_ptr    * addinfo_ptr_array = NULL;
+   UG_typ               ugs_in          [1];
+   OBJ_EXISTS_typ       obj_exist_array [MAX_GROUPS];
+   U2UG_PARAMS_rec_typ  u2ug_out        [MAX_GROUPS];
+ 
+   short                num_ugs_in;
+   USER_typ           * users_in_sa     = NULL;
+   UG_typ               ugs_in_sp       [MAX_GROUPS];
+   UG_typ               ugs_out         [MAX_GROUPS];
+   USER_typ             users_out       [MAX_GROUPS];
+ 
+   short                num_users_in;
+   USER_typ             users_in_prs    [MAX_GROUPS];
+ 
+   USER_typ             users_in_usrs   [MAX_CONNS];
+   OBJ_EXISTS_typ       obj_exist_array_usrs [MAX_CONNS];
+   U2UG_PARAMS_rec_typ  u2ug_out_usrs        [MAX_CONNS];
+   static char          func [] = "BATLIST_listconn_rtn";
+ 
+   ESA_DIAG_enter(ESA_COMP_BATCH, 1, func);
+ 
+   printf (":LISTCONN:\n");
+ 
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                   "about to call rpl_addinfo_loop routine");
+ 
+   rc = rpl_addinfo_loop();
+ 
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                   "rc from rpl_addinfo_loop routine = %d", rc);
+ 
+   if (rc EQ ESA_FATAL) return rc;
+ 
+   /*
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                   "addinfo_keyword_encountered = %d\n",
+                   addinfo_keyword_encountered);
+   if (addinfo_keyword_encountered EQ 0)
+      // then loop through the keyword table looking for a CONNECTION-
+         related keyword.  For each one found, we add an entry to the
+         out_kwd array and update out_i.                             //
+   // get_rss_keywords((int) CONNECTION_API_KEYWORDS); //
+      get_rss_keywords((int) FUNC_ADDU2UG);
+   */
+ 
+   /* At this point, these fields are set when:
+      - filter_conn_encountered  - FILTER.CONN specified
+        - if FILTER.CONN=* was specified, req->num_users_in = 0 and
+          req->num_groups_in = 0
+        - if FILTER.CONN=(userid,groupid) was specified, then
+          req->users_in[0] is set to userid and req->groups_in[0] is
+          set to groupid
+      - filter_group_encountered - FILTER.GROUP specified
+        - req->num_groups_in contains the number of groups specified
+          in...
+        - req->groups_in [n] contains the actual groups specified on
+          the FILTER.GROUP line. This could be group or many groups.
+      - filter_user_encountered  - FILTER.USER specified
+        - req->num_users_in contains the number of users specified
+          in...
+        - req->users_in [n] contains the actual users specified on
+          the FILTER.USER line. This could be user or many users.
+      - If none of these 3 fields are set, we will do a :LISTCONN
+        as if FILTER.CONN=* was specified. This is the default.      */
+ 
+   if (filter_conn_encountered EQ 1) {
+      ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+          "FILTER.CONN: num_users_in  = %d,  users_in[0]  = %s",
+          req->num_users_in, req->users_in[0]);
+      ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+          "             num_groups_in = %d,  groups_in[0] = %s",
+          req->num_groups_in, req->groups_in[0]);
+      goto listconn_conn;
+   }
+ 
+   if (filter_group_encountered EQ 1) {
+      ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+          "FILTER.GROUP: num_groups_in = %d, groups_in[0] = %s\n",
+          req->num_groups_in, req->groups_in[0]);
+      goto listconn_group;
+   }
+ 
+   if (filter_user_encountered EQ 1) {
+      ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+          "FILTER.USER: num_users_in = %d,  users_in[0] = %s\n",
+          req->num_users_in, req->users_in[0]);
+      goto listconn_user;
+   }
+ 
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                   "Default setting: FILTER.CONN=* ");
+ 
+   req->num_groups_in = 0;
+   req->num_users_in  = 0;
+ 
+   listconn_conn: /* processing a :LISTCONN - FILTER.CONN=* or
+                                FILTER.CONN=(userid,groupid) request */
+ 
+   if ((req->num_users_in EQ 0) AND (req->num_groups_in EQ 0))
+      goto listconn_all;
+   else goto listconn_pair;
+ 
+   listconn_all:
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                   "Processing a :LISTCONN - FILTER.CONN=* request");
+ 
+   u_in = 0;
+   g_in = 0;
+ 
+   /* Get the list of addinfo keywords, create an array of pointers
+    * to MAX_GROUPS addinfo arrays filled with the keywords.
+    */
+ 
+   rc = utl_get_addinfo (MAX_GROUPS, &addinfo_ptr_array);
+ 
+   if (rc NE ESA_OK)
+      goto cleanup;
+ 
+   have_more = HAVE_MORE;
+   strcpy (prev_user, "");
+ 
+   while (have_more EQ HAVE_MORE) {
+ 
+      /* Clear values in all addinfo, user, ug and u2ug structs */
+ 
+      nuke_u2ug_details   (u2ug_out,          MAX_GROUPS);
+      nuke_addinfo_values (addinfo_ptr_array, MAX_GROUPS);
+ 
+      API_PROLOG;
+ 
+      rc = (*func_struct.gtug2uc_ptr) (GET_ALL_CONNS, MAX_GROUPS,
+                                       &actual,
+                                       &have_more, &handle,
+                                       u_in,
+                                       g_in,
+                                       ugs_in,
+                                       users_in,
+                                       &u2ug_out[0],
+                                       addinfo_ptr_array,
+                                       obj_exist_array,
+                                       admin_ptr, err_ptr);
+      API_EPILOG;
+ 
+      if (rc NE ESA_OK) {
+         CK_RC (rc, ":LISTCONN");
+         PR_MSG (rc);
+         CLEAN_ERR;
+         break;         /* abort on first error */
+      }
+      else {
+         if (first_time) {
+            printf ("User to User-Group List\n");
+            printf ("=======================\n");
+            first_time = 0;
+         }
+         for (k = 0; k LT actual; k++) {
+            if (strcmp (u2ug_out[k].user, prev_user) NE 0)
+            printf ("User: %-8s -- Group: %-8s\n",
+                     u2ug_out[k].user,
+                     u2ug_out[k].group);
+            else
+            printf ("               -- Group: %-8s\n",
+                     u2ug_out[k].group);
+            pr_u2ug_details (&u2ug_out[k]);
+         /* utl_dump_addinfo (addinfo_ptr_array[k]); */
+            total++;
+            strcpy(prev_user, u2ug_out[k].user);
+         }
+         if (actual EQ 0)
+            printf ("No groups found or no connections found\n");
+      }
+   } /* while we HAVE_MORE */
+ 
+   goto cleanup;
+ 
+ 
+   listconn_pair:
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+       "Processing a :LISTCONN - FILTER.CONN=(usr,grp) request");
+ 
+   /* Get the list of addinfo keywords, create an array of pointers
+    * to MAX_GROUPS addinfo arrays filled with the keywords.
+    */
+ 
+   rc = utl_get_addinfo (MAX_GROUPS, &addinfo_ptr_array);
+ 
+   if (rc NE ESA_OK)
+      goto cleanup;
+ 
+   num_ugs_in   = 1;
+   num_users_in = 1;
+ 
+   strcpy (ugs_in_sp [0], req->groups_in [0]);
+ 
+   strcpy (users_in_prs [0], req->users_in [0]);
+ 
+   have_more = HAVE_MORE;
+   strcpy (prev_user, "");
+ 
+   while (have_more EQ HAVE_MORE) {
+ 
+      /* Clear values in all addinfo, user, ug and u2ug structs */
+ 
+      nuke_u2ug_details   (u2ug_out,          MAX_GROUPS);
+      nuke_addinfo_values (addinfo_ptr_array, MAX_GROUPS);
+ 
+      API_PROLOG;
+ 
+      rc = (*func_struct.gtug2uc_ptr) (GET_MANY_CONNS,
+                                       MAX_GROUPS,
+                                       &actual,
+                                       &have_more, &handle,
+                                       num_ugs_in, num_users_in,
+                                       &ugs_in_sp[0],
+                                       &users_in_prs[0],
+                                       &u2ug_out[0],
+                                       addinfo_ptr_array,
+                                       obj_exist_array,
+                                       admin_ptr, err_ptr);
+      API_EPILOG;
+ 
+      if (rc NE ESA_OK) {
+         CK_RC (rc, ":LISTCONN");
+         PR_MSG (rc);
+         CLEAN_ERR;
+         break;         /* abort on first error */
+      }
+      else {
+         if (first_time) {
+            printf ("User to User-Group List\n");
+            printf ("=======================\n");
+            first_time = 0;
+         }
+         for (k = 0; k LT actual; k++) {
+            if (strcmp (u2ug_out[k].user, prev_user) NE 0)
+            printf ("User: %-8s -- Group: %-8s\n",
+                     u2ug_out[k].user,
+                     u2ug_out[k].group);
+            else
+            printf ("               -- Group: %-8s\n",
+                     u2ug_out[k].group);
+            strcpy(prev_user, u2ug_out[k].user);
+            if (obj_exist_array[k] EQ OBJ_EXIST) {
+               pr_u2ug_details (&u2ug_out[k]);
+            /* utl_dump_addinfo (addinfo_ptr_array[k]); */
+               total++;
+            }
+            else
+               printf (
+               "*** Group %s does not exist or user %s not in group ***\n",
+               ugs_in_sp, users_in_prs);
+         }
+         if (actual EQ 0)
+            printf ( "No groups found or no connections found for user %s group %s\n",
+            users_in_prs, ugs_in_sp);
+      }
+   } /* while we have_more */
+ 
+   goto cleanup;
+ 
+ 
+   listconn_group:
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                   "Processing a :LISTCONN - FILTER.GROUP= request");
+ 
+   /* Get the list of addinfo keywords, create an array of pointers
+    * to MAX_GROUPS addinfo arrays filled with the keywords.
+    */
+ 
+   rc = utl_get_addinfo (MAX_GROUPS, &addinfo_ptr_array);
+ 
+   if (rc NE ESA_OK)
+       goto cleanup;
+ 
+   num_ugs_in = 0;
+ 
+   while ((num_ugs_in LT MAX_GROUPS) AND
+          (num_ugs_in LT req->num_groups_in)) {
+ 
+      strcpy (ugs_in_sp[num_ugs_in], req->groups_in[num_ugs_in]);
+ 
+      num_ugs_in++;
+   }
+ 
+   have_more = HAVE_MORE;
+   strcpy (prev_group, "");
+ 
+   while (have_more EQ HAVE_MORE) {
+ 
+      /* Clear values in all addinfo, user, ug and u2ug structs */
+ 
+      memset ((char *)users_out, NULL_CHAR,
+              MAX_GROUPS * sizeof (USER_typ));
+      memset ((char *)ugs_out,
+              NULL_CHAR, MAX_GROUPS * sizeof (UG_typ));
+      nuke_u2ug_details   (u2ug_out,          MAX_GROUPS);
+      nuke_addinfo_values (addinfo_ptr_array, MAX_GROUPS);
+ 
+      API_PROLOG;
+ 
+      rc = (*func_struct.gtug2uc_ptr) (GET_GROUPS_CONNS,
+                                       MAX_GROUPS, &actual,
+                                       &have_more, &handle,
+                                       num_ugs_in, 1,
+                                       &ugs_in_sp[0],
+                                       users_in_sa,
+                                       &u2ug_out[0],
+                                       addinfo_ptr_array,
+                                       obj_exist_array,
+                                       admin_ptr, err_ptr);
+ 
+      API_EPILOG;
+ 
+      if (rc NE ESA_OK) {
+         CK_RC (rc, ":LISTCONN");
+         PR_MSG (rc);
+         CLEAN_ERR;
+         break;         /* abort on first error */
+      }
+      else {
+         if (first_time) {
+            printf ("Group to User List\n");
+            printf ("==================\n");
+            first_time = 0;
+         }
+         for (k = 0; k LT actual; k++) {
+            if (strcmp (u2ug_out[k].group, prev_group) NE 0)
+            printf ("Group: %-8s -- User: %-8s\n",
+                     u2ug_out[k].group,
+                     u2ug_out[k].user);
+            else
+            printf ("                 -- User: %-8s\n",
+                     u2ug_out[k].user);
+            pr_u2ug_details (&u2ug_out[k]);
+         /* utl_dump_addinfo (addinfo_ptr_array[k]); */
+            total++;
+            strcpy(prev_group, u2ug_out[k].group);
+         }
+         if (actual EQ 0)
+            printf ("No groups found or no connections found\n");
+      }
+   } /* while we have_more */
+ 
+   goto cleanup;
+ 
+ 
+   listconn_user:
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                   "Processing a :LISTCONN - FILTER.USER= request");
+ 
+   /* Get the list of addinfo keywords, create an array of pointers
+    * to MAX_CONNS addinfo arrays filled with the keywords.
+    */
+ 
+   rc = utl_get_addinfo (MAX_CONNS, &addinfo_ptr_array);
+ 
+   if (rc NE ESA_OK)
+       goto cleanup;
+ 
+   num_users_in = 0;
+ 
+   while ((num_users_in LT MAX_GROUPS) AND
+          (num_users_in LT req->num_users_in)) {
+ 
+      strcpy (users_in_usrs[num_users_in], req->users_in[num_users_in]) ;
+ 
+      num_users_in++;
+   }
+ 
+   have_more = HAVE_MORE;
+   strcpy (prev_user, "");
+ 
+   while (have_more EQ HAVE_MORE) {
+ 
+      /* Clear values in all addinfo, user, ug and u2ug structs */
+ 
+      nuke_u2ug_details   (u2ug_out_usrs,     MAX_CONNS);
+      nuke_addinfo_values (addinfo_ptr_array, MAX_CONNS);
+ 
+      API_PROLOG;
+ 
+      rc = (*func_struct.gtug2uc_ptr) (GET_USERS_CONNS,
+                                       MAX_CONNS, &actual,
+                                       &have_more, &handle,
+                                       1, num_users_in,
+                                       &ugs_in[0],
+                                       users_in_usrs,
+                                       &u2ug_out_usrs[0],
+                                       addinfo_ptr_array,
+                                       obj_exist_array_usrs,
+                                       admin_ptr, err_ptr);
+ 
+      API_EPILOG;
+ 
+      if (rc NE ESA_OK) {
+         CK_RC (rc, ":LISTCONN");
+         PR_MSG (rc);
+         CLEAN_ERR;
+         break;         /* abort on first error */
+      }
+      else {
+         if (first_time) {
+            printf ("User to User-Group List\n");
+            printf ("=======================\n");
+            first_time = 0;
+         }
+         for (k = 0; k LT actual; k++) {
+            if (strcmp (u2ug_out_usrs[k].user, prev_user) NE 0)
+            printf ("User: %-8s -- Group: %-8s\n",
+                     u2ug_out_usrs[k].user,
+                     u2ug_out_usrs[k].group);
+            else
+            printf ("               -- Group: %-8s\n",
+                     u2ug_out_usrs[k].group);
+            pr_u2ug_details (&u2ug_out_usrs[k]);
+         /* utl_dump_addinfo (addinfo_ptr_array[k]); */
+            total++;
+            strcpy(prev_user, u2ug_out_usrs[k].user);
+         }
+         if (actual EQ 0)
+            printf ("No groups found or no connections found\n");
+      }
+   } /* while we have_more */
+ 
+   cleanup:
+ 
+   printf ("\n*** Total number of connections found: %d ***\n", total);
+ 
+   if (addinfo_ptr_array) {
+      for (k = 0; k LT MAX_GROUPS; k++) {
+         if (addinfo_ptr_array [k])
+            free (addinfo_ptr_array [k]);
+      }
+      free (addinfo_ptr_array);
+   }
+ 
+   if (handle)
+      free (handle);
+ 
+   ESA_DIAG_exit(ESA_COMP_BATCH, 1, func, rc);
+ 
+   return rc;
+ 
+   }
+ 
+ 
+ 
+/****************************************************
+ * Procedure Name: obtain_users
+ * Description   : Obtain the names of users
+ * Input         :
+ * Output        : users, # of users
+ * Input/Output  :
+ * Return Value  : ESA_RC
+ * Side Effects  :
+ * Scope         : Local
+ ***************************************************/
+ 
+static ESA_RC obtain_users (USER_PARAMS_rec_ptr * user_params_in,
+                            short               * n_users)
+{
+   short                 ctr = 0;
+   UG_typ                user;
+   unsigned long         size;                            /* BS10062 */
+   USER_PARAMS_rec_typ * upi;
+   static char           func [] = "BATLIST_obtain_users";
+ 
+   ESA_DIAG_enter(ESA_COMP_BATCH, 1, func);
+ 
+ 
+   /* Alloc room for MAX_MANY users */
+ 
+   size = MAX_MANY * sizeof (USER_PARAMS_rec_typ);        /* BS10062 */
+   upi = (USER_PARAMS_rec_typ *) calloc (MAX_MANY,
+                                         sizeof (USER_PARAMS_rec_typ));
+ 
+   if (NOT upi)
+      /* * * * BS10062 start * * * */
+      {
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      printf ("Memory allocation failed for USER_PARAMS_rec_typ U, size %d\n",
+              size);
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      /* * * * BS10062 end * * * */
+      return ESA_FATAL;
+      }
+ 
+   while ((ctr LT MAX_MANY) AND (ctr LT req->num_users_in)) {
+ 
+      ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+          "req->users_in[%d] = %s", ctr, req->users_in[ctr]);
+ 
+      strcpy (upi[ctr].user, req->users_in[ctr]);
+ 
+      ctr++;
+   }
+ 
+   *user_params_in = upi;
+   *n_users        = ctr;
+ 
+   ESA_DIAG_exit(ESA_COMP_BATCH, 1, func, ESA_OK);
+ 
+   return ESA_OK;
+ 
+} /* obtain_users */
+ 
+ 
+ 
+/****************************************************
+ * Procedure Name: obtain_groups
+ * Description   : Obtain the names of groups
+ * Input         :
+ * Output        : groups, # of groups
+ * Input/Output  :
+ * Return Value  : ESA_RC
+ * Side Effects  :
+ * Scope         : local
+ ***************************************************/
+ 
+static ESA_RC obtain_groups (UG_PARAMS_rec_ptr * ug_params_in,
+                             short             * n_groups)
+{
+   short               ctr = 0;
+   UG_typ              group;
+   unsigned long       size;                              /* BS10062 */
+   UG_PARAMS_rec_typ * upi;
+   static char         func [] = "BATLIST_obtain_groups";
+ 
+   ESA_DIAG_enter(ESA_COMP_BATCH, 1, func);
+ 
+   /* Alloc room for MAX_MANY groups */
+ 
+   size = MAX_MANY * sizeof (UG_PARAMS_rec_typ);          /* BS10062 */
+   upi = (UG_PARAMS_rec_typ *) calloc (MAX_MANY,
+                                        sizeof (UG_PARAMS_rec_typ));
+ 
+   if (NOT upi)
+      /* * * * BS10062 start * * * */
+      {
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      printf ("Memory allocation failed for UG_PARAMS_rec_typ G, size %d\n",
+              size);
+      printf ("* * * * * * * * * * Fatal Error * * * * * * * * * *\n");
+      /* * * * BS10062 end * * * */
+      return ESA_FATAL;
+      }
+ 
+   while ((ctr LT MAX_MANY) AND (ctr LT req->num_groups_in)) {
+ 
+      ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+          "req->groups_in[%d] = %s", ctr, req->groups_in[ctr]);
+ 
+      strcpy (upi[ctr].group, req->groups_in[ctr]);
+ 
+      ctr++;
+   }
+ 
+   *ug_params_in = upi;
+   *n_groups     = ctr;
+ 
+   ESA_DIAG_exit(ESA_COMP_BATCH, 1, func, ESA_OK);
+ 
+   return ESA_OK;
+ 
+} /* obtain_groups */
+ 
+ 
+ 
+ 
+/****************************************************
+ * Procedure Name: dump_ace_type
+ * Description   : Decode ACE type
+ * Input         : ace_type
+ * Output        :
+ * Input/Output  :
+ * Return Value  :
+ * Side Effects  : Prints
+ * Scope         : Local
+ ***************************************************/
+ 
+static void dump_ace_type (ACE_TYPE_typ at)
+{
+   printf ("  ACE type:       ");
+ 
+   switch (at) {
+     case ACE_TYPE_UNDEFINED:
+         printf ("UNDEFINED\n");
+         break;
+     case ACE_TYPE_IGNORED:
+         printf ("IGNORE\n");
+         break;
+     case ACE_TYPE_USER:
+         printf ("USER\n");
+         break;
+     case ACE_TYPE_GROUP:
+         printf ("GROUP\n");
+         break;
+     case ACE_TYPE_USER_AND_GROUP:
+         printf ("BOTH\n");
+         break;
+     case ACE_TYPE_WORLD:
+         printf ("WORLD\n");
+         break;
+     case ACE_TYPE_MASK:
+         printf ("MASK\n");
+         break;
+     case ACE_TYPE_OE:
+         printf ("OE\n");
+         break;
+   }
+} /* dump_ace_type */
+ 
+ 
+ 
+/****************************************************
+ * Procedure Name: dump_ace_attrs
+ * Description   : Decode ACE attributes
+ * Input         : ace_attributes (enum)
+ * Output        :
+ * Input/Output  :
+ * Return Value  :
+ * Side Effects  : Prints
+ * Scope         : Local
+ ***************************************************/
+ 
+static void dump_ace_attrs (ACE_ATTR_typ ace_attrs)
+{
+   printf ("  ACE attributes: %s\n",
+            (ace_attrs EQ ACE_ATTR_PERMANENT) ?
+            "PERMANENT" : "OPTIONAL");
+} /* dump_ace_attrs */
+ 
+ 
+ 
+/****************************************************
+ * Procedure Name: listacl_rtn
+ * Description   : Process the :LISTACL request.
+ *               : Some details:
+ *               :
+ *               : We call the rpl_addinfo_loop routine to process
+ *               : the RPL and addinfo lines.  When we return from the
+ *               : routine (if there was no error) we prepare and call
+ *               : the USA-API.  Then we leave this routine and we go
+ *               : back up to req_rtn and we go back up to the main
+ *               : loop.
+ * Input         : array of request details
+ * Output        : none
+ * Input/Output  :
+ * Return Value  : ESA_OK or ESA_FATAL
+ * Side Effects  :
+ * Scope         : Internal To API Test Program
+ ***************************************************/
+ 
+   ESA_RC listacl_rtn (void) {
+   ESA_RC               rc = ESA_OK;
+   int                  k, total;
+   short                actual = 0;
+   short                num_aces = MAX_ACES;
+   unsigned long        size;
+   int                  first_time = 1;
+   HAVE_MORE_typ        have_more = NO_MORE;
+   void               * handle = NULL;
+   RES_PARAMS_rec_typ   res_params;
+   ADDINFO_rec_ptr    * addinfo_ptr_array = NULL;
+   ACE_rec_typ          ace_array [MAX_ACES];
+   static char          func [] = "BATLIST_listacl_rtn";
+ 
+   ESA_DIAG_enter(ESA_COMP_BATCH, 1, func);
+ 
+   printf (":LISTACL:\n");
+ 
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                   "about to call rpl_addinfo_loop routine");
+ 
+   rc = rpl_addinfo_loop();
+ 
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                   "rc from rpl_addinfo_loop routine = %d", rc);
+ 
+   if (rc EQ ESA_FATAL) return rc;
+ 
+   ESA_DIAG_printf(ESA_COMP_BATCH, 1,
+                   "addinfo_keyword_encountered = %d",
+                   addinfo_keyword_encountered);
+   if (addinfo_keyword_encountered EQ 0)
+      /* then loop through the keyword table looking for a GROUP-related
+         keyword.  For each one found, we add an entry to the out_kwd
+         array and update out_i.                                     */
+   /* get_rss_keywords((int) ?????_API_KEYWORDS); */
+      get_rss_keywords((int) FUNC_ADDACE);
+ 
+   strcpy (res_params.resource, req->resource);
+ 
+#ifdef NEED_RES_TYPE
+   if (req->restype NE NULL_CHAR)
+      strcpy (res_params.restype, req->restype);
+   else strcpy (res_params.restype, DEFAULT_RES_TYPE);
+#endif
+ 
+   /* Get the list of addinfo keywords, create an array of pointers
+    * to MAX_ACES addinfo arrays filled with the keywords.
+    */
+ 
+   rc = utl_get_addinfo (num_aces, &addinfo_ptr_array);
+ 
+   if (rc NE ESA_OK)
+      goto cleanup;
+ 
+   /* Calculate size of each addinfo struct */
+ 
+   size = sizeof (ADDINFO_rec_typ) +
+       (addinfo_ptr_array[0]->num_pairs-1) *
+       sizeof (ONE_FIELD_rec_typ);
+ 
+   /* Duplicate the keywords from first record to all others */
+ 
+   for (k = 1; k LT num_aces; k++)
+      memcpy ((char *)addinfo_ptr_array[k],
+              (char *)addinfo_ptr_array[0], size);
+ 
+   have_more = HAVE_MORE;
+   total     = 0;
+   k         = 0;
+ 
+   while (have_more EQ HAVE_MORE) {
+ 
+      /* Clear values in all addinfo structs */
+ 
+      nuke_addinfo_values (addinfo_ptr_array, num_aces);
+ 
+      API_PROLOG;
+ 
+      rc = (*func_struct.gtrsacl_ptr) (GET_RESOURCE_ACL,
+                                       num_aces, &actual,
+                                       &have_more, &handle,
+                                       &res_params,
+                                       ace_array,
+                                       addinfo_ptr_array,
+                                       admin_ptr, err_ptr);
+ 
+      API_EPILOG;
+ 
+      if (rc EQ ESA_OK) {
+         if (first_time) {
+            first_time = 0;
+            printf ("RESOURCE ACL:\n");
+            printf ("=============\n");
+            printf (" Resource: %s\n Type    : %s\n",
+                     res_params.resource, res_params.restype);
+         }
+ 
+         if (actual EQ 0)    /* sanity check */
+            break;
+ 
+         total += actual;
+         for (k = 0; k LT actual; k++) {
+            printf (" ACE: (%s.%s)\n",
+                    ace_array[k].user_name,
+                    ace_array[k].ug_name);
+            dump_ace_type  (ace_array[k].ace_type);
+            dump_ace_attrs (ace_array[k].ace_attrs);
+            utl_dump_addinfo (addinfo_ptr_array[k]);
+         } /* for */
+      }
+      else {
+         CK_RC(rc, ":LISTACL");
+         PR_MSG(rc);
+         CLEAN_ERR;
+         break;
+      }
+   } /* while */
+ 
+   if (total)
+      printf ("\n*** Total number of ACEs found: %d ***\n", total);
+ 
+   cleanup:
+   if (addinfo_ptr_array) {
+      for (k = 0; k LT num_aces; k++) {
+         if (addinfo_ptr_array[k])
+            free (addinfo_ptr_array[k]);
+      }
+      free (addinfo_ptr_array);
+   }
+ 
+   if (handle) {
+      free (handle);
+   }
+ 
+   ESA_DIAG_exit(ESA_COMP_BATCH, 1, func, rc);
+ 
+   return rc;
+ 
+   }

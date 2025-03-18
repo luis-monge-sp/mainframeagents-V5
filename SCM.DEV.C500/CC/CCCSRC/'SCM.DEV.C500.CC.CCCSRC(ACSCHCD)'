@@ -1,0 +1,395 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: acschcd.c %
+ * Instance        : %instance: 1 %
+ * Created by      : %created_by: leonid_s %
+ * Created on      : %date_created: Wed Aug 06 14:31:47 2003 %
+ * Current Version : %version: 2 %
+ * Last Modified by: %derived_by: leonid_s %
+ * Last Modified on: %date_modified: Wed Aug 06 14:31:48 2003 %
+ */
+ 
+/***********************************************
+ * Mod.ID  Who      When         Description
+ * =============================================
+ * IS10072 AvnerL	07-02-12	Implement AV001 made by Ajay in 2010 -
+ *                              Temporary changes to avoid ABEND in CD (while RSSOFLI updation)on Mainframe (ISS03537689)
+ * SAS2IBMA AvnerL 21-Dec-16 SAS/C to IBM C Conversion Project
+ * BS10129  AvnerL  28-Dec-23    Recompile due to WS10078 ESAINIT
+ * WS10082A AvnerL 18-Oct-23 ADDINFO drop unused code
+ **********************************************/
+ 
+#include "globs.h"
+ 
+#include ESA_INIT
+#include ESA_API
+#include ESA_PROC
+#include ESA_RSS
+#include ESA_ADMIN
+ 
+/****************************************************
+ * Procedure Name: CS_scheduler
+ * Description   : Call to intercept scheduler
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_scheduler (int SwScheduler)
+{
+  static long           MinApcIntrvl;
+  static time_t         NextApcTime;
+  char                  RssKwdValue[RSSPRM_VALUE_LEN+ 1];
+  char                  fn[]="CS_scheduler";
+  ESA_RC                rc= ESA_OK;
+  int                   from_rss_num= 0, from_adm_num= 0;
+  /* no reference to this var.drop it.ApcSw= 0; AvnerL 29apr2003
+   *                                            for MVS - task 7941*/
+  MEMBER_ADM_rec_typ    apc_adm_rec;
+  time_t                CurTime, ChgIntrvl;
+  /*WS10082A ADDINFO_rec_typ       AddInfoSpace; code dropped        */
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSCHED, DIAG_COMMON, fn);
+  CurTime= time(NULL);
+  ESA_DIAG_printf (ESA_COMP_ACSCHED, DIAG_MORE,
+     "CurTime=%ld Initial Service sended=%c status_date=%s Entity kwds=%d SwScheduler=%d.",
+      CurTime, envir_ptr->initial_service, envir_ptr->rss_status_date,
+	  envir_ptr->num_entity_kwds, SwScheduler);
+  if (envir_ptr->initial_service EQ INIT_SERVICE_SENDED)
+  {
+  /*WS10082A Minimun Password Change interval is not used in MF
+     if (MinApcIntrvl EQ 0)
+     {
+        rc= rssprm_get_opt (ALL_RSS, MIN_APC_INTRVL, TIME_LEN,
+                            RssKwdValue, OPT_TRUE, OPT_TRUE);
+        if (rc EQ ESA_OK)
+        {
+            ESA_DIAG_printf (ESA_COMP_ACSCHED, 16, "rssprm_get_opt: rc=%d %s=%s.",
+               (int)rc, RSS_STATUS_INTERVAL, RssKwdValue);
+            MinApcIntrvl= atol (RssKwdValue);
+ 
+            rc= ADM_next_apc (&from_rss_num, &from_adm_num, &apc_adm_rec);
+            if (rc EQ ESA_OK)
+			{
+               NextApcTime= CurTime+ (MinApcIntrvl* 60);
+               ESA_DIAG_printf(ESA_COMP_ACSCHED, DIAG_BASIC,
+                   "*****>... APC: will be at %s (%ld). Apc Interval=%d.",
+			       ctime (&NextApcTime), NextApcTime, MinApcIntrvl);
+			}
+            else
+			{
+               ESA_DIAG_printf(ESA_COMP_ACSCHED, DIAG_BASIC,
+                "*****>...APC: There is not any Administrator with Automatic Password Change.");
+			   MinApcIntrvl= -1;
+     		   NextApcTime= -1;
+			}
+		}
+		else
+		{
+           ESA_DIAG_printf(ESA_COMP_ACSCHED, DIAG_BASIC,
+              "*****>...APC: There is not %s prm.for Automatic Password Change.",MIN_APC_INTRVL);
+		   MinApcIntrvl= -1;
+		   NextApcTime= -1;
+		}
+        rc= ESA_OK;
+     }
+	 if ( (NextApcTime GT 0) AND (CurTime GE NextApcTime) )
+     {
+        while (rc EQ ESA_OK)
+		{
+           rc= ADM_next_apc (&from_rss_num, &from_adm_num, &apc_adm_rec);
+           if (rc EQ ESA_OK)
+           {
+              ChgIntrvl = (time_t)(apc_adm_rec.change_interval * 60);
+              if (ChgIntrvl GT CurTime- (time_t)apc_adm_rec.date_of_last_change)
+			  {
+                 ESA_DIAG_printf (ESA_COMP_ACSADM, DIAG_MORE,
+                    "Password Change for Administrator %s of %s RSS postpone.",
+	                 apc_adm_rec.admin_name, envir_ptr->interest[from_rss_num].rss);
+                 continue;
+			  }
+              ESA_DIAG_printf (ESA_COMP_ACSADM, DIAG_MORE,
+                 "Going to APC for Administrator %s of %s RSS.",
+	             apc_adm_rec.admin_name, envir_ptr->interest[from_rss_num].rss);
+			  AddInfoSpace.max_pairs= 0;
+              AddInfoSpace.num_pairs= 0;
+              rc= rssprm_get (envir_ptr->interest[from_rss_num].rss,
+				              RSS_TYPE, sizeof (RSS_typ), RssKwdValue);
+			  if (rc EQ ESA_OK)
+                 rc= CTSPassModEvent (RssKwdValue, envir_ptr->interest[from_rss_num].rss,
+                               NULL, apc_adm_rec.admin_name, "", &AddInfoSpace,
+                               &envir_ptr->msg_admin_param);
+		   }
+		}
+        NextApcTime= CurTime+ (MinApcIntrvl* 60);
+        ESA_DIAG_printf(ESA_COMP_ACSCHED, DIAG_BASIC,
+               "*****>... APC: Next Automatic Password Change will be at %s (%ld).",
+               ctime (&NextApcTime), NextApcTime);
+		if (rc EQ ESA_EOF)
+		    rc= ESA_OK;
+     }
+end of WS10082A **************/
+	 if (strlen (envir_ptr->rss_status_date) NE 0)
+        CS_rss_status_scheduler ();
+	  /*IS10072 Start*/
+    /* if (
+		   (envir_ptr->num_entity_kwds GT 0)
+          AND
+		   (SwScheduler EQ TRUE)
+        )
+	 {
+        ESA_DIAG_printf(ESA_COMP_ACSCHED, DIAG_MORE, "Call to CS_intercept_scheduler.");
+        rc= CS_intercept_scheduler ();
+	 }*/
+	 /*IS10072 End*/
+ 
+  }
+  /*WS10082A no rc is set after deleting the above code
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+ 
+  end of WS10082A **********/
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSCHED, DIAG_COMMON, fn, rc);
+ return (rc);
+}
+ 
+ 
+ 
+/****************************************************
+ * Procedure Name: CS_rss_status_scheduler
+ * Description   : Check RSS status ACTIVE or INACTIVE  .
+ *                 for every yet inactive RSS and
+ *                 if RSS alreadt Active
+ *                 send UQ message to ESS about it
+ ****************************************************/
+ 
+ESA_RC CS_rss_status_scheduler (void)
+{
+ 
+  ESA_RC                  rc= ESA_OK;
+  int                     attach_rss_num, sw_rss_down= FALSE;
+  TIME_typ                cur_time,  next_time;  /*start_time,*/
+  DATE_typ                cur_date,  next_date;  /*start_date,*/
+  long int                interval_time;
+  TIME_typ                interval;
+  void                  * handle_log_evnt= NULL;
+  RSS_STATUS_typ          rss_status;
+  ADMIN_PARAMS_rec_typ    admin_params;
+  ERR_STRUCT_rec_typ      msg_err;
+  char                    fn[]="CS_rss_status_scheduler";
+  ENVIRONMENT_rec_typ   * envir_ptr;
+  static int              SendEvent= 0;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSCHED, DIAG_COMMON, fn);
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSCHED, 13,
+      "Number of RSSes=%d Maximum RSSes=%d Q_wait=%d.",
+      (int)envir_ptr->num_of_rss,
+      (int)envir_ptr->max_rss_num,
+      (int)envir_ptr->q_wait);
+  CLEAR (next_date);
+  CLEAR (next_time);
+/* First call to CS_intercept_sceduler only load
+ *  'startlst' struc. and exit
+ */
+ 
+  memcpy ((char *)&admin_params,
+	      (char *)&envir_ptr->msg_admin_param,
+		  sizeof (ADMIN_PARAMS_rec_typ));
+ 
+  CS_get_cur_time (cur_date,
+                   cur_time);
+  ESA_DIAG_printf (ESA_COMP_ACSCHED, DIAG_MORE,
+          "Current time=%.*s date=%.*s.", TIME_LEN, cur_time, DATE_LEN, cur_date);
+ 
+/* if STATUS interval  */
+  interval[0]='\0';
+  rc= rssprm_get_opt (ALL_RSS,
+                      RSS_STATUS_INTERVAL,
+                      TIME_LEN,
+                      interval,
+					  OPT_TRUE,
+					  OPT_FALSE);
+  if (rc NE ESA_OK)
+    strcpy (interval, DEFAULT_STATUS_INTERVAL);
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSCHED, 16,
+        "rssprm_get_opt: rc=%d %s=%s.",
+         (int)rc,
+         RSS_STATUS_INTERVAL,
+         interval);
+  rc= ESA_OK;
+  TrnsfIntervalToNumber ((char *)interval, &interval_time);
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSCHED, DIAG_MORE,
+        "Interval time %d Q_wait=%d SendEvent=%d.",
+         (int)interval_time, (int)envir_ptr->q_wait, SendEvent);
+ 
+  if ( (interval_time LE envir_ptr->q_wait) AND (SendEvent EQ 0) )
+  {
+     CTSAMSG_print (ERR_QWAIT_INTRCPT_INTRVL,
+                    envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                    envir_ptr->msg_admin_param.ctsamsg_dest,
+                    ALL_RSS);
+     CTSLogEvent (envir_ptr->msg_admin_param.rss_type,
+                  envir_ptr->msg_admin_param.rss_name,
+                  handle_log_evnt,
+                  ERR_QWAIT_INTRCPT_INTRVL,
+                  ALL_RSS);
+	 SendEvent++;
+  }
+ 
+  if (
+	    (memcmp (envir_ptr->rss_status_date,
+                 cur_date,
+                 DATE_LEN) GT 0)
+       OR
+	    (
+           (memcmp (envir_ptr->rss_status_date,
+                    cur_date,
+                    DATE_LEN) EQ 0)
+          AND
+           (memcmp (envir_ptr->rss_status_time,
+                    cur_time,
+                    TIME_LEN) GT 0)
+ 
+		)
+     )
+  {
+      ESA_DIAG_printf (ESA_COMP_ACSCHED, DIAG_MORE,
+		 "Next check of rss status will performed at %.*s-%.*s.",
+         DATE_LEN, envir_ptr->rss_status_date,
+         TIME_LEN, envir_ptr->rss_status_time);
+      goto cleanup;
+  }
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSCHED, 16,
+                   "Prev. status time=%s date=%s.",
+				   envir_ptr->rss_status_time,
+				   envir_ptr->rss_status_date);
+ 
+  rc= set_next_time (ALL_RSS,
+	                 interval,
+                     envir_ptr->rss_status_date,
+                     envir_ptr->rss_status_time);
+  memcpy (next_time,
+          envir_ptr->rss_status_time,
+          TIME_LEN);
+  memcpy (next_date,
+          envir_ptr->rss_status_date,
+          DATE_LEN);
+  if (rc NE ESA_OK) {
+      ESA_DIAG_printf (ESA_COMP_ACSCHED, 16,
+                       "Fail set_next_time for ALL_RSS");
+      goto cleanup;
+  }
+  memcpy (envir_ptr->rss_status_time,
+          next_time,
+          TIME_LEN);
+  memcpy (envir_ptr->rss_status_date,
+          next_date,
+          DATE_LEN);
+ 
+  for (attach_rss_num= 0;
+       attach_rss_num LT envir_ptr->max_rss_num;
+       attach_rss_num++)
+  {
+      ESA_DIAG_printf (ESA_COMP_ACSCHED, DIAG_MORE,
+         "%d: rss_name=%s rss_type=%s rss_status=%d.",
+         (int)attach_rss_num,
+         envir_ptr->interest[attach_rss_num].rss,
+         envir_ptr->interest[attach_rss_num].rss_type,
+         envir_ptr->interest[attach_rss_num].rss_status);
+      if (envir_ptr->interest[attach_rss_num].rss_status EQ RSS_UP)
+        continue;
+      sw_rss_down= TRUE;
+ 
+	  strcpy (admin_params.rss_name,
+	          envir_ptr->interest[attach_rss_num].rss);
+      strcpy (admin_params.rss_type,
+	          envir_ptr->interest[attach_rss_num].rss_type);
+      strcpy (admin_params.admin_uname, "");
+      strcpy (admin_params.admin_gname, "");
+      admin_params.os_proc_handle= envir_ptr->os_proc_handle;
+      envir_ptr->num_intercept_rec= 0;
+ 
+      rc= CS_attach_rss (&admin_params,
+	                     HOT_PATH_OFF,
+                         envir_ptr->interest[attach_rss_num].rss,
+                         envir_ptr->interest[attach_rss_num].rss_type);
+      if (rc NE ESA_OK)
+          continue;
+ 
+      envir_ptr->rss_num= attach_rss_num;
+ 
+      ESA_DIAG_printf (ESA_COMP_ACSCHED, DIAG_BASIC,
+    		"    -> Call to CTSRSSCheck USA-API for RSS=%s.",
+			envir_ptr->msg_admin_param.rss_name);
+      rc= envir_ptr->func_ptr.rss_check_ptr (admin_params.rss_name,
+                                        &rss_status,
+                                        &admin_params,
+                                        &msg_err);
+	
+	  ESA_DIAG_printf (ESA_COMP_ACSCHED, DIAG_BASIC,
+			"    <- CTSRSSCheck USA-API completed with rc=%d (%s) RssStat=%s.",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK",
+			(rss_status == RSS_UP) ? "RSS_UP" : "RSS_DOWN");
+ 
+      ESA_DIAG_printf (ESA_COMP_ACSCHED, 15,
+           "RSS %s check completed with return code:%s and status:%d",
+                     admin_params.rss_name,
+                     ESA_rc2str(rc),
+                     rss_status);
+ 
+      if (
+	       (rc EQ ESA_OK)
+		  AND
+		   (rss_status EQ RSS_UP)
+	     )
+	  {
+        rc= CTSRssStatusEvent (admin_params.rss_type,
+                               admin_params.rss_name,
+                               NULL,
+                               &rss_status,
+                               &admin_params);
+        ESA_DIAG_printf (ESA_COMP_ACSCHED, DIAG_MORE,
+			"CTSRssStatusEvent: rc=%d.", (int)rc);
+        envir_ptr->interest[attach_rss_num].rss_status= RSS_UP;
+ 
+	  }
+ 
+  }
+ 
+  if (sw_rss_down EQ FALSE)
+  {
+	  memset (envir_ptr->rss_status_date, '\0', DATE_LEN);
+	  memset (envir_ptr->rss_status_time, '\0', TIME_LEN);
+      ESA_DIAG_printf (ESA_COMP_ACSCHED, DIAG_BASIC,
+		  "*****>... Set RSS status date & time to null-empty.");
+  }
+  else
+      ESA_DIAG_printf (ESA_COMP_ACSCHED, DIAG_BASIC,
+          "*****>... Next RSS status check time will be at %s %s.",
+		   envir_ptr->rss_status_time, envir_ptr->rss_status_date);
+ 
+cleanup:
+ 
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+  ESA_DIAG_exit (ESA_COMP_ACSCHED, DIAG_COMMON, fn, rc);
+  return (rc);
+ 
+}

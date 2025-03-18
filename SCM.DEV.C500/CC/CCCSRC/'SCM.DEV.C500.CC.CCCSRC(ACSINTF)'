@@ -1,0 +1,316 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: acsintf.c %
+ * Instance        : %instance: 1 %
+ * Created by      : %created_by: leonid_s %
+ * Created on      : %date_created: Tue May 20 09:19:34 2003 %
+ * Current Version : %version: 4 %
+ * Last Modified by: %derived_by: leonid_s %
+ * Last Modified on: %date_modified: Tue May 20 09:19:35 2003 %
+ */
+ 
+/***********************************************
+ * Mod.ID   Who      When         Description
+ * =============================================
+ * SAS2IBMA AvnerL   21-Dec-16    SAS/C to IBM C Conversion Project
+ **********************************************/
+ 
+#include "globs.h"
+ 
+#include ESA_MSG
+#include ESA_CS_SINFO
+#include ESA_CS_OS
+#include ESA_PROC
+#include ESA_OS_PROC
+ 
+/****************************************************
+ * Procedure Name: CS_interceptor_service
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_interceptor_service (MSG_typ             * msg_ptr,
+                               RSS_MSG_HDR_rec_typ * msg_hdr_cd)
+{
+  static char               fn[]="CS_interceptor_service";
+  ESA_RC                    rc;
+  RSS_MSG_HDR_rec_typ       msg_hdr;
+  RSS_MSG_HDR_rec_typ       msg_hdr_sav;
+  TRAN_rec_typ              tran;
+  CSFLAG                    current_srv;
+  char                      last_mhltl=' ';
+  ENVIRONMENT_rec_typ     * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSINTF, DIAG_COMMON, fn);
+ 
+  memcpy ((char *)&msg_hdr_sav, (char *)msg_hdr_cd,
+          sizeof (RSS_MSG_HDR_rec_typ));
+  rc = ESA_OK;
+ 
+  current_srv =CSON;
+ 
+  envir_ptr->read_alternatives = BLANK;  /* No queue read */
+ 
+  while (current_srv EQ CSON) {
+ 
+    CLEAR(msg_ptr);
+ 
+    rc= CS_get_next_msg (msg_ptr, &msg_hdr);
+ 
+    memcpy ((char *)&msg_hdr_sav,(char *)&msg_hdr,
+            sizeof (RSS_MSG_HDR_rec_typ));
+    last_mhltl= msg_hdr.mhltl;
+ 
+    if (rc NE ESA_OK)
+      goto cleanup;
+ 
+    else if (COND(MSG_START_INTERCEPT))
+      rc=CS_get_intercept_data(msg_ptr, &tran);
+ 
+    /* End of service indicator */
+    else if (COND(END_OF_SERVICE))
+      current_srv = CSOFF;
+ 
+    /* undefined service */
+    else {
+      CTSAMSG_print (ERR_CS_UNDEF_MSG_TYP,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn,
+                     &msg_hdr.mhmtyp);
+      rc = ESA_FATAL;
+      goto cleanup;
+    }
+ 
+    /* close CS */
+    if (rc EQ ESA_TERM_CTSA)
+      current_srv = CSOFF;
+ 
+    /* error occurred */
+    else if (rc NE ESA_OK) {
+      goto cleanup;
+    }
+ 
+    /* last message indication the same as end of service*/
+    else if (msg_hdr.mhltl EQ MH_MESSAGE_LAST)
+      current_srv = CSOFF;
+ 
+    /* confirm message on temp last condition */
+    else if (last_mhltl EQ MH_MESSAGE_LAST_TMP) {
+      rc = CS_confirm (&msg_hdr);
+      if (rc NE ESA_OK)
+        goto cleanup;
+    }
+ 
+  }
+ 
+  cleanup:
+ 
+  if (rc EQ ESA_CANCEL_SERVICE)
+    CTSAMSG_print (ERR_CS_SERVICE_CANCEL,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   fn);
+ 
+  if ((rc NE ESA_OK) AND
+      (rc NE ESA_TERM_CTSA)AND
+      (rc NE ESA_CANCEL_SERVICE))
+    CTSAMSG_print (ERR_CS_SERVICE,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   fn, envir_ptr->msg_ptr);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSINTF, DIAG_COMMON, fn, rc);
+ 
+  return(rc);
+}
+ 
+/****************************************************
+ * Procedure Name: CS_get_intercept_data
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_get_intercept_data (MSG_typ      * msg_ptr,
+                              TRAN_rec_typ * tran)
+{
+  static char           fn[]="CS_get_intercept_data";
+  ESA_RC                rc;
+  NUM_MSGS_typ          num_msgs;
+  NUM_MSGS_typ          len_msg;
+  TIME_RANGE_rec_typ    time_range;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSINTF, DIAG_COMMON, fn);
+ 
+  CLEAR_STRUCT (time_range);
+ 
+  msg_ptr = CS_get_aplic_msg(msg_ptr);
+ 
+  msg_ptr = CS_get_rss_msg (&num_msgs, msg_ptr);
+ 
+  if (msg_ptr EQ NULL) {
+      rc= ESA_ERR;
+      goto cleanup;
+  }
+  msg_ptr = CS_get_singl_msg (&len_msg, tran, msg_ptr);
+ 
+  if (msg_ptr EQ NULL) {
+      rc= ESA_ERR;
+      goto cleanup;
+  }
+ 
+  msg_ptr = CS_get_fld (time_range.from_date,msg_ptr,DATE_LEN,
+                        C_FROM_DATE);
+  if (msg_ptr EQ NULL) {
+      rc =ESA_ERR;
+      goto cleanup;
+  }
+ 
+  msg_ptr = CS_get_fld (time_range.from_time,msg_ptr,TIME_LEN,
+                        C_FROM_TIME);
+  if (msg_ptr EQ NULL) {
+      rc =ESA_ERR;
+      goto cleanup;
+  }
+ 
+  msg_ptr = CS_get_fld (time_range.end_date,msg_ptr,DATE_LEN,
+                        C_TO_DATE);
+  if (msg_ptr EQ NULL) {
+      rc =ESA_ERR;
+      goto cleanup;
+  }
+ 
+  msg_ptr = CS_get_fld (time_range.end_time,msg_ptr,TIME_LEN,
+                        C_TO_TIME);
+  if (msg_ptr EQ NULL) {
+      rc =ESA_ERR;
+      goto cleanup;
+  }
+ 
+  rc= date_check (time_range.from_date);
+  if (rc NE ESA_OK) {
+      goto cleanup;
+  }
+ 
+  rc= time_check (time_range.from_time, TIME_REGULAR_MODE);
+  if (rc NE ESA_OK) {
+      goto cleanup;
+  }
+ 
+  if (strlen (time_range.end_date) NE 0)
+    rc= date_check (time_range.end_date);
+ 
+  if (rc NE ESA_OK) {
+      goto cleanup;
+  }
+ 
+  if (strlen (time_range.end_time) NE 0)
+    rc= time_check (time_range.end_time, TIME_REGULAR_MODE);
+ 
+  if (rc NE ESA_OK) {
+      goto cleanup;
+  }
+ 
+  CS_start_interceptor (&time_range);
+ 
+ cleanup:
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSINTF, DIAG_COMMON, fn, ESA_OK);
+ 
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+  return(rc);
+ 
+}
+ 
+/****************************************************
+ * Procedure Name: CS_start_interceptor
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_start_interceptor (TIME_RANGE_rec_typ * time_range)
+{
+  static char           fn[]="CS_start_interceptor";
+  ESA_RC                rc;
+  ESA_RC                rc_submit = ESA_OK;   /* AJK001 */
+  char                  from_str[21], to_str[21];
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSINTF, DIAG_COMMON, fn);
+ 
+  rc= CS_intercept_change (time_range);
+  if (rc NE ESA_OK) {
+    goto cleanup;
+  }
+  ESA_DIAG_printf (ESA_COMP_ACSINTF, 13,
+     "CS_start_interceptor: interceptor submited for rss=%s",
+                      envir_ptr->msg_admin_param.rss_name);
+ 
+  rc_submit = envir_ptr->func_ptr.rss_start_intercept_ptr (
+                                 envir_ptr->msg_admin_param.rss_name,
+                                 (char *)envir_ptr->host_name,
+                                 &envir_ptr->msg_admin_param,
+                                 &envir_ptr->msg_err);
+  if (rc_submit NE ESA_OK) {
+    goto cleanup;
+  }
+ 
+  sprintf (from_str,
+           "%.4s-%.2s-%.2s %.2s:%.2s.%.2s",
+           time_range->from_date,
+           &(time_range->from_date[4]),
+           &(time_range->from_date[6]),
+           time_range->from_time,
+           &(time_range->from_time[2]),
+           &(time_range->from_time[4]));
+ 
+  sprintf (to_str,
+           "%.4s-%.2s-%.2s %.2s:%.2s.%.2s",
+           time_range->end_date,
+           &(time_range->end_date[4]),
+           &(time_range->end_date[6]),
+           time_range->end_time,
+           &(time_range->end_time[2]),
+           &(time_range->end_time[4]));
+ 
+  rc = CTSLogEvent (envir_ptr->msg_admin_param.rss_type,
+                    envir_ptr->msg_admin_param.rss_name,
+                    &envir_ptr->q_handle,
+                    MSG_OFLI_SUBMIT,
+                    envir_ptr->msg_admin_param.rss_name,
+                    from_str,
+                    to_str);
+  cleanup:
+ 
+  if (rc_submit NE ESA_OK) {
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+ 
+    if (rc EQ ESA_OK)
+      rc = CTSLogEvent (envir_ptr->msg_admin_param.rss_type,
+                        envir_ptr->msg_admin_param.rss_name,
+                        &envir_ptr->q_handle,
+                        MSG_OFLI_SUBMIT_FAIL,
+                        envir_ptr->msg_admin_param.rss_name,
+                        (int)rc_submit);
+  }
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSINTF, DIAG_COMMON, fn, ESA_OK);
+  return (ESA_OK);
+}

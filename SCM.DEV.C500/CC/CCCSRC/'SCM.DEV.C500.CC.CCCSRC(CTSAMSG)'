@@ -1,0 +1,2459 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: ctsamsg.c %
+ * Instance        : %instance: 1 %
+ * Created by      : %created_by: leonid_s %
+ * Created on      : %date_created: Sun Jul 25 15:15:44 2004 %
+ * Current Version : %version: 4.1.1 %
+ * Last Modified by: %derived_by: leonid_s %
+ * Last Modified on: %date_modified: Wed Nov 19 18:20:46 2003 %
+ */
+ 
+/******************************************************************************
+ * Mod.ID  Who      When        Description
+ * =============================================
+ * IMH001  Ian H.   27-Jul-03   Non-windows platforms:
+ *                              Add return code to vsprintf
+ * IMH002  Ian H.   19-Nov-03   WSAN101342 Thread-safe code (ERRNO)
+ * IMH003  Ian H.   03-May-04   (Unix) Use mutex for multithread use of ctsamsg
+ * IS10058 Avner    31-Aug-2011 Use OS_LocalTime for DST
+ * SAS2IBMN NuritY  27-Jun-2016 Compile with IBM XL C/C++:
+ *                              1. change all x'05' to ' '
+ *                              2. Remove include for lcio
+ *    "      "      13Feb2017   Remove empty and unused routines.
+ * SAS2IBMT SeligT  30/06/16    SAS/C to IBM C Conversion Project
+ * WS10082  NuritY  18/10/2023  Retrieve handle and dest when not passed
+ *****************************************************************************/
+ /**********************************************************************
+ *                                                                     *
+ * How to issue a message when msgs and dest are not available         *
+ * ===========================================================         *
+ * 1. Each main program should have the folloing routines:             *
+ *                                                                     *
+ *    CTSAMSG_HANDLE_rec_typ     * CS_get_ctsamsg_handle()             *
+ *    {                                                                *
+ *       return (<msg-handle>);                                        *
+ *    }                                                                *
+ *                                                                     *
+ *    CTSAMSG_DEST_TABLE_rec_typ * CS_get_ctsamsg_dest()               *
+ *    {                                                                *
+ *       return (<msg-dest>);                                          *
+ *    }                                                                *
+ *                                                                     *
+ *    In programs having access to envir, the first roiutine should    *
+ *    return envir.ctsamsg_handle and the second routine should        *
+ *    return envir.ctsamsg_dest. Programs not having access to envir   *
+ *    should return the msgs and dest they received.                   *
+ *    See these routines in ESAINIT and CTSCVAR for different          *
+ *    implementation of these routines.                                *
+ *                                                                     *
+ *    These routines should be added to all programs link-edited with  *
+ *    CTSAMSG.                                                         *
+ *                                                                     *
+ *                                                                     *
+ * 2. In the routine that needs to issue a message but does not have   *
+ *    access to msgs and dest call CSAMSG_print like this              *
+ *                                                                     *
+ *           CTSAMSG_print(<msg code>,                                 *
+ *                         NULL, NULL,                                 *
+ *           ((CTSAMSG_DEST_TABLE_rec_ptr)CTSAMSG_FIND_DEST),          *
+ *                         <plants>);                                  *
+ *    When CTSAMSG_print get null as handle and CTSAMSG_FIND_DEST      *
+ *    as dest it will call the routines above to get the addresses     *
+ *    of these tables.                                                 *
+ *                                                                     *
+ **********************************************************************/
+#define    CTSAMSG_C
+#include   "globs.h"
+ 
+/*
+ *   Standard include files
+ */
+#include   ERRNO        /* IMH002 */
+#include   STDLIB
+#include   STDARG
+#include   STDIO
+#include   STRING
+#include   TIME
+#include   CTYPE
+ 
+#include   ESA_CTSAMSG
+#include   ESA_ADMIN
+#include   ESA_DIAG
+#include   ESA_API
+#include   ESA_OS_CONSOLE            /* AJK001 */
+#include   ESA_ESAADI
+#include   ESA_ESALIST
+ 
+/* SAS2IBMN #include LCIO     */
+ 
+/*
+ *   Error message macro
+ */
+ 
+/*
+    The 4 functions below take care of critical sections.
+ They can be expanded in order to support other OS.
+ The prototypes are declared here since the functions are private.
+ 24/10/2001 - Avishay Balderman
+*/
+/* SAS2IBMN void CTSAMSG_cs_init(void);           */
+/* SAS2IBMN void CTSAMSG_cs_term(void);           */
+/* SAS2IBMN void CTSAMSG_cs_lock(void);           */
+/* SAS2IBMN void CTSAMSG_cs_unlock(void);         */
+ 
+#define PRTERR(msg) fprintf(stderr,msg);
+#define PRTERR1(msg,a1) fprintf(stderr,msg,a1);
+#define PRTERR2(msg,a1,a2) fprintf(stderr,msg,a1,a2);
+#define PRTERR3(msg,a1,a2,a3) fprintf(stderr,msg,a1,a2,a3);
+ 
+#define ctsamsg_stricmp          cmsgcmp
+ 
+/*
+ *   CONTROL-SA include files
+ */
+ 
+#define    CTSAMSG_owner
+ 
+/*
+ * Forward declarations of local functions
+ */
+ 
+static CTSAMSG_MSG_rec_ptr CTSAMSG_scan (
+    const char          * msgid,        /* AJK - const */
+    CTSAMSG_MSG_rec_typ * buffer,
+    short                 limit);
+ 
+static CTSAMSG_MSG_rec_ptr CTSAMSG_search (
+    const char             * msgid,     /* AJK - const */
+    CTSAMSG_HANDLE_rec_ptr   handle);
+ 
+static int CTSAMSG_compare (const void * msg1,
+                            const void * msg2);
+ 
+static int str_shift_left (char * str);
+ 
+static void convert_escape_sequences (char *str);
+static void strcpy_normalized(char * str2, char * str1);
+ESA_RC ctsamsg_stricmp (char * str1,
+                   char * str2);
+ 
+ 
+/*
+ *   Predefined destination functions
+ */
+ 
+static CTSAMSG_INITFUNC CTSAMSG_initfile;
+static CTSAMSG_INITFUNC CTSAMSG_initfile_append;
+static CTSAMSG_PRTFUNC  CTSAMSG_prtfile;
+static CTSAMSG_TERMFUNC CTSAMSG_termfile;
+ 
+static CTSAMSG_PRTFUNC  CTSAMSG_prterr;
+static CTSAMSG_INITFUNC CTSAMSG_initerr;
+static CTSAMSG_TERMFUNC CTSAMSG_termerr;
+ 
+static CTSAMSG_INITFUNC CTSAMSG_initcons;
+static CTSAMSG_PRTFUNC  CTSAMSG_prtcons;
+static CTSAMSG_PRTFUNC  CTSAMSG_prtcon2;
+ 
+ 
+/*** Log switch support definitions ***/
+ 
+#define LOGFILE_CONTINUE_MSG_FORMAT_PREV \
+      "**** Log File switched. Previous Log in file %s\n"
+ 
+#define LOGFILE_CONTINUE_MSG_FORMAT_NEXT \
+      "**** Switching Log File. Log continues in file %s\n"
+ 
+typedef struct S_FILE_DEST_STRUCT {
+  FILE  * file_handle;  /* File Handle */
+  int     enable_gen;   /* Log file generation enabled */
+  int     max_gen;      /* Max Number of genrations */
+  int     max_lines;    /* Max number of messages in a generation */
+  int     max_interval; /* Max time between generations */
+  int     curr_gen;     /* Current generation number */
+  time_t  last_switch;  /* Time stamp of last switch */
+  int     curr_msgs;    /* Number of messages since last switch */
+} CTSAMSG_FILE_DEST_rec_typ, *CTSAMSG_FILE_DEST_rec_ptr;
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_initialize                       *
+*                                                             *
+* Description      : Initialize CTSAMSG handle                *
+*                                                             *
+* Input            :  1) dh             -  esa_diag handle    *
+*                                                             *
+* Output           :  1) handle         -  ctsamsg handle     *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC CTSAMSG_initialize (CTSAMSG_HANDLE_rec_typ * handle,
+                           void                   * dh )
+{
+ static char fn [] = "CTSAMSG_initialize";
+ ESA_RC rc = ESA_OK;
+ 
+ if ( (dh EQ NULL) OR (handle EQ NULL) )
+    return ESA_FATAL;
+ 
+ if (dh)
+ {
+    ESA_DIAGR_enter  ( dh, ESA_COMP_CTSAMSG, DIAG_COMMON, fn);
+ }
+ /* SAS2IBMN CTSAMSG_cs_init();              */
+ handle->buffer = NULL;
+ handle->size = 0;
+ handle->used = 0;
+ handle->diag_handle = dh;
+ 
+ if (dh)
+    ESA_DIAGR_exit ( dh, ESA_COMP_CTSAMSG, DIAG_COMMON, fn, rc );
+ 
+ return rc;
+ 
+} /* CTSAMSG_initialize */
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_load                             *
+*                                                             *
+* Description      : Load Messages file into storage          *
+*                                                             *
+* Input            :  1) msg_file_name  -  file name          *
+*                     2) handle         -  buffer handle      *
+*                     3) dupflag        -  duplicate entries  *
+*                                          action flag        *
+*                          IGNORE   - will ignore new entries *
+*                                     that already exist      *
+*                          OVERRIDE - will update existing    *
+*                                     entries with newly read *
+*                                     format                  *
+*                          FAIL     - will fail entire loading*
+*                                     if entries already exist*
+*                     4) rlsflag        -  release unused     *
+*                                                             *
+*                          FLAG_YES - will release any unused *
+*                                     buffer storage area     *
+*                                     when loading finishes   *
+*                          FLAG_NO  - will leave unused areas *
+*                                     at the end of the buffer*
+*                                     to be used by future    *
+*                                     loading                 *
+*                                                             *
+* Output           : none                                     *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC CTSAMSG_load (char                   * msg_file_name,
+                     CTSAMSG_HANDLE_rec_typ * handle,
+                     CTSAMSG_DUPLICATE_typ    dupflag,
+                     CTSAMSG_FLAG_typ         rlsflag)
+{
+    static char fn [] = "CTSAMSG_load";
+ 
+    FILE              * msg_file;
+    CTSAMSG_MSG_rec_ptr cmsg,new_buffer;
+    unsigned int        cused = 0;
+    unsigned int        init_num, inc_num;
+    ESA_RC              rc = ESA_OK;
+    char              * id_start, * id_end;
+    unsigned int        id_len;
+    char                line[CTSAMSG_LINE_LEN];
+    CTSAMSG_FLAG_typ    sort_flag = FLAG_YES;
+    CTSAMSG_MSGID_typ   last_id;
+    void                * dh;                 /* dc2704 */
+    char                ddn_with[50]="";                  /* SAS2IBMT */
+ char                msg_from_file[CTSAMSG_LINE_LEN];
+ char                msg_from_buff[CTSAMSG_LINE_LEN];
+ 
+   /*
+    *   starting ...
+    */
+ 
+    if (handle EQ NULL) {
+       PRTERR( "CTSAMSG_load failed - no handle passed\n" );
+       return ESA_FATAL;
+    }
+/*    else if (handle->diag_handle EQ NULL) {
+       PRTERR("CTSAMSG_load failed - uninitialized handle\n");
+       return ESA_FATAL;
+    }*/
+    else dh = handle -> diag_handle;
+ 
+    if (dh)
+       ESA_DIAGR_enter  ( dh, ESA_COMP_CTSAMSG, DIAG_COMMON, fn );
+ 
+    if (dh)
+ {
+       ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, DIAG_BASIC,
+                     "File name=%s.", msg_file_name);
+       ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, DIAG_DETAILES+ 1,
+                     "File name=%s Handle=%p Dupflag=%d Rlsflag=%d",
+                     msg_file_name, handle, dupflag, rlsflag );
+    }
+   /*
+    *   Open messages file into storage
+    */
+ 
+    strcpy(ddn_with,"DD:");                               /* SAS2IBMT */
+    strcat(ddn_with, msg_file_name);                      /* SAS2IBMT */
+    /* SAS2IBMT msg_file = fopen (msg_file_name,"r");                */
+    msg_file = fopen (ddn_with,"r");                      /* SAS2IBMT */
+    if (msg_file EQ NULL) {
+       PRTERR1("Messages file %s could not be opened\n",
+               msg_file_name);
+       rc = ESA_ERR;
+       goto exit;
+    }
+ 
+   /*
+    *   Initialize Slot Numbers
+    */
+ 
+    init_num = CTSAMSG_DEFAULT_BUFFER_INIT;
+    inc_num = CTSAMSG_DEFAULT_BUFFER_INC;
+ 
+   /*
+    *   Initialize Buffer Area
+    */
+ 
+    if (handle->buffer EQ NULL) {
+       sort_flag = FLAG_NO;
+       handle->buffer =
+              (CTSAMSG_MSG_rec_ptr)malloc(CTSAMSG_size(init_num));
+ 
+       if (handle->buffer EQ NULL) {
+          PRTERR1("Messages file %s - Buffer could not be obtained\n",
+               msg_file_name);
+          rc = ESA_ERR;
+          goto exit;
+       }
+       handle->size = init_num;
+       if (dh)
+          ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, 13,
+            "CTSAMSG_load malloc msg file buffer size %d address = %p",
+                  init_num ,
+                  handle->buffer );
+       handle->used = 0 ;
+    }
+ 
+   /*
+    *   Read messages file into buffer
+    */
+ 
+    cused = handle->used;
+    strcpy(last_id,"");
+ 
+    fgets(line,sizeof(line),msg_file);
+    while (feof(msg_file) EQ 0) {
+ 
+         /* Beware of I/O errors */
+ 
+         if (ferror(msg_file)) {
+            PRTERR1("Messages file %s - i/o error reading file\n",
+                    msg_file_name);
+            rc = ESA_ERR;
+            goto exit;
+         } /* if I/O error */
+ 
+         /* Identify Msgid */
+ 
+         if (dh)
+            ESA_DIAGR_printf ( dh, ESA_COMP_ACSCB, DIAG_DETAILES+ 1, "line=%s",line);
+ 
+         id_start = line + strspn(line," ");
+ 
+         /* If empty line or remark line , ignore it */
+ 
+         if (strchr("*#/.!\n", *id_start) NE NULL)
+            goto next;
+ 
+         id_end   = strpbrk(id_start," ");
+         id_len   = id_end - id_start;
+         if ( (id_end EQ NULL) OR (id_len EQ 0) ) {
+            PRTERR2("Messages file %s - invalid line - %s",
+                    msg_file_name, line );
+            goto next;
+         }
+ 
+         if (dh)
+            ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, 15,
+                          "id at %p, end at %p len=%d",
+                          id_start, id_end, id_len);
+         (*id_end) = NULL_CHAR;
+         id_end++;
+ 
+         /* Check Msgid Validity */
+ 
+         if (id_len GT CTSAMSG_MSGID_LEN) {
+           PRTERR3("Msgs file %s at '%s' - id length err (%d)\n",
+                   msg_file_name, id_start, id_len);
+            goto next;
+         }
+         else if ( strlen(id_end) GT CTSAMSG_FORMAT_LEN) {
+           PRTERR3("Msgs file %s at '%s' - format length err (%ld)\n",
+                   msg_file_name, id_start, (long int)strlen(id_end));
+           goto next;
+         }
+ 
+         /* Check Message type (Regular/Technical) */
+ 
+         if (( id_end[0] NE 'R') AND ( id_end[0] NE 'T') ) {
+            PRTERR2("Messages file %s at '%s' - invalid msg type\n",
+                    msg_file_name, id_start);
+            goto next;
+         }
+         else if ( id_end[1]  NE ' ') {
+            PRTERR2("Msgs file %s at '%s' - invalid msg type format\n",
+                    msg_file_name, id_start);
+            goto next;
+         }
+ 
+         /* Check for duplicates */
+ 
+         cmsg = CTSAMSG_search(id_start,handle);
+         if (cmsg EQ NULL)
+             cmsg = CTSAMSG_scan( id_start,
+                                  &(handle->buffer[handle->used]),
+                                  (short)(cused-handle->used) ) ;
+         if (cmsg NE NULL) {
+             if (dh)
+       ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, 20,
+       "id_end=%s/ cmsg =%s/", id_end,cmsg->format);
+ 
+    strcpy_normalized(msg_from_file, id_end);
+    strcpy_normalized(msg_from_buff, cmsg->format);
+ 
+            /* :::::: Add convertion BSAN101208 ::: */
+            /* Eliminate escape sequences  */
+             convert_escape_sequences(msg_from_file);
+ 
+             if (dh)
+       ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, 20,
+          "msg1:%s/ msg2:%s/",msg_from_file, msg_from_buff);
+ 
+    if (ctsamsg_stricmp (msg_from_file, msg_from_buff) EQ 0)
+    goto next;
+    if (dupflag EQ DUP_IGNORE) {
+               if (dh)
+                  ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, 14,
+                        "Id=%s duplicate. entry ignored", id_start);
+               goto next;
+            }
+            else if (dupflag EQ DUP_FAIL) {
+               PRTERR2("Msgs file %s at '%s' - duplicate error\n",
+                        msg_file_name, id_start);
+               rc = ESA_ERR;
+               goto exit;
+            }
+         }
+         else {
+ 
+             /* increase buffer size if necessarry */
+ 
+             if (cused GE handle->size) {
+                new_buffer =
+                  (CTSAMSG_MSG_rec_ptr)realloc(handle->buffer,
+                               CTSAMSG_size(handle->size + inc_num));
+                if (new_buffer EQ NULL) {
+                    PRTERR1("Messages file %s - realloc failed\n",
+                            msg_file_name );
+                   goto next;
+                }
+ 
+                handle->buffer = new_buffer ;
+                cmsg= handle->buffer+ handle->size;
+    memset ((char *)cmsg, '\0', CTSAMSG_size(inc_num));
+                handle->size += inc_num;
+                if (dh)
+                   ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, 13,
+                     "CTSAMSG_load realloc msg file buffer size %d address = %p",
+                     handle->size,
+                     handle->buffer );
+             }
+             cmsg = handle->buffer + cused;
+             cused++;
+         }
+ 
+         /* Update next message slot  */
+ 
+         if (dh)
+            ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, 16,
+                          "id at %p,%s format at %p",
+                          id_start, id_start, id_end);
+ 
+         strcpy(cmsg->id,id_start);
+         strcpy(cmsg->format,id_end);
+ 
+ 
+         /* Eliminate escape sequences  */
+         convert_escape_sequences(cmsg->format);
+ 
+         /* Determine if sort will needed */
+ 
+         if (dh)
+            ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, 16,
+                          "old='%s' new='%s' sort_flag = %d",
+                          last_id,id_start,sort_flag);
+         if ( (sort_flag EQ FLAG_NO) AND
+              (strcmp(last_id,id_start) GT 0) )
+            sort_flag = FLAG_YES;
+ 
+ 
+         strcpy(last_id,id_start);
+ 
+         /* Next line */
+ 
+         next:;
+ 
+         fgets (line,sizeof (line),msg_file);
+ 
+    } /* while */
+ 
+   /*
+    *    Prepare Buffer for searches
+    */
+ 
+    if (cused GT handle->used) {
+        handle->used = cused;              /* update use count */
+ 
+       /*
+        *    release unused area
+        */
+        if (rlsflag EQ FLAG_YES) {
+           new_buffer =
+             (CTSAMSG_MSG_rec_ptr)realloc(handle->buffer,
+                                          CTSAMSG_size(handle->used));
+           if (dh)
+              ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, 13,
+                "CTSAMSG_load released spare slots. Old addr %p(%d) "
+                "new addr %p(%d)",
+                handle->buffer,handle->size,new_buffer,handle->used);
+           if (new_buffer NE NULL) {
+              handle->buffer = new_buffer ;
+              handle->size = handle->used;
+           } /* realloc ok */
+ 
+        } /* rlsflag on */
+ 
+       /*
+        *    Sort buffer
+        */
+        if (sort_flag EQ FLAG_YES) {
+           if (dh)
+              ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, 13,
+                            "Sorting buffer. num msgs=%d",
+                            handle->used);
+ 
+           qsort(handle->buffer,              /* search area   */
+                 handle->used,                /* num elements  */
+                 sizeof(CTSAMSG_MSG_rec_typ), /* element size  */
+                 &CTSAMSG_compare);           /* compare func  */
+        }
+    }
+ 
+   /*
+    *    finish
+    */
+ 
+    exit:;
+ 
+    if (msg_file NE NULL)
+       fclose(msg_file);
+ 
+    if (dh)
+       ESA_DIAGR_exit ( dh, ESA_COMP_CTSAMSG, DIAG_COMMON, fn, rc );
+ 
+    return rc;
+} /* CTSAMSG_load */
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_free                             *
+*                                                             *
+* Description      : Free messages buffer                     *
+*                                                             *
+* Input            : 1) handle                                *
+*                                                             *
+* Output           : None                                     *
+*                                                             *
+* Return Value     : None                                     *
+*                                                             *
+**************************************************************/
+ 
+void CTSAMSG_free (CTSAMSG_HANDLE_rec_typ * handle)
+{
+   static char   fn [] = "CTSAMSG_free";
+   void        * dh;
+ 
+ 
+   if (handle EQ NULL) {
+      PRTERR ("CTSAMSG_free failed - no handle passed\n");
+      return;
+   }
+/*   else if (handle->diag_handle EQ NULL) {
+      PRTERR ("CTSAMSG_free failed - uninitialized handle\n");
+      return;
+   }*/
+   else dh = handle -> diag_handle;
+ 
+   if (dh)
+      ESA_DIAGR_enter (dh, ESA_COMP_CTSAMSG, DIAG_COMMON , fn);
+ 
+   if (handle->buffer NE NULL)
+      free (handle->buffer);
+ 
+   handle->used = 0;
+   handle->size = 0;
+   handle->buffer = NULL ;
+   /* SAS2IBMN CTSAMSG_cs_term();           */
+   if (dh)
+      ESA_DIAGR_exit (dh, ESA_COMP_CTSAMSG, DIAG_COMMON, fn, ESA_RC_VOID);
+ 
+} /* CTSAMSG_free */
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_print                            *
+*                                                             *
+* Description      : Issue a message to the requested         *
+*                    destinations                             *
+*                                                             *
+* Input            : 1) msgid   - msgid to be printed         *
+*                    2) handle  - loaded messages handle      *
+*                    3) buffer  - output buffer for formatted *
+*                                 message or NULL .           *
+*                    4) dest_tab- destinations table          *
+*                    5) ...     - arguments for message       *
+*                                                             *
+* Output           : None                                     *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+* Comments         : The function process the arg list and    *
+*                    calls CTSAMSG_print_direct               *
+**************************************************************/
+ 
+ESA_RC CTSAMSG_print (const char                 * msgid,
+                      CTSAMSG_HANDLE_rec_typ     * handle,
+                      char                       * buffer,
+                      CTSAMSG_DEST_TABLE_rec_typ * dest,
+                      ... )
+{
+ 
+    va_list   arg_list;
+    ESA_RC    rc;
+ 
+   /*
+    *   Call the real print function
+    */
+ /* SAS2IBMN CTSAMSG_cs_lock();            */
+    va_start(arg_list, dest);
+    rc = CTSAMSG_print_direct ( msgid, handle, buffer, dest, arg_list);
+    va_end(arg_list);
+ /* SAS2IBMN CTSAMSG_cs_unlock();          */
+    return rc;
+ 
+} /* CTSAMSG_print */
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_print_direct                     *
+*                                                             *
+* Description      : Issue a message to the requested         *
+*                    destinations                             *
+*                                                             *
+* Input            : 1) msgid   - msgid to be printed         *
+*                    2) handle  - loaded messages handle      *
+*                    3) buffer  - output buffer for formatted *
+*                                 message or NULL .           *
+*                    4) dest_tab- destinations table          *
+*                    5) arglist - arguments for message       *
+*                                                             *
+* Output           : None                                     *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+* Comments         : Message is located in the loaded messages*
+*                    buffer and formatted to the output       *
+*                    buffer.                                  *
+*                    For each destination, the destination    *
+*                    print function is called until           *
+*                    a destination print function returns an  *
+*                    ESA_FATAL rc .                           *
+*                    If a destination is not initialized yet, *
+*                    the initialization function is called    *
+*                    before the message is printed to the     *
+*                    destination .                            *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC CTSAMSG_print_direct  (
+                      const char                 * msgid,
+                      CTSAMSG_HANDLE_rec_typ     * i_handle,/*WS10082 */
+                      char                       * buffer,
+                      CTSAMSG_DEST_TABLE_rec_typ * i_dest,  /*WS10082 */
+                      va_list                      arg_list )
+       /* WS10082     CTSAMSG_HANDLE_rec_typ     * handle,            */
+       /* WS10082     CTSAMSG_DEST_TABLE_rec_typ * dest,              */
+{
+ static char           fn [] = "CTSAMSG_print_direct";
+ int                   sw_diag= 0;
+ int                   rcv= 0;
+ unsigned int          num_chars = 0;
+ unsigned int          msg_max_size;
+ short                 i;
+ ESA_RC                rc = ESA_OK;
+ ESA_RC                dest_rc = ESA_OK;
+ CTSAMSG_MSG_rec_ptr   cmsg;
+ time_t                current_time;
+ struct tm             tm_space;
+ char                * dest_buffer = NULL; /* formatted msg buf */
+ char                * text_buffer = NULL; /* msg text buffer   */
+ char                  date_buffer[20];    /* date string       */
+ char                  time_buffer[20];    /* time string       */
+ void                * dh;                 /* dc2704            */
+ DWORD                 errnmb;
+ unsigned short Year, Month, Day, Hour, Minute, Second, Milliseconds; /*IS10058*/
+ short                 time_is_set;  /*IS10058*/
+ 
+ CTSAMSG_HANDLE_rec_typ     * handle = NULL;              /* WS10082 */
+ CTSAMSG_DEST_TABLE_rec_typ * dest = NULL;                /* WS10082 */
+ 
+ static  CTSAMSG_MSG_rec_typ err_no_msg = {
+    "CTS0000E",
+ "R ERROR - Message %s can not be issued - message format not found\n"
+ };
+ 
+ /*
+  *   Initialize
+  */
+ 
+ /* if handle was not provided, try to fetch it.             WS10082  */
+ if (i_handle EQ NULL)                                    /* WS10082  */
+   handle = CS_get_ctsamsg_handle(); /* fetch handle.        WS10082  */
+ else                                                     /* WS10082  */
+   handle = i_handle;     /* handle was provided.            WS10082  */
+ 
+ if (handle EQ NULL) {
+    PRTERR( "CTSAMSG_print failed - no handle passed\n" );
+    PRTERR1( "CTSAMSG_print ignored message %s\n", msgid );
+    return ESA_FATAL;
+ };
+/* else if (handle->diag_handle EQ NULL) {
+    PRTERR("CTSAMSG_free failed - uninitialized handle\n");
+    PRTERR1( "CTSAMSG_print ignored message %s\n", msgid );
+    return ESA_FATAL;
+ }*/
+ /* WS10082 else dh = handle -> diag_handle;  */
+ dh = handle -> diag_handle;                              /* WS10082 */
+ 
+ if (dh)
+    ESA_DIAGR_enter( dh, ESA_COMP_CTSAMSG, DIAG_COMMON , fn );
+ 
+ /* WS10082 - start */
+ /* if we are requested to find dests, try to fetch it.     WS10082  */
+ if (i_dest EQ (CTSAMSG_DEST_TABLE_rec_typ *)CTSAMSG_FIND_DEST)
+   dest = CS_get_ctsamsg_dest();     /* fetch dest   */
+ else
+   dest = i_dest;                    /* take dest provided */
+ 
+ if (dest EQ NULL  AND buffer EQ NULL)
+ {
+   PRTERR1( "CTSAMSG_print ignored. No dest and buffer.  message %s\n",
+            msgid );
+   return ESA_FATAL;
+ }
+ 
+ ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, DIAG_COMMON,
+           "handle = %p     dset = %p", handle, dest);
+ 
+/* WS10082  - end   */
+ 
+/* IS10058 start */
+ time_is_set = 0;
+ 
+ rc= OS_LocalTime (&Year, &Month, &Day, &Hour, &Minute, &Second, &Milliseconds);
+ if (rc EQ ESA_OK)
+   {
+      sprintf (date_buffer,
+            "%4d/%02d/%02d",
+            Year, Month, Day);
+   sprintf (time_buffer,
+            "%2d:%02d:%02d",
+            Hour, Minute, Second);
+   time_is_set = 1;
+   if (dh)
+  ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, 14,
+       "OS_LocalTime rc = 0");
+   }
+ else
+  time (&current_time);
+ 
+ 
+ if (time_is_set EQ 0) /*when MVS & OSLocalTime - date & time are set already IS10058*/
+ {
+ memcpy ((char *)&tm_space,
+             (char *)localtime (&current_time),
+                 sizeof (struct tm));
+ 
+ strftime (date_buffer, sizeof(date_buffer), "%Y/%m/%d",&tm_space);
+ strftime (time_buffer, sizeof(time_buffer), "%H:%M:%S",&tm_space);
+ }
+/* IS10058 end */
+ 
+ 
+ /*
+  *   Allocate message format
+  */
+ 
+ text_buffer = malloc(sizeof(CTSAMSG_MSG_typ));
+ 
+ errnmb = errno;
+ 
+ if (text_buffer EQ NULL) {
+    PRTERR2(
+      "Message %s can not be formatted. Buffer malloc failed on %d\n",
+       msgid ,
+    errnmb);
+    rc = ESA_WARN;
+    goto exit;
+ }
+ if (dh)
+    ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, 14,    /* dc2704 */
+       "CTSAMSG_print_direct malloc text buffer address %p , size = %d",
+           text_buffer, sizeof(CTSAMSG_MSG_typ)) ;
+ 
+ msg_max_size = sizeof(CTSAMSG_MSG_typ);
+ 
+ /*
+  *   Locate the message format
+  */
+ 
+ cmsg = CTSAMSG_search(msgid,handle);
+ 
+ /*** Message not found handling ***/
+ 
+ if (cmsg EQ NULL) {
+    cmsg = &err_no_msg;
+    num_chars = sprintf (text_buffer, cmsg->format, msgid );
+    PRTERR1 ( cmsg->format+2, msgid );
+ }
+ 
+ /*** Format message to buffer ***/
+ 
+ else {
+   rcv = vsprintf (text_buffer, cmsg->format, arg_list);
+ 
+   if (rcv GT 0)
+      num_chars = strlen (text_buffer);
+ }
+ 
+ if ( (dh NE NULL) AND (rcv GE 0) )
+    ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, 17,    /* dc2704 */
+           "%d characters written to buffer at %p. Max = %d",
+           num_chars, text_buffer, msg_max_size);
+ 
+ /*
+  *   Possible overlay error check
+  */
+ 
+ if (num_chars GT msg_max_size) {
+    PRTERR1("Internal buffer overflow when issuing message %s\n",
+            msgid);
+    text_buffer[msg_max_size-1] = NULL_CHAR;
+ }
+ 
+ /*
+  *   Copy message to user buffer if passed
+  */
+ 
+ if (buffer NE NULL)
+    strcpy(buffer, text_buffer+2);
+ 
+ /*
+  *   Send Message to destinations
+  */
+ 
+ if ( dest NE NULL ) {
+ 
+    /**** obtain buffer space for destination formatted msg ***/
+ 
+    dest_buffer = malloc(sizeof(CTSAMSG_MSG_typ));
+    if (dest_buffer EQ NULL) {
+       PRTERR1(
+         "Message id %s can not be issued. no storage for buffer\n",
+         msgid);
+        rc = ESA_WARN;
+      goto exit;
+    }
+    if (dh)
+       ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, 14,    /* dc2704 */
+          "CTSAMSG_print_direct malloc dest buffer address %p , size = %d",
+             dest_buffer, sizeof(CTSAMSG_MSG_typ)) ;
+ 
+    /**** loop on destinations  ***/
+ 
+    for (i=0;((i LT dest->num) AND (rc NE ESA_FATAL)); i++)
+        if ( (dest->dests[i].active EQ FLAG_YES) AND
+             ((void *)(dest->dests[i].prt_func) NE NULL) ) {
+ 
+          /***** Set date and time in message *****/
+ 
+          switch (dest->dests[i].timestamp) {
+              case TIMES_FULL:
+                       sprintf(dest_buffer, "%s %s ",
+                               date_buffer, time_buffer);
+                       break;
+              case TIMES_SHORT:
+                       strcpy(dest_buffer, time_buffer);
+                       strcat(dest_buffer, " ");
+                       break;
+              default:
+                       dest_buffer[0] = NULL_CHAR;
+                       break;
+ 
+          }/* end switch */
+ 
+          /***** Set Message ID *****/
+ 
+          strcat(dest_buffer, cmsg->id );
+          strcat(dest_buffer, " " );
+ 
+          /***** Ignore filter data for non dest_err  *****/
+ 
+          if (dest->dests[i].type NE DEST_ERR)
+             strcat(dest_buffer, text_buffer + 2);
+          else strcat(dest_buffer, text_buffer);
+ 
+          /***** Call the printing routine *****/
+          if (dh)
+    {
+    ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG,
+     (sw_diag EQ 1) ? DIAG_BASIC : 12,
+                "%s", dest_buffer);
+    sw_diag++;
+    }
+          if (dh)
+             ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, 12,
+                "i=%d name=%s dest->max_: gen=%d lines=%d interval=%d.",
+                i, (dest->dests[i].name) ? dest->dests[i].name : "NULL",
+       dest->max_gen, dest->max_lines, dest->max_interval);
+ 
+          dest_rc=(*dest->dests[i].prt_func)(dest->dests[i].name,
+                   handle, dest_buffer, &dest->dests[i].handle,
+                   dest->max_gen, dest->max_lines, dest->max_interval);
+ 
+          if ( (dest_rc EQ ESA_WARN) AND (rc EQ ESA_OK) )
+             rc = dest_rc;
+ 
+       } /* endif */
+  } /* endif */
+ 
+ /*
+  *   Finish
+  */
+ 
+ exit: ;
+ 
+ if (dh)
+    ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, 14,    /* dc2704 */
+          "Releasing text buffer at %p and dest_buffer at %p",
+          text_buffer, dest_buffer);
+ 
+ if (text_buffer NE NULL)
+    free(text_buffer);
+ if (dest_buffer NE NULL)
+    free(dest_buffer);
+ 
+ if (dh)
+    ESA_DIAGR_exit ( dh, ESA_COMP_CTSAMSG, DIAG_COMMON, fn, rc );
+ 
+ return rc;
+ 
+} /* CTSAMSG_print_direct */
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_initdest                         *
+*                                                             *
+* Description      : Initialize destinations                  *
+*                                                             *
+* Input            :  1) dest table - dest table              *
+*                                                             *
+* Output           : none                                     *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+* Comments         : For each destination, the destination    *
+*                    initialization function is called.       *
+*                    It is the responsibility of the          *
+*                    initialization function to allocate an   *
+*                    handle (for printing function usage)     *
+*                    and set the appropriate handle pointer.  *
+*                    All destination are initialized until    *
+*                    a destination initialization routine     *
+*                    returns an ESA_FATAL rc .                *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC CTSAMSG_initdest (CTSAMSG_DEST_TABLE_rec_typ * dest,
+                         CTSAMSG_HANDLE_rec_typ     * handle)
+ 
+{
+    ESA_RC rc = ESA_OK ;
+    ESA_RC max_rc = ESA_OK ;
+    short  i;
+    static char fn [] = "CTSAMSG_initdest";
+    void * dh;
+ 
+   /*
+    *   Initialize
+    */
+ 
+    if (handle EQ NULL) {
+       PRTERR( "CTSAMSG_initdest failed - no handle passed\n" );
+       return ESA_FATAL;
+    }
+/*    else if (handle->diag_handle EQ NULL) {
+       PRTERR( "CTSAMSG_initdest failed - uninitialized handle\n");
+       return ESA_FATAL;
+    }*/
+    else dh = handle -> diag_handle;
+ 
+    if (dh)
+       ESA_DIAGR_enter ( dh, ESA_COMP_CTSAMSG, DIAG_COMMON, fn );
+ 
+   /*
+    *   Initialize destinations
+    */
+ 
+    if ( (dest EQ NULL) OR (dest->num EQ 0) )
+       goto exit;
+ 
+    for (i=0; ((i LT dest->num) AND (rc NE ESA_FATAL)); i++) {
+ 
+        /* setup a FILE destination */
+ 
+        if (dest->dests[i].type EQ DEST_FILE) {
+           dest->dests[i].init_func = &CTSAMSG_initfile;
+           dest->dests[i].term_func = &CTSAMSG_termfile;
+           dest->dests[i].prt_func  = &CTSAMSG_prtfile;
+        }
+ 
+        /* setup a FILE_APPEND destination */
+ 
+        else if (dest->dests[i].type EQ DEST_FILE_APPEND) {
+           dest->dests[i].init_func = &CTSAMSG_initfile_append;
+           dest->dests[i].term_func = &CTSAMSG_termfile;
+           dest->dests[i].prt_func  = &CTSAMSG_prtfile;
+        }
+ 
+        /* setup an ERR destination */
+ 
+        else if (dest->dests[i].type EQ DEST_ERR) {
+           dest->dests[i].init_func = &CTSAMSG_initerr;
+           dest->dests[i].term_func = &CTSAMSG_termerr;
+           dest->dests[i].prt_func  = &CTSAMSG_prterr;
+        }
+ 
+        /* setup a CONSOLE destination */
+ 
+        else if (dest->dests[i].type EQ DEST_CONSOLE) {
+           dest->dests[i].init_func = &CTSAMSG_initcons;
+           dest->dests[i].term_func = NULL;
+           dest->dests[i].prt_func  = &CTSAMSG_prtcons;
+        }
+ 
+        /* setup a CONSOLE2 destination */
+ 
+        else if (dest->dests[i].type EQ DEST_CONSOLE2) {
+           dest->dests[i].init_func = &CTSAMSG_initcons;
+           dest->dests[i].term_func = NULL;
+           dest->dests[i].prt_func  = &CTSAMSG_prtcon2;
+        }
+ 
+        /* Call destination initialization routine */
+ 
+        if (dest->dests[i].init_func NE NULL)
+           rc = (*dest->dests[i].init_func)(dest->dests[i].name,
+                                            &dest->dests[i].handle);
+        if (rc NE ESA_OK) {
+           PRTERR1(
+              "Initialization of destination no. %d has failed\n", i);
+           if (max_rc EQ ESA_OK)
+              max_rc = rc ;
+        }
+ 
+    } /* loop on destinations vector */
+ 
+   /*
+    *   Finished
+    */
+ 
+    exit:
+ 
+    if (dh)
+       ESA_DIAGR_exit ( dh, ESA_COMP_CTSAMSG, DIAG_COMMON, fn, rc );
+ 
+    return max_rc;
+ 
+} /* CTSAMSG_initdest */
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_termdest                         *
+*                                                             *
+* Description      : Terminate destinations                   *
+*                                                             *
+* Input            :  1) dest - destinations table            *
+*                                                             *
+* Output           : none                                     *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+* Comments         : For each destination, the destination    *
+*                    termination function is called.          *
+*                    All destination are terminated until     *
+*                    a destination termination routine        *
+*                    returns an ESA_FATAL rc .                *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC CTSAMSG_termdest (CTSAMSG_DEST_TABLE_rec_typ * dest,
+                         CTSAMSG_HANDLE_rec_typ     * handle)
+{
+    static char fn [] = "CTSAMSG_termdest";
+    ESA_RC rc = ESA_OK;
+    short  i;
+    void * dh;
+ 
+   /*
+    *   Initialize
+    */
+ 
+    if (handle EQ NULL) {
+       PRTERR( "CTSAMSG_termdest failed - no handle passed\n" );
+       return ESA_FATAL;
+    }
+/*    else if (handle->diag_handle EQ NULL) {
+       PRTERR( "CTSAMSG_termdest failed - uninitialized handle\n");
+       return ESA_FATAL;
+    }*/
+    else dh = handle -> diag_handle;
+ 
+    if (dh)
+       ESA_DIAGR_enter ( dh, ESA_COMP_CTSAMSG, DIAG_COMMON, fn );
+ 
+   /*
+    *   Terminate destinations
+    */
+ 
+    if ( (dest EQ NULL) OR (dest->num EQ 0) )
+       goto exit;
+ 
+    for (i=0; ((i LT dest->num) AND (rc NE ESA_FATAL)); i++) {
+ 
+        /* Call termination routine */
+ 
+        if (dest->dests[i].term_func NE NULL) {
+           rc = (*(dest->dests[i].term_func))(dest->dests[i].name,
+                                              &dest->dests[i].handle);
+           if (rc EQ ESA_OK)
+              dest->dests[i].handle = NULL;
+        }
+ 
+    } /* loop on destinations vector */
+ 
+   /*
+    *   Finished
+    */
+ 
+    exit:;
+ 
+    if (dh)
+       ESA_DIAGR_exit ( dh, ESA_COMP_CTSAMSG, DIAG_COMMON, fn, rc );
+ 
+    return rc;
+ 
+} /* CTSAMSG_termdest */
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_dump                             *
+*                                                             *
+* Description      : Dump CTSAMSG handle contents             *
+*                                                             *
+* Input            : 1) handle                                *
+*                                                             *
+* Output           : None                                     *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC CTSAMSG_dump (CTSAMSG_HANDLE_rec_typ  * handle)
+{
+   ESA_RC              rc = ESA_OK;
+   CTSAMSG_MSG_rec_ptr cmsg;
+   unsigned int        i;
+ 
+ 
+   /*
+    *   Dump Handle
+    */
+   printf ("Buffer at 0x%p, size=%d used=%d\n",
+           (void *)handle->buffer, handle->size, handle->used);
+ 
+   /*
+    *   Dump Messages
+    */
+    cmsg = handle->buffer;
+    for (i=0;i LT handle->used;i++) {
+        printf("%3d: %s %s",i,cmsg->id,cmsg->format);
+        cmsg++;
+    }
+ 
+    return rc;
+ 
+} /* CTSAMSG_dump */
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_dest_table_alloc                 *
+*                                                             *
+* Description      : Allocate a destination table             *
+*                                                             *
+* Input            : 1) numdest -  number of destinations     *
+*                                                             *
+* Output           : None                                     *
+*                                                             *
+* Return Value     : Pointer to destination table             *
+*                                                             *
+**************************************************************/
+ 
+CTSAMSG_DEST_TABLE_rec_typ *CTSAMSG_dest_table_alloc (short num_dest)
+{
+   CTSAMSG_DEST_TABLE_rec_typ  * dest_t = NULL;
+   unsigned long                 size;
+ 
+   if ( num_dest LE 0 )
+      goto exit;
+ 
+   /* Calculate area size */
+ 
+   size = sizeof (CTSAMSG_DEST_TABLE_rec_typ) +
+                 (num_dest-1) * sizeof (CTSAMSG_DEST_rec_typ);
+ 
+   /* Obtain area */
+ 
+   dest_t = (CTSAMSG_DEST_TABLE_rec_typ *)malloc (size);
+ 
+   if (dest_t NE NULL)
+      dest_t->num = num_dest;
+ 
+   CTSAMSG_dest_table_init (dest_t);
+ 
+   /* Finish            */
+ 
+  exit:;
+ 
+ 
+  return dest_t;
+ 
+} /* CTSAMSG_dest_table_alloc */
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_dest_table_free                  *
+*                                                             *
+* Description      : Free area of destination table           *
+*                                                             *
+* Input/Output     : 1) dest_t - destination table pointer    *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC CTSAMSG_dest_table_free (CTSAMSG_DEST_TABLE_rec_typ * dest_t)
+{
+ 
+  if (dest_t NE NULL)
+     free (dest_t);
+ 
+  return ESA_OK;
+ 
+} /* CTSAMSG_dest_table_free */
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_dest_table_init                  *
+*                                                             *
+* Description      : Initialize destination table destinations*
+*                                                             *
+* Input/Output     : 1) dest_t - destination table pointer    *
+*                                                             *
+* Return Value     : None                                     *
+*                                                             *
+**************************************************************/
+ 
+void CTSAMSG_dest_table_init (CTSAMSG_DEST_TABLE_rec_typ * dest_t)
+{
+  int i;
+ 
+  if (dest_t NE NULL) {
+     for ( i=0; i LT dest_t->num; i++ ) {
+         dest_t->dests[i].type      = DEST_FILE;
+         dest_t->dests[i].name      = NULL;
+         dest_t->dests[i].handle    = NULL;
+         dest_t->dests[i].init_func = NULL;
+         dest_t->dests[i].prt_func  = NULL;
+         dest_t->dests[i].term_func = NULL;
+         dest_t->dests[i].active    = FLAG_NO;
+         dest_t->dests[i].timestamp = TIMES_NONE;
+     }
+  }
+ 
+  return;
+ 
+} /* CTSAMSG_dest_table_init */
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_compare                          *
+*                                                             *
+* Description      : Compare routine for qsort and bsearch    *
+*                                                             *
+* Input            : 1) msg entry 1                           *
+*                    2) msg entry 2                           *
+*                                                             *
+* Output           : None                                     *
+*                                                             *
+* Return Value     : negative - msg1 less than msg2           *
+*                  : zero     - msg1 equal to msg2            *
+*                  : positive - msg2 greater than msg2        *
+*                                                             *
+**************************************************************/
+ 
+static int CTSAMSG_compare (const void * msg1,
+                            const void * msg2)
+{
+  CTSAMSG_MSG_rec_ptr first  = (CTSAMSG_MSG_rec_ptr)msg1;
+  CTSAMSG_MSG_rec_ptr second = (CTSAMSG_MSG_rec_ptr)msg2;
+ 
+  return
+     strncmp (first->id, second->id, sizeof(CTSAMSG_MSGID_typ));
+ 
+} /* CTSAMSG_compare */
+ 
+ 
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : RepFileGenNum                            *
+*                                                             *
+* Description      : Replace generation variable              *
+*                                                             *
+* Input            :  2) name           -  original file name *
+*                  :  3) curr_gen       -  generation number  *
+*                                                             *
+* Output           :  1) gen_file_name  - Updated file name   *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+**************************************************************/
+ 
+static void RepFileGenNum( char * gen_file_name,
+                                                   char * name,
+                                                   int curr_gen)
+{
+        int i, l;
+        char * p, *t;
+        char gen_str[10]="";
+ 
+#define CTSAMSG_GEN_NUM  "##G##"
+#define CTSAMSG_GEN_NUM1 "##G1##"
+#define CTSAMSG_GEN_NUM2 "##G2##"
+#define CTSAMSG_GEN_NUM3 "##G3##"
+ 
+        /*** Locate generation variable in file name ***/
+ 
+ 
+        if ( (p = strstr( name, CTSAMSG_GEN_NUM )) NE NULL ) {
+                i = strlen(CTSAMSG_GEN_NUM);
+                if ( (curr_gen LT 1) OR (curr_gen GT 999)  )
+                  strcpy(gen_str, "0" );
+                else
+                  sprintf ( gen_str, "%d", curr_gen );
+        }
+        else if ( (p = strstr( name, CTSAMSG_GEN_NUM1 )) NE NULL ) {
+                i = strlen( CTSAMSG_GEN_NUM1 );
+                if ( (curr_gen LT 1) OR (curr_gen GT 9)  )
+                  strcpy(gen_str, "0" );
+                else
+                  sprintf ( gen_str, "%01d", curr_gen );
+        }
+        else if ( (p = strstr( name, CTSAMSG_GEN_NUM2 )) NE NULL ) {
+                i = strlen( CTSAMSG_GEN_NUM2 );
+                if ( (curr_gen LT 1) OR (curr_gen GT 99)  )
+                  strcpy(gen_str, "0" );
+                else
+                  sprintf ( gen_str, "%02d", curr_gen );
+        }
+        else if ( (p = strstr( name, CTSAMSG_GEN_NUM3)) NE NULL ) {
+                i = strlen( CTSAMSG_GEN_NUM3 );
+                if ( (curr_gen LT 1) OR (curr_gen GT 999)  )
+                  strcpy(gen_str, "0" );
+                else
+                  sprintf ( gen_str, "%03d", curr_gen );
+        }
+ 
+        /*** If generation variables found, build new file name ***/
+ 
+        if (p) {
+           t = p + i;
+           l = p - name;
+           memcpy( gen_file_name, name, l );
+           gen_file_name[l] = '\0';
+           strcat( gen_file_name, gen_str );
+           strcat( gen_file_name, t );
+        }
+ 
+        /*** Otherwise, leave file name asis ***/
+ 
+        else
+           strcpy( gen_file_name, name );
+ 
+        /*** Done ***/
+ 
+        return;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : InitFileGenHandle                        *
+*                                                             *
+* Description      : Initialize Generations Handle            *
+*                                                             *
+* Input/Output     :  1) handle         -  uninitilized handle*
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+**************************************************************/
+ 
+static void InitFileGenHandle( CTSAMSG_FILE_DEST_rec_typ * my_handle )
+ 
+{
+ 
+ /* Initialize Handle */
+ 
+ my_handle->file_handle = NULL;
+ my_handle->curr_gen    = 1;          /* Current generation number  */
+ my_handle->last_switch = time(NULL); /* Time stamp of last switch  */
+ my_handle->curr_msgs   = 0;          /* Number of msg since switch */
+ my_handle->enable_gen  = FALSE;      /* Assume log switch disabled */
+ my_handle->max_gen     = -1;
+ my_handle->max_lines   = -1;
+ my_handle->max_interval= -1;
+ 
+ return ;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : OpenFileGen                              *
+*                                                             *
+* Description      : Open Current Log file                    *
+*                                                             *
+* Input/Output     :  1) file_name -  log file name           *
+*                     2) append_mode  TRUE- append            *
+*                                     FALSE-write             *
+*                     3) handle                               *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+**************************************************************/
+ 
+static ESA_RC OpenGenFile ( char                      * name,
+                            int                         append_mode,
+                            CTSAMSG_FILE_DEST_rec_typ * my_handle)
+ 
+{
+ char        err_func[20];
+ ESA_RC      rc = ESA_OK;
+ char        ddn_with[50]="";                             /* SAS2IBMT */
+ 
+ strcpy (err_func, "fopen");
+ strcpy(ddn_with,"DD:");                                  /* SAS2IBMT */
+ strcat(ddn_with, name);                                  /* SAS2IBMT */
+ if ( append_mode )
+    /* SAS2IBMT my_handle->file_handle = (void *)fopen(name,"a");    */
+    my_handle->file_handle = (void *)fopen(ddn_with,"a"); /* SAS2IBMT */
+ else
+    /* SAS2IBMT my_handle->file_handle = (void *)fopen(name,"w");    */
+    my_handle->file_handle = (void *)fopen(ddn_with,"w,recfm=*"); /* SAS2IBMT */
+ 
+ /* strcpy (err_func, "_sopen"); Alex commented out this on Nov 6, 2000 */
+ 
+ /* Handle Open operation failure */
+ 
+ if (my_handle->file_handle EQ NULL) {
+    PRTERR2( "Messages file %s could not be opened - %s\n",
+             name, strerror(errno));
+    rc = ESA_ERR;
+    goto exit;
+ }
+ 
+ /* return Handle parameter */
+ 
+ exit:
+ 
+ return rc ;
+}
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_initfile                         *
+*                                                             *
+* Description      : Initialize a FILE destination            *
+*                                                             *
+* Input            :  1) dest           -  dest name          *
+*                  :  2) handle         -  dest handle        *
+*                                                             *
+* Output           : none                                     *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+* Comments         : On UNIX, file permissions are changed to *
+*                    rw-r--r-- (anyone can read)              *
+*                                                             *
+**************************************************************/
+ 
+static ESA_RC CTSAMSG_initfile (void   * name,
+                                void  ** handle)
+{
+ ESA_RC  rc = ESA_OK;
+ CTSAMSG_FILE_DEST_rec_typ * my_handle = NULL;
+ char    gen_file_name[MAX_FILENAME_LEN+1];
+ 
+ /*** If standard output - nothing to do .... ***/
+ 
+ if ((strcmp(name,"STDOUT")  EQ 0) OR (strcmp(name,"stdout")  EQ 0) OR
+     (strcmp(name,"STDERR")  EQ 0) OR (strcmp(name,"stderr")  EQ 0) OR
+     (strcmp(name,"NONE")    EQ 0) OR (strcmp(name,"none")    EQ 0) OR
+     (strcmp(name,"CONSOLE") EQ 0) OR (strcmp(name,"console") EQ 0) OR
+     (strcmp(name, NULL_DEVICE) EQ 0)  )
+ 
+     goto exit;
+ 
+ 
+ /* Non empty handle passed ? Huston, we have a problem ... */
+ 
+ if (*handle) {
+    PRTERR1( "Internal Error - non NULL handle passed for %s\n",
+             (char *) name );  /* STM001 */
+    rc = ESA_ERR;
+    goto exit;
+ }
+ 
+ /* Allocate Handle */
+ 
+ my_handle = malloc (sizeof(CTSAMSG_FILE_DEST_rec_typ));
+ if (my_handle EQ NULL) {
+    PRTERR1( "Internal Error - could not allocate handle for %s\n",
+             (char *) name );  /* STM001 */
+    rc = ESA_ERR;
+    goto exit;
+ }
+ 
+ /* Initialize Handle */
+ 
+ InitFileGenHandle(my_handle) ;
+ 
+ /* Add Generation number to file name */
+ 
+ RepFileGenNum( gen_file_name, name, my_handle->curr_gen);
+ if (strcmp( gen_file_name, name))
+    my_handle->enable_gen   = TRUE;
+ 
+ /* Open File */
+ 
+ rc = OpenGenFile( gen_file_name, FALSE, my_handle);
+ 
+ if (rc NE ESA_OK)
+    goto exit;
+ 
+ *handle = my_handle;
+ 
+ exit:
+ 
+ /*** In case of failure , close file and free handle ***/
+ 
+ if (rc NE ESA_OK) {
+    if (my_handle) {
+       if (my_handle->file_handle)
+          fclose (my_handle->file_handle);
+       free(my_handle);
+    }
+ }
+ 
+ return rc;
+ 
+} /* CTSAMSG_initfile */
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_initfile_append                  *
+*                                                             *
+* Description      : Initialize a FILE destination            *
+*                                                             *
+* Input            :  1) dest           -  dest name          *
+*                  :  2) handle         -  dest handle        *
+*                                                             *
+* Output           : none                                     *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+* Comments         : On UNIX, file permissions are changed to *
+*                    rw-r--r-- (anyone can read)              *
+*                                                             *
+**************************************************************/
+ 
+static ESA_RC CTSAMSG_initfile_append (void   * name,
+                                       void  ** handle)
+{
+  ESA_RC   rc = ESA_OK;
+  CTSAMSG_FILE_DEST_rec_typ * my_handle = NULL;
+  char     gen_file_name[MAX_FILENAME_LEN+1];
+ 
+ /*** If standard output - nothing to do .... ***/
+ 
+ if ((strcmp(name,"STDOUT")  EQ 0) OR (strcmp(name,"stdout")  EQ 0) OR
+     (strcmp(name,"STDERR")  EQ 0) OR (strcmp(name,"stderr")  EQ 0) OR
+     (strcmp(name,"NONE")    EQ 0) OR (strcmp(name,"none")    EQ 0) OR
+     (strcmp(name,"CONSOLE") EQ 0) OR (strcmp(name,"console") EQ 0) OR
+     (strcmp(name, NULL_DEVICE) EQ 0)  )
+ 
+     goto exit;
+ 
+ /* If non empty handle passed - we have a problem ... */
+ 
+ if (*handle) {
+    PRTERR1( "Internal Error - non NULL handle passed for %s\n",
+             (char *) name );  /* STM001 */
+    rc = ESA_ERR;
+    goto exit;
+ }
+ 
+ /* Allocate Handle */
+ 
+ my_handle = malloc (sizeof(CTSAMSG_FILE_DEST_rec_typ));
+ if (my_handle EQ NULL) {
+    PRTERR1( "Internal Error - could not allocate handle for %s\n",
+             (char *) name );  /* STM001 */
+    rc = ESA_ERR;
+    goto exit;
+ }
+ 
+ /* Initialize Handle */
+ 
+ InitFileGenHandle( my_handle) ;
+ 
+ /* Add Generation number to file name */
+ 
+ RepFileGenNum( gen_file_name, name, my_handle->curr_gen);
+ if (strcmp(gen_file_name, name))
+    my_handle->enable_gen   = TRUE;
+ 
+ /* Open File */
+ 
+ if ( my_handle->enable_gen )
+    rc = OpenGenFile( gen_file_name, FALSE, my_handle);
+ else
+    rc = OpenGenFile( gen_file_name, TRUE, my_handle);
+ 
+ if (rc NE ESA_OK)
+    goto exit;
+ 
+ /* set handle parameter */
+ 
+ *handle = my_handle;
+ 
+ exit:
+ 
+ /*** In case of failure , close file and free handle ***/
+ 
+ if (rc NE ESA_OK) {
+ 
+    if (my_handle) {
+       if (my_handle->file_handle)
+          fclose (my_handle->file_handle);
+       free(my_handle);
+    }
+ }
+ 
+ return rc;
+ 
+} /* CTSAMSG_initfile_append */
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_prtfile                          *
+*                                                             *
+* Description      : Print to a FILE destination              *
+*                                                             *
+* Input            :  1) dest           -  dest name          *
+*                  :  2) msg            -  msg buffer         *
+*                  :  3) handle         -  dest handle        *
+*                                                             *
+* Output           : none                                     *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+**************************************************************/
+ 
+static ESA_RC CTSAMSG_prtfile (void                    * name,
+                            CTSAMSG_HANDLE_rec_typ  * msg_handle,
+                               CTSAMSG_MSG_typ           msg_buffer,
+                               void                   ** handle,
+                               int                       max_gen,
+                               int                       max_lines,
+                               int                       max_interval)
+{
+  ESA_RC   rc = ESA_WARN;
+  int      put_rc;
+  char     fn[]="CTSAMSG_prtfile";
+  CTSAMSG_FILE_DEST_rec_typ * my_handle = *handle;
+  time_t   curr_time;
+  char     gen_file_name[MAX_FILENAME_LEN+1];
+  char     old_gen_file_name[MAX_FILENAME_LEN+1];
+  void   * dh;
+ 
+  if (msg_handle EQ NULL) {
+    PRTERR( "CTSAMSG_print failed - no handle passed\n" );
+    /*PRTERR1( "CTSAMSG_print ignored message %s\n", msgid );*/
+    return ESA_FATAL;
+  }
+/*  else if (msg_handle->diag_handle EQ NULL) {
+    PRTERR("CTSAMSG_free failed - uninitialized handle\n");
+    return ESA_FATAL;
+  }*/
+  else dh = msg_handle -> diag_handle;
+ 
+  if (dh)
+     ESA_DIAGR_enter( dh, ESA_COMP_CTSAMSG, DIAG_COMMON , fn );
+ 
+  if (dh)
+     ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, 12,
+             "name=%s max_: gen=%d lines=%d interval=%d.",
+              name, max_gen, max_lines, max_interval);
+ 
+  /*** Handle standard output files ***/
+ 
+  if ( (strcmp(name,"STDOUT") EQ 0) OR
+       (strcmp(name,"stdout") EQ 0)    ) {
+     put_rc = fputs (msg_buffer, stdout);
+     if (put_rc NE EOF)
+        rc = ESA_OK;
+         goto exit;
+  }
+  else if ( (strcmp(name,"CONSOLE") EQ 0) OR
+            (strcmp(name,"console") EQ 0)    ) {
+     rc = OS_CONSOLE_print (msg_buffer,
+                              OS_CONS_ROLLABLE_YES, /* rollable msg */
+                              OS_CONS_SEV_NOTICE);
+         goto exit;
+  }
+  else if ( (strcmp(name,"STDERR") EQ 0) OR
+            (strcmp(name,"stderr") EQ 0)    ) {
+     put_rc = fputs (msg_buffer, stderr);
+     if (put_rc NE EOF)
+        rc = ESA_OK;
+     goto exit;
+  }
+  else if ( (strcmp(name,NULL_DEVICE) EQ 0) OR
+            (strcmp(name,"NONE")      EQ 0) OR
+            (strcmp(name,"none")      EQ 0)  )  {
+     rc = ESA_OK;
+         goto exit;
+  }
+ 
+  /*** Destination is a real log file ***/
+  if (my_handle EQ NULL) {
+     PRTERR1( "Message can not be printed - no log file %s\n",
+              (char *) name );  /* STM001 */
+     goto exit;
+  }
+  if (my_handle->file_handle EQ NULL) {
+     PRTERR1( "Message can not be printed - open failed for - %s\n",
+              (char *) name );  /* STM001 */
+     goto exit;
+  }
+ 
+  if (dh)
+     ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, 12,
+       "hndl: gen=%d enbl=%d.",my_handle->max_gen, my_handle->enable_gen);
+  /* Parameters Setup */
+  if ( my_handle->max_gen LT 0 )  {
+    my_handle->max_gen =      max_gen;      /*7*/
+    my_handle->max_lines =    max_lines;    /*1000*/
+    my_handle->max_interval = max_interval; /*0*/
+  }
+  if (dh)
+     ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, 12,
+       "hndl: gen=%d lines=%d intrvl=%d enbl=%d.",
+             my_handle->max_gen, my_handle->max_lines,
+    my_handle->max_interval, my_handle->enable_gen);
+ 
+  /*** Perform Log Switch, if supported ***/
+ 
+  if ( (my_handle->enable_gen ) AND  (my_handle->max_gen GT 1) ) {
+ 
+     curr_time = time(NULL);
+ 
+     if (dh)
+        ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, 12,
+          "hndl: curr_msgs=%d last_switch=%d curr_time=%d.",
+        my_handle->curr_msgs, my_handle->last_switch, curr_time);
+ 
+     if (  ( (my_handle->curr_msgs GE my_handle->max_lines) AND
+             (my_handle->max_lines)
+           )  OR
+           ( (my_handle->max_interval) AND
+             (my_handle->last_switch + my_handle->max_interval LE
+              curr_time)
+           )
+        ) {
+ 
+        /* Start the new log file generation */
+ 
+        RepFileGenNum( old_gen_file_name, name, my_handle->curr_gen);
+ 
+        (my_handle->curr_gen)++;
+        if (my_handle->curr_gen GT my_handle->max_gen)
+           my_handle->curr_gen = 1;
+ 
+        my_handle->last_switch = curr_time;
+        my_handle->curr_msgs = 0;
+        RepFileGenNum( gen_file_name, name, my_handle->curr_gen);
+ 
+        if (dh)
+           ESA_DIAGR_printf ( dh, ESA_COMP_CTSAMSG, 12,
+               "gen_file_name=%s old_gen_file_name=%s curr_gen=%d.",
+                gen_file_name, old_gen_file_name, my_handle->curr_gen);
+        /* Close the current log file */
+ 
+        fprintf ( my_handle->file_handle,
+                  LOGFILE_CONTINUE_MSG_FORMAT_NEXT, gen_file_name );
+ 
+        fclose (my_handle->file_handle);
+ 
+        /* Open the file */
+ 
+        rc = OpenGenFile( gen_file_name, FALSE, my_handle);
+        if (rc NE ESA_OK)
+           goto exit;
+ 
+        fprintf ( my_handle->file_handle,
+                  LOGFILE_CONTINUE_MSG_FORMAT_PREV,old_gen_file_name );
+ 
+     } /* Log Switch performed */
+ 
+  }  /* Log file switch enabled */
+ 
+  /*** finally - issue the message ***/
+ 
+  put_rc = fputs (msg_buffer, my_handle->file_handle);
+  if (put_rc NE EOF) {
+     rc = ESA_OK;
+     fflush (my_handle->file_handle);
+  }
+  else {
+     PRTERR2( "I/O error in messages file %s - %s\n",
+              (char *) name,  /* STM001 */
+              strerror(errno));
+  }
+ 
+  (my_handle->curr_msgs)++;
+ 
+  exit:
+ 
+  if (dh)
+     ESA_DIAGR_exit ( dh, ESA_COMP_CTSAMSG, DIAG_COMMON, fn, rc );
+  return rc;
+ 
+} /* CTSAMSG_prtfile */
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_termfile                         *
+*                                                             *
+* Description      : end a FILE destination                   *
+*                                                             *
+* Input            :  1) dest           -  dest structure     *
+*                  :  2) handle         -  dest handle        *
+*                                                             *
+* Output           : none                                     *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+**************************************************************/
+ 
+static ESA_RC CTSAMSG_termfile (void  * name,
+                                void ** handle)
+{
+ 
+ ESA_RC   rc = ESA_OK;
+ int      close_rc ;
+ CTSAMSG_FILE_DEST_rec_typ * my_handle = *handle;
+ 
+ /*** If standard output - nothing to do .... ***/
+ 
+ if ((strcmp(name,"STDOUT") EQ 0) OR (strcmp(name,"stdout") EQ 0) OR
+     (strcmp(name,"STDERR") EQ 0) OR (strcmp(name,"stderr") EQ 0) OR
+     (strcmp(name,"NONE")   EQ 0) OR (strcmp(name,"none")   EQ 0) OR
+     (strcmp(name,"CONSOLE") EQ 0) OR (strcmp(name,"console") EQ 0) OR
+     (strcmp(name, NULL_DEVICE) EQ 0)  )
+ 
+        goto exit;
+ 
+ /*** If no handle - do nothing ***/
+ 
+ if (my_handle EQ NULL)
+    goto exit;
+ 
+ /*** Close file ***/
+ 
+ if (my_handle->file_handle) {
+ 
+    close_rc = fclose (my_handle->file_handle);
+    if (close_rc)
+       rc = ESA_WARN;
+ 
+ } /* file is open */
+ 
+ /*** Free Handle ***/
+ 
+ free(my_handle);
+ *handle = NULL;
+ 
+ exit:
+ 
+ return rc;
+ 
+} /* CTSAMSG_termfile */
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_initcons                         *
+*                                                             *
+* Description      : Initialize a CONSOLE destination         *
+*                                                             *
+* Input            :  1) dest           -  dest name          *
+*                  :  2) handle         -  dest handle        *
+*                                                             *
+* Output           : none                                     *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+**************************************************************/
+ 
+ 
+static ESA_RC CTSAMSG_initcons (void  * name,
+                                void ** handle)
+{
+  return ESA_OK;
+} /* CTSAMSG_initcons */
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_prtcons                          *
+*                                                             *
+* Description      : Print to a CONSOLE destination           *
+*                                                             *
+* Input            :  1) dest           -  dest name          *
+*                  :  2) msg            -  msg buffer         *
+*                  :  3) handle         -  dest handle        *
+*                                                             *
+* Output           : none                                     *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+**************************************************************/
+ 
+ 
+static ESA_RC CTSAMSG_prtcons (void                    * name,
+                            CTSAMSG_HANDLE_rec_typ  * msg_handle,
+                               CTSAMSG_MSG_typ           msg_buffer,
+                               void                   ** handle,
+                               int                       max_gen,
+                               int                       max_lines,
+                               int                       max_interval)
+{
+   return OS_CONSOLE_print (msg_buffer,
+                            OS_CONS_ROLLABLE_YES, /* rollable msg */
+                            OS_CONS_SEV_NOTICE);
+} /* CTSAMSG_prtcons */
+ 
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_prtcon2                          *
+*                                                             *
+* Description      : Print to a CONSOLE2 destination          *
+*                                                             *
+* Input            :  1) dest           -  dest name          *
+*                  :  2) msg            -  msg buffer         *
+*                  :  3) handle         -  dest handle        *
+*                                                             *
+* Output           : none                                     *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+**************************************************************/
+ 
+ 
+static ESA_RC CTSAMSG_prtcon2 (void                    * name,
+                            CTSAMSG_HANDLE_rec_typ  * msg_handle,
+                               CTSAMSG_MSG_typ           msg_buffer,
+                               void                   ** handle,
+                               int                       max_gen,
+                               int                       max_lines,
+                               int                       max_interval)
+{
+   return OS_CONSOLE_print (msg_buffer,
+                            OS_CONS_ROLLABLE_NO, /* non-rollable msg */
+                            OS_CONS_SEV_NOTICE);
+} /* CTSAMSG_prtcon2 */
+ 
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_initerr                          *
+*                                                             *
+* Description      : Initialize a ERR  destination            *
+*                                                             *
+* Input            :  1) dest           -  dest name          *
+*                  :  2) handle         -  dest handle        *
+*                                                             *
+* Output           : none                                     *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+**************************************************************/
+ 
+static ESA_RC CTSAMSG_initerr (void  * name,
+                               void ** handle)
+{
+  ERR_STRUCT_rec_typ * err;
+  ESA_RC               rc = ESA_WARN;
+ 
+  err = (ERR_STRUCT_rec_typ *)name;
+  if (err NE NULL) {
+ 
+     /*
+      *  err -> err_num = 0;
+      *  err -> length  = 0;
+      *  memset(err->err_msg_text,NULL_CHAR,sizeof(err->err_msg_text));
+      */
+ 
+     /* Set handle */
+ 
+     (*handle) = (void *)err;
+     rc = ESA_OK;
+  }
+ 
+  return rc;
+ 
+} /* CTSAMSG_initerr */
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_prterr                           *
+*                                                             *
+* Description      : Print to a ERR_STRUCT destination        *
+*                                                             *
+* Input            :  1) dest           -  dest name          *
+*                  :  2) msg            -  msg buffer         *
+*                  :  3) handle         -  dest handle        *
+*                                                             *
+* Output           : none                                     *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+**************************************************************/
+ 
+ 
+static ESA_RC CTSAMSG_prterr  (void                    * name,
+                            CTSAMSG_HANDLE_rec_typ  * msg_handle,
+                               CTSAMSG_MSG_typ           msg_buffer,
+                               void                   ** handle,
+                               int                       max_gen,
+                               int                       max_lines,
+                               int                       max_interval)
+{
+ ESA_RC               rc = ESA_WARN;
+ unsigned short       line_len, line_left;
+ char               * line_ptr;
+ ERR_STRUCT_rec_typ * err;
+ 
+/*
+ *     If error buffer was passed
+ */
+ 
+ if (*handle NE NULL) {
+ 
+   /*
+    *     Calculate size of line to copy
+    */
+ 
+    err = (ERR_STRUCT_rec_typ *)(*handle);
+    line_len = strlen(msg_buffer) + 1;
+    line_left = sizeof(err->err_msg_text) - err->length - 1 ;
+    if  (line_len GT line_left)
+        line_len = line_left;
+    else rc = ESA_OK;
+ 
+   /*
+    *     Copy line into buffer
+    */
+ 
+    line_ptr = err->err_msg_text + err->length;
+    strncpy(line_ptr, msg_buffer, line_len);
+    line_ptr[line_len] = NULL_CHAR;
+    err->length += line_len;
+ 
+   /*
+    *     Eliminate last NEWLINE character
+    */
+ 
+    if (line_ptr[line_len-1] EQ NEWLINE) {
+       line_ptr[line_len-1] = NULL_CHAR;
+       err->length--;
+    }
+ }
+ 
+ return rc;
+ 
+} /* CTSAMSG_prterr */
+ 
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_termerr                          *
+*                                                             *
+* Description      : end a ERR  destination                   *
+*                                                             *
+* Input            :  1) dest           -  dest structure     *
+*                  :  2) handle         -  dest handle        *
+*                                                             *
+* Output           : none                                     *
+*                                                             *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+**************************************************************/
+ 
+ 
+static ESA_RC CTSAMSG_termerr (void  * name,
+                               void ** handle)
+{
+  ESA_RC rc = ESA_WARN;
+ 
+  if (*handle NE NULL)
+     rc = ESA_OK;
+  return rc;
+} /* CTSAMSG_termerr */
+ 
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_search                           *
+*                                                             *
+* Description      : Search MessageId in a loaded buffer      *
+*                    (Binary search, buffer is sorted during  *
+*                     load function)                          *
+*                                                             *
+* Input            : 1) msgid   - msgid to be searched        *
+*                    2) handle  - messages buffer handle      *
+*                                                             *
+* Output           : NOTE                                     *
+*                                                             *
+* Return Value     : Pointer to the requested message area    *
+*                                                             *
+**************************************************************/
+ 
+static CTSAMSG_MSG_rec_typ * CTSAMSG_search (
+                              const char             * msgid,
+                              CTSAMSG_HANDLE_rec_typ * handle)
+{
+ if ( (handle->buffer NE NULL) AND (handle->used GT 0) )
+ 
+    return (CTSAMSG_MSG_rec_typ *)bsearch(msgid,  /* searched msg  */
+                               handle->buffer,    /* search area   */
+                               handle->used,      /* num elements  */
+                               sizeof(CTSAMSG_MSG_rec_typ),
+                               &CTSAMSG_compare); /* compare func  */
+ 
+ else
+    return (CTSAMSG_MSG_rec_typ *)NULL;
+} /* CTSAMSG_search */
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CTSAMSG_scan                             *
+*                                                             *
+* Description      : Search MessageId serially in a buffer    *
+*                                                             *
+* Input            : 1) msgid                                 *
+*                    2) msgid entry                           *
+*                    3) max entreis to scan                   *
+*                                                             *
+* Output           : None                                     *
+*                                                             *
+* Return Value     : Message entry pointer or NULL            *
+*                                                             *
+**************************************************************/
+ 
+static CTSAMSG_MSG_rec_ptr CTSAMSG_scan (
+                                    const char          * msgid,
+                                    CTSAMSG_MSG_rec_typ * buffer,
+                                    short                 limit)
+{
+ CTSAMSG_MSG_rec_ptr buffer_end, scan_rc = NULL;
+ 
+ if ( (buffer NE NULL) AND (limit GT 0) )
+    for (buffer_end = buffer + limit; buffer LT buffer_end; buffer++)
+        if (strcmp(buffer->id,msgid) EQ 0 ) {
+           scan_rc = buffer;
+           break;
+        }
+ 
+ return scan_rc;
+ 
+} /* CTSAMSG_scan */
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : convert_esacpe_sequneces                 *
+*                                                             *
+* Description      : convert escape sequnces from character   *
+*                    to their real code                       *
+*                                                             *
+* Input            : 1) string                                *
+*                                                             *
+* Output           : None                                     *
+*                                                             *
+* Return Value     : None                                     *
+*                                                             *
+**************************************************************/
+ 
+static void convert_escape_sequences (char * str)
+{
+ int i ;
+ 
+ for ( i= 0; str[i] NE NULL_CHAR; i++ )
+     if ( str[i] EQ BACKSLASH )
+        switch ( str[i+1] ) {
+          case CTSAMSG_NL_CHAR:
+                            str[i] = CTSAMSG_NL_CODE;
+                            str_shift_left(&str[i+1]);
+                            break;
+          case CTSAMSG_ALERT_CHAR:
+                            str[i] = CTSAMSG_ALERT_CODE;
+                            str_shift_left(&str[i+1]);
+                            break;
+          case CTSAMSG_BS_CHAR:
+                            str[i] = CTSAMSG_BS_CODE;
+                            str_shift_left(&str[i+1]);
+                            break;
+          case CTSAMSG_FF_CHAR:
+                            str[i] = CTSAMSG_FF_CODE;
+                            str_shift_left(&str[i+1]);
+                            break;
+          case CTSAMSG_CR_CHAR:
+                            str[i] = CTSAMSG_CR_CODE;
+                            str_shift_left(&str[i+1]);
+                            break;
+          case CTSAMSG_HT_CHAR:
+                            str[i] = CTSAMSG_HT_CODE;
+                            str_shift_left(&str[i+1]);
+                            break;
+          case CTSAMSG_VT_CHAR:
+                            str[i] = CTSAMSG_VT_CODE;
+                            str_shift_left(&str[i+1]);
+                            break;
+        } /* switch */
+ return ;
+ 
+} /* convert_esacpe_sequneces */
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : str_shift_left                           *
+*                                                             *
+* Description      : Shift a string 1 character to the left   *
+*                                                             *
+* Input            : 1) string                                *
+*                                                             *
+* Output           : None                                     *
+*                                                             *
+* Return Value     : Number of charcters in shifted string    *
+*                                                             *
+**************************************************************/
+ 
+static int str_shift_left (char * str)
+{
+   int i ;
+ 
+   for ( i = 0; str[i] NE NULL_CHAR; i++)
+      str[i] = str[i+1];
+ 
+   return i;
+ 
+} /* str_shift_left */
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : strcpy_normalized                        *
+*                                                             *
+* Description      : Copy a string. Copy only one space       *
+*                    instead of a sequence of spaces and tabs.*
+*                                                             *
+* Input            : destination string, source string.       *
+*                                                             *
+* Output           : Normalized string. contains not more than*
+*                    one consecutive space.                   *
+*                                                             *
+* Return Value     : None                                     *
+*                                                             *
+* Example: input: "  ab   c  d  e    "                        *
+*          output:" ab c d e "                                *
+*                                                             *
+**************************************************************/
+ 
+static void strcpy_normalized(char * str2, char * str1)
+{
+ int i1=0,i2=0, str1_len =0 , in_space=0;
+ 
+ str1_len = strlen(str1) ;
+ for (i1=0,i2=0; i1 < str1_len; i1++)
+ {
+   if (strchr(" \t", str1[i1]) == 0)
+   {   /* copy non-space char */
+      str2[i2]= str1[i1];
+      in_space = 0;
+      i2++;
+   }
+   else                /* any white space or tab */
+   if (!in_space)      /* last character copied was not a space */
+   {
+      str2[i2]=' ';
+      in_space=1;
+      i2++;
+   }
+ }
+ str2[i2] = 0x00;
+ 
+ while (strlen(str2) GT 0)
+ {
+   if (strchr(WHITECHARS, str2[strlen(str2)- 1]) == 0)
+  break;
+   else
+     str2[strlen(str2)- 1] = '\0';
+ }
+ 
+} /* strcpy_normalized */
+ 
+/*****************************************************************
+* Procedure Name: ctsamsg_stricmp
+* Description   : Insencitive MString Compare
+* Input         : str1,
+*               : str2
+* Return Value  : ESA_RC
+* Side Effects  :
+* Scope         :
+*****************************************************************/
+ 
+ESA_RC ctsamsg_stricmp (char * str1,
+                   char * str2)
+{
+ 
+ESA_RC       rc= ESA_WARN;
+char         char1, char2;
+unsigned int ii;
+ 
+   for (ii= 0; str1[ii] AND str2[ii]; ii++)
+   {
+      char1= toupper(str1[ii]);
+      char2= toupper(str2[ii]);
+      if (char1 NE char2)
+         break;
+   }
+   if (str1[ii] EQ str2[ii])
+      rc= ESA_OK;
+ 
+   return (rc);
+ 
+}
+/* SAS2IBMN
+ *****************************************************************
+* Procedure Name: CTSAMSG_cs_init
+* Description   : Initialize a thread lock object
+* Input         :
+*               :
+* Return Value  :
+* Side Effects  :
+* Scope         :
+*****************************************************************
+void CTSAMSG_cs_init()
+{
+ 
+}
+ *****************************************************************
+* Procedure Name: CTSAMSG_cs_term
+* Description   : Terminate a thread lock object
+* Input         :
+*               :
+* Return Value  :
+* Side Effects  :
+* Scope         :
+*****************************************************************
+void CTSAMSG_cs_term()
+{
+ 
+}
+ *****************************************************************
+* Procedure Name: CTSAMSG_cs_lock
+* Description   : Lock a thread lock object
+* Input         :
+*               :
+* Return Value  :
+* Side Effects  :
+* Scope         :
+*****************************************************************
+void CTSAMSG_cs_lock()
+{
+ 
+}
+ *****************************************************************
+* Procedure Name: CTSAMSG_cs_unlock
+* Description   : Unlock a thread lock object
+* Input         :
+*               :
+* Return Value  :
+* Side Effects  :
+* Scope         :
+*****************************************************************
+void CTSAMSG_cs_unlock()
+{
+ 
+}
+*/

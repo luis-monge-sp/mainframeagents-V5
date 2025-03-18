@@ -1,0 +1,503 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: acsched.c %
+ * Instance        : %instance: 1 %
+ * Created by      : %created_by: leonid_s %
+ * Created on      : %date_created: Wed May 14 17:25:38 2003 %
+ * Current Version : %version: 15 %
+ * Last Modified by: %derived_by: leonid_s %
+ * Last Modified on: %date_modified: Wed May 14 17:25:38 2003 %
+ */
+ 
+/***********************************************
+ * Mod.ID   Who      When         Description
+ * =============================================
+ * SAS2IBMA AvnerL   21-Dec-16    SAS/C to IBM C Conversion Project
+ * BS10129  AvnerL   28-Dec-23    Recompile due to WS10078 ESAINIT
+ **********************************************/
+ 
+#include   "globs.h"
+ 
+ 
+#include   ESA_INIT
+#include   ESA_PROC
+#include   ESA_RSS
+#include   ESA_RSSF
+#include   ESA_CS_OS
+ 
+/**************************************************************
+* Procedure Name   : CS_intercept_scheduler
+* Description      : Control interceptor activity
+* Return Value     : ESA_RC
+**************************************************************/
+ 
+ESA_RC CS_intercept_scheduler (void)
+{
+  char fn[]="CS_intercept_sceduler";
+  ESA_RC                  rc= ESA_OK, OfliInerval_rc= ESA_OK;
+  char                    offline_intercept[2];
+  RSSTBL_rec_typ        * rsstbl = NULL;
+  int                     attach_rss_num, ii;
+  TIME_typ                cur_time,  next_time;  /*start_time,*/
+  DATE_typ                cur_date,  next_date;  /*start_date,*/
+  TIME_typ                OfliRunInterval="", OfliInterval="";
+  long int                OfliRunNum;
+  void                  * handle_log_evnt= NULL;
+  struct tm               NextTm;
+  time_t                  CurTimeNum, NextTimeNum;
+  ADMIN_PARAMS_rec_typ    admin_params;
+  static int              SendEvent= 0;
+ 
+  ENVIRONMENT_rec_typ   * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSCHED, DIAG_COMMON, fn);
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSCHED, 13,
+      "Number of RSSes=%d Maximum RSSes=%d Q_wait=%d.",
+      (int)envir_ptr->num_of_rss,
+      (int)envir_ptr->max_rss_num,
+      (int)envir_ptr->q_wait);
+  CLEAR (next_date);
+  CLEAR (next_time);
+/* First call to CS_intercept_sceduler only load
+ *  'startlst' struc. and exit
+ */
+ 
+  memcpy ((char *)&admin_params,
+	      (char *)&envir_ptr->msg_admin_param,
+		  sizeof (ADMIN_PARAMS_rec_typ));
+ 
+  if (envir_ptr->num_of_rss EQ 0) {
+    memset ((char *)envir_ptr->startlst, '\0',
+            sizeof(STARTLST_rec_typ)* envir_ptr->max_rss_num);
+ 
+    rc= tbl_load (&rsstbl,
+                  &envir_ptr->num_of_rss);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    for (ii= 0; ii LT envir_ptr->num_of_rss AND rc EQ ESA_OK; ii++) {
+      memcpy (envir_ptr->startlst[ii].rss,
+              rsstbl[ii].rss,
+              RSS_NAME_LEN);
+      strtok (envir_ptr->startlst[ii].rss,
+              " ");
+      memcpy (envir_ptr->startlst[ii].time,
+              rsstbl[ii].intercept_next_time,
+              TIME_LEN);
+      memcpy (envir_ptr->startlst[ii].date,
+              rsstbl[ii].intercept_next_date,
+              DATE_LEN);
+      memcpy (envir_ptr->startlst[ii].host,
+              rsstbl[ii].host,
+              HOST_NAME_LENGTH);
+      strtok (envir_ptr->startlst[ii].host,
+              " \n");
+ 
+      ESA_DIAG_printf (ESA_COMP_ACSCHED, 16,
+          "ii=%d: rss=%s time=%.6s date=%.8s host=%s.",
+          ii,
+          envir_ptr->startlst[ii].rss,
+          envir_ptr->startlst[ii].time,
+          envir_ptr->startlst[ii].date,
+          envir_ptr->startlst[ii].host);
+    }
+ 
+    ESA_DIAG_printf (ESA_COMP_ACSCHED, 11,
+        "tbl_load: file=%s rc=%d num_of_rss=%d.",
+        envir_ptr->file_rssofli,
+        (int)rc,
+        (int)envir_ptr->num_of_rss);
+  }
+ 
+  CS_get_cur_time (cur_date,
+                   cur_time);
+  ESA_DIAG_printf (ESA_COMP_ACSCHED, 16,
+          "Current time=%.6s date=%.8s.",
+          cur_time,
+          cur_date);
+ 
+  for (ii= 0; ii LT envir_ptr->num_of_rss ; ii++)
+  {
+    offline_intercept[0]='\0';
+    rc= rssprm_get (envir_ptr->startlst[ii].rss,
+                    OFLI_INTERCEPT,
+                    1,
+                    offline_intercept);
+    ESA_DIAG_printf (ESA_COMP_ACSCHED, 16,
+        "rssprm_get:ii=%d rss=%s rc=%d %s=%c.",
+         ii,
+         envir_ptr->startlst[ii].rss,
+         (int)rc,
+         OFLI_INTERCEPT,
+         offline_intercept[0]);
+    if (rc NE ESA_OK)
+      continue;
+ 
+    if (offline_intercept[0] EQ INTERCEPT_NOT_ACTIVE)
+    {
+      ESA_DIAG_printf (ESA_COMP_ACSCHED, 16,
+                       "offline interceptor %s is not active",
+                       envir_ptr->startlst[ii].rss);
+      continue;
+    }
+ 
+    /* Do not start interception for RSS if download
+     * had not processed
+     */
+    for (attach_rss_num= 0;
+         attach_rss_num LT envir_ptr->max_rss_num;
+         attach_rss_num++) {
+      ESA_DIAG_printf (ESA_COMP_ACSCHED, 16,
+         "%d: rss=%s ug+usr+u2ug=%d.",
+         (int)attach_rss_num,
+         envir_ptr->interest[attach_rss_num].rss,
+         (int)(envir_ptr->interest[attach_rss_num].pre_num_users+
+               envir_ptr->interest[attach_rss_num].pre_num_ugs+
+               envir_ptr->interest[attach_rss_num].pre_num_oes+
+               envir_ptr->interest[attach_rss_num].pre_num_u2ugs));
+      if (My_stricmp (envir_ptr->startlst[ii].rss,
+          envir_ptr->interest[attach_rss_num].rss) EQ 0)
+        break;
+    }
+    if (
+          (attach_rss_num GE envir_ptr->max_rss_num)
+         OR
+          (0  EQ (envir_ptr->interest[attach_rss_num].pre_num_ugs +
+                  envir_ptr->interest[attach_rss_num].pre_num_oes +
+                  envir_ptr->interest[attach_rss_num].pre_num_users +
+                  envir_ptr->interest[attach_rss_num].pre_num_u2ugs) )
+       )
+    {
+ 
+       if (envir_ptr->interest[attach_rss_num].ofli_activated NE
+		   ESS_YES_SIGN)
+       {
+          CTSAMSG_print (MSG_OFLI_NOT_ACTIVATED,
+                 admin_params.ctsamsg_handle, NULL,
+                 admin_params.ctsamsg_dest,
+                 envir_ptr->interest[attach_rss_num].rss);
+          envir_ptr->interest[attach_rss_num].ofli_activated=
+			  ESS_YES_SIGN;
+       }
+       ESA_DIAG_printf (ESA_COMP_ACSCHED, 16,
+          "Before first interception must be Douwnload for RSS %s.",
+           envir_ptr->startlst[ii].rss);
+       continue;
+    }
+    if (memcmp (envir_ptr->startlst[ii].date,
+                cur_date,
+                DATE_LEN) GT 0)
+    {
+      ESA_DIAG_printf (ESA_COMP_ACSCHED, 16,
+         "Offline interceptor %s \
+          was not submitted at %.8s-%.6s. \
+          Will submit at %.8s-%.6s.",
+         envir_ptr->startlst[ii].rss,
+         cur_date,
+         cur_time,
+         envir_ptr->startlst[ii].date,
+         envir_ptr->startlst[ii].time);
+      continue;
+    }
+    if (
+          (memcmp (envir_ptr->startlst[ii].date,
+                   cur_date,
+                   DATE_LEN) EQ 0)
+         AND
+          (memcmp (envir_ptr->startlst[ii].time,
+                   cur_time,
+                   TIME_LEN) GT 0)
+       )
+    {
+       ESA_DIAG_printf (ESA_COMP_ACSCHED, 16,
+          "Offline interceptor %s \
+           was not submitted at %.8s-%.6s. \
+           Will submit at %.8s-%.6s.",
+           envir_ptr->startlst[ii].rss,
+           cur_date,
+           cur_time,
+           envir_ptr->startlst[ii].date,
+           envir_ptr->startlst[ii].time);
+      continue;
+    }
+ 
+	OfliInerval_rc=rssprm_get_opt ((char *)envir_ptr->startlst[ii].rss,
+                        OFLI_INTERVAL,
+         			    TIME_LEN, OfliInterval,
+		    		    OPT_TRUE, OPT_FALSE);
+	rc= rssprm_get_opt ((char *)envir_ptr->startlst[ii].rss,
+		                OFLI_RUN_INTERVAL,
+         			    TIME_LEN, OfliRunInterval,
+		    		    OPT_TRUE, OPT_FALSE);
+	ESA_DIAG_printf (ESA_COMP_ACSCHED, 16,
+        "rss=%s Ofli: Interval=%s/rc=%d RunInterval=%s/rc=%d.",
+         envir_ptr->startlst[ii].rss,
+         OfliInterval, (int)OfliInerval_rc, OfliRunInterval, (int)rc);
+ 
+    if (rc NE ESA_OK)
+       strcpy (OfliRunInterval, DEF_OFLI_RUN_INTERVAL);
+    rc= ESA_OK;
+ 
+	if (
+		  (OfliInerval_rc EQ ESA_OK)
+		 AND
+		  (memcmp (OfliInterval, "000000", TIME_LEN) EQ 0)
+ 	   )
+	{
+       ESA_DIAG_printf (ESA_COMP_ACSCHED, DIAG_MORE,
+         "Offline interceptor %s willn't submitted (offl.interval == 000000)",
+          envir_ptr->startlst[ii].rss);
+       continue;
+	}
+ 
+    TrnsfIntervalToNumber ((char *)OfliRunInterval, &OfliRunNum);
+	CurTimeNum= time(NULL);
+    to_time_tm_convert (&NextTm,
+                        envir_ptr->startlst[ii].date,
+                        envir_ptr->startlst[ii].time);
+    NextTimeNum= mktime (&NextTm);
+ 
+    ESA_DIAG_printf (ESA_COMP_ACSCHED, 16,
+        "OfliRunNum=%d CurTimeNum=%d NextTimeNum=%d Q_wait=%d.",
+		OfliRunNum, CurTimeNum, NextTimeNum, (int)envir_ptr->q_wait);
+    if (OfliRunNum LE envir_ptr->q_wait)
+	{
+       if (SendEvent EQ 0)
+	   {
+          CTSAMSG_print (ERR_QWAIT_INTRCPT_INTRVL,
+                      admin_params.ctsamsg_handle, NULL,
+                      admin_params.ctsamsg_dest,
+                      envir_ptr->startlst[ii].rss);
+ 
+          CTSLogEvent (admin_params.rss_type,
+                    admin_params.rss_name,
+                    handle_log_evnt,
+                    ERR_QWAIT_INTRCPT_INTRVL,
+                    envir_ptr->startlst[ii].rss);
+	   }
+       OfliRunNum= envir_ptr->q_wait+ 1;
+	   SendEvent++;
+    }
+    rc= set_next_time(envir_ptr->startlst[ii].rss,
+		              (OfliInerval_rc EQ ESA_OK) ? OfliInterval : NULL,
+                      envir_ptr->startlst[ii].date,
+                      envir_ptr->startlst[ii].time);
+    memcpy (next_time,
+            envir_ptr->startlst[ii].time,
+            TIME_LEN);
+    memcpy (next_date,
+            envir_ptr->startlst[ii].date,
+            DATE_LEN);
+    if (rc NE ESA_OK) {
+      ESA_DIAG_printf (ESA_COMP_ACSCHED, 16,
+                       "Fail set_next_time for rss %s.",
+                       envir_ptr->startlst[ii].rss);
+      continue;
+    }
+    ESA_DIAG_printf (ESA_COMP_ACSCHED, DIAG_BASIC,
+         "Next Offline Interceptor for rss %s will run at: time=%.6s date=%.8s host=%s.",
+          envir_ptr->startlst[ii].rss, envir_ptr->startlst[ii].time,
+          envir_ptr->startlst[ii].date, envir_ptr->startlst[ii].host);
+ 
+ 
+    strcpy (admin_params.rss_name,
+	       envir_ptr->interest[attach_rss_num].rss);
+    if (My_stricmp (envir_ptr->interest[envir_ptr->rss_num].rss_type,
+                envir_ptr->interest[attach_rss_num].rss_type) NE 0)
+    {
+ 
+       strcpy (admin_params.rss_type,
+		       envir_ptr->interest[attach_rss_num].rss_type);
+       strcpy (admin_params.admin_uname, "");
+       strcpy (admin_params.admin_gname, "");
+       admin_params.os_proc_handle= envir_ptr->os_proc_handle;
+       envir_ptr->num_intercept_rec= 0;
+ 
+       rc= CS_attach_rss (
+                  &admin_params,
+			      HOT_PATH_OFF,
+		          envir_ptr->interest[attach_rss_num].rss,
+                  envir_ptr->interest[attach_rss_num].rss_type);
+       if (rc NE ESA_OK)
+	   {
+          CTSLogEvent (envir_ptr->interest[envir_ptr->rss_num].rss_type,
+                       envir_ptr->interest[envir_ptr->rss_num].rss,
+                       handle_log_evnt,
+                       ERR_APIINIT,
+   		               envir_ptr->interest[attach_rss_num].rss,
+                       envir_ptr->interest[attach_rss_num].rss_type);
+          continue;
+	   }
+    }
+ 
+    envir_ptr->rss_num= attach_rss_num;
+ 
+    if (rsstbl NE NULL)
+    {
+        CSA_free ((char **)&rsstbl);
+        rsstbl = NULL;
+    }
+    rc= tbl_load (&rsstbl,
+                  &envir_ptr->num_of_rss);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    for (ii= 0; ii LT envir_ptr->num_of_rss AND rc EQ ESA_OK; ii++) {
+      memcpy (envir_ptr->startlst[ii].rss,
+              rsstbl[ii].rss,
+              RSS_NAME_LEN);
+      strtok (envir_ptr->startlst[ii].rss,
+              " ");
+      memcpy (envir_ptr->startlst[ii].time,
+              rsstbl[ii].intercept_next_time,
+              TIME_LEN);
+      memcpy (envir_ptr->startlst[ii].date,
+              rsstbl[ii].intercept_next_date,
+              DATE_LEN);
+      memcpy (envir_ptr->startlst[ii].host,
+              rsstbl[ii].host,
+              HOST_NAME_LENGTH);
+      strtok (envir_ptr->startlst[ii].host,
+              " \n");
+ 
+      ESA_DIAG_printf (ESA_COMP_ACSCHED, 16,
+          "ii=%d: rss=%s time=%.6s date=%.8s host=%s.",
+          ii,
+          envir_ptr->startlst[ii].rss,
+          envir_ptr->startlst[ii].time,
+          envir_ptr->startlst[ii].date,
+          envir_ptr->startlst[ii].host);
+    }
+ 
+    ESA_DIAG_printf (ESA_COMP_ACSCHED, 11,
+        "tbl_load: file=%s rc=%d num_of_rss=%d.",
+        envir_ptr->file_rssofli,
+        (int)rc,
+        (int)envir_ptr->num_of_rss);
+ 
+    for (ii= 0; ii LT envir_ptr->num_of_rss; ii++) {
+      if (My_stricmp (envir_ptr->startlst[ii].rss,
+                  envir_ptr->interest[attach_rss_num].rss) EQ 0)
+          break;
+    }
+ 
+    if (ii GE envir_ptr->num_of_rss) {
+ 
+       CTSAMSG_print (MSG_OFLI_FILE_CORRUPTED,
+                      admin_params.ctsamsg_handle, NULL,
+                      admin_params.ctsamsg_dest,
+                      envir_ptr->file_rssofli);
+       rc= ESA_ERR;
+       goto cleanup;
+    }
+    memcpy (envir_ptr->startlst[ii].time,
+            next_time,
+            TIME_LEN);
+    memcpy (envir_ptr->startlst[ii].date,
+            next_date,
+            DATE_LEN);
+ 
+    memcpy (rsstbl[ii].intercept_next_time,
+            envir_ptr->startlst[ii].time,
+            TIME_LEN);
+    memcpy (rsstbl[ii].intercept_next_date,
+            envir_ptr->startlst[ii].date,
+            DATE_LEN);
+ 
+    /*
+      Check if offline semaphore is busy.
+    */
+ 
+    /* Rewrite rss table */
+    rc= tbl_rebuild (rsstbl, envir_ptr->num_of_rss);
+    ESA_DIAG_printf (ESA_COMP_ACSCHED, 16,
+           "tbl_rebuild: file=%s rc=%d.",
+            envir_ptr->file_rssofli, (int)rc);
+ 
+	if (
+		  (CurTimeNum LT NextTimeNum+ OfliRunNum)
+		 OR
+		  (OfliInerval_rc EQ ESA_OK)
+	   )
+	{
+       rc= CSA_lock (
+         envir_ptr->interest[envir_ptr->rss_num].file_ofli_semaphore,
+         fn, SCOPE_LOCAL);
+       if (rc NE ESA_OK) {
+          ESA_DIAG_printf (ESA_COMP_ACSCHED, DIAG_BASIC,
+             "Offline Interceptor can't submitted: Offline semaphore %s is busy (rc=%d)",
+          envir_ptr->interest[envir_ptr->rss_num].file_ofli_semaphore,
+          (int)rc);
+	      if (rc EQ ESA_TERM_CTSA)
+		     goto cleanup;
+          rc= ESA_OK;
+          continue;
+	   }
+       rc= CSA_unlock
+         (envir_ptr->interest[envir_ptr->rss_num].file_ofli_semaphore,
+         fn);
+ 
+       ESA_DIAG_printf (ESA_COMP_ACSCHED, 16,
+         "Offline interceptor %s submitted at %.8s-%.6s rc_unlock=%d.",
+          envir_ptr->startlst[ii].rss, cur_date, cur_time, (int)rc);
+ 
+       ESA_DIAG_printf (ESA_COMP_ACSCHED, DIAG_BASIC,
+    		"    -> Call to CTSInterceptorStart USA-API for RSS=%s Host=%s.",
+			envir_ptr->interest[envir_ptr->rss_num].rss,
+			envir_ptr->startlst[ii].host);
+       rc= envir_ptr->func_ptr.rss_start_intercept_ptr
+           (envir_ptr->interest[envir_ptr->rss_num].rss,
+            envir_ptr->startlst[ii].host,
+            &admin_params,
+            &envir_ptr->msg_err);
+       ESA_DIAG_printf (ESA_COMP_ACSCHED, DIAG_BASIC,
+			"    <- CTSInterceptorStart USA-API completed with rc=%d (%s)",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+ 
+       ESA_DIAG_printf (ESA_COMP_ACSCHED, 16,
+                     "rss_start_intercept for rss %s rc=%d.",
+                     envir_ptr->startlst[ii].rss,
+                     (int)rc);
+       if (rc NE ESA_OK)
+	   {
+          CTSAMSG_print (MSG_OFLI_END_ERR,
+                      admin_params.ctsamsg_handle, NULL,
+                      admin_params.ctsamsg_dest,
+                      envir_ptr->interest[envir_ptr->rss_num].rss);
+          CTSLogEvent (admin_params.rss_type,
+                    admin_params.rss_name,
+                    handle_log_evnt,
+                    MSG_OFLI_END_ERR,
+                    envir_ptr->interest[envir_ptr->rss_num].rss);
+          rc = ESA_OK;
+	   }
+       else
+          CTSAMSG_print (MSG_OFLI_ACTIVATED,
+                 admin_params.ctsamsg_handle, NULL,
+                 admin_params.ctsamsg_dest,
+                 admin_params.rss_name);
+    }
+	else
+       ESA_DIAG_printf (ESA_COMP_ACSCHED, 16,
+           "Rss=%s: Offline interceptor run skiped.",
+		   envir_ptr->interest[envir_ptr->rss_num].rss);
+ 
+  }
+ 
+  cleanup:
+  if (rsstbl NE NULL)
+  {
+     CSA_free ((char **)&rsstbl);
+     rsstbl = NULL;
+  }
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                   admin_params.ctsamsg_handle, NULL,
+                   admin_params.ctsamsg_dest, fn);
+  ESA_DIAG_exit (ESA_COMP_ACSCHED, DIAG_COMMON, fn, rc);
+  return (rc);
+ 
+}
+ 

@@ -1,0 +1,1398 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: esaque.c %
+ * Instance        : %instance: 1 %
+ * Created by      : %created_by: leonid_s %
+ * Created on      : %date_created: Thu May 15 11:31:20 2003 %
+ * Current Version : %version: 18 %
+ * Last Modified by: %derived_by: leonid_s %
+ * Last Modified on: %date_modified: Thu May 15 11:31:21 2003 %
+ */
+ 
+/***********************************************
+ * Mod.ID  Who      When         Description
+ * =============================================
+ * ws0455 Shmuelk   17/06/01     MVS-adapt OS-Q-rename
+ * SAS2IBMA AvnerL  21-Dec-16    SAS/C to IBM C Conversion Project
+ * SAS2IBMN NuritY  19-Feb-17    SAS/C to IBM C Conversion Project
+ * BS10076  SeligT  11-Dec-17    Organize Connector Locking
+ *                               Functions and Structures
+ **********************************************/
+ 
+/***************************************************************
+* This package includes the following functions:              *
+*                                                             *
+*  - OS_Q_rename ws0455 (WSAN100761 for Tandem )              *
+*  - OS_Q_create                                              *
+*  - OS_Q_open                                                *
+*  - OS_Q_close                                               *
+*  - OS_Q_get                                                 *
+*  - OS_Q_read                                                *
+*  - OS_Q_put                                                 *
+*                                                             *
+* This package requires the following OS functions:           *
+*                                                             *
+*  - OS_FILE_open                                             *
+*  - OS_FILE_close                                            *
+*  - OS_FILE_write                                            *
+*  - OS_FILE_read                                             *
+*  - OS_FILE_flush                                            *
+*  - OS_FILE_seek                                             *
+*  - OS_FILE_tell                                             *
+*                                                             *
+*  - OS_CS_lock_init                                          *
+*  - OS_CS_lock_term                                          *
+*  - OS_CS_lock                                               *
+*  - OS_CS_unlock                                             *
+*                                                             *
+*  - OS_CS_wait                                               *
+*                                                             *
+*                                                             *
+***************************************************************
+*                                                             *
+*  Queue structure                                            *
+* -----------------                                           *
+*                                                             *
+*  The queue is implemented as a single wrap-around file.     *
+*  It is designed for multiple readers and writers.           *
+*                                                             *
+*  The first record (Rec0) holds the current positions:       *
+*  get  - where to get next item.                             *
+*  put  - where to put next item.                             *
+*  last - highest occupied position.                          *
+*  end  - maximum size allowed.                               *
+*                                                             *
+*  Each item written to the queue is prefixed with            *
+*  4-bytes length.                                            *
+*                                                             *
+*  Each put/get operation involves:                           *
+*   - lock the file                                           *
+*   - read Rec0                                               *
+*   - determine the put/get position (wrap-around if needed)  *
+*   - put/get item                                            *
+*   - update Rec0                                             *
+*   - unlock the file                                         *
+*                                                             *
+*  If the queue is empty (get) or full (put) -                *
+*  the operation is retried for the specified time.           *
+*                                                             *
+**************************************************************/
+ 
+#include   "globs.h"
+ 
+ 
+/*
+ *   Standard include files
+ */
+ 
+#include   ERRNO
+#include   FCNTL
+#include   STDIO
+#include   STDLIB
+#include   STRING
+#include   TIME
+ 
+#include   MEMORY
+ 
+#include   CTYPE
+ 
+/*
+ *   CONTROL-SA include files
+ */
+ 
+#include   ESA_CTSAMSG
+#include   ESA_INIT
+ 
+#include   ESA_QUEUE
+#include   ESA_QUEUE_OS
+ 
+#include   ESA_DIAG
+#include   ESA_API
+#include   ESA_API_CODES
+#include   ESA_CS_OS
+ 
+#define __MSG_PARAMS  (*msg_params)
+ 
+static char  diagPrintBuff[200];      /* User for diag print */
+                                      /* QUEUE buffer        */
+ 
+/**************************************************************
+*                                                             *
+*   update crypt unprintable symbols                          *
+*                                                             *
+**************************************************************/
+ 
+static void update_crypt_symb (char * buf,
+                               int    len,
+                               char   smb)
+{
+   int    i;
+   char   func[]="update_crypt_symb";
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+   for (i=0; i LT len ; i++, buf++ ) {
+      if ( isprint( *buf ) EQ 0 )   /* Unprintable symbol */
+         *buf = smb ;
+    }
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, ESA_RC_VOID);
+} /* update_crypt_symb */
+ 
+ 
+/****************************************************
+ * Procedure Name: OS_Q_rename
+ *
+ * Description   : Rename the temporary Q file to
+ *                  permanent name
+ *
+ * Input         : Queue file temp name
+ *                 Queue file perm name
+ *                 CTSAMSG params
+ *
+ * Output        : None (the queue file is renamed)
+ *
+ * Return Value  : ESA_OK     upon success
+ *                 ESA_FATAL  on any fail situation
+ *
+ ****************************************************/
+ 
+ESA_RC OS_Q_rename (char * RenameFrom ,
+     char * RenameTo,
+                    CTSAMSG_PARAMS_rec_typ * msg_params)
+{
+   ESA_RC      rc           = ESA_NOT_SUPP;
+   char        fn[]         = "OS_Q_rename";
+ 
+ 
+   ESA_DIAG_enter (ESA_COMP_QUEUE, DIAG_COMMON, fn );
+   ESA_DIAG_printf (ESA_COMP_QUEUE, DIAG_OS, "...<->: %d.", __LINE__);
+ 
+ /*ws0455 if (rc NE ESA_OK) */
+ /*on mvs rc is ESA_NOT_SUPP*/
+   if (rc EQ ESA_ERR)
+      CTSAMSG_print (ERR_CS_FUNCTION,
+                     msg_params->ctsamsg_handle, NULL,
+                     msg_params->ctsamsg_dest, fn);
+ 
+   ESA_DIAG_exit (ESA_COMP_QUEUE, DIAG_COMMON, fn, rc );
+   return (rc);
+ 
+}
+ 
+ 
+/****************************************************
+ * Procedure Name: OS_Q_create
+ *
+ * Description   : Create/initialize the queue file
+ *
+ * Input         : Queue file name
+ *                 Queue file maximum size
+ *                 CTSAMSG params
+ *
+ * Output        : None (the queue file is created)
+ *
+ * Return Value  : ESA_OK     upon success
+ *                 ESA_FATAL  on any fail situation
+ *
+ * Logic         : if the file does not exist - create it
+ *                 initialize Record 0 and write it
+ *                 write messages.
+ *
+ * Note:           For MVS, the queue size must be a multiple
+ *                 of the block size therefore we get
+ *                 the real size of the queue back from the
+ *                 os_format function (based on the qsize parm)
+ *
+ ****************************************************/
+ 
+ESA_RC OS_Q_create (char                   * qname,
+                    long                     qsize,
+                    CTSAMSG_PARAMS_rec_typ * msg_params)
+{
+   ESA_RC rc = ESA_OK;
+   Q_REC0 rec0;
+   void *qfile;
+   long pos;
+   int new_file = TRUE;
+   long real_qsize ;
+ 
+   static char func[]="OS_Q_create";
+ 
+   ESA_DIAG_enter (ESA_COMP_QUEUE, DIAG_COMMON, func );
+   ESA_DIAG_printf (ESA_COMP_QUEUE, DIAG_OS, "...<->: %d.", __LINE__);
+ 
+   real_qsize =  qsize;
+ 
+   /* in MVS the queue file must be pre-defined */
+ 
+   /***** get queue size (MVS only) *****/
+ 
+   rc = OS_FILE_format ( qname, &real_qsize, msg_params );
+ 
+   if ( (rc NE ESA_OK) OR (real_qsize EQ 0) ) {
+      rc = ESA_FATAL;
+      goto the_exit;
+      }
+   new_file = FALSE;
+ 
+   /***** create a new queue file *****/
+   rc = OS_FILE_open ( qname, "w+b", &qfile, msg_params );
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto the_exit;
+      }
+ 
+   /***** init record 0 fields *****/
+ 
+   /* we write record 0 to get the position after it */
+ 
+   rc = OS_FILE_write ( &rec0, sizeof(rec0), qfile, msg_params );
+   pos = OS_FILE_tell ( qfile, msg_params );
+ 
+   memcpy((char *)rec0.eye_catcher,"CTSA",4);
+   rec0.wrap     = FALSE ;
+   rec0.get_pos  = pos;
+   rec0.put_pos  = pos;
+   rec0.last_pos = pos;
+   rec0.end_pos  = real_qsize;
+ 
+   /***** write record 0 *****/
+ 
+   OS_FILE_seek ( qfile, 0, SEEK_SET, msg_params );
+   rc= OS_FILE_write ( &rec0, sizeof(rec0), qfile, msg_params );
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto the_exit;
+      }
+ 
+   ESA_DIAG_printf (ESA_COMP_QUEUE, DIAG_OS,
+                   "queue initialized. start : %d end: %d",
+                    rec0.get_pos, rec0.end_pos );
+ 
+ 
+   /***** print "Queue created" msg *****/
+ 
+   if (new_file EQ TRUE)
+      CTSAMSG_print(MSG_QUEUE_CREATE,
+                  msg_params->ctsamsg_handle,
+                  NULL,
+                  msg_params->ctsamsg_dest,
+                  qname);
+ 
+   /***** print "Queue initialized" msg *****/
+ 
+   CTSAMSG_print (MSG_QUEUE_INIT,
+                  msg_params->ctsamsg_handle,
+                  NULL,
+                  msg_params->ctsamsg_dest,
+                  real_qsize);
+ 
+   OS_FILE_close ( &qfile, msg_params );
+ 
+ 
+   the_exit:;
+ 
+   if (rc NE ESA_OK)
+      QUEUE_ERR ( "Create", qname );
+ 
+   ESA_DIAG_exit (ESA_COMP_QUEUE, DIAG_COMMON, func, rc );
+   return rc;
+} /* OS_Q_create */
+ 
+/****************************************************
+ * Procedure Name: OS_Q_open
+ *
+ * Description   : Open the queue file
+ *
+ * Input         : Queue file name
+ *                 Queue handle (pointer)
+ *                 CTSAMSG params
+ *
+ * Output        : Handle fields are initialized.
+ *
+ * Return Value  : ESA_OK     upon success
+ *                 ESA_FATAL  on any fail situation
+ *
+ * Logic         : call OS_FILE_open
+ *                 call OS_CS_lock_init
+ *                 read Rec0 and check that queue is init'd
+ *                 initialize the handle.
+ *
+ * Note:           The queue must be initialized before
+ *                 (by OS_Q_create).
+ *                 This function verifies that by checking the
+ *                 existence of record 0.
+ *
+ ****************************************************/
+ 
+ESA_RC OS_Q_open (char                   * qname,
+                  Q_HANDLE               * q_handle,
+                  CTSAMSG_PARAMS_rec_typ * msg_params)
+{
+   char                  func[]= "OS_Q_open";
+   ESA_RC                rc = ESA_OK;
+   void                * file_hndl= NULL;
+   void                * lock_handle=0;
+   int                   q_locked = FALSE;
+   FILE                * real_fh;
+   Q_REC0                rec0;
+   /* BS10076 no need for these fields any longer
+   char                  wait_seconds[RSSPRM_VALUE_LEN+ 1];
+   int                   seconds;                                     */
+   char                  wait_queue_char[10] = " ";        /* BS10076 */
+   char                  wait_queue_interval_char[10]=" "; /* BS10076 */
+   int                   wait_queue_value;                 /* BS10076 */
+   int                   wait_queue_interval_value;        /* BS10076 */
+   ENVIRONMENT_rec_typ * envir_ptr;
+ 
+   CS_get_envir_address (&envir_ptr);
+ 
+   ESA_DIAG_enter (ESA_COMP_QUEUE, DIAG_COMMON, func);
+   ESA_DIAG_printf (ESA_COMP_QUEUE, DIAG_OS, "...<->: %d.", __LINE__);
+ 
+   /***** open queue file *****/
+   rc = OS_FILE_open ( qname, "r+b", &file_hndl, msg_params );
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto the_exit;
+   }
+ 
+   /***** init lock *****/
+ 
+   OS_FILE_getfh( file_hndl, &real_fh, msg_params);
+ 
+   /* * * * * * * BS10076 start * * * * * * */
+   rc = rssprm_get_opt (ALL_RSS, "WAIT_QUEUE",
+                    sizeof(wait_queue_char),
+                    wait_queue_char,
+                    OPT_TRUE,
+                    OPT_FALSE);
+ 
+   if (rc EQ ESA_OK)
+      wait_queue_value = atoi(wait_queue_char);
+   else
+      wait_queue_value = WAIT_QUEUE_TOTAL;
+ 
+   ESA_DIAG_printf (ESA_COMP_QUEUE, 6,
+                    "WAIT_QUEUE parm = <%s> = <%d>",
+                    wait_queue_char,
+                    wait_queue_value);
+ 
+   rc = rssprm_get_opt (ALL_RSS, "WAIT_QUEUE_INTERVAL",
+                    sizeof(wait_queue_interval_char),
+                    wait_queue_interval_char,
+                    OPT_TRUE,
+                    OPT_FALSE);
+ 
+   if (rc EQ ESA_OK)
+      wait_queue_interval_value = atoi(wait_queue_interval_char);
+   else
+      wait_queue_interval_value = WAIT_QUEUE_INTERVAL_DFLT;
+ 
+   ESA_DIAG_printf (ESA_COMP_QUEUE, 6,
+                    "WAIT_QUEUE_INTERVAL parm = <%s> = <%d>",
+                    wait_queue_interval_char,
+                    wait_queue_interval_value);
+   /* * * * * * * BS10076 end * * * * * * */
+ 
+   /* BS10076
+   rc = OS_CS_lock_init (qname, LOCK_RES_FILE, &lock_handle,
+                         real_fh, SCOPE_REMOTE, msg_params);         */
+   rc = OS_CS_lock_init (qname, &lock_handle,             /* BS10076 */
+                         wait_queue_value,                /* BS10076 */
+                         wait_queue_interval_value,       /* BS10076 */
+                         SCOPE_REMOTE, msg_params);       /* BS10076 */
+   if (rc NE ESA_OK) {
+      rc= ESA_TERM_CTSA;
+      goto the_exit;
+      }
+ 
+   /***** Lock File *****/
+ 
+   /* we lock the queue file to ensure that the read for */
+   /* record 0 will not fail */
+ 
+   /* BS10076 remove these lines
+   CLEAR (wait_seconds);
+   rc= envir_ptr->msg_admin_param.cs_func.rssprm_get_ptr (ALL_RSS,
+             WAIT_LOCK, 10, wait_seconds);
+ 
+   if (rc NE ESA_OK)
+      goto the_exit;
+   seconds= atoi (wait_seconds);                                     */
+ 
+   rc = OS_CS_lock ( lock_handle, /* BS10076 seconds, */ msg_params );
+   if (rc NE ESA_OK) {
+      CTSAMSG_print(ERR_QUEUE_LOCKED,
+                  msg_params->ctsamsg_handle,
+                  NULL,
+                  msg_params->ctsamsg_dest,
+                  qname );
+      if (rc EQ ESA_FATAL)
+         rc= ESA_TERM_CTSA;
+   else
+         rc= ESA_LOCKED;
+      goto the_exit;
+      }
+   else q_locked = TRUE;
+ 
+   /***** read Record 0 *****/
+ 
+   OS_FILE_seek ( file_hndl, 0, SEEK_SET, msg_params );
+   rc = OS_FILE_read ( &rec0, sizeof(rec0), file_hndl, msg_params );
+   if (rc NE ESA_OK) {   /* i/o error */
+      rc = ESA_FATAL;
+      goto the_exit;
+      }
+ 
+   /***** check if queue initialized *****/
+ 
+   if (memcmp((char *)rec0.eye_catcher,"CTSA",4) NE 0) {
+      CTSAMSG_print(ERR_QUEUE_INIT,
+                    msg_params->ctsamsg_handle,
+                    NULL,
+                    msg_params->ctsamsg_dest,
+                    qname);
+      rc = ESA_FATAL;
+      goto the_exit;
+      }
+ 
+   /***** init handle fields *****/
+ 
+   q_handle->file  = file_hndl;
+   q_handle->lock  = lock_handle;
+   strncpy(q_handle->qname,qname,MAX_FILENAME_LEN);
+   q_handle->msg_params = msg_params;
+   q_handle->ctsamsg_handle = msg_params->ctsamsg_handle;
+   q_handle->ctsamsg_dest  = msg_params->ctsamsg_dest;
+ 
+   /* SAS2IBMN - start */
+   /* Call flush to force reading rec0 from file next time */
+   rc = OS_FILE_flush (file_hndl, msg_params );
+   if (rc NE ESA_OK)
+      rc = ESA_FATAL;
+   /* SAS2IBMN - end   */
+   /***** terminate *****/
+ 
+   the_exit:;
+ 
+   if (q_locked EQ TRUE)
+      OS_CS_unlock( lock_handle, msg_params);
+ 
+   if (rc NE ESA_OK)
+      QUEUE_ERR ( "Open", qname );
+ 
+ 
+   ESA_DIAG_exit (ESA_COMP_QUEUE, DIAG_COMMON, func, rc);
+   return rc;
+ 
+}  /* OS_Q_open */
+ 
+#undef  __MSG_PARAMS
+#define __MSG_PARAMS  (*q_handle)
+ 
+/****************************************************
+ * Procedure Name: OS_Q_close
+ *
+ * Description   : Close the queue file
+ *
+ * Input         : Queue handle (pointer)
+ *
+ * Output        : Handle fields are cleared.
+ *
+ * Return Value  : ESA_OK     upon success
+ *                 ESA_FATAL  on any fail situation
+ *
+ *
+ * Logic         : call OS_FILE_close
+ *                 call OS_CS_lock_term
+ *                 clear handle fields
+ *
+ ****************************************************/
+ 
+ESA_RC OS_Q_close (Q_HANDLE * q_handle)
+{
+   ESA_RC  rc = ESA_OK;
+   void  * lock_handle;
+ 
+   static char func[]= "OS_Q_close";
+ 
+   ESA_DIAG_enter (ESA_COMP_QUEUE, DIAG_COMMON, func);
+   ESA_DIAG_printf (ESA_COMP_QUEUE, DIAG_OS, "...<->: %d.", __LINE__);
+ 
+   if  (q_handle EQ NULL)
+       goto the_exit;
+ 
+   /***** close queue file *****/
+ 
+   rc = OS_FILE_close( &(q_handle->file), q_handle->msg_params );
+   if (rc NE 0) {
+      rc = ESA_FATAL;
+      goto the_exit;
+      }
+ 
+   /***** term lock *****/
+ 
+   lock_handle = q_handle->lock;
+   rc = OS_CS_lock_term(&lock_handle,
+                        q_handle->msg_params);
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto the_exit;
+      }
+ 
+   /***** clear handle fields *****/
+ 
+   q_handle->file = NULL;
+   q_handle->lock = NULL;
+   q_handle->ctsamsg_handle = NULL;
+   q_handle->ctsamsg_dest  = NULL;
+ 
+   the_exit:;
+ 
+   if (rc NE ESA_OK)
+      QUEUE_ERR ( "Close", q_handle->qname );
+ 
+   ESA_DIAG_exit (ESA_COMP_QUEUE, DIAG_COMMON, func, rc);
+   return rc;
+ 
+}  /* OS_Q_close */
+ 
+/****************************************************
+ * Procedure Name: do_put
+ *
+ * Description   : perform the actual write to the queue
+ *
+ * Input         : queue block (length + data)
+ *                 wait time (for lock)
+ *                 queue handle
+ *
+ * Output        : none
+ *
+ * Return Value  : 1 - I/O error
+ *                 2 - queue locked
+ *                 3 - queue full
+ *
+ * Logic         : see "Queue structure"
+ *
+ ****************************************************/
+ 
+static int do_put (Q_BLK    * q_blk,
+                   int        wait,
+                   Q_HANDLE * q_handle)
+{
+   Q_REC0 rec0;
+   void *qfile;
+   int len;
+   int q_locked = FALSE;
+   int rc = 0;
+   int flush_rc = 0;                                     /* SAS2IBMN */
+ 
+   static char func[]="do_put";
+ 
+   ESA_DIAG_enter (ESA_COMP_QUEUE, DIAG_COMMON, func);
+   ESA_DIAG_printf (ESA_COMP_QUEUE, DIAG_COMMON,
+                    "...<->: %d.", __LINE__);
+ 
+   /***** init *****/
+ 
+   qfile = q_handle->file;
+   len   = q_blk->len + sizeof(int);
+ 
+   /**** lock file *****/
+ 
+   /* BS10076
+   rc = OS_CS_lock(q_handle->lock,wait,q_handle->msg_params);        */
+   rc = OS_CS_lock(q_handle->lock, q_handle->msg_params); /* BS10076 */
+   if (rc NE ESA_OK) {
+      if (rc EQ ESA_FATAL)
+         rc= ESA_TERM_CTSA;
+   else
+         rc= 2;
+      goto the_exit;
+   }
+   else q_locked = TRUE;
+ 
+   /***** read Record 0 *****/
+ 
+   OS_FILE_seek( qfile, 0, SEEK_SET, q_handle->msg_params );
+   rc = OS_FILE_read ( &rec0, sizeof(rec0), qfile,
+                       q_handle->msg_params );
+   if (rc NE ESA_OK) {   /* i/o error */
+      rc = 1;
+      goto the_exit;
+      }
+ 
+   ESA_DIAG_printf (ESA_COMP_QUEUE, 11,                   /* SAS2IBMN */
+                   "rec0 = %s, %d, %d, %d, %d, %d",       /* SAS2IBMN */
+                    rec0.eye_catcher, rec0.get_pos,       /* SAS2IBMN */
+                    rec0.put_pos, rec0.last_pos,          /* SAS2IBMN */
+                    rec0.end_pos, rec0.wrap);             /* SAS2IBMN */
+ 
+   /***** check put position *****/
+ 
+   if (NOT rec0.wrap) {
+      if ((rec0.put_pos + len) GT rec0.end_pos) {
+         if ((sizeof(Q_REC0) + len) GT (unsigned long)rec0.get_pos) {
+            rc = 3;                    /* file is full               */
+            /* SAS2IBMN goto the_exit; */
+            goto do_flush;                               /* SAS2IBMN */
+         }
+         else {
+            rec0.wrap    = TRUE ;          /* mark wrap mode */
+            rec0.put_pos = sizeof(Q_REC0); /* wrap around    */
+            ESA_DIAG_printf (ESA_COMP_QUEUE, 11,
+                             "queue wrap-around (put) ");
+         }
+      }
+   }
+   else {    /* wrap mode */
+      if ((rec0.put_pos + len) GT rec0.get_pos) {
+         rc = 3;                         /* file is full             */
+         /* SAS2IBMN goto the_exit;   */
+         goto do_flush;                                  /* SAS2IBMN */
+      }
+   }
+ 
+   /***** set position and write record *****/
+ 
+   OS_FILE_seek ( qfile, rec0.put_pos, SEEK_SET, q_handle->msg_params );
+   ESA_DIAG_printf (ESA_COMP_QUEUE, 11,
+                    "before write. pos: %d len: %d",
+                    rec0.put_pos, len );
+ 
+   if ( ESA_DIAG_get_debug_level(ESA_COMP_QUEUE) GT 10 ) {
+ 
+     if ( q_blk->len GT (int)( sizeof(diagPrintBuff) - 2 )) {
+        memcpy( (char *)diagPrintBuff, (char *)q_blk->data,
+                sizeof(diagPrintBuff) - 2);
+        diagPrintBuff[sizeof(diagPrintBuff) - 1 ] = NULL_CHAR ;
+     }
+     else {
+        memcpy( (char *)diagPrintBuff , (char *)q_blk->data ,
+                (unsigned)q_blk->len );
+        diagPrintBuff[ q_blk->len ] = NULL_CHAR ;
+     }
+ 
+     update_crypt_symb (diagPrintBuff, (int)strlen(diagPrintBuff),
+                        '.' );
+ 
+     ESA_DIAG_printf (ESA_COMP_QUEUE, 0, "Write=%d %d/%s",
+                                      len,  q_blk->len, diagPrintBuff);
+   }
+ 
+   rc = OS_FILE_write ( q_blk, (unsigned)len, qfile,
+                        q_handle->msg_params );
+   if (rc NE ESA_OK) {
+      rc = 1;
+      /* SAS2IBMN goto the_exit; */
+      goto do_flush;                                     /* SAS2IBMN */
+      }
+ 
+   /***** update Record 0 fields *****/
+ 
+   rec0.put_pos = OS_FILE_tell ( qfile, q_handle->msg_params );
+ 
+   if (rec0.put_pos GT rec0.last_pos)
+      rec0.last_pos = rec0.put_pos;
+ 
+   ESA_DIAG_printf (ESA_COMP_QUEUE, 11,                   /* SAS2IBMN */
+                   "new rec0 = %s, %d, %d, %d, %d, %d",   /* SAS2IBMN */
+                    rec0.eye_catcher, rec0.get_pos,       /* SAS2IBMN */
+                    rec0.put_pos, rec0.last_pos,          /* SAS2IBMN */
+                    rec0.end_pos, rec0.wrap);             /* SAS2IBMN */
+ 
+   /***** write Record 0 *****/
+ 
+   rc = OS_FILE_seek ( qfile, 0, SEEK_SET, q_handle->msg_params );
+   rc = OS_FILE_write ( &rec0, sizeof(rec0), qfile,
+                        q_handle->msg_params );
+   if (rc NE ESA_OK) {
+      rc = 1;
+      /* SAS2IBMN goto the_exit; */
+      goto do_flush;                                     /* SAS2IBMN */
+      }
+ 
+   /***** flush buffers *****/
+ 
+ do_flush:;                                              /* SAS2IBMN */
+   /* SAS2IBMN - start */
+   /*
+   rc = OS_FILE_flush ( qfile, q_handle->msg_params );
+   if (rc NE ESA_OK) {
+      rc = 1;
+      goto the_exit;
+      }
+   */
+   flush_rc = OS_FILE_flush ( qfile, q_handle->msg_params );
+   if (flush_rc NE ESA_OK)
+      rc = 1;
+   /* SAS2IBMN - end   */
+ 
+ the_exit:;
+ 
+   if (q_locked EQ TRUE)
+      OS_CS_unlock(q_handle->lock,q_handle->msg_params);
+ 
+   ESA_DIAG_exit (ESA_COMP_QUEUE, DIAG_COMMON, func, rc);
+   return rc;
+} /* do_put */
+ 
+/****************************************************
+ * Procedure Name: OS_Q_put
+ *
+ * Description   : put an item into the queue file
+ *
+ * Input         : item to put
+ *                 length of item
+ *                 wait time (if locked or full)
+ *                 queue handle
+ *
+ * Output        : none
+ *
+ * Return Value  : ESA_OK     upon success
+ *                 ESA_LOCKED queue locked
+ *                 ESA_EOF    queue full
+ *                 ESA_FATAL  on any fail situation
+ *
+ * Logic         : allocate & init a Queue Block
+ *                 call do_put to write it
+ *                 retry operation if queue is full
+ *                 give messages if error
+ *
+ ****************************************************/
+ 
+ESA_RC OS_Q_put (void     * buf,
+                 int        len,
+                 int        wait,
+                 Q_HANDLE * q_handle)
+{
+   ESA_RC  rc = ESA_OK, rc_tmp= ESA_OK;
+   time_t  start_time;
+   int     time_in_lock, my_wait;
+   Q_BLK * q_blk = NULL ;
+ 
+   static char func[]= "OS_Q_put";
+ 
+   ESA_DIAG_enter (ESA_COMP_QUEUE, DIAG_COMMON, func);
+   ESA_DIAG_printf (ESA_COMP_QUEUE, DIAG_OS, "...<->: %d.", __LINE__);
+ 
+  /*------------------------------
+   *   Init
+   *-----------------------------*/
+ 
+   /***** check parms validity *****/
+ 
+   if (len EQ 0) {
+      CTSAMSG_print(ERR_INTERNAL,
+                    q_handle->ctsamsg_handle,
+                    NULL,
+                    q_handle->ctsamsg_dest,
+                    "queue","put",1,__LINE__);
+      rc = ESA_FATAL;
+      goto the_exit;
+      }
+ 
+   /***** Alloc queue block *****/
+ 
+   q_blk = (Q_BLK *)malloc (len + sizeof(int));
+ 
+   if (q_blk EQ NULL) {
+      CTSAMSG_print(ERR_MALLOC,
+                    q_handle->ctsamsg_handle,
+                    NULL,
+                    q_handle->ctsamsg_dest,
+                    "queue block",len+2);
+      rc = ESA_FATAL;
+      goto the_exit;
+      }
+ 
+   ESA_DIAG_printf (ESA_COMP_QUEUE, 11,
+                    "OS_Q_put q_blk allocated. address : %p.", q_blk);
+ 
+   /***** Init queue block *****/
+ 
+   q_blk->len = len;
+   memcpy ((char *)q_blk->data, (const char *)buf, (unsigned)len);
+ 
+   start_time = time( NULL );
+ 
+  /*------------------------------
+   *   Call "do_put" in a loop
+   *-----------------------------*/
+ 
+   for (;;) {
+ 
+      rc = do_put(q_blk, wait, q_handle);
+ 
+      /***** if queue is full - retry *****/
+ 
+      if (rc NE 3) break;
+ 
+      ESA_DIAG_printf (ESA_COMP_QUEUE, 11, "queue is full");
+ 
+      if (wait EQ Q_WAIT_FOREVER) continue;
+ 
+      time_in_lock =      difftime( time ( NULL ), start_time );
+ 
+      if (time_in_lock GE wait)
+         break;
+ 
+      /* Note: Q_GET_INTERVAL is in milliseconds, "wait" in seconds */
+ 
+      my_wait = MIN ( Q_PUT_INTERVAL, ( (wait - time_in_lock)*1000) );
+      ESA_DIAG_printf (ESA_COMP_QUEUE, 11,
+         "queue is full. wait %d seconds", my_wait/1000);
+ 
+      ESA_DIAG_printf (ESA_COMP_QUEUE, DIAG_OS,
+            "...-> OS_CS_wait: wait=%d (%s=%d).",
+              my_wait, "Q_PUT_INTERVAL", Q_PUT_INTERVAL);
+      rc_tmp= OS_CS_wait ( my_wait );
+      ESA_DIAG_printf (ESA_COMP_QUEUE, DIAG_OS,
+            "...<- OS_CS_wait: rc=%d (%s).",
+            rc_tmp, (rc_tmp EQ ESA_OK) ? "OS==OK" : "OS##OK");
+ 
+   } /* call do_put in a loop */
+ 
+  /*------------------------------
+   *   Analyze rc
+   *-----------------------------*/
+ 
+   switch ((int)rc) {
+ 
+      case 0:                                    /* OK */
+         rc = ESA_OK;
+         break;
+ 
+      case 1:                                    /* i/o error */
+         rc = ESA_FATAL;
+         break;
+ 
+      case 2:                                    /* queue locked */
+         CTSAMSG_print(ERR_QUEUE_LOCKED,
+                     q_handle->ctsamsg_handle,
+                     NULL,
+                     q_handle->ctsamsg_dest,
+                     q_handle->qname);
+         rc = ESA_LOCKED;
+         break;
+ 
+      case 3:                                    /* queue full */
+         CTSAMSG_print(ERR_QUEUE_IS_FULL,
+                     q_handle->ctsamsg_handle,
+                     NULL,
+                     q_handle->ctsamsg_dest,
+                     q_handle->qname);
+         rc = ESA_EOF;
+         break;
+ 
+      default:                                   /* unexpected error */
+         CTSAMSG_print(ERR_INTERNAL,
+                     q_handle->ctsamsg_handle,
+                     NULL,
+                     q_handle->ctsamsg_dest,
+                    "queue","put",2,__LINE__);
+         rc = ESA_FATAL;
+         break;
+ 
+      } /* switch (rc) */
+ 
+   /***** exit *****/
+ 
+   the_exit:;
+ 
+   if (q_blk NE NULL) {
+      free(q_blk);
+      ESA_DIAG_printf (ESA_COMP_QUEUE, 11,
+                     "q_blk freed. addr: %p.", q_blk);
+      }
+ 
+   if (rc NE ESA_OK)
+      QUEUE_ERR ( "Put", q_handle->qname );
+ 
+   ESA_DIAG_exit (ESA_COMP_QUEUE, DIAG_COMMON, func, rc);
+   return rc;
+ 
+}  /* OS_Q_put */
+ 
+/****************************************************
+ * Procedure Name: do_get
+ *
+ * Description   : perform the actual read from the queue
+ *
+ * Input         : wait time (for lock)
+ *                 queue handle
+ *
+ * Output        : item data
+ *                 item length
+ *
+ * Return Value  : 1 - I/O error
+ *                 2 - queue locked
+ *                 3 - queue empty
+ *                 4 - queue item too long
+ *
+ * Logic         : see "Queue structure"
+ *
+ ****************************************************/
+ 
+static int do_get (void     * buf,
+                   int      * len_ptr,
+                   int        maxlen,
+                   int        wait,
+                   Q_HANDLE * q_handle)
+{
+   int    rc = 0;
+   int    flush_rc = 0;                              /* SAS2IBMN */
+   Q_REC0 rec0;
+   void  *qfile;
+   int    q_locked = FALSE;
+ 
+   static char func[]="do_get";
+ 
+   ESA_DIAG_enter (ESA_COMP_QUEUE, DIAG_COMMON+ 1, func);
+   ESA_DIAG_printf (ESA_COMP_QUEUE, DIAG_COMMON,
+                    "...<->: %d.", __LINE__);
+ 
+   qfile = q_handle->file;
+ 
+   /***** Lock File *****/
+ 
+   /* BS10076
+   rc = OS_CS_lock ( q_handle->lock, wait, q_handle->msg_params );    */
+   rc = OS_CS_lock (q_handle->lock, q_handle->msg_params); /* BS10076 */
+   if (rc NE ESA_OK) {
+      if (rc EQ ESA_FATAL)
+         rc= ESA_TERM_CTSA;
+   else
+         rc= ESA_LOCKED;
+      goto the_exit;
+   }
+   else q_locked = TRUE;
+ 
+   /***** Read Record 0 *****/
+ 
+   OS_FILE_seek ( qfile, 0, SEEK_SET, q_handle->msg_params );
+   rc = OS_FILE_read ( &rec0, sizeof(rec0), qfile,
+                       q_handle->msg_params );
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto the_exit;
+      }
+ 
+   ESA_DIAG_printf (ESA_COMP_QUEUE, 11,                   /* SAS2IBMN */
+                   "rec0 = %s, %d, %d, %d, %d, %d",       /* SAS2IBMN */
+                    rec0.eye_catcher, rec0.get_pos,       /* SAS2IBMN */
+                    rec0.put_pos, rec0.last_pos,          /* SAS2IBMN */
+                    rec0.end_pos, rec0.wrap);             /* SAS2IBMN */
+ 
+   /***** If queue empty - return *****/
+ 
+   if ((NOT rec0.wrap) AND (rec0.get_pos EQ rec0.put_pos)) {
+      rc = ESA_EOF;
+      /* SAS2IBMN goto the_exit;  */
+      goto do_flush;  /* flush to get a new buffer next read SAS2IBMN */
+      }
+ 
+   /***** If needed - wrap around *****/
+ 
+   if (rec0.get_pos EQ rec0.last_pos) {
+      rec0.get_pos  = sizeof(Q_REC0);
+      rec0.last_pos = rec0.put_pos;
+      rec0.wrap = FALSE ;
+      ESA_DIAG_printf (ESA_COMP_QUEUE, 11, "queue wrap-around (get) ");
+      }
+ 
+   /***** Read length of data *****/
+ 
+   OS_FILE_seek ( qfile, rec0.get_pos, SEEK_SET, q_handle->msg_params );
+   rc = OS_FILE_read ( len_ptr, sizeof(int), qfile,
+                       q_handle->msg_params );
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      /* SAS2IBMN goto the_exit; */
+      goto do_flush;  /* flush to get a new buffer next read SAS2IBMN */
+      }
+ 
+   /***** check length against maxlen *****/
+ 
+   if (*len_ptr GT maxlen) {
+      rc = ESA_ERR;
+      /* SAS2IBMN goto the_exit;  */
+      goto do_flush;  /* flush to get a new buffer next read SAS2IBMN */
+      }
+ 
+   /***** now read data *****/
+ 
+   ESA_DIAG_printf (ESA_COMP_QUEUE, 11, "before read. pos: %d len: %d",
+                    rec0.get_pos, *len_ptr+sizeof(int) );
+ 
+   rc = OS_FILE_read ( buf, (unsigned)*len_ptr, qfile,
+                       q_handle->msg_params );
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      /* SAS2IBMN goto the_exit;  */
+      goto do_flush;  /* flush to get a new buffer next read SAS2IBMN */
+      }
+ 
+ 
+   if ( ESA_DIAG_get_debug_level(ESA_COMP_QUEUE) GT 10 ) {
+ 
+     if ( (*len_ptr) GT (int)( sizeof(diagPrintBuff) - 2 )) {
+        memcpy((char *) diagPrintBuff,
+                (char *)buf, sizeof(diagPrintBuff) - 2);
+        diagPrintBuff[sizeof(diagPrintBuff) - 1 ] = NULL_CHAR ;
+     }
+     else  {
+        memcpy((char *)diagPrintBuff , (char *)buf,
+                           (unsigned)(*len_ptr) );
+        diagPrintBuff[(*len_ptr)] = NULL_CHAR;
+     }
+ 
+     update_crypt_symb (diagPrintBuff, (int)strlen(diagPrintBuff),
+                        '.' );
+ 
+     ESA_DIAG_printf (ESA_COMP_QUEUE, 0, "Read=%d/%s",
+                                      (*len_ptr), diagPrintBuff);
+   }
+ 
+   /***** Update record 0 *****/
+ 
+   rec0.get_pos = OS_FILE_tell ( qfile, q_handle->msg_params );
+ 
+   /*
+    * if, after this get, the queue is empty -
+    * we reset put/get positions.
+    */
+ 
+   if (rec0.get_pos EQ rec0.put_pos)
+      rec0.get_pos = rec0.put_pos = rec0.last_pos = sizeof(rec0);
+ 
+   ESA_DIAG_printf (ESA_COMP_QUEUE, 11,                   /* SAS2IBMN */
+                   "new rec0 = %s, %d, %d, %d, %d, %d",   /* SAS2IBMN */
+                    rec0.eye_catcher, rec0.get_pos,       /* SAS2IBMN */
+                    rec0.put_pos, rec0.last_pos,          /* SAS2IBMN */
+                    rec0.end_pos, rec0.wrap);             /* SAS2IBMN */
+ 
+   /***** write record 0 *****/
+ 
+   rc = OS_FILE_seek ( qfile, 0, SEEK_SET, q_handle->msg_params );
+   rc = OS_FILE_write ( &rec0, sizeof(rec0), qfile,
+                        q_handle->msg_params );
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      /* SAS2IBMN goto the_exit;  */
+      goto do_flush;  /* flush to get a new buffer next read SAS2IBMN */
+      }
+ 
+   /***** flush buffers *****/
+ 
+do_flush:;                                               /* SAS2IBMN */
+   /* SAS2IBMN - start */
+   /*
+   rc = OS_FILE_flush ( qfile, q_handle->msg_params );
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto the_exit;
+      }
+   */
+   flush_rc = OS_FILE_flush ( qfile, q_handle->msg_params );
+   if (flush_rc NE ESA_OK)
+      rc = ESA_FATAL;
+   /* SAS2IBMN - end   */
+ 
+the_exit:;
+ 
+   if (q_locked EQ TRUE)
+      OS_CS_unlock(q_handle->lock,q_handle->msg_params);
+ 
+   ESA_DIAG_exit (ESA_COMP_QUEUE, DIAG_COMMON+ 1, func, rc);
+   return rc;
+} /* do_get */
+ 
+/****************************************************
+ * Procedure Name: OS_Q_get
+ *
+ * Description   : get an item from the queue file
+ *
+ * Input         : wait time (if locked or empty)
+ *                 maximum length of data to be read
+ *                 queue handle
+ *
+ * Output        : item data
+ *                 item length
+ *
+ * Return Value  : ESA_OK     upon success
+ *                 ESA_EOF    queue empty
+ *                 ESA_ERR    queue item is too long
+ *                 ESA_LOCKED queue locked
+ *                 ESA_FATAL  on any fail situation
+ *
+ * Logic         : call do_get to read item
+ *                 retry operation if queue is empty
+ *                 give messages if error
+ *
+ ****************************************************/
+ 
+ESA_RC OS_Q_get (void     * buf,
+                 int      * len_ptr,
+                 int        maxlen,
+                 int        wait,
+                 Q_HANDLE * q_handle)
+{
+   ESA_RC  rc = ESA_OK, rc_tmp=ESA_OK;
+   time_t  start_time;
+   int     time_in_lock, my_wait;
+   static char func[]= "OS_Q_get";
+ 
+   ESA_DIAG_enter (ESA_COMP_QUEUE, DIAG_COMMON+ 1, func);
+   ESA_DIAG_printf (ESA_COMP_QUEUE, DIAG_COMMON,
+                    "...<->: %d.", __LINE__);
+ 
+   start_time = time( NULL );
+ 
+  /*------------------------------
+   *   Call "do_get" in a loop
+   *-----------------------------*/
+ 
+   for (;;) {
+ 
+      rc = do_get(buf, len_ptr , maxlen, wait, q_handle);
+ 
+      if (rc NE ESA_EOF) break;
+ 
+      /***** if queue is empty - retry *****/
+ 
+      if (wait EQ Q_DONT_WAIT) break;
+ 
+      if (wait EQ Q_WAIT_FOREVER) continue;
+ 
+      time_in_lock =      difftime( time ( NULL ), start_time );
+	
+      ESA_DIAG_printf (ESA_COMP_QUEUE, 11,
+         "queue times: time_in_lock %d wait %d ", time_in_lock, wait);
+      if (time_in_lock GE wait)
+         break;
+ 
+      /* Note: Q_GET_INTERVAL is in milliseconds, "wait" in seconds */
+ 
+      my_wait = MIN ( Q_GET_INTERVAL, ( (wait - time_in_lock)*1000) );
+      ESA_DIAG_printf (ESA_COMP_QUEUE, 11,
+         "queue is empty. wait %d seconds", my_wait/1000);
+ 
+      ESA_DIAG_printf (ESA_COMP_QUEUE, DIAG_MORE,
+            "...-> OS_CS_wait: wait=%d (%s=%d).",
+              my_wait, "Q_GET_INTERVAL", Q_GET_INTERVAL);
+      rc_tmp= OS_CS_wait ( my_wait );
+      if ( (rc_tmp) OR  (ESA_DIAG_get_debug_level(ESA_COMP_QUEUE) GE
+		           (int)DIAG_MORE)  )
+         ESA_DIAG_printf (ESA_COMP_QUEUE, DIAG_OS,
+            "...<- OS_CS_wait: rc=%d (%s).",
+            rc_tmp, (rc_tmp EQ ESA_OK) ? "OS==OK" : "OS##OK");
+   }
+ 
+  /*------------------------------
+   *   Analyze rc
+   *-----------------------------*/
+/*
+   switch ((int)rc) {
+ 
+      case 0:                       get ok
+         rc = ESA_OK;
+         break;
+ 
+      case 4:                       i/o error
+         rc = ESA_FATAL;
+         break;
+ 
+      case 5:                       queue locked */
+   if (rc EQ ESA_LOCKED)
+      CTSAMSG_print(ERR_QUEUE_LOCKED,
+                     q_handle->ctsamsg_handle,
+                     NULL,
+                     q_handle->ctsamsg_dest,
+                     q_handle->qname);
+/*         rc = ESA_LOCKED;
+         break;
+ 
+      case 8:                       queue empty
+         rc = ESA_EOF;
+         break;
+ 
+      case 3:                       queue item too long */
+   else if (rc EQ ESA_ERR)
+      CTSAMSG_print(ERR_QUEUE_RECORD_LEN,
+                     q_handle->ctsamsg_handle,
+                     NULL,
+                     q_handle->ctsamsg_dest,
+                     *len_ptr, maxlen);
+/*         rc = ESA_ERR;
+         break;
+ 
+      default:                      unknown */
+   else if ( (rc NE ESA_OK) AND (rc NE ESA_FATAL) AND (rc NE ESA_EOF) )  {
+      CTSAMSG_print(ERR_INTERNAL,
+                     q_handle->ctsamsg_handle,
+                     NULL,
+                     q_handle->ctsamsg_dest,
+                    "queue","put",2,__LINE__);
+         rc = ESA_FATAL;
+   }
+/*         break;
+ 
+      }  switch (rc) */
+ 
+   if ( (rc NE ESA_OK) AND (rc NE ESA_EOF) )
+      QUEUE_ERR ( "Get", q_handle->qname );
+ 
+   ESA_DIAG_exit (ESA_COMP_QUEUE, DIAG_COMMON+ 1, func, rc);
+   return rc;
+ 
+}  /* OS_Q_get */
+ 
+/****************************************************
+ * Procedure Name: OS_Q_read
+ *
+ * Description   : get an item from the queue file
+ *                 without changes in record 0
+ *
+ * Input         : rec0
+ *                 queue handle
+ *
+ * Output        : item data
+ *                 item length
+ *                 rec0 (updated)
+ *                 is_seq (TRUE / FALSE) - see Usage notes below.
+ *
+ * Return Value  : ESA_OK     upon success
+ *                 ESA_EOF    end of queue file
+ *                 ESA_FATAL  unexpected error
+ *
+ * Logic         : if first call ( len=0 )
+ *                   read record0 only
+ *                 read next record from queue
+ *
+ * Usage notes   : If record 0 is read only once and all
+ *                 other records are called according to its
+ *                 contents (sequential read), set is_seq=TRUE
+ *                 Otherwise (if record 0 is read more than
+ *                 once), set is_seq=FALSE.
+ *                 When is_seq is FALSE, the function will
+ *                 flush the buffers after each call to force
+ *                 reading the blocks from the file on each
+ *                 call.
+ *
+ ****************************************************/
+ 
+ESA_RC OS_Q_read (void     * buf,
+                  int      * len_ptr,
+                  int        maxlen,
+                  Q_HANDLE * q_handle,
+                  Q_REC0   * q_rec0,
+                  int        is_seq)                     /* SAS2IBMN */
+{
+   ESA_RC rc;
+   ESA_RC flush_rc;                                      /* SAS2IBMN */
+   static char func[]= "OS_Q_read";
+   void *qfile;
+ 
+   ESA_DIAG_enter (ESA_COMP_QUEUE, DIAG_COMMON, func);
+   ESA_DIAG_printf (ESA_COMP_QUEUE, DIAG_COMMON,
+                    "...<->: %d.", __LINE__);
+ 
+   qfile = q_handle->file;
+ 
+   /***** Read Record 0 (1st time only) *****/
+ 
+   if ( *len_ptr EQ 0 )  {
+        OS_FILE_seek ( qfile, 0, SEEK_SET, q_handle->msg_params );
+        rc = OS_FILE_read ( q_rec0, sizeof(Q_REC0), qfile,
+                            q_handle->msg_params );
+        if (rc NE ESA_OK ) {
+            rc = ESA_FATAL;
+            goto the_exit;
+         }
+        /* SAS2IBMN goto the_exit;   */
+        goto do_flush;                                   /* SAS2IBMN */
+   }
+ 
+  /***** If queue empty - return *****/
+ 
+   if ((NOT q_rec0->wrap) AND (q_rec0->get_pos EQ q_rec0->put_pos)) {
+     rc = ESA_EOF;
+     goto the_exit;
+   }
+ 
+  /***** If needed - wrap around *****/
+ 
+   if (q_rec0->get_pos EQ q_rec0->last_pos) {
+      q_rec0->get_pos  = sizeof(Q_REC0);
+      q_rec0->last_pos = q_rec0->put_pos;
+      q_rec0->wrap = FALSE ;
+      ESA_DIAG_printf (ESA_COMP_QUEUE, 11, "queue wrap-around (get) ");
+   }
+ 
+   /***** Read length of queue item *****/
+ 
+   OS_FILE_seek ( qfile, q_rec0->get_pos, SEEK_SET,
+                  q_handle->msg_params );
+   rc = OS_FILE_read ( len_ptr, sizeof(int), qfile,
+                       q_handle->msg_params );
+   if (rc NE ESA_OK) {
+      rc = 1;
+      goto the_exit;
+      }
+ 
+   /***** check length against maxlen *****/
+ 
+   if (*len_ptr GT maxlen) {
+      rc = 4;
+      /* SAS2IBMN goto the_exit;  */
+      goto do_flush;                                     /* SAS2IBMN */
+      }
+ 
+   /***** now read data *****/
+ 
+   ESA_DIAG_printf (ESA_COMP_QUEUE, 11, "before read. pos: %d len: %d",
+                     q_rec0->get_pos, *len_ptr + sizeof(int) );
+ 
+   rc = OS_FILE_read ( buf, (unsigned)*len_ptr, qfile,
+                       q_handle->msg_params );
+   if (rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto the_exit;
+   }
+ 
+   /***** Change record 0 *****/
+ 
+   q_rec0->get_pos = OS_FILE_tell ( qfile, q_handle->msg_params );
+ 
+   /*
+   * if, after this get, the queue is empty -
+   * we reset put/get positions.
+   */
+ 
+   if (q_rec0->get_pos EQ q_rec0->put_pos)
+      q_rec0->get_pos =
+      q_rec0->put_pos = q_rec0->last_pos = sizeof(Q_REC0);
+ 
+   /***** flush buffers *****/
+   /* SAS2IBMN - start */
+ 
+   /* OS_FILE_flush ( qfile, q_handle->msg_params );  */
+ do_flush:;
+   if (NOT is_seq)
+   {
+     flush_rc = OS_FILE_flush ( qfile, q_handle->msg_params );
+     if (flush_rc NE ESA_OK)
+       rc = ESA_FATAL;
+   }
+   /* SAS2IBMN - end   */
+ 
+ the_exit :;
+ 
+   ESA_DIAG_exit (ESA_COMP_QUEUE, DIAG_COMMON, func, rc);
+   return rc;
+ 
+}  /* OS_Q_read */
+ 
+ 

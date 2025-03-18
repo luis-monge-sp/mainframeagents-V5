@@ -1,0 +1,2084 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: esaofso.c %
+ * Instance        : %instance: 1 %
+ * Created by      : %created_by: ihoffma %
+ * Created on      : %date_created: Wed Nov 19 15:03:11 2003 %
+ * Current Version : %version: 5 %
+ * Last Modified by: %derived_by: ihoffma %
+ * Last Modified on: %date_modified: Wed Nov 19 15:03:11 2003 %
+ */
+ 
+/**************************************************************
+ * Mod.ID  Who      When       Description
+ * ============================================================
+ * IMH001  Ian H.   19-Nov-03  WSAN101432 Thread-safe code (errno)
+ * SAS2IBMT SeligT  14/11/16   SAS/C to IBM C Conversion Project
+ *                             In SAS C, when using a data set
+ *                             name in fopen, we had to use the
+ *                             following construct: "dsn:dsname".
+ *                             However, in IBM C, we must use the
+ *                             following construct: //'dsname'.
+ * CIQ#6    SeligT  19/03/17   Account Aggr includes Connections
+ **************************************************************/
+ 
+#include "globs.h"
+ 
+/*
+ *   Standard header files
+ */
+#include ERRNO
+#include STRING
+#include STDIO
+#include STDLIB
+#include TIME
+ 
+/* not AS400 & not TANDEM */
+#include SYS_TYPES_H
+/* AS400 */
+ 
+/*
+ *   Common code header files
+ */
+ 
+#include ESA_API
+#include ESA_DIAG
+#include ESA_API_CODES
+#include ESA_INIT
+#include ESA_CHKSUM
+#include ESA_ESAADI
+#include ESA_ADMIN
+ 
+/*
+ *   Offline Int. header files
+ */
+ 
+#include ESA_ESAOFLI
+#include ESA_ESAOFIO
+ 
+#define GET_DONE_UNSUPPORTED 3
+#define GET_DONE_NOTFOUND    4
+ 
+static char component [] = "OFFLINE INTERCEPTOR";
+ 
+static OE_typ empty_oe = "";    /* AJKxxx */
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : OS_OFLI_get_keywords_from_env             *
+*                                                             *
+* DESCRIPTION     : Get interesting keywords from environment *
+*                                                             *
+* INPUT           : rss_name                                  *
+*                   env_keywords                              *
+*                   env_kwd_num                               *
+*                   keywords_type                             *
+*                                                             *
+* OUTPUT          : keywords                                  *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC OS_OFLI_get_keywords_from_env(
+        RSS_typ                     rss_name,
+        RSSAPI_KWD_rec_ptr          envir_keywrds,
+        int                         envir_kwd_num,
+        const int                   api_keywords_type,
+        OFLI_KEYWORDS_rec_typ      *keywords,
+        CTSAMSG_DEST_TABLE_rec_typ *dest,
+        CTSAMSG_HANDLE_rec_typ     *msgs)
+{
+ 
+   ESA_RC             rc = ESA_OK;
+   int                i;
+   char              *wrk;
+   char               k_api[4];
+   char               chksum_flg[3];
+   char               addinfo_typ[5];
+   ADDINFO_typ        kwd_typ;
+   RSSAPI_KWD_rec_typ envir_rec;
+   static   char      charset[] = " \t\n";
+   static   char  func[] = "OS_OFLI_get_keywords_from_env";
+ 
+ /*
+  *  Initialize
+  */
+ 
+  ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+  ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                  "RSS=%s envir_kwd_num=%d api_keywords_type=%d",
+                   rss_name, envir_kwd_num, api_keywords_type);
+ 
+ /*
+  *  Initialize keywords structure
+  */
+ 
+  keywords->cnt     = 0;
+  keywords->amount  = 0;
+  keywords->kwds    = NULL;
+  keywords->addinfo = NULL;
+ 
+ /*
+  *  Copy API keywords from env to internal OS_OFLI vars
+  */
+ 
+  for (i=0; i LT envir_kwd_num ; i++) {
+      /*
+       *  Get keywords record from environment
+       */
+       memcpy( (char *)&envir_rec, (char *)&(envir_keywrds[i]),
+               sizeof( RSSAPI_KWD_rec_typ ) );
+      /*
+       * Repair environment's keyword's record (RSS name) -
+       * remove tabs, newlines & spaces.
+       */
+       wrk = strpbrk(envir_rec.rss, charset);
+       if ( wrk )
+          *wrk = NULL_CHAR;
+ 
+      /*
+       * Repair environment's keyword's record (addinfo_keyword) -
+       * remove tabs, newlines & spaces.
+       */
+       wrk = strpbrk(envir_rec.keyword, charset);
+       if ( wrk )
+          *wrk = NULL_CHAR;
+      /*
+       *  Get keywords processing
+       */
+ 
+      chksum_flg[0] = envir_rec.keyword_type;
+      chksum_flg[1] = NULL_CHAR;
+      memcpy( addinfo_typ , envir_rec.addtyp, 2);
+      addinfo_typ[2] = NULL_CHAR;
+ 
+      if ( ( My_stricmp ( envir_rec.rss, rss_name ) EQ 0 ) AND
+           ( IsCheckSumKeyword(envir_rec.keyword,     /*  WSAN100361 */
+                               addinfo_typ, chksum_flg,
+                               &kwd_typ)       EQ ESA_OK)  ) {
+            memcpy(k_api, envir_rec.api, 2);
+            k_api[2] = NULL_CHAR;
+            if ( atoi(k_api) EQ api_keywords_type )
+              rc = SaveKeywords( keywords, envir_rec.keyword,
+                                 kwd_typ, dest, msgs );
+      }
+   }
+ 
+  /*
+   *   Sort Obtained keywords
+   */
+ 
+  if ( keywords->cnt GT 1 )
+     qsort( (char *)keywords->kwds, keywords->cnt,
+            sizeof(OFLI_KWD_type_rec), &keywords_sort_compare);
+ 
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+   return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetSingleUserInfo                         *
+*                                                             *
+* DESCRIPTION     : get user information                      *
+*                                                             *
+* INPUT           : user                                      *
+*                   users_keywords                            *
+*                                                             *
+* OUTPUT          : CheckSum                                  *
+*                   def_group                                 *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC GetSingleUserInfo(USER_typ                         user,
+                         CHECKSUM_typ                    *CheckSum,
+                         OFLI_KEYWORDS_rec_typ           *user_keywords,
+                         OFFLINE_INTERCEPT_STUFF_rec_typ *offl_params,
+                         UG_typ                           def_group,
+    /* WSAN100361 */     int                             *user_renamed,
+    /* WSAN100361 */     char                            *new_user_name)
+{
+ 
+   ESA_RC                               rc = ESA_OK;
+   static                               char func[]="GetSingleUserInfo";
+   int                                  get_done = GET_DONE_WITH_FATAL;
+   ONE_FIELD_rec_typ                  * cpair;   /* WSAN100361 */
+ 
+   /*
+    *  Get User parameters
+    */
+    int                    i;
+    unsigned int           size;
+    GET_USER_MODE          mode = GET_MANY_USERS;
+    short                  max_users = 1;
+    short                  actual_num;
+    HAVE_MORE_typ          have_more = HAVE_MORE;
+    void                  *get_user_handle = NULL;
+    short                  num_users_in=1;
+    USER_PARAMS_rec_typ    user_params_in[1];
+    USER_PARAMS_rec_typ    user_params[1];
+    ADDINFO_rec_ptr       *addinfo        = NULL;
+    OBJ_EXISTS_typ         objs_exist[1];
+    char                   CheckSumStr[sizeof(CHECKSUM_typ)+ 1];
+    char                   get_conn       = 'N';            /* CIQ#6 */
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, "User=%s", user);
+ 
+    /*
+     * Get ADDINFO
+     */
+ 
+    rc = GetAddinfo( &addinfo, max_users, user_keywords,
+                     offl_params->dest, offl_params->msgs );
+    if (rc NE ESA_OK) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    API_LOGIN
+    if ( rc NE ESA_OK ) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    /*
+     *  Set User ( single ) info
+     */
+ 
+    memset( (char *)&user_params_in[0], NULL_CHAR,
+             sizeof (USER_PARAMS_rec_typ));
+    strcpy( user_params_in[0].user, user );
+ 
+    /*
+     *   Clear addinfo and output users params
+     */
+ 
+     size = max_users * sizeof (USER_PARAMS_rec_typ);
+     memset( &user_params, NULL_CHAR, size);
+     for (i=0; i LT max_users; i++ )
+        ADDINFO_clear( addinfo[i] );
+ 
+    /*
+     *  API call GetUser ( single )
+     */
+ 
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetUsers USA-API for user=%s.", user_params_in[0].user);
+    CS_DIAG_USER_IN (ESA_COMP_RSS_INTERCEPT, mode, empty_oe,
+			 1, num_users_in, user_params_in, get_user_handle,
+			 addinfo);
+    rc = (offl_params->func_ptr->gtusers_ptr) ( mode, empty_oe, 1,
+                                   &actual_num,
+                                   &have_more, &get_user_handle,
+                                   num_users_in, user_params_in,
+                                   user_params, addinfo, objs_exist,
+                                   &offl_params->admin_params,
+                                   offl_params->err,
+                                   get_conn);               /* CIQ#6 */
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetUsers USA-API completed with rc=%d (%s).",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+	if (rc EQ ESA_OK)
+       CS_DIAG_USER_OUT (ESA_COMP_RSS_INTERCEPT, empty_oe,
+			 actual_num, have_more, user_params, objs_exist,
+			 get_user_handle, addinfo);
+ 
+    API_LOGOUT
+    if ( rc EQ ESA_NOT_SUPP ) {
+       get_done = GET_DONE_UNSUPPORTED;
+       rc = ESA_OK;
+	   actual_num= 0;
+       goto exit;
+    }
+    else if ( rc NE ESA_OK ) {
+       get_done = GET_DONE_WITH_ERR;
+       rc = ESA_OK;
+       goto exit;
+    }
+    else if ( rc EQ ESA_OK ) {
+ 
+       if (objs_exist[0] NE OBJ_EXIST)
+          get_done = GET_DONE_NOTFOUND;
+       else
+          get_done = GET_DONE_SUCCESS;
+       /*
+        *  Print diagnostic information
+        */
+ 
+       ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+                       "Actual num=%d",  actual_num);
+ 
+       if ( ESA_DIAG_get_debug_level(ESA_COMP_RSS_INTERCEPT) GE 19) {
+          ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+              "User=%s exist=%d DFLTGRP=%s rev_status=%d user_admin=%d",
+               user_params[0].user,
+               objs_exist[0],
+               user_params[0].def_group,
+               user_params[0].rev_status,
+               user_params[0].user_admin);
+          if ( ( objs_exist[0] EQ OBJ_EXIST ) AND
+               ( ESA_DIAG_get_debug_level(ESA_COMP_RSS_INTERCEPT)
+                                          GE 2 ) )
+             ADDINFO_dump(addinfo[0], 0);
+       }
+ 
+       /*
+        *   Build check-sum buffer
+        */
+ 
+       if ( objs_exist[0] EQ OBJ_EXIST ) {
+          cpair = ADDINFO_search("77SANewOEName",      /* WSAN100361 */
+                          MAX_RSS_ADDINFO_KWD_LEN,     /* WSAN100361 */
+                          addinfo[0]->pair,            /* WSAN100361 */
+                          addinfo[0]->max_pairs );     /* WSAN100361 */
+          if (cpair) {                                 /* WSAN100361 */
+           if (cpair->vallen GT 0)                     /* WSAN100361 */
+             strcpy(user_params[0].parent_oe,          /* WSAN100361 */
+                    cpair->value);                     /* WSAN100361 */
+          }                                            /* WSAN100361 */
+ 
+          cpair = ADDINFO_search("77SANewName",        /* WSAN100361 */
+                          MAX_RSS_ADDINFO_KWD_LEN,     /* WSAN100361 */
+                          addinfo[0]->pair,            /* WSAN100361 */
+                          addinfo[0]->max_pairs );     /* WSAN100361 */
+          if (cpair) {                                 /* WSAN100361 */
+           if (cpair->vallen GT 0) {                   /* WSAN100361 */
+             (*user_renamed) = TRUE;                   /* WSAN100361 */
+             strcpy(new_user_name, cpair->value);      /* WSAN100361 */
+             }                                         /* WSAN100361 */
+          }                                            /* WSAN100361 */
+ 
+          strcpy( def_group, user_params[0].def_group);
+          GetUserCheckSum( CheckSum, &user_params[0], addinfo[0] );
+          memcpy (CheckSumStr, CheckSum, sizeof(CHECKSUM_typ));
+              CheckSumStr[sizeof(CHECKSUM_typ)]= '\0';
+          ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,15,
+                          "user=%s check-sum=%s",
+                          user_params[0].user, CheckSumStr );
+       }
+       else
+          get_done = GET_DONE_NOTFOUND; /* ISAN000864 */
+    }
+ 
+ 
+    exit :;
+ 
+    /*
+     *  If was Unsuccessfull termination.
+     *  API call free his handle
+     */
+ 
+    if ( get_user_handle ) {
+ 
+       API_LOGIN
+       if ( rc EQ ESA_OK ) {
+          ESA_RC rcc= ESA_OK;
+          mode =  GET_FREE_HANDLE_USERS;
+ 
+          /*
+           *  API call GetUser ( FREE HANDLE )
+           */
+ 
+          ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetUsers USA-API for user=%s.", user_params_in[0].user);
+          CS_DIAG_USER_IN (ESA_COMP_RSS_INTERCEPT, mode, empty_oe,
+			 0, 0, user_params_in, get_user_handle, addinfo);
+          rcc= (offl_params->func_ptr->gtusers_ptr) ( mode, empty_oe,
+                                    max_users, &actual_num,
+                                    &have_more, &get_user_handle,
+                                    num_users_in, user_params_in,
+                                    user_params, addinfo, objs_exist,
+                                    &offl_params->admin_params,
+                                    offl_params->err,
+                                    get_conn);              /* CIQ#6 */
+          ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetUsers USA-API completed with rc=%d (%s).",
+			     rcc, (rcc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+		  if (rcc EQ ESA_OK)
+             CS_DIAG_USER_OUT (ESA_COMP_RSS_INTERCEPT, empty_oe,
+    			 0, have_more, user_params, objs_exist, get_user_handle, addinfo);
+          API_LOGOUT
+       }
+       else {
+          CTSAMSG_print(ERR_INTERNAL2,
+                        offl_params->msgs, NULL, offl_params->dest,
+                        component, func,
+                        "GetUser handle not freed due to Login failure",
+                        16, __LINE__);
+          rc = ESA_FATAL;
+          get_done = GET_DONE_WITH_FATAL;
+       }
+    }
+ 
+ 
+    /*
+     *   Free
+     */
+ 
+    if ( addinfo )
+       FreeAddinfo ( max_users, &addinfo );
+ 
+    if ( get_done EQ GET_DONE_SUCCESS)
+       rc = ESA_OK;
+	else if (get_done EQ GET_DONE_UNSUPPORTED)
+       rc= ESA_NOT_SUPP;
+	else if (get_done EQ GET_DONE_NOTFOUND)
+       rc= ESA_KEY_NOT_FOUND;
+    else if (get_done EQ GET_DONE_WITH_ERR)
+       rc = ESA_ERR;
+    else
+       rc = ESA_FATAL;
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+    return rc;
+ 
+}
+ 
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetSingleOEInfo                           *
+*                                                             *
+* DESCRIPTION     : get OE information                        *
+*                                                             *
+* INPUT           : oe                                        *
+*                   oe_keywords                               *
+*                                                             *
+* OUTPUT          : CheckSum                                  *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC GetSingleOEInfo(OE_typ                           oe,
+                       CHECKSUM_typ                    *CheckSum,
+                       OFLI_KEYWORDS_rec_typ           *oe_keywords,
+                       OFFLINE_INTERCEPT_STUFF_rec_typ *offl_params)
+{
+ 
+   ESA_RC                               rc = ESA_OK;
+   static                               char func[]="GetSingleOEInfo";
+   int                                  get_done = GET_DONE_WITH_FATAL;
+ 
+   /*
+    *  Get OE parameters
+    */
+    int                    i;
+    unsigned int           size;
+    GET_OE_MODE            mode = GET_MANY_OES;
+    short                  max_oes = 1;
+    short                  actual_num;
+    HAVE_MORE_typ          have_more = HAVE_MORE;
+    void                  *get_oe_handle = NULL;
+    short                  num_oes_in=1;
+    OE_PARAMS_rec_typ      oe_params_in[1];
+    OE_PARAMS_rec_typ      oe_params[1];
+    ADDINFO_rec_ptr       *addinfo        = NULL;
+    OBJ_EXISTS_typ         objs_exist[1];
+    char                   CheckSumStr[sizeof(CHECKSUM_typ)+ 1];
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, "OE=%s", oe);
+ 
+    /*
+     * Get ADDINFO
+     */
+ 
+    rc = GetAddinfo( &addinfo, max_oes, oe_keywords,
+                     offl_params->dest, offl_params->msgs );
+    if (rc NE ESA_OK) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    API_LOGIN
+    if ( rc NE ESA_OK ) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    /*
+     *   Clear addinfo and output parameters
+     */
+ 
+     for (i=0; i LT max_oes; i++ )
+      ADDINFO_clear( addinfo[i] );
+ 
+     size = max_oes * sizeof (OE_PARAMS_rec_typ);
+     memset(&oe_params, NULL_CHAR, size);
+ 
+    /*
+     *  API call GetOE ( single )
+     */
+ 
+    memset ((char *)&oe_params_in[0], NULL_CHAR, sizeof(OE_PARAMS_rec_typ));
+    strcpy( oe_params_in[0].oe, oe );
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetOEs USA-API for container=%s.", oe_params_in[0].oe);
+    CS_DIAG_OE_IN (ESA_COMP_RSS_INTERCEPT, mode, empty_oe,
+           1, num_oes_in, oe_params_in, get_oe_handle, addinfo);
+    rc = (offl_params->func_ptr->getoes_ptr) ( mode, empty_oe,
+                                  1, &actual_num,
+                                  &have_more, &get_oe_handle,
+                                  num_oes_in,  oe_params_in,
+                                  oe_params,  addinfo, objs_exist,
+                                  &offl_params->admin_params,
+                                  offl_params->err );
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetOEs USA-API completed with rc=%d (%s).",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+    if (rc EQ ESA_OK)
+       CS_DIAG_OE_OUT (ESA_COMP_RSS_INTERCEPT, empty_oe, actual_num,
+			 have_more, oe_params, objs_exist, get_oe_handle, addinfo);
+    API_LOGOUT
+    if ( rc EQ ESA_NOT_SUPP ) {
+       get_done = GET_DONE_UNSUPPORTED;
+       rc = ESA_OK;
+       actual_num= 0;
+       goto exit;
+    }
+    else if ( rc NE ESA_OK ) {
+       get_done = GET_DONE_WITH_ERR;
+       goto exit;
+    }
+    else if ( rc EQ ESA_OK ) {
+       if (objs_exist[0] NE OBJ_EXIST)
+          get_done = GET_DONE_NOTFOUND;
+       else
+          get_done = GET_DONE_SUCCESS;
+ 
+       /*
+        *  Print diagnostic information
+        */
+ 
+       ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+                       "Actual num=%d",  actual_num);
+ 
+       if ( ESA_DIAG_get_debug_level(ESA_COMP_RSS_INTERCEPT) GE 19) {
+          ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,
+              "OE=%s exist=%d parent=%s attr=%d",
+               oe_params[0].oe,
+               objs_exist[0],
+               oe_params[0].parent,
+               oe_params[0].attr);
+          if ( objs_exist[0] EQ OBJ_EXIST )
+             ADDINFO_dump(addinfo[0], 0);
+       }
+ 
+       /*
+        *   Build check-sum buffer
+        */
+ 
+       if ( objs_exist[0] EQ OBJ_EXIST ) {
+          GetOECheckSum( CheckSum, &oe_params[0], addinfo[0] );
+          memcpy (CheckSumStr, CheckSum, sizeof(CHECKSUM_typ));
+              CheckSumStr[sizeof(CHECKSUM_typ)]= '\0';
+          ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,15,
+                          "OE=%s check-sum=%s",
+                          oe_params[0].oe, CheckSumStr );
+       }
+       else
+          get_done = GET_DONE_NOTFOUND; /* ISAN000864 */
+    }
+ 
+ 
+    exit :;
+ 
+    /*
+     *  If was Unsuccessfull termination.
+     *  API call free his handle
+     */
+ 
+    if ( get_oe_handle ) {
+ 
+       API_LOGIN
+       if ( rc EQ ESA_OK ) {
+          ESA_RC rcc= ESA_OK;
+          mode =  GET_FREE_HANDLE_OES;
+ 
+          /*
+           *  API call GetOE ( FREE HANDLE )
+           */
+ 
+          ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetOEs USA-API for container=%s.", oe_params_in[0].oe);
+          CS_DIAG_OE_IN (ESA_COMP_RSS_INTERCEPT, mode, empty_oe,
+           0, 0, oe_params_in, get_oe_handle, addinfo);
+          rcc= (offl_params->func_ptr->getoes_ptr) ( mode, empty_oe,
+                                   max_oes, &actual_num,
+                                   &have_more, &get_oe_handle,
+                                   num_oes_in, oe_params_in,
+                                   oe_params, addinfo, objs_exist,
+                                   &offl_params->admin_params,
+                                   offl_params->err );
+          ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetOEs USA-API completed with rc=%d (%s).",
+			     rcc, (rcc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+          if (rcc EQ ESA_OK)
+             CS_DIAG_OE_OUT (ESA_COMP_RSS_INTERCEPT, empty_oe, 0,
+		    	 have_more, oe_params, objs_exist, get_oe_handle, addinfo);
+          API_LOGOUT
+       }
+       else {
+          CTSAMSG_print(ERR_INTERNAL2,
+                        offl_params->msgs, NULL, offl_params->dest,
+                        component, func,
+                        "GetOE handle not freed due to Login failure",
+                        16, __LINE__);
+          rc = ESA_FATAL;
+          get_done = GET_DONE_WITH_FATAL;
+       }
+    }
+ 
+ 
+    /*
+     *   Free
+     */
+ 
+    if ( addinfo )
+       FreeAddinfo ( max_oes, &addinfo );
+ 
+    if ( get_done EQ GET_DONE_SUCCESS)
+       rc = ESA_OK;
+	else if (get_done EQ GET_DONE_UNSUPPORTED)
+       rc= ESA_NOT_SUPP;
+	else if (get_done EQ GET_DONE_NOTFOUND)
+       rc= ESA_KEY_NOT_FOUND;
+    else  if ( get_done EQ GET_DONE_WITH_ERR)
+       rc = ESA_ERR;
+    else
+       rc = ESA_FATAL;
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+    return rc;
+ 
+}
+ 
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetRSSParamsInfoForOS                     *
+*                                                             *
+* DESCRIPTION     : get rss parameters information            *
+*                                                             *
+* INPUT           : rss_file - rss result file                *
+*                   rss_keywords                              *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC GetRSSParamsInfoForOS(
+               CHECKSUM_typ                    *CheckSum,
+               OFLI_KEYWORDS_rec_typ           *rss_keywords,
+               OFFLINE_INTERCEPT_STUFF_rec_typ *offl_params)
+{
+   ESA_RC  rc = ESA_OK;
+   static  char func[] = "GetRSSParamsInfoForOS";
+   int     get_done    = GET_DONE_WITH_FATAL;
+   char    CheckSumStr[sizeof(CHECKSUM_typ)+ 1];
+   /*
+    *  Get RSS parameters
+    */
+ 
+    RSS_PARAMS_rec_typ     rss_params;
+    ADDINFO_rec_ptr       *addinfo        = NULL;
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+    /*
+     * Get ADDINFO
+     */
+ 
+    rc = GetAddinfo( &addinfo, 1, rss_keywords,
+                     offl_params->dest, offl_params->msgs );
+    if (rc NE ESA_OK) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    API_LOGIN
+    if ( rc NE ESA_OK ) {
+       get_done = GET_DONE_WITH_FATAL;
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+ 
+    /*
+     *  API call GetRSSParameters
+     */
+ 
+    ADDINFO_clear( addinfo[0] );
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+		"    -> Call to CTSGetRSSParams USA-API.");
+    CS_DIAG_ADDINFO (ESA_COMP_RSS_INTERCEPT, addinfo[0], 0, FALSE);
+    rc = (offl_params->func_ptr->gtrsprm_ptr) (&rss_params, addinfo[0],
+                                          &offl_params->admin_params,
+                                          offl_params->err);
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+	  "     MinPwdLen=%d MaxExpire=%d MaxLogins=%d.",
+      rss_params.min_pass_len, rss_params.max_expire,
+	  rss_params.max_logins);
+    if (rc EQ ESA_OK)
+       CS_DIAG_ADDINFO (ESA_COMP_RSS_INTERCEPT, addinfo[0], 0, TRUE);
+    API_LOGOUT
+    if ( rc EQ ESA_NOT_SUPP ) {
+       get_done = GET_DONE_UNSUPPORTED;
+       rc = ESA_OK;
+       goto exit;
+    }
+    else if ( rc NE ESA_OK ) {
+       get_done = GET_DONE_WITH_FATAL;
+       goto exit;
+    }
+    else
+       get_done = GET_DONE_SUCCESS;
+ 
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetRSSParams USA-API completed with rc=%d (%s).",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+    /*
+     *  Print diagnostic information
+     */
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18, "RSS Parameters:");
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+                    "Min. password length    : %d",
+                    rss_params.min_pass_len);
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+                    "Max. password expiration: %d",
+                    rss_params.max_expire);
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+                    "Max. number of logins   : %d",
+                    rss_params.max_logins);
+ 
+    if  ( ESA_DIAG_get_debug_level(ESA_COMP_RSS_INTERCEPT) GE 19)
+       ADDINFO_dump(addinfo[0], 0);
+ 
+ 
+    /*
+     *   Build check-sum buffer
+     */
+ 
+     GetRSSCheckSum( CheckSum, &rss_params, addinfo[0] );
+     memcpy (CheckSumStr, CheckSum, sizeof(CHECKSUM_typ));
+     CheckSumStr[sizeof(CHECKSUM_typ)]= '\0';
+     ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,15,
+                     "RSS Parameters check-sum=%s",
+                     CheckSumStr );
+ 
+ 
+    exit :;
+ 
+    /*
+     *   Free
+     */
+ 
+    if ( addinfo )
+       FreeAddinfo ( 1, &addinfo );
+ 
+    if ( get_done EQ GET_DONE_SUCCESS)
+       rc = ESA_OK;
+	else if (get_done EQ GET_DONE_UNSUPPORTED)
+       rc= ESA_NOT_SUPP;
+    else
+	   rc = ESA_FATAL;
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+    return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetSingleGroupInfo                        *
+*                                                             *
+* DESCRIPTION     : get group information                     *
+*                                                             *
+* INPUT           : group                                     *
+*                   group_keywords                            *
+*                                                             *
+* OUTPUT          : CheckSum                                  *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC GetSingleGroupInfo(
+     UG_typ                          group,
+     CHECKSUM_typ                    *CheckSum,
+     OFLI_KEYWORDS_rec_typ           *group_keywords,
+     OFFLINE_INTERCEPT_STUFF_rec_typ *offl_params,
+    /* WSAN100361 */ int             *group_renamed,
+    /* WSAN100361 */ char            *new_group_name)
+{
+ 
+   ESA_RC                rc = ESA_OK;
+   static char           func[]="GetSingleGroupInfo";
+   int                   get_done = GET_DONE_WITH_FATAL;
+   ONE_FIELD_rec_typ   * cpair;   /* WSAN100361 */
+ 
+   /*
+    *  Get Group parameters
+    */
+    int                    i;
+    unsigned int           size;
+    GET_GROUP_MODE         mode = GET_MANY_GROUPS;
+    short                  max_groups = 1;
+    short                  actual_num;
+    HAVE_MORE_typ          have_more = HAVE_MORE;
+    void                  *get_group_handle = NULL;
+    short                  num_ug_in=1;
+    UG_PARAMS_rec_typ      ug_params_in[1];
+    UG_PARAMS_rec_typ      ug_params[1];
+    ADDINFO_rec_ptr       *addinfo = NULL;
+    OBJ_EXISTS_typ         objs_exist[1];
+    char                   CheckSumStr[sizeof(CHECKSUM_typ)+ 1];
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, "Group=%s", group);
+ 
+    /*
+     * Get ADDINFO
+     */
+ 
+    rc = GetAddinfo( &addinfo, max_groups, group_keywords,
+                     offl_params->dest, offl_params->msgs );
+    if (rc NE ESA_OK) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    API_LOGIN
+    if ( rc NE ESA_OK ) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+   /*
+    *   Clear addinfo and output params
+    */
+ 
+    for (i=0; i LT max_groups; i++ )
+       ADDINFO_clear( addinfo[i] );
+ 
+    size = max_groups * sizeof (UG_PARAMS_rec_typ);
+    memset(&ug_params, NULL_CHAR, size);
+ 
+    /*
+     *  API call GetGroup ( single )
+     */
+ 
+    memset( (char *)&ug_params_in[0], NULL_CHAR, sizeof (UG_PARAMS_rec_typ));
+    strcpy(ug_params_in[0].group, group );
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetUGs USA-API for group=%s.", ug_params_in[0].group);
+    CS_DIAG_UG_IN (ESA_COMP_RSS_INTERCEPT,mode, empty_oe,
+			 max_groups, num_ug_in, ug_params_in, get_group_handle,
+			 addinfo);
+    rc = (offl_params->func_ptr->getugs_ptr) (mode, empty_oe,
+                                 max_groups,
+                                 &actual_num, &have_more,
+                                 &get_group_handle,
+                                 num_ug_in, ug_params_in,
+                                 ug_params, addinfo, objs_exist,
+                                 &offl_params->admin_params,
+                                 offl_params->err);
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetUGs USA-API completed with rc=%d (%s).",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+    if (rc EQ ESA_OK)
+       CS_DIAG_UG_OUT (ESA_COMP_RSS_INTERCEPT, empty_oe, actual_num,
+			 have_more, ug_params, objs_exist, get_group_handle, addinfo);
+ 
+    API_LOGOUT
+    if ( rc EQ ESA_NOT_SUPP ) {
+       get_done = GET_DONE_UNSUPPORTED;
+       rc = ESA_OK;
+       actual_num= 0;
+       goto exit;
+    }
+    else if ( rc NE ESA_OK ) {
+       get_done = GET_DONE_WITH_ERR;
+       goto exit;
+    }
+    else if ( rc EQ ESA_OK ) {
+       if (objs_exist[0] NE OBJ_EXIST)
+          get_done = GET_DONE_NOTFOUND;
+       else
+          get_done = GET_DONE_SUCCESS;
+       /*
+        *  Print diagnostic information
+        */
+ 
+       ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+                       "actual num=%d", actual_num);
+ 
+       if ( ESA_DIAG_get_debug_level(ESA_COMP_RSS_INTERCEPT) GE 19) {
+          ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,8,
+                          "Group=%s exist=%d parent_group=%s",
+                          ug_params[0].group,
+                          objs_exist[0],
+                          ug_params[0].parent_group);
+          if ( ( objs_exist[0] EQ OBJ_EXIST ) AND
+               ( ESA_DIAG_get_debug_level(ESA_COMP_RSS_INTERCEPT)
+                                          GE 9 ) )
+             ADDINFO_dump(addinfo[0], 0);
+       }
+ 
+       /*
+        *   Build check-sum buffer
+        */
+ 
+       if ( objs_exist[0] EQ OBJ_EXIST ) {
+ 
+          cpair = ADDINFO_search("77SANewOEName",      /* WSAN100361 */
+                          MAX_RSS_ADDINFO_KWD_LEN,     /* WSAN100361 */
+                          addinfo[0]->pair,            /* WSAN100361 */
+                          addinfo[0]->max_pairs );     /* WSAN100361 */
+          if (cpair) {                                 /* WSAN100361 */
+           if (cpair->vallen GT 0)                     /* WSAN100361 */
+             strcpy(ug_params[0].parent_oe,            /* WSAN100361 */
+                    cpair->value);                     /* WSAN100361 */
+          }                                            /* WSAN100361 */
+ 
+          cpair = ADDINFO_search("77SANewName",        /* WSAN100361 */
+                          MAX_RSS_ADDINFO_KWD_LEN,     /* WSAN100361 */
+                          addinfo[0]->pair,            /* WSAN100361 */
+                          addinfo[0]->max_pairs );     /* WSAN100361 */
+          if (cpair) {                                 /* WSAN100361 */
+           if (cpair->vallen GT 0) {                   /* WSAN100361 */
+             (*group_renamed) = TRUE;                  /* WSAN100361 */
+             strcpy(new_group_name, cpair->value);     /* WSAN100361 */
+             }                                         /* WSAN100361 */
+          }                                            /* WSAN100361 */
+ 
+          GetGroupCheckSum( CheckSum, &ug_params[0], addinfo[0] );
+          memcpy (CheckSumStr, CheckSum, sizeof(CHECKSUM_typ));
+          CheckSumStr[sizeof(CHECKSUM_typ)]= '\0';
+          ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,15,
+                          "group=%s check-sum=%s",
+                          ug_params[0].group, CheckSumStr);
+       }
+       else
+          get_done = GET_DONE_NOTFOUND; /* ISAN000864 */
+    }
+ 
+    exit :;
+ 
+    /*
+     *  If was Unsuccessfull termination.
+     *  API call free his handle
+     */
+ 
+     if ( get_group_handle ) {
+ 
+        API_LOGIN
+        if ( rc EQ ESA_OK ) {
+           ESA_RC rcc= ESA_OK;
+           mode =  GET_FREE_HANDLE_GROUPS ;
+ 
+           /*
+            * API call GetGroup ( FREE HANDLE )
+            */
+ 
+           ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetUGs USA-API for group=%s.", ug_params_in[0].group);
+           CS_DIAG_UG_IN (ESA_COMP_RSS_INTERCEPT,mode, empty_oe,
+			 0, 0, ug_params_in, get_group_handle, addinfo);
+           rcc= (offl_params->func_ptr->getugs_ptr) (mode, empty_oe,
+                                   max_groups, &actual_num,
+                                   &have_more, &get_group_handle,
+                                   num_ug_in, ug_params_in,
+                                   ug_params, addinfo, objs_exist,
+                                   &offl_params->admin_params,
+                                   offl_params->err);
+           ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetUGs USA-API completed with rc=%d (%s).",
+			     rcc, (rcc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+           if (rcc EQ ESA_OK)
+              CS_DIAG_UG_OUT (ESA_COMP_RSS_INTERCEPT, empty_oe, 0,
+			      have_more, ug_params, objs_exist, get_group_handle, addinfo);
+           API_LOGOUT
+        }
+        else {
+           CTSAMSG_print(ERR_INTERNAL2,
+             offl_params->msgs, NULL, offl_params->dest,
+             component, func,
+             "GetGroup handle not freed due to Login failure",
+             16, __LINE__);
+           rc = ESA_FATAL;
+           get_done = GET_DONE_WITH_FATAL;
+        }
+     }
+ 
+    /*
+     *   Free
+     */
+ 
+     if ( addinfo )
+        FreeAddinfo ( max_groups, &addinfo );
+ 
+     if ( get_done EQ GET_DONE_SUCCESS)
+        rc = ESA_OK;
+     else if (get_done EQ GET_DONE_UNSUPPORTED)
+        rc= ESA_NOT_SUPP;
+	 else if (get_done EQ GET_DONE_NOTFOUND)
+        rc= ESA_KEY_NOT_FOUND;
+     else  if ( get_done EQ GET_DONE_WITH_ERR)
+        rc = ESA_ERR;
+     else
+        rc = ESA_FATAL;
+ 
+     ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+     return rc;
+ 
+}
+ 
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : AddAllUsersConnections                    *
+*                                                             *
+* DESCRIPTION     : get users connection information          *
+*                                                             *
+* INPUT           : user                                      *
+*                   connection_keywords                       *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC AddAllUsersConnections(
+        USER_typ                         user,
+        char                            *db_file,
+        OFLI_KEYWORDS_rec_typ           *connection_keywords,
+        OFFLINE_INTERCEPT_STUFF_rec_typ *offl_params)
+{
+ 
+   ESA_RC       rc = ESA_OK;
+   static       char func[]="AddAllUsersConnections";
+   unsigned int size = sizeof (ADDINFO_rec_typ);
+   int          i;
+   int          i_dump;
+   int          get_done = GET_DONE_WITH_FATAL;
+ 
+   /*
+    *   Check Sum parameters
+    */
+ 
+    CHECKSUM_typ           CheckSum;
+ 
+   /*
+    *  Get Connection parameters
+    */
+ 
+    GET_CONN_MODE          mode = GET_USERS_CONNS;
+    short                  max_connections = OFLI_GET_MAX_CONNECTION;
+    short                  actual_num;
+    HAVE_MORE_typ          have_more = HAVE_MORE;
+    void                  *get_connection_handle = NULL;
+    short                  num_user_in    = 1;
+    short                  num_ug_in      = 0;
+    USER_typ               user_in[1];
+    UG_typ                *ug_in          = NULL;
+    U2UG_PARAMS_rec_typ   *u2ug_params    = NULL;
+    ADDINFO_rec_ptr       *addinfo        = NULL;
+    OBJ_EXISTS_typ        *objs_exist     = NULL;
+    char                   CheckSumStr[sizeof(CHECKSUM_typ)+ 1];
+   /*
+    *   Initialize
+    */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, "User=%s", user);
+ 
+   /*
+    * Get Array of max_users for output user names
+    */
+ 
+   size = max_connections * sizeof(U2UG_PARAMS_rec_typ);
+   u2ug_params  = (U2UG_PARAMS_rec_typ *)calloc (1, size);
+ 
+   if (u2ug_params EQ NULL) {
+      CTSAMSG_print (ERR_MALLOC,
+                     offl_params->msgs, NULL, offl_params->dest,
+                     "u2ug_params", size);
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   /*
+    * Get Array for obj_exist indicators
+    */
+ 
+   size = max_connections * sizeof (OBJ_EXISTS_typ);
+   objs_exist = (OBJ_EXISTS_typ *)calloc (1, size);
+ 
+   if (objs_exist EQ NULL) {
+      CTSAMSG_print (ERR_MALLOC,
+                     offl_params->msgs, NULL, offl_params->dest,
+                     "u2ug_params", size);
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   /*
+    * Get ADDINFO
+    */
+ 
+   rc = GetAddinfo( &addinfo, max_connections,
+                    connection_keywords,
+                    offl_params->dest, offl_params->msgs );
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   strcpy( user_in[0], user);
+ 
+   /*
+    *  GetConnection ( all user's connections )
+    */
+ 
+   while (have_more EQ HAVE_MORE) {
+ 
+       /*
+        *   Clear addinfo and output params
+        */
+ 
+       for (i=0; i LT max_connections; i++ )
+          ADDINFO_clear( addinfo[i] );
+ 
+       size = max_connections * sizeof(U2UG_PARAMS_rec_typ);
+       memset(u2ug_params , NULL_CHAR, size);
+ 
+       API_LOGIN
+       if ( rc NE ESA_OK ) {
+          get_done = GET_DONE_WITH_FATAL;
+          rc = ESA_FATAL;
+          goto exit;
+       }
+ 
+       /*
+        *  API call GetConnection
+        */
+ 
+       ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetConns for user=%s connection.",
+			user_in[0]);
+       CS_DIAG_UG2UC_IN (ESA_COMP_RSS_INTERCEPT,mode,max_connections,
+			 num_ug_in, num_user_in, ug_in, user_in,
+			 get_connection_handle, addinfo);
+       rc = (offl_params->func_ptr->gtug2uc_ptr) (mode, max_connections,
+                                     &actual_num, &have_more,
+                                     &get_connection_handle,
+                                     num_ug_in, num_user_in,
+                                     ug_in, user_in,
+                                     u2ug_params,  addinfo,
+                                     objs_exist,
+                                     &offl_params->admin_params,
+                                     offl_params->err);
+       ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetConns USA-API completed with rc=%d (%s).",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+       if (rc EQ ESA_OK)
+          CS_DIAG_UG2UC_OUT(ESA_COMP_RSS_INTERCEPT,actual_num,have_more,
+    			u2ug_params, objs_exist, get_connection_handle, addinfo);
+ 
+       API_LOGOUT
+       if ( rc EQ ESA_NOT_SUPP ) {
+          get_done = GET_DONE_UNSUPPORTED;
+          rc = ESA_OK;
+          actual_num= 0;
+          goto exit;
+       }
+       else if ( rc NE ESA_OK ) {
+          get_done = GET_DONE_WITH_ERR;
+          break;
+       }
+ 
+       if (objs_exist[0] NE OBJ_EXIST)
+          get_done = GET_DONE_NOTFOUND;
+       else
+          get_done = GET_DONE_SUCCESS;
+      /*
+       *  Print diagnostic information
+       */
+ 
+       ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+                       "max_conns=%d actual num=%d",
+                       max_connections, actual_num);
+ 
+       if ( ESA_DIAG_get_debug_level(ESA_COMP_RSS_INTERCEPT) GE 19) {
+ 
+          for (i_dump=0; i_dump LT actual_num; i_dump++) {
+             ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+                      "User=%s Group=%s exist=%d connect_data=%d",
+                      u2ug_params[i_dump].user,
+                      u2ug_params[i_dump].group,
+                      objs_exist[i_dump],
+                      u2ug_params[i_dump].u2ug_admin_data);
+              if ( objs_exist[i_dump] EQ OBJ_EXIST )
+                ADDINFO_dump(addinfo[i_dump],0);
+          }
+       }
+ 
+ 
+       /*
+        *   Put OSOFLI Records
+        */
+ 
+       for (i=0; i LT actual_num; i++) {
+          if ( objs_exist[i] EQ OBJ_EXIST ) {
+             GetConnectionCheckSum( &CheckSum,
+                                    &u2ug_params[i], addinfo[i] );
+             memcpy (CheckSumStr, CheckSum, sizeof(CHECKSUM_typ));
+             CheckSumStr[sizeof(CHECKSUM_typ)]= '\0';
+             ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,15,
+                             "user=%s group=%s check-sum=%s",
+                             u2ug_params[i].user,
+                             u2ug_params[i].group, CheckSumStr);
+ 
+             rc = PutOSRecord(db_file, OBJECT_UPDATED,
+                              u2ug_params[i].user ,
+                              u2ug_params[i].group,
+                              CheckSum,
+                              offl_params->dest, offl_params->msgs);
+             if ( rc NE ESA_OK ) {
+                rc = ESA_FATAL;
+                goto exit;
+             }
+          } /* Object exists */
+       } /* Put OSOFLI Records */
+   } /* while HAVE_MORE */
+ 
+   exit :;
+ 
+   /*
+    *  If was Unsuccessfull termination.
+    *  API call free his handle
+    */
+ 
+    if ( get_connection_handle ) {
+ 
+       API_LOGIN
+       if ( rc EQ ESA_OK ) {
+          ESA_RC rcc= ESA_OK;
+          mode =  GET_FREE_HANDLE_CONNS;
+ 
+          /*
+           *  API call GetConnection ( FREE HANDLE )
+           */
+ 
+          ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetConns for user=%s connection.",
+			user_in[0]);
+          CS_DIAG_UG2UC_IN (ESA_COMP_RSS_INTERCEPT,mode,
+				0, 0, 0, ug_in, user_in, get_connection_handle, addinfo);
+          rcc= (offl_params->func_ptr->gtug2uc_ptr) (mode, max_connections,
+                                   &actual_num, &have_more,
+                                   &get_connection_handle,
+                                   num_ug_in, num_user_in,
+                                   ug_in, user_in,
+                                   u2ug_params,  addinfo,
+                                   objs_exist,
+                                   &offl_params->admin_params,
+                                   offl_params->err);
+          ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetConns USA-API completed with rc=%d (%s).",
+			     rcc, (rcc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+          if (rcc EQ ESA_OK)
+             CS_DIAG_UG2UC_OUT(ESA_COMP_RSS_INTERCEPT,0,have_more,
+	       		u2ug_params, objs_exist, get_connection_handle, addinfo);
+          API_LOGOUT
+       }
+       else {
+          CTSAMSG_print(ERR_INTERNAL2,
+           offl_params->msgs, NULL, offl_params->dest,
+           component, func,
+           "GetConnection handle not freed due to Login failure",
+           16, __LINE__);
+          rc = ESA_FATAL;
+          get_done = GET_DONE_WITH_FATAL;
+       }
+    }
+ 
+    if ( objs_exist )
+      free( objs_exist );
+ 
+    if ( u2ug_params )
+      free( u2ug_params );
+ 
+    if ( addinfo )
+       FreeAddinfo ( max_connections, &addinfo );
+ 
+    if ( get_done EQ GET_DONE_SUCCESS)
+       rc = ESA_OK;
+    else if (get_done EQ GET_DONE_UNSUPPORTED)
+       rc= ESA_NOT_SUPP;
+    else if (get_done EQ GET_DONE_NOTFOUND)
+       rc= ESA_KEY_NOT_FOUND;
+    else  if ( get_done EQ GET_DONE_WITH_ERR)
+       rc = ESA_ERR;
+    else
+       rc = ESA_FATAL;
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+    return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : AddAllGroupsConnections                   *
+*                                                             *
+* DESCRIPTION     : get groups connection information         *
+*                                                             *
+* INPUT           : group                                     *
+*                   connection_keywords                       *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC AddAllGroupsConnections(
+        UG_typ                           ug,
+        char                            *db_file,
+        OFLI_KEYWORDS_rec_typ           *connection_keywords,
+        OFFLINE_INTERCEPT_STUFF_rec_typ *offl_params)
+{
+ 
+   ESA_RC       rc = ESA_OK;
+   static       char func[]="AddAllGroupsConnections";
+   unsigned int size = sizeof (ADDINFO_rec_typ);
+   int          i;
+   int          i_dump;
+   int          get_done = GET_DONE_WITH_FATAL;
+ 
+   /*
+    *   Check Sum parameters
+    */
+ 
+    CHECKSUM_typ           CheckSum;
+ 
+   /*
+    *  Get Connection parameters
+    */
+ 
+    GET_CONN_MODE          mode = GET_GROUPS_CONNS;
+    short                  max_connections = OFLI_GET_MAX_CONNECTION;
+    short                  actual_num;
+    HAVE_MORE_typ          have_more = HAVE_MORE;
+    void                  *get_connection_handle = NULL;
+    short                  num_user_in    = 0;
+    short                  num_ug_in      = 1;
+    USER_typ               *user_in       = NULL;
+    UG_typ                 ug_in[1];
+    U2UG_PARAMS_rec_typ   *u2ug_params    = NULL;
+    ADDINFO_rec_ptr       *addinfo        = NULL;
+    OBJ_EXISTS_typ        *objs_exist     = NULL;
+    char                   CheckSumStr[sizeof(CHECKSUM_typ)+ 1];
+ 
+   /*
+    *   Initialize
+    */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, "Group=%s", ug);
+ 
+   /*
+    * Get Array of max_connections for output
+    */
+ 
+   size = max_connections * sizeof(U2UG_PARAMS_rec_typ);
+   u2ug_params  = (U2UG_PARAMS_rec_typ *)calloc (1, size);
+ 
+   if (u2ug_params EQ NULL) {
+      CTSAMSG_print (ERR_MALLOC,
+                     offl_params->msgs, NULL, offl_params->dest,
+                     "u2ug_params", size);
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   /*
+    * Get Array for obj_exist indicators
+    */
+ 
+   size = max_connections * sizeof (OBJ_EXISTS_typ);
+   objs_exist = (OBJ_EXISTS_typ *)calloc (1, size);
+ 
+   if (objs_exist EQ NULL) {
+      CTSAMSG_print (ERR_MALLOC,
+                     offl_params->msgs, NULL, offl_params->dest,
+                     "u2ug_params", size);
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   /*
+    * Get ADDINFO
+    */
+ 
+   rc = GetAddinfo( &addinfo, max_connections,
+                    connection_keywords,
+                    offl_params->dest, offl_params->msgs );
+   if (rc NE ESA_OK) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+   strcpy( ug_in[0], ug);
+ 
+   /*
+    *  GetConnection ( all group's connections )
+    */
+ 
+   while (have_more EQ HAVE_MORE) {
+ 
+       /*
+        *   Clear addinfo and output params
+        */
+ 
+       for (i=0; i LT max_connections; i++ )
+          ADDINFO_clear( addinfo[i] );
+ 
+       size = max_connections * sizeof(U2UG_PARAMS_rec_typ);
+       memset(u2ug_params , NULL_CHAR, size);
+ 
+       API_LOGIN
+       if ( rc NE ESA_OK ) {
+          get_done = GET_DONE_WITH_FATAL;
+          rc = ESA_FATAL;
+          goto exit;
+       }
+ 
+       /*
+        *  API call GetConnection
+        */
+ 
+       ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetConns for group=%s connection.",
+			 ug_in[0]);
+       CS_DIAG_UG2UC_IN (ESA_COMP_RSS_INTERCEPT,mode,max_connections,
+			 num_ug_in, num_user_in, ug_in, user_in,
+			 get_connection_handle, addinfo);
+       rc = (offl_params->func_ptr->gtug2uc_ptr) (mode, max_connections,
+                                     &actual_num, &have_more,
+                                     &get_connection_handle,
+                                     num_ug_in, num_user_in,
+                                     ug_in, user_in,
+                                     u2ug_params,  addinfo,
+                                     objs_exist,
+                                     &offl_params->admin_params,
+                                     offl_params->err);
+       ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetConns USA-API completed with rc=%d (%s).",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+       if (rc EQ ESA_OK)
+          CS_DIAG_UG2UC_OUT(ESA_COMP_RSS_INTERCEPT,actual_num,have_more,
+   			u2ug_params, objs_exist, get_connection_handle, addinfo);
+       API_LOGOUT
+       if ( rc EQ ESA_NOT_SUPP ) {
+          get_done = GET_DONE_UNSUPPORTED;
+          rc = ESA_OK;
+		  actual_num= 0;
+          goto exit;
+       }
+       else if ( rc NE ESA_OK ) {
+          get_done = GET_DONE_WITH_ERR;
+          break;
+       }
+       if (objs_exist[0] NE OBJ_EXIST)
+          get_done = GET_DONE_NOTFOUND;
+       else
+          get_done = GET_DONE_SUCCESS;
+ 
+      /*
+       *  Print diagnostic information
+       */
+ 
+       ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+                       "max_conns=%d actual num=%d",
+                       max_connections, actual_num);
+ 
+       if ( ESA_DIAG_get_debug_level(ESA_COMP_RSS_INTERCEPT) GE 19) {
+ 
+          for (i_dump=0; i_dump LT actual_num; i_dump++) {
+             ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+                      "User=%s Group=%s exist=%d connect_data=%d",
+                      u2ug_params[i_dump].user,
+                      u2ug_params[i_dump].group,
+                      objs_exist[i_dump],
+                      u2ug_params[i_dump].u2ug_admin_data);
+             if ( objs_exist[i_dump] EQ OBJ_EXIST )
+                ADDINFO_dump(addinfo[i_dump],0);
+          }
+       }
+ 
+ 
+       /*
+        *   Put OSOFLI Records
+        */
+ 
+       for (i=0; i LT actual_num; i++) {
+          if ( objs_exist[i] EQ OBJ_EXIST ) {
+             GetConnectionCheckSum( &CheckSum,
+                                    &u2ug_params[i], addinfo[i] );
+             memcpy (CheckSumStr, CheckSum, sizeof(CHECKSUM_typ));
+             CheckSumStr[sizeof(CHECKSUM_typ)]= '\0';
+             ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,15,
+                             "user=%s group=%s check-sum=%s",
+                             u2ug_params[i].user,
+                             u2ug_params[i].group, CheckSumStr);
+ 
+             rc = PutOSRecord(db_file, OBJECT_UPDATED,
+                              u2ug_params[i].user ,
+                              u2ug_params[i].group,
+                              CheckSum, offl_params->dest,
+                              offl_params->msgs);
+             if ( rc NE ESA_OK ) {
+                rc = ESA_FATAL;
+                goto exit;
+             }
+          } /* Object exists */
+       } /* Put OSOFLI Records */
+   } /* while HAVE_MORE */
+ 
+   exit :;
+ 
+   /*
+    *  If was Unsuccessfull termination.
+    *  API call free his handle
+    */
+ 
+    if ( get_connection_handle ) {
+ 
+       API_LOGIN
+       if ( rc EQ ESA_OK ) {
+          ESA_RC rcc= ESA_OK;
+          mode =  GET_FREE_HANDLE_CONNS ;
+ 
+          /*
+           *  API call GetConnection ( FREE HANDLE )
+           */
+ 
+          ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetConns for group=%s connection.",
+			ug_in[0]);
+          CS_DIAG_UG2UC_IN (ESA_COMP_RSS_INTERCEPT,mode,
+				0, 0, 0, ug_in, user_in, get_connection_handle, addinfo);
+          rcc= (offl_params->func_ptr->gtug2uc_ptr) (mode, max_connections,
+                                   &actual_num, &have_more,
+                                   &get_connection_handle,
+                                   num_ug_in, num_user_in,
+                                   ug_in, user_in,
+                                   u2ug_params,  addinfo,
+                                   objs_exist,
+                                   &offl_params->admin_params,
+                                   offl_params->err);
+          ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetConns USA-API completed with rc=%d (%s).",
+			     rcc, (rcc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+		  if (rcc EQ ESA_OK)
+             CS_DIAG_UG2UC_OUT(ESA_COMP_RSS_INTERCEPT,0,have_more,
+			    u2ug_params, objs_exist, get_connection_handle, addinfo);
+          API_LOGOUT
+       }
+       else {
+          CTSAMSG_print(ERR_INTERNAL2,
+           offl_params->msgs, NULL, offl_params->dest,
+           component, func,
+           "GetConnection handle not freed due to Login failure",
+           16, __LINE__);
+          rc = ESA_FATAL;
+          get_done = GET_DONE_WITH_FATAL;
+       }
+    }
+ 
+    if ( objs_exist )
+      free( objs_exist );
+ 
+    if ( u2ug_params )
+      free( u2ug_params );
+ 
+    if ( addinfo )
+       FreeAddinfo ( max_connections, &addinfo );
+ 
+    if ( get_done EQ GET_DONE_SUCCESS)
+       rc = ESA_OK;
+    else if (get_done EQ GET_DONE_UNSUPPORTED)
+       rc= ESA_NOT_SUPP;
+    else if (get_done EQ GET_DONE_NOTFOUND)
+       rc= ESA_KEY_NOT_FOUND;
+    else  if ( get_done EQ GET_DONE_WITH_ERR)
+       rc = ESA_ERR;
+    else
+       rc = ESA_FATAL;
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+    return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetSingleConnectionPairInfo               *
+*                                                             *
+* DESCRIPTION     : get connection (pair) information         *
+*                                                             *
+* INPUT           : user                                      *
+*                   group                                     *
+*                   connection_keywords                       *
+*                                                             *
+* OUTPUT          : CheckSum                                  *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC GetSingleConnectionPairInfo(
+        USER_typ                         user,
+        UG_typ                           group,
+        CHECKSUM_typ                    *CheckSum,
+        OFLI_KEYWORDS_rec_typ           *connection_keywords,
+        OFFLINE_INTERCEPT_STUFF_rec_typ *offl_params)
+{
+ 
+   ESA_RC      rc = ESA_OK;
+   static      char func[]="GetSingleConnectionPairInfo";
+   int         get_done = GET_DONE_WITH_FATAL;
+ 
+   /*
+    *  Get Connection parameters
+    */
+    unsigned int           size;
+    int                    i;
+    GET_CONN_MODE          mode = GET_MANY_CONNS;
+    short                  max_connections = 1;
+    short                  actual_num;
+    HAVE_MORE_typ          have_more = HAVE_MORE;
+    void                  *get_connection_handle = NULL;
+    short                  num_user_in    = 1;
+    short                  num_ug_in      = 1;
+    USER_typ               user_in[1];
+    UG_typ                 ug_in[1];
+    U2UG_PARAMS_rec_typ    u2ug_params[1];
+    ADDINFO_rec_ptr       *addinfo        = NULL;
+    OBJ_EXISTS_typ         objs_exist[1];
+    char                   CheckSumStr[sizeof(CHECKSUM_typ)+ 1];
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11, "User=%s Group=%s",
+                    user, group );
+ 
+    /*
+     * Get ADDINFO
+     */
+ 
+    rc = GetAddinfo( &addinfo,
+                     max_connections,
+                     connection_keywords,
+                     offl_params->dest, offl_params->msgs );
+    if (rc NE ESA_OK) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+    API_LOGIN
+    if ( rc NE ESA_OK ) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+   /*
+    *   Clear addinfo and output params
+    */
+ 
+    for (i=0; i LT max_connections; i++ )
+       ADDINFO_clear( addinfo[i] );
+ 
+    size = max_connections * sizeof(U2UG_PARAMS_rec_typ);
+    memset(&u2ug_params , NULL_CHAR, size);
+ 
+   /*
+    *  API call GetConnection ( PAIR )
+    */
+ 
+    strcpy( (char *)ug_in[0],   (char *)group);
+    strcpy( (char *)user_in[0], (char *)user );
+ 
+	ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetConns for user=%s to group=%s connection.",
+			user_in[0], ug_in[0]);
+    CS_DIAG_UG2UC_IN (ESA_COMP_RSS_INTERCEPT,mode,max_connections,
+			 num_ug_in, num_user_in, ug_in, user_in,
+			 get_connection_handle, addinfo);
+    rc = (offl_params->func_ptr->gtug2uc_ptr) (mode, max_connections,
+                                  &actual_num, &have_more,
+                                  &get_connection_handle,
+                                  num_ug_in, num_user_in,
+                                  ug_in, user_in,
+                                  u2ug_params,  addinfo,
+                                  objs_exist,
+                                  &offl_params->admin_params,
+                                  offl_params->err);
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetConns USA-API completed with rc=%d (%s).",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+	if (rc EQ ESA_OK)
+       CS_DIAG_UG2UC_OUT(ESA_COMP_RSS_INTERCEPT,actual_num,have_more,
+			u2ug_params, objs_exist, get_connection_handle, addinfo);
+ 
+    API_LOGOUT
+    if ( rc EQ ESA_NOT_SUPP ) {
+       get_done = GET_DONE_UNSUPPORTED;
+       rc = ESA_OK;
+       actual_num= 0;
+       goto exit;
+    }
+    else if ( rc NE ESA_OK ) {
+       get_done = GET_DONE_WITH_ERR;
+       rc = ESA_OK;
+       goto exit;
+    }
+    else if ( rc EQ ESA_OK ) {
+       if (objs_exist[0] NE OBJ_EXIST)
+          get_done = GET_DONE_NOTFOUND;
+       else
+          get_done = GET_DONE_SUCCESS;
+       /*
+        *  Print diagnostic information
+        */
+ 
+       ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+                       "actual num=%d", actual_num);
+ 
+       if ( ESA_DIAG_get_debug_level(ESA_COMP_RSS_INTERCEPT) GE 19)  {
+          ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,18,
+                          "User=%s Group=%s exist=%d connect_data=%d",
+                          u2ug_params[0].user,
+                          u2ug_params[0].group,
+                          objs_exist[0],
+                          u2ug_params[0].u2ug_admin_data);
+          if ( ( objs_exist[0] EQ OBJ_EXIST ) AND
+               ( ESA_DIAG_get_debug_level(ESA_COMP_RSS_INTERCEPT)
+                                          GE 19 ) )
+             ADDINFO_dump(addinfo[0],0);
+       }
+ 
+ 
+       /*
+        *   Build check-sum buffer
+        */
+ 
+       if ( objs_exist[0] EQ OBJ_EXIST ) {
+          GetConnectionCheckSum( CheckSum,
+                                 &u2ug_params[0], addinfo[0] );
+          memcpy (CheckSumStr, CheckSum, sizeof(CHECKSUM_typ));
+          CheckSumStr[sizeof(CHECKSUM_typ)]= '\0';
+          ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,15,
+                          "user=%s group=%s check-sum=%s",
+                          u2ug_params[0].user,
+                          u2ug_params[0].group, CheckSumStr);
+       }
+       else
+          get_done = GET_DONE_NOTFOUND; /* ISAN000864 */
+ 
+    }
+ 
+    exit :;
+ 
+    /*
+     *  If was Unsuccessfull termination.
+     *  API call free his handle
+     */
+ 
+    if ( get_connection_handle ) {
+ 
+       API_LOGIN
+       if ( rc EQ ESA_OK ) {
+		    ESA_RC rcc= ESA_OK;
+            mode =  GET_FREE_HANDLE_CONNS;
+ 
+            /*
+             *  API call GetConnection ( FREE HANDLE )
+             */
+ 
+        	ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    -> Call to CTSGetConns for user=%s to group=%s connection.",
+			user_in[0], ug_in[0]);
+            CS_DIAG_UG2UC_IN (ESA_COMP_RSS_INTERCEPT,mode,
+			   0, 0, 0, ug_in, user_in, get_connection_handle, addinfo);
+            rcc= (offl_params->func_ptr->gtug2uc_ptr) (mode, max_connections,
+                                     &actual_num, &have_more,
+                                     &get_connection_handle,
+                                     num_ug_in, num_user_in,
+                                     ug_in, user_in,
+                                     u2ug_params,  addinfo,
+                                     objs_exist,
+                                     &offl_params->admin_params,
+                                     offl_params->err);
+            ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"    <- CTSGetConns USA-API completed with rc=%d (%s).",
+			     rcc, (rcc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+         	if (rcc EQ ESA_OK)
+                CS_DIAG_UG2UC_OUT(ESA_COMP_RSS_INTERCEPT,0,have_more,
+	    	     	u2ug_params, objs_exist, get_connection_handle, addinfo);
+            API_LOGOUT
+       }
+       else {
+          CTSAMSG_print(ERR_INTERNAL2,
+            offl_params->msgs, NULL, offl_params->dest,
+            component, func,
+            "GetConnection handle not freed due to Login failure",
+            16, __LINE__);
+          rc = ESA_FATAL;
+          get_done = GET_DONE_WITH_FATAL;
+       }
+    }
+ 
+    /*
+     *   Free
+     */
+ 
+    if ( addinfo )
+       FreeAddinfo ( max_connections, &addinfo );
+ 
+    if ( get_done EQ GET_DONE_SUCCESS)
+       rc = ESA_OK;
+    else if (get_done EQ GET_DONE_UNSUPPORTED)
+       rc= ESA_NOT_SUPP;
+    else if (get_done EQ GET_DONE_NOTFOUND)
+       rc= ESA_KEY_NOT_FOUND;
+    else  if ( get_done EQ GET_DONE_WITH_ERR)
+       rc = ESA_ERR;
+    else
+       rc = ESA_FATAL;
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+    return rc;
+ 
+}
+/**************************************************************
+*                                                             *
+* Subroutine name : PutOSRecord                               *
+*                                                             *
+* DESCRIPTION     : Compress, Put OSOFLI record               *
+*                                                             *
+* INPUT           : res_rec    - ptr to event record          *
+*                   result_file - file full path              *
+*                   result_fptr - ptr to FILE struct          *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC PutOSRecord (char                       * os_file,
+                    char                         action,
+                    const char                 * obj1,
+                    const char                 * obj2,
+                    CHECKSUM_typ                 CheckSum,
+                    CTSAMSG_DEST_TABLE_rec_typ * dest,
+                    CTSAMSG_HANDLE_rec_typ     * msgs)
+{
+   static     char  func[] = "PutOSRecord";
+   ESA_RC     rc = ESA_OK, rc_lock= ESA_ERR;
+   char       *record;
+   FILE       *fptr= NULL;
+   char       dsn_with[50]="";                            /* SAS2IBMT */
+   OFFLINE_INTERCEPT_DB_RECORD_rec_typ os_record;
+   CHECKSUM_typ                        zero_chksum;
+ 
+   /*
+    *  Initialize
+    */
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+  /*
+   *  Compress record
+   */
+ 
+   record  = (char *)&os_record;
+ 
+  /*
+   *   DB action
+   */
+ 
+   *record = action;
+   record++;
+   *record = DB_FIELDS_SEPARATOR_CHAR;
+   record++;
+ 
+  /*
+   *   Object #1
+   */
+ 
+   strcpy( record, obj1);
+   record += strlen(obj1);
+   *record = DB_FIELDS_SEPARATOR_CHAR;
+   record++;
+ 
+  /*
+   *   Object #2
+   */
+ 
+   if ( obj2 AND strlen(obj2) GT 0) {
+     strcpy( record, obj2);
+     record += strlen(obj2);
+   }
+   else {
+     *record = ' ';
+     record++;
+   }
+ 
+   *record = DB_FIELDS_SEPARATOR_CHAR;
+   record++;
+ 
+  /*
+   *   Check Sum
+   */
+ 
+   memset (zero_chksum, '\0', sizeof (zero_chksum));
+ 
+   /* Check whether checksum is empty */
+ 
+   if (memcmp ((void *)CheckSum, (void *)zero_chksum,
+               sizeof (zero_chksum)) NE 0) {          /* not */
+      memcpy( record, CheckSum, sizeof(os_record.CheckSum));
+      record += sizeof(os_record.CheckSum);
+   }
+   else {                                             /* empty */
+     *record = ' ';
+     record++;
+   }
+ 
+   *record = DB_FIELDS_SEPARATOR_CHAR;
+   record++;
+ 
+   *record = '\n';
+   record++;
+   *record = '\0';
+ 
+   rc_lock= CSA_lock (os_file, func, SCOPE_LOCAL);
+   if (rc_lock NE ESA_OK)
+   {
+      rc= rc_lock;
+      goto exit;
+   }
+   /*
+    *   Open OSOFLI DB (for append)
+    */
+ 
+ 
+    strcpy(dsn_with,"//'");                               /* SAS2IBMT */
+    strcat(dsn_with, os_file+4);     /* copy name after dsn: SAS2IBMT */
+    strcat(dsn_with,"'");                                 /* SAS2IBMT */
+    /* strcpy(dsn_with,"DD:");                               SAS2IBMT */
+    /* strcat(dsn_with, os_file);                            SAS2IBMT */
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 0,            /* SAS2IBMT */
+        "ESAOFSO: About to fopen %s", os_file);
+ 
+    /* SAS2IBMT fptr = fopen(os_file , "a");                         */
+    fptr = fopen(dsn_with , "a,recfm=*");                 /* SAS2IBMT */
+ 
+   /*
+    *  Errors handling
+    */
+ 
+   if ( !fptr ) {
+      CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                    "fopen", os_file, strerror(errno) );
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                      "file %s/%s error %d/%s",
+                      os_file, "fopen", errno,
+                      strerror(errno));
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+  /*
+   *  Put record
+   */
+ 
+   fputs ( (char *)&os_record, fptr);
+   if ( ferror(fptr) )  {
+       CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                     "fputs", os_file, strerror(errno) );
+       ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                     "file %s/%s error %d/%s",
+                     os_file, "fputs", errno,
+                    strerror(errno));
+       rc = ESA_FATAL;
+   }
+   else
+       ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, DIAG_DETAILES,
+	      "     ==> Write Record to %s file for Account-1=%s Account-2=%s.",
+	      os_file, (obj1) ? obj1 : "NULL", (obj2) ? obj2 : "NULL");
+ 
+ 
+   exit :;
+ 
+   if (rc_lock EQ ESA_OK)
+      CSA_unlock (os_file, func);
+ 
+   if ( fptr )
+      fclose( fptr);
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+   return rc;
+}

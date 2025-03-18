@@ -1,0 +1,1579 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: ctsofli.c %
+ * Instance        : %instance: 1 %
+ * Created on      : %date_created: Mon Jan 19 15:22:54 2004 %
+ * Created by      : %created_by: leonid_s %
+ * Current Version : %version: 4.2.3 %
+ * Last Modified by: %derived_by: leonid_s %
+ * Last Modified on: %date_modified: Mon Jan 19 15:22:56 2004 %
+ */
+ 
+/**********************************************************************
+ * Mod.ID       Who      When         Description
+ * ===================================================================
+ * IMH001       Ian H.   17/09/03       Add support for CheckAndPrintVersion *
+ * IMH002       Ian H.   16/10/03       Thread-safe code                     *
+ * BSAN102349   Nmore    25-Jan-05      Adding RSSPARAM to ignore uppercase conversion
+ *                                      Additional parameter to send ofli parameter to leaf functions
+ * SAS2IBMT     SeligT   05-Sep-16      SAS/C to IBM C Conversion Project
+ * SAS2IBMN     NuritY   01/01/2017     SAS/C to IBM C Conversion:
+ *                                      Remove signal processing because
+ *                                      it depends on the HANDLE_ABENDS
+ *                                      RSSPARM ALL_RSS parameter which
+ *                                      is always N. If/when recovery is
+ *                                      needed, the appropriate recovery
+ *                                      services will have to be used.
+ * WS10082A     AvnerL   12-Nov-23      Remove ADM_free
+ *********************************************************************/
+ 
+/****************************************************
+ * Procedure Name: ctsofli
+ * Description   : Offline interceptor main routine.
+ *
+ * Command line
+ * args:           [-i] RSS-name
+ *
+ * Return Value  : ESA_OK, ESA_FATAL
+ *
+ * Comments      :
+ * Scope         :
+ *
+ ****************************************************/
+ 
+#define THIS_IS_MAIN
+#include "globs.h"
+ 
+/*#define  OS_OFLI_WAIT        1 WSAN100128*/
+ 
+/*
+ *   Standard header files
+ */
+#include <errno.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+ 
+ 
+/*
+ *   ESA code header files
+ */
+ 
+#include ESA_API
+#include ESA_INIT
+#include ESA_VER
+#include ESA_ADMIN
+#include ESA_CS_OS
+#include ESA_DIAG
+#include ESA_API_CODES
+ 
+/*
+ *   Offline header files
+ */
+#include ESA_OS_OFLI
+#include ESA_ESAOFLI
+#include ESA_ESAOFIO
+ 
+/* ps0381 */
+#define  HANDLE_FILE_IOERR(fp,fnm,opcode)                    \
+   if ( ferror( (fp) ) ) {                                   \
+       CTSAMSG_print(ERR_IO,                                 \
+                     msgs,                                   \
+                     NULL,                                   \
+                     dest,                                   \
+                     (opcode), (fnm), strerror(errno) );     \
+       ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,DIAG_DETAILES, \
+                       "file %s/%s error %d/%s",             \
+                       (fnm),(opcode), errno,                \
+                       strerror(errno));                     \
+       rc = ESA_FATAL;                                       \
+       goto exit;                                            \
+   }
+/* ps0381 */
+static ESA_RC CopyCAREOE( RSS_typ                     rss_name,
+                          RESOURCE_typ                file_name_in,
+                          RESOURCE_typ                file_name_out,
+                          CTSAMSG_DEST_TABLE_rec_typ *dest,
+                          CTSAMSG_HANDLE_rec_typ     *msgs);
+ 
+/* SAS2IBMN - remove signal processing
+void CS_signal (int signal_code);
+*/
+ 
+/***************************************************************/
+ 
+static void Usage (void)
+{
+ fprintf(stderr,"OFFLINE_INTERCEPTOR: Usage: [-i] Connector_name\n");
+} /* Usage */
+ 
+ 
+int CheckMaxDelExceeded(int nMaxDel, struct stat_data *pStat)
+{
+	int  rc;
+	char func[]="CheckMaxDelExceeded";
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+	if (nMaxDel GE 100)
+		rc= 0;
+	else if ((pStat->old EQ 0 AND pStat->deleted GT 0) OR
+		     (pStat->old GT 0 AND (nMaxDel / 100.0) LT (pStat->deleted
+                                / (double)pStat->old)))
+		rc= 1;
+    else
+	    rc= 0;
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+    return (rc);
+} /* CheckMaxDelExceeded */
+ 
+/***************************************************************/
+ 
+/*
+ *  Main program
+ */
+ 
+int main (int argc, char **argv)
+{
+ 
+  static char func[] = "ctsofli";
+ 
+ /*
+  *     Variables
+  */
+ 
+  ESA_RC                       rc = ESA_OK, rc2= ESA_OK;
+  TIME_RANGE_rec_typ           time_range;
+ 
+  char                         gtoe[8]= "ALL";  /* ps0381 */
+  char                         runofli[2] = "N";
+  void                        *attach_handle= NULL;
+  INTERCEPT_RSS_PARAMS_rec_typ rss_parm;
+  RSS_STATUS_typ               rss_status=RSS_UP;
+  char                         mode[10];
+  char                         cache_mode[10];    /* BSAN100422 */
+  FUNC_PTR_rec_typ             func_ptr;
+  INTERCEPT_FILES_rec_typ      Files;
+ 
+  OFFLINE_INTERCEPT_STUFF_rec_typ      offl_params;
+  OFFLINE_INTERCEPT_STAT_DATA_rec_typ  stat_data;
+  char                        *user_file= NULL;
+  char                        *group_file= NULL;
+  char                        *connection_file= NULL;
+  char                        *rss_file= NULL;
+  char                        *oe_file= NULL;
+/* for MVS */
+  void                        *os_init_handle = NULL;
+ /* MVS */
+ 
+  RSS_LIMITS_rec_typ          rss_limits;
+ 
+  /*
+   *  Keywords
+   */
+ 
+  OFLI_KEYWORDS_rec_typ  user_keywords       = { 0, 0, NULL, NULL };
+  OFLI_KEYWORDS_rec_typ  group_keywords      = { 0, 0, NULL, NULL };
+  OFLI_KEYWORDS_rec_typ  connection_keywords = { 0, 0, NULL, NULL };
+  OFLI_KEYWORDS_rec_typ  rss_keywords        = { 0, 0, NULL, NULL };
+  OFLI_KEYWORDS_rec_typ  oe_keywords         = { 0, 0, NULL, NULL };
+ 
+  /*
+   *  Running flags ( Done steps )
+   */
+ 
+  int                         CTSInterceptorInit_flag    = 0;
+  int                         OS_CS_attach_rss_flag      = 0;
+  int                         apiinit_flag               = 0;
+  int                         GetUserInfo_flag           = 0;
+  int                         GetGroupInfo_flag          = 0;
+  int                         GetConnectionInfo_flag     = 0;
+  int                         GetRSSParamsInfo_flag      = 0;
+  int                         GetOEInfo_flag             = 0;
+  int                         CompareUserInfo_flag       = 0;
+  int                         CompareGroupInfo_flag      = 0;
+  int                         CompareConnectionInfo_flag = 0;
+  int                         CompareRSSParamsInfo_flag  = 0;
+  int                         CompareOEInfo_flag         = 0;
+  int                         first_login_done           = 0;
+/*RESOURCE_typ                RName; WSAN100128*/
+ 
+  /*
+   *  Time managament vars
+   */
+ 
+  time_t       before,  after; /* , ss; */
+  double       difft, ss;
+  int          hh, mm;
+  char         elapsed_t[200];
+  ENVIRONMENT_rec_typ   * envir_ptr;
+ 
+ 
+  /*
+   *  Running flags ( Done steps )
+   */
+ 
+  /*
+   *     Initialize
+   */
+  memset ((char *)(&func_ptr), '\0', sizeof (FUNC_PTR_rec_typ));
+  rss_parm.handle     = NULL;
+  rss_parm.msg_params = &offl_params.msg_params;
+ 
+  /* Amir :Do this, since at label 'exit:' it is checked, but not
+   * necessarily initialized - Insure got it!
+   */
+ 
+  offl_params.adm_load_done = 0;
+ 
+  memset (rss_parm.type, '\0', sizeof(RSS_typ));
+  memset (rss_parm.name, '\0', sizeof(RSS_typ));
+ 
+/* IMH001 start */
+ 
+   rc = CheckAndPrintVersion (argc, argv);
+   if (rc EQ ESA_OK)
+       goto cleanup;
+ 
+    rc = ESA_OK;
+/* IMH001 end */
+ 
+  switch (argc) {
+   case 2:  /* One parameter obtained
+             *
+             *  mode = REGULAR
+             *  parameter - rss_name
+             */
+       strcpy( mode, "REGULAR");
+       strncpy( rss_parm.name, argv[1],
+                sizeof(rss_parm.name)-1);
+       break;
+ 
+   case 3:  /* Two parameters obtained
+             *
+             *  1st parameter -i -> mode=INIT
+             *  2nd parameter - rss_name
+             */
+       if ( (strcmp(argv[1], "-i") EQ 0 ) OR
+            (strcmp(argv[1], "-I") EQ 0 )  )
+          strcpy( mode, "INIT");
+       else {
+          fprintf(stderr,
+                   "OFFLINE_INTERCEPTOR: Invalid parameter %s\n",
+                   argv[1]);
+          Usage ();
+          rc = ESA_FATAL;
+          goto cleanup;
+       }
+ 
+       strncpy (rss_parm.name, argv[2], sizeof(rss_parm.name)-1);
+       break;
+ 
+    default:
+        Usage ();
+        rc = ESA_FATAL;
+        goto cleanup;
+  }
+ 
+  rc = CTSInterceptorInit( rss_parm.type, rss_parm.name,
+          &rss_parm.handle, NULL, INTERCEPT_OFFLINE,
+          &time_range, &offl_params.admin_params, argc, argv);
+  if ( rc NE ESA_OK ) {
+     fprintf(stderr,
+       "OFFLINE_INTERCEPTOR: Connector %s/%s Init failed rc=%ld\n",
+       rss_parm.name, rss_parm.type,  rc);
+     rc = ESA_FATAL;
+     goto cleanup;
+  }
+ 
+  offl_params.msg_params.ctsamsg_handle =
+       offl_params.admin_params.ctsamsg_handle;
+  offl_params.msg_params.ctsamsg_dest =
+       offl_params.admin_params.ctsamsg_dest;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  CTSInterceptorInit_flag = 1;  /* Init done */
+ 
+  ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+  /* SAS2IBMN - start  */
+  /*****************************************************************
+  *                                                                *
+  * SAS2IBMN - Remove signal processing                            *
+  *                                                                *
+  * Signal processing is removed because it depends on the         *
+  * HANDLE_ABENDS RSSPARM ALL_RSS parameter which is always N.     *
+  * If/when recovery is needed, these routines will have to be     *
+  * written using the appropriate IBM C or LE services.            *
+  *                                                                *
+  * Considerations:                                                *
+  * 1. The siginfo is not availabe in IBM C.                       *
+  * 2. LE has its own recovery so we should find a way to control  *
+  *    LE dump and backtrace according to our needs.               *
+  *                                                                *
+  ******************************************************************
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+                   "...-> OS_PROC_set_signal: os_proc_handle=%p.",
+				   envir_ptr->os_proc_handle);
+  rc= OS_PROC_set_signal ((&CS_signal),
+                                envir_ptr->p_main_name,
+                                envir_ptr->os_proc_handle);
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+	                    "...<- OS_PROC_set_signal: rc=%d (%s).",
+			            rc, (rc EQ ESA_OK) ? "OS==OK" : "OS##OK");
+  */
+  ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,DIAG_BASIC,
+                  "Connector %s/%s mode=%s rsinit rc =%d",
+                  rss_parm.name, rss_parm.type, mode, rc);
+ 
+  ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,"file keywords      :%s",
+                  envir_ptr->file_rsskwds);
+  ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,"file offl/intrscptr:%s",
+                  envir_ptr->file_rssofli);
+ /*
+  *   Set end-date EQ start-date
+  */
+ 
+  time_range.from_date[8] = NULL_CHAR;
+  time_range.from_time[6] = NULL_CHAR;
+ 
+  strcpy(time_range.end_date, time_range.from_date);  /* Default */
+  strcpy(time_range.end_time, time_range.from_time);  /* Default */
+ 
+ /*
+  *   Set common parameters
+  */
+ 
+  rc = BuildOfflParams(OFFLINE_INTERCEPTOR, rss_parm.name,
+                       rss_parm.type,
+                       &envir_ptr->msg_admin_param, &offl_params);
+  if (rc NE ESA_OK) {
+    rc = ESA_FATAL;
+    goto exit;
+  }
+ /*
+  *  User DB file name
+  */
+  rc= OS_OFLI_Build_FileNames (rss_parm.name,
+	                           &Files,
+      							   &envir_ptr->msg_admin_param);
+  if (rc NE ESA_OK) {
+    rc = ESA_FATAL;
+    goto exit;
+  }
+ 
+/*WSAN100128 start
+ 
+ Lines below commented out because lock to SYNC_SEMAPHORE
+ will be done by function CTSInterceptorInit
+ 
+  rc= envir_ptr->msg_admin_param.cs_func.rssprm_get_ptr(rss_parm.name,
+	                           SYNC_SEMAPHORE, sizeof (RName), RName);
+ 
+  if (rc NE ESA_OK) {
+     ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 1, "ssprm_get(%s) failed",
+                      SYNC_SEMAPHORE);
+     rc = ESA_FATAL;
+     goto exit;
+  }
+ 
+  *
+  *  Lock INIT
+  *
+ 
+  rc = OS_CS_lock_init(RName, LOCK_RES_FILE,
+                       &(offl_params.lock_handle),
+                       offl_params.lock_file_handle,
+                       SCOPE_REMOTE, &(offl_params.msg_params));
+ 
+  if (rc NE ESA_OK ) {
+     ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 1,
+                      "OS_CS_lock_init failed");
+     rc = ESA_FATAL;
+     goto exit;
+  }
+ 
+  *
+  *  Lock
+  *
+ 
+  rc = OS_CS_lock ( offl_params.lock_handle, OS_OFLI_WAIT,
+                    &(offl_params.msg_params));
+  if (rc NE ESA_OK ){
+     ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 1, "OS_CS_lock failed");
+     rc = ESA_FATAL;
+     goto exit;
+  }
+ 
+  offl_params.lock_done = 1;
+ 
+ WSAN100128 end*/
+ 
+    rc = envir_ptr->msg_admin_param.cs_func.rssprm_get_opt_ptr(
+                                           offl_params.rss_name,
+                                                               OFLI_INTERCEPT, 1,
+                                                               runofli, OPT_TRUE, OPT_TRUE);
+    if (rc NE ESA_OK OR runofli[0] EQ 'N')
+    {
+        CTSAMSG_print(ERR_UL_STRING, offl_params.msgs, NULL,
+        offl_params.dest,
+        "Common Offline Interceptor "
+        " cannot be run if OFLI_INTERCEPT parameter is set to N.");
+        CTSAMSG_print(ERR_UL_STRING, offl_params.msgs, NULL,
+        offl_params.dest,
+        " If you want to"
+        " run OFLI only manually, set OFLI_INTERCEPT to Y and "
+        " OFLI_INTERVAL to 000000");
+        rc = ESA_FATAL;
+        goto exit;
+    }
+ 
+ /*  ps0381
+  *  Get "get" mode
+  */
+ 
+  envir_ptr->msg_admin_param.cs_func.rssprm_get_opt_ptr
+                   (offl_params.rss_name,
+                    "OFLI_GET_MODE",
+                    sizeof(gtoe) - 1,
+                    gtoe, OPT_TRUE, OPT_TRUE);
+  CTSAMSG_print(ERR_3_STRINGS,
+                offl_params.msgs,  NULL, offl_params.dest,
+     "Offline interceptor mode (OFLI_GET_MODE) is set to ", gtoe, "");
+ 
+ 
+ /*
+  *  BSAN100422
+  *  Get cache_mode parameter ( optional )
+  */
+ 
+  rc = offl_params.admin_params.cs_func.rssprm_get_opt_ptr
+                    (offl_params.rss_name,
+                     "OFLI_NO_CACHE",
+                     sizeof(cache_mode), cache_mode,
+                     OPT_TRUE,  OPT_FALSE);
+  if (rc NE ESA_OK)
+     strcpy(cache_mode, "Y");   /* Default */
+ 
+ /*
+  *  Interceptor start from date,time
+  */
+ 
+  CTSAMSG_print(MSG_OFLI_START_DATE,
+                offl_params.msgs,
+                NULL,
+                offl_params.dest,
+                rss_parm.name,
+                time_range.from_date,
+                time_range.from_time);
+ 
+ /*
+  *  Create file names
+  *  ------------------
+  *  init_file_name     -  db file name
+  *  regular_file_name  -  current running db file name
+  *  compare_file_name  -  work file
+  *  osofli_file_name   -  corresponding os ofli file name
+  */
+ 
+ /*
+  *  Check mode and set file names for result files
+  */
+ 
+  ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,DIAG_BASIC, "mode=%s", mode);
+ 
+  if ( (strcmp(mode, "init" ) EQ 0 ) OR
+       (strcmp(mode, "INIT" ) EQ 0 )  ) {
+     user_file       =  Files.user_init_result_file;
+     group_file      =  Files.group_init_result_file;
+     connection_file =  Files.connection_init_result_file;
+     rss_file        =  Files.rss_init_result_file;
+     oe_file         =  Files.oe_init_result_file;
+  }
+  else {
+     user_file       =  Files.user_regular_result_file;
+     group_file      =  Files.group_regular_result_file;
+     connection_file =  Files.connection_regular_result_file;
+     rss_file        =  Files.rss_regular_result_file;
+     oe_file         =  Files.oe_regular_result_file;
+ 
+     rc = CheckFileExistance( Files.user_init_result_file,
+                              Files.group_init_result_file,
+                              Files.connection_init_result_file,
+                              Files.rss_init_result_file,
+                              Files.oe_init_result_file,
+                              offl_params.dest, offl_params.msgs);
+ 
+     if ( rc NE ESA_OK ) { /* Init DB files does not exist */
+        rc = ESA_OK;
+        user_file       =  Files.user_init_result_file;
+        group_file      =  Files.group_init_result_file;
+        connection_file =  Files.connection_init_result_file;
+        rss_file        =  Files.rss_init_result_file;
+        oe_file         =  Files.oe_init_result_file;
+        strcpy( mode, "init" );
+     }
+  }
+ 
+ /*
+  *   Attach RSS
+  */
+ 
+/* for MVS */
+  {
+   ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+                   "...-> OS_CS_init: func=%s.",func);
+   rc2=OS_CS_init (func, rss_parm.msg_params, &os_init_handle);
+   ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+   "...<- OS_CS_init: rc=%d (%s) hndl=%p.",
+			rc2, (rc2 EQ ESA_OK) ? "OS==OK" : "OS##OK",
+			os_init_handle);
+  }
+ /* MVS */
+ 
+ /*
+  * Attach RSS
+  */
+ 
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+                   "...-> OS_CS_attach_rss: RssName=%s RssType=%s.",
+				   rss_parm.name, rss_parm.type);
+  rc = OS_CS_attach_rss (rss_parm.name, rss_parm.type,
+                         &func_ptr,
+                         &rss_limits,
+                         &offl_params.admin_params,
+                         offl_params.err, &attach_handle);
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+  "...<- OS_CS_attach_rss: rc=%d (%s) hndl=%p func_ptr=%p RssLim=%p.",
+			rc, (rc EQ ESA_OK) ? "OS==OK" : "OS##OK",
+			attach_handle, &func_ptr, &rss_limits);
+  if ( rc NE ESA_OK ) {
+     ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 0,
+        "Connector %s API library load, completed with return code:%s",
+         rss_parm.name, ESA_rc2str(rc));
+     rc = ESA_FATAL; /* Messages were sent from  OS_CS_attach_rss */
+     goto exit;
+  }
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+ "Lim:Pwd=%d Res/Typ=%d/%d Usr=%d/%d OE=%d/%d UG=%d/%d Kwd/Len=%d/%d.",
+  rss_limits.max_pwd_len, rss_limits.max_resource_len,
+  rss_limits.max_restype_len, rss_limits.max_user_len,
+  rss_limits.max_ace_user_len, rss_limits.max_oe_len,
+  rss_limits.max_ace_oe_len, rss_limits.max_ug_len,
+  rss_limits.max_ace_ug_len, rss_limits.max_addinfo_kwd_len,
+  rss_limits.max_addinfo_val_len);
+ 
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+     "Func Pointers: ----------------------");
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+     "   apiinit_ptr=%p apiterm_ptr=%p strsprm_ptr=%p adduser_ptr=%p",
+     func_ptr.apiinit_ptr, func_ptr.apiterm_ptr,
+	 func_ptr.strsprm_ptr, func_ptr.adduser_ptr);
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+     "   upduser_ptr=%p deluser_ptr=%p revuser_ptr=%p updpass_ptr=%p",
+     func_ptr.upduser_ptr, func_ptr.deluser_ptr,
+	 func_ptr.revuser_ptr, func_ptr.updpass_ptr);
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+"   addug_ptr=%p updug_ptr=%p delug_ptr=%p rss_start_intercept_ptr=%p",
+     func_ptr.addug_ptr, func_ptr.updug_ptr,
+	 func_ptr.delug_ptr, func_ptr.rss_start_intercept_ptr);
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+    "   updu2ug_ptr=%p delu2ug_ptr=%p addace_ptr=%p apiversion_ptr=%p",
+    func_ptr.updu2ug_ptr, func_ptr.delu2ug_ptr,
+    func_ptr.addace_ptr, func_ptr.apiversion_ptr);
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+     "   updace_ptr=%p addres_ptr=%p delres_ptr=%p updres_ptr=%p",
+     func_ptr.updace_ptr, func_ptr.addres_ptr,
+	 func_ptr.delres_ptr, func_ptr.updres_ptr);
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+     "   gtrsprm_ptr=%p gtusers_ptr=%p getugs_ptr=%p gtug2uc_ptr=%p",
+     func_ptr.gtrsprm_ptr, func_ptr.gtusers_ptr,
+	 func_ptr.getugs_ptr,  func_ptr.gtug2uc_ptr);
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+  "   getres_ptr=%p gtrsacl_ptr=%p rss_login_ptr=%p rss_logout_ptr=%p",
+     func_ptr.getres_ptr, func_ptr.gtrsacl_ptr,
+     func_ptr.rss_login_ptr, func_ptr.rss_logout_ptr);
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+     "   rss_check_ptr=%p addu2ug_ptr=%p addoe_ptr=%p updoe_ptr=%p",
+     func_ptr.rss_check_ptr, func_ptr.addu2ug_ptr,
+	 func_ptr.addoe_ptr, func_ptr.updoe_ptr);
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+     "   deloe_ptr=%p getoes_ptr=%p isuserinoe_ptr=%p isuginoe_ptr=%p",
+     func_ptr.deloe_ptr, func_ptr.getoes_ptr,
+     func_ptr.isuserinoe_ptr, func_ptr.isuginoe_ptr);
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+ "   isoeinoe_ptr=%p ismaskmatch_ptr=%p trnsevnt_ptr=%p delace_ptr=%p",
+     func_ptr.isoeinoe_ptr, func_ptr.ismaskmatch_ptr,
+     func_ptr.trnsevnt_ptr, func_ptr.delace_ptr);
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+     "----------------------");
+ 
+ 
+ 
+  OS_CS_attach_rss_flag  = 1;  /* RSS attached */
+  offl_params.func_ptr   = &func_ptr;
+ 
+ /* Fill in stub functions pointer if returned attached pointer
+    is NULL */
+ 
+  CS_attach_empty_to_unsupported (&func_ptr);
+ 
+ /*
+  * Call APIINIT
+  */
+ 
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+    		"...-> apiinit_ptr.");
+  rc = (func_ptr.apiinit_ptr) (&offl_params.admin_params,
+                               offl_params.err);
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"...<- apiinit_ptr: rc=%d (%s)",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+ 
+  envir_ptr->apiinit_handle= offl_params.admin_params.apiinit_handle;
+ 
+  if ( rc NE ESA_OK ) {
+     CTSAMSG_print (ERR_APIINIT,
+                    envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                    envir_ptr->msg_admin_param.ctsamsg_dest,
+                    rss_parm.name,
+                    rss_parm.type);
+     rc = ESA_FATAL;  /* Messages were sent from apiinit */
+     goto exit;
+  }
+ 
+  apiinit_flag = 1;   /* API init done */
+ 
+  /*
+   * Check RSS
+   */
+ 
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+    		"...-> rss_check_ptr: RSS=%s.", rss_parm.name);
+  rc = (func_ptr.rss_check_ptr) (rss_parm.name,
+                                 &rss_status,
+                                 &offl_params.admin_params,
+                                 offl_params.err);
+  ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"...<- rss_check_ptr: rc=%d (%s) RssStat=%s.",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK",
+			(rss_status == RSS_UP) ? "Connector_UP" : "Connector_DOWN");
+  if ( (rc NE ESA_OK) OR ( rss_status EQ RSS_DOWN) ) {
+     rc = ESA_FATAL;  /* Messages were sent from rsscheck */
+     goto exit;
+  }
+ 
+ /*
+  *  Get keywords
+  *  ( first parameter to  GetOfliKeywords function was:
+  *    rss_parm.name; now rss_parm.type )
+  */
+ 
+  rc = GetOfliKeywords( rss_parm.type, envir_ptr->file_rsskwds,
+                        &user_keywords, &group_keywords,
+                        &connection_keywords, &rss_keywords,
+                        &oe_keywords,
+                        offl_params.dest, offl_params.msgs);
+  if ( rc NE ESA_OK ) {
+     rc = ESA_FATAL;
+     goto exit;
+  }
+ 
+  /*--- Memory diagnostics treatment (start = ESA_OK) ---*/
+  ESA_DIAG_memory_status (envir_ptr->diag_handle, func, ESA_OK);
+ 
+ /*
+  *  ps0381. Get OE care file
+  */
+ 
+  if (strcmp(gtoe, "OE") EQ 0)  {
+     rc = GetCAREOE( rss_parm.name, envir_ptr->file_intoe, TRUE,
+                     offl_params.dest, offl_params.msgs);
+     if (rc EQ ESA_SKIP) {     /* No interesting were found */
+         strcpy(gtoe, "ALL");
+         CTSAMSG_print(ERR_3_STRINGS,
+                 offl_params.msgs,  NULL, offl_params.dest,
+                "Offline interceptor mode ignored - aggregation"
+                " by container was not done", "", "") ;
+     }
+     else if ( rc NE ESA_OK ) {
+        rc = ESA_FATAL;
+        goto exit;
+     }
+  }
+ 
+  /*
+   *  FIRST Login
+   */
+ 
+   if (offl_params.ofli_admin_login_req EQ 'Y')  {
+       ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+	    	"...-> rss_login_ptr: rss=%s adm=%s ug=%s mode=%s(%d).",
+			offl_params.rss_name,
+            offl_params.ofli_admin_user,
+            offl_params.ofli_admin_group,
+            "LOGIN_MODE_FIRST",LOGIN_MODE_FIRST);
+ 
+/*     Removed according to the wish to avoid password exposing
+				
+		   ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 99, "pwd=%s",
+                          offl_params.ofli_admin_pswd);*/
+ 
+       rc = (func_ptr.rss_login_ptr) (offl_params.rss_name,
+                          offl_params.ofli_admin_user,
+                          offl_params.ofli_admin_group,
+                          offl_params.ofli_admin_pswd,
+                          LOGIN_MODE_FIRST,
+                          &(offl_params.admin_params.login_handle),
+                          &offl_params.admin_params,
+                          offl_params.err);
+       ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"...<- rss_login_ptr: rc=%d (%s) hndl=%p.",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK",
+			offl_params.admin_params.login_handle);
+       if ( rc NE ESA_OK ) {
+          rc = ESA_FATAL;
+          goto exit;
+       }
+       else
+         first_login_done = 1;
+   } /* if (offl_params->ofli_admin_login_req EQ 'Y') */
+ 
+  /*
+   *   Create OE Info
+   */
+ 
+  time(&before);
+  rc = GetOEInfo( oe_file, &oe_keywords, &offl_params,
+                  gtoe); /* BSAN100874 */
+  if ( rc NE ESA_OK ) {
+     rc = ESA_FATAL;
+     goto exit;
+  }
+ 
+  time(&after);
+  difft = difftime(after, before);
+  hh = (int)(difft/3600);
+  mm = (int)((difft - (hh * 3600))/60);
+  ss = difft - (hh * 3600) - (mm * 60);
+  sprintf(elapsed_t,
+         "GetOEInfo    :Elapsed time=%10.4f seconds %02d.%02d.%07.4f",
+          difft, hh, mm, ss );
+  /* */
+  CTSAMSG_print(MSG_OFLI_DURATION,
+                offl_params.msgs, NULL, offl_params.dest,
+                "GetOEInfo",  difft, hh, mm, ss );
+ 
+  GetOEInfo_flag = 1; /* GetOEInfo done */
+ 
+  /*
+   *   Create User Info
+   */
+ 
+  time(&before);
+  if (strcmp(cache_mode, "Y") EQ 0)  /* BSAN100422 */
+   rc = GetUserInfo( user_file, oe_file, &user_keywords, &offl_params,
+                     gtoe); /* BSAN100874 */
+  else
+   rc = GetUserInfo( user_file, NULL, &user_keywords, &offl_params,
+                     gtoe); /* BSAN100874 */
+  if ( rc NE ESA_OK ) {
+     rc = ESA_FATAL;
+     goto exit;
+  }
+ 
+  time(&after);
+  difft = difftime(after, before);
+  hh = (int)(difft/3600);
+  mm = (int)((difft - (hh * 3600))/60);
+  ss = difft - (hh * 3600) - (mm * 60);
+  sprintf(elapsed_t,
+         "GetUserInfo  :Elapsed time=%10.4f seconds %02d.%02d.%07.4f",
+          difft, hh, mm, ss );
+  /* */
+  CTSAMSG_print(MSG_OFLI_DURATION,
+                offl_params.msgs, NULL, offl_params.dest,
+                "GetUserInfo",  difft, hh, mm, ss );
+ 
+  GetUserInfo_flag = 1; /* GetUserInfo done */
+ 
+ /*
+  *   Create Group Info
+  */
+ 
+  time(&before);
+  if (strcmp(cache_mode, "Y") EQ 0)   /* BSAN100422 */
+    rc = GetGroupInfo(group_file,oe_file,&group_keywords,&offl_params,
+                      gtoe); /* BSAN100874 */
+  else
+    rc = GetGroupInfo(group_file,NULL,&group_keywords,&offl_params,
+                      gtoe); /* BSAN100874 */
+  if ( rc NE ESA_OK ) {
+     rc = ESA_FATAL;
+     goto exit;
+  }
+ 
+  time(&after);
+  difft = difftime(after, before);
+  hh = (int)(difft/3600);
+  mm = (int)((difft - (hh * 3600))/60);
+  ss = difft - (hh * 3600) - (mm * 60);
+  sprintf(elapsed_t,
+         "GetGroupInfo :Elapsed time=%10.4f seconds %02d.%02d.%07.4f",
+          difft, hh, mm, ss );
+  CTSAMSG_print(MSG_OFLI_DURATION,
+                offl_params.msgs, NULL, offl_params.dest,
+                "GetGroupInfo",  difft, hh, mm, ss );
+ 
+  GetGroupInfo_flag = 1;  /* Get Groups done */
+ 
+  /*
+   *  Create Connection Info
+   */
+ 
+  time(&before);
+  if (strcmp(gtoe, "OE") EQ 0)                  /* ps0381 */
+     rc = GetConnectionInfoByOE( connection_file,    /* ps0381 */
+                             user_file, group_file,  /* ps0381 */
+                             &connection_keywords,   /* ps0381 */
+                             &offl_params);          /* ps0381 */
+ 
+  else if (strcmp(cache_mode, "Y") EQ 0)  /* BSAN100422 */
+     rc = GetConnectionInfo( connection_file, user_file, group_file,
+                             &connection_keywords, &offl_params);
+  else
+     rc = GetConnectionInfo( connection_file, NULL, NULL,
+                             &connection_keywords, &offl_params);
+  if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+  }
+ 
+  time(&after);
+ 
+  difft = difftime(after, before);
+  hh = (int)(difft/3600);
+  mm = (int)((difft - (hh * 3600))/60);
+  ss = difft - (hh * 3600) - (mm * 60);
+  sprintf(elapsed_t,
+         "GetConnInfo  :Elapsed time=%10.4f seconds %02d.%02d.%07.4f",
+          difft, hh, mm, ss );
+  CTSAMSG_print(MSG_OFLI_DURATION,
+                offl_params.msgs, NULL, offl_params.dest,
+                "GetConnInfo",  difft, hh, mm, ss );
+ 
+  GetConnectionInfo_flag  = 1; /* Get Connection done */
+ 
+  /*
+   *  Create RSS Parameters Info
+   */
+ 
+  time(&before);
+   rc = GetRSSParamsInfo( rss_file, &rss_keywords, &offl_params);
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+  time(&after);
+ 
+  difft = difftime(after, before);
+  hh = (int)(difft/3600);
+  mm = (int)((difft - (hh * 3600))/60);
+  ss = difft - (hh * 3600) - (mm * 60);
+  sprintf(elapsed_t,
+         "GetRssInfo   :Elapsed time=%10.4f seconds %02d.%02d.%07.4f",
+          difft, hh, mm, ss );
+  CTSAMSG_print(MSG_OFLI_DURATION,
+                offl_params.msgs, NULL, offl_params.dest,
+                "GetRssInfo",  difft, hh, mm, ss );
+ 
+   GetRSSParamsInfo_flag  = 1; /* Get RSS Parameters done */
+ 
+   /*
+    *  Get Statistics
+    */
+ 
+   rc = GetStatData( user_file, group_file, connection_file,
+                     rss_file,  oe_file,
+                     &stat_data,
+                     offl_params.dest, offl_params.msgs);
+   /*
+    * INIT mode . That's all.
+    */
+ 
+   if ( (strcmp(mode, "init" ) EQ 0 ) OR
+        (strcmp(mode, "INIT" ) EQ 0 )  )
+      goto exit;
+ 
+   /*
+    *  REGULAR mode. Continue
+    */
+ 
+   /*
+    *  Update OE Init file with OSOFLI file
+    */
+ 
+    rc= UpdateInitDB (OFLI_OE_DB, Files.oe_init_result_file, Files.oe_os_file,
+	                  Files.oe_compare_result_file, offl_params.dest, offl_params.msgs);
+    if ( rc NE ESA_OK ) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+   /*
+    *  Update User Init file with OSOFLI file
+    */
+ 
+    rc= UpdateInitDB (OFLI_USER_DB, Files.user_init_result_file, Files.user_os_file,
+	                  Files.user_compare_result_file, offl_params.dest, offl_params.msgs);
+    if ( rc NE ESA_OK ) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+   /*
+    *  Update Group Init file with OSOFLI file
+    */
+ 
+    rc= UpdateInitDB (OFLI_GROUP_DB,Files.group_init_result_file, Files.group_os_file,
+		              Files.group_compare_result_file, offl_params.dest,offl_params.msgs);
+    if ( rc NE ESA_OK ) {
+       rc = ESA_FATAL;
+       goto exit;
+    }
+ 
+   /*
+    *  Update Connections Init file with OSOFLI file
+    */
+ 
+ 
+    rc= UpdateInitDB  (OFLI_CONNECTION_DB, Files.connection_init_result_file,
+                       Files.connection_os_file,  Files.connection_compare_result_file,
+                       offl_params.dest, offl_params.msgs);
+    if ( rc NE ESA_OK ) {
+        rc = ESA_FATAL;
+        goto exit;
+    }
+ 
+   /*
+    *  Update RSS Init file with OSOFLI file
+    */
+ 
+    rc= UpdateInitDB (OFLI_RSS_DB, Files.rss_init_result_file, Files.rss_os_file,
+		              Files.rss_compare_result_file, offl_params.dest, offl_params.msgs);
+    if ( rc NE ESA_OK ) {
+        rc = ESA_FATAL;
+        goto exit;
+    }
+ 
+   /*
+    *  Compare OE information
+    */
+ 
+  time(&before);
+   rc = CompareInfo( Files.oe_init_result_file,
+	                 Files.oe_regular_result_file,
+                     Files.oe_compare_result_file,
+					 &(stat_data.oe_stat),
+                     OFLI_OE_DB, offl_params.dest, offl_params.msgs,&offl_params );
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+  time(&after);
+ 
+  difft = difftime(after, before);
+  hh = (int)(difft/3600);
+  mm = (int)((difft - (hh * 3600))/60);
+  ss = difft - (hh * 3600) - (mm * 60);
+  sprintf(elapsed_t,
+         "CompareOE    :Elapsed time=%10.4f seconds %02d.%02d.%07.4f",
+          difft, hh, mm, ss );
+  CTSAMSG_print(MSG_OFLI_DURATION,
+                offl_params.msgs, NULL, offl_params.dest,
+                "CompareOE",  difft, hh, mm, ss );
+ 
+  CompareOEInfo_flag = 1;
+ 
+   /*
+    *  Compare User information
+    */
+ 
+   time(&before);
+   rc = CompareInfo( Files.user_init_result_file,
+                     Files.user_regular_result_file,
+                     Files.user_compare_result_file,
+                     &(stat_data.user_stat),
+                     OFLI_USER_DB,
+                     offl_params.dest, offl_params.msgs,&offl_params );
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+  time(&after);
+ 
+  difft = difftime(after, before);
+  hh = (int)(difft/3600);
+  mm = (int)((difft - (hh * 3600))/60);
+  ss = difft - (hh * 3600) - (mm * 60);
+  sprintf(elapsed_t,
+         "CompareUser  :Elapsed time=%10.4f seconds %02d.%02d.%07.4f",
+          difft, hh, mm, ss );
+  CTSAMSG_print(MSG_OFLI_DURATION,
+                offl_params.msgs, NULL, offl_params.dest,
+                "CompareUser",  difft, hh, mm, ss );
+ 
+  CompareUserInfo_flag = 1;
+ 
+   /*
+    *  Compare Group information
+    */
+ 
+   time(&before);
+   rc = CompareInfo( Files.group_init_result_file,
+                     Files.group_regular_result_file,
+                     Files.group_compare_result_file,
+                     &(stat_data.group_stat),
+                     OFLI_GROUP_DB,
+                     offl_params.dest, offl_params.msgs ,&offl_params );
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+  time(&after);
+ 
+  difft = difftime(after, before);
+  hh = (int)(difft/3600);
+  mm = (int)((difft - (hh * 3600))/60);
+  ss = difft - (hh * 3600) - (mm * 60);
+  sprintf(elapsed_t,
+         "CompareGroup :Elapsed time=%10.4f seconds %02d.%02d.%07.4f",
+          difft, hh, mm, ss );
+  CTSAMSG_print(MSG_OFLI_DURATION,
+                offl_params.msgs, NULL, offl_params.dest,
+                "CompareGroup",  difft, hh, mm, ss );
+ 
+   CompareGroupInfo_flag = 1;
+ 
+   /*
+    *  Compare Connection information
+    */
+ 
+   time(&before);
+   rc = CompareInfo( Files.connection_init_result_file,
+                     Files.connection_regular_result_file,
+                     Files.connection_compare_result_file,
+                     &(stat_data.connection_stat),
+                     OFLI_CONNECTION_DB,
+                     offl_params.dest, offl_params.msgs ,&offl_params );
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+  time(&after);
+ 
+  difft = difftime(after, before);
+  hh = (int)(difft/3600);
+  mm = (int)((difft - (hh * 3600))/60);
+  ss = difft - (hh * 3600) - (mm * 60);
+  sprintf(elapsed_t,
+         "CompareConn  :Elapsed time=%10.4f seconds %02d.%02d.%07.4f",
+          difft, hh, mm, ss );
+  CTSAMSG_print(MSG_OFLI_DURATION,
+                offl_params.msgs, NULL, offl_params.dest,
+                "CompareConn",  difft, hh, mm, ss );
+ 
+  CompareConnectionInfo_flag = 1;
+ 
+   /*
+    *  Compare RSS Parameters information
+    */
+ 
+   time(&before);
+   rc = CompareInfo( Files.rss_init_result_file,
+                     Files.rss_regular_result_file,
+                     Files.rss_compare_result_file,
+                     &(stat_data.rss_stat),
+                     OFLI_RSS_DB,
+                     offl_params.dest, offl_params.msgs ,&offl_params );
+   if ( rc NE ESA_OK ) {
+      rc = ESA_FATAL;
+      goto exit;
+   }
+ 
+  time(&after);
+ 
+  difft = difftime(after, before);
+  hh = (int)(difft/3600);
+  mm = (int)((difft - (hh * 3600))/60);
+  ss = difft - (hh * 3600) - (mm * 60);
+  sprintf(elapsed_t,
+         "CompareRss   :Elapsed time=%10.4f seconds %02d.%02d.%07.4f",
+          difft, hh, mm, ss );
+  CTSAMSG_print(MSG_OFLI_DURATION,
+                offl_params.msgs, NULL, offl_params.dest,
+                "CompareRss",  difft, hh, mm, ss );
+ 
+  CompareRSSParamsInfo_flag = 1;
+ 
+ 
+	/* Check for extraordinarly large number of deletes WSAN101173 */
+	if (CheckMaxDelExceeded(offl_params.max_del, &stat_data.user_stat) OR
+		CheckMaxDelExceeded(offl_params.max_del, &stat_data.group_stat) OR
+		CheckMaxDelExceeded(offl_params.max_del, &stat_data.connection_stat) OR
+		CheckMaxDelExceeded(offl_params.max_del, &stat_data.oe_stat))
+	{
+		CTSAMSG_print(ERR_3_STRINGS, offl_params.msgs, NULL, offl_params.dest,
+					  "FATAL: Rss ", offl_params.rss_name,
+  					  ": Maximum percent of deleted entities exceeded!!!");
+		PrintOfflineInterceptorStatistics(&rss_parm, &stat_data,
+										  &offl_params.admin_params);
+		rc = ESA_FATAL;
+		goto exit;
+	}
+ 
+   /*
+    *  Create DB changes events
+    */
+ 
+   time(&before);
+   rc = Event2RS (Files.user_compare_result_file,
+                  Files.group_compare_result_file,
+                  Files.connection_compare_result_file,
+                  Files.rss_compare_result_file,
+                  Files.oe_compare_result_file,
+                  Files.careoeof,
+                  &rss_parm, &offl_params,
+                  gtoe); /* BSAN100874 */
+  time(&after);
+ 
+  difft = difftime(after, before);
+  hh = (int)(difft/3600);
+  mm = (int)((difft - (hh * 3600))/60);
+  ss = difft - (hh * 3600) - (mm * 60);
+  sprintf(elapsed_t,
+         "Event2RSS    :Elapsed time=%10.4f seconds %02d.%02d.%07.4f",
+          difft, hh, mm, ss );
+  CTSAMSG_print(MSG_OFLI_DURATION,
+                offl_params.msgs, NULL, offl_params.dest,
+                "Event2RSS",  difft, hh, mm, ss );
+ 
+   if ( rc NE ESA_OK ) {
+       /*
+        *  Restore DB from Backup files
+        */
+ 
+ 
+      /*
+       *  Clean DB Backup files
+       */
+ 
+ 
+      rc = ESA_FATAL;
+      goto exit;
+   }
+   else {
+       /*
+        *  Clean DB Backup files
+        */
+ 
+   }
+ 
+   /*
+    *  Rename files, delete work files
+    */
+ 
+   OfflineIntrcptrDBRename( Files.oe_init_result_file,
+                            Files.oe_regular_result_file,
+                            Files.oe_compare_result_file,
+                            OFLI_OE_DB,
+                            offl_params.dest, offl_params.msgs );
+ 
+   OfflineIntrcptrDBRename( Files.user_init_result_file,
+                            Files.user_regular_result_file,
+                            Files.user_compare_result_file,
+                            OFLI_USER_DB,
+                            offl_params.dest, offl_params.msgs );
+ 
+   OfflineIntrcptrDBRename( Files.group_init_result_file,
+                            Files.group_regular_result_file,
+                            Files.group_compare_result_file,
+                            OFLI_GROUP_DB,
+                            offl_params.dest, offl_params.msgs );
+ 
+   OfflineIntrcptrDBRename( Files.connection_init_result_file,
+                            Files.connection_regular_result_file,
+                            Files.connection_compare_result_file,
+                            OFLI_CONNECTION_DB,
+                            offl_params.dest, offl_params.msgs );
+ 
+   OfflineIntrcptrDBRename( Files.rss_init_result_file,
+                            Files.rss_regular_result_file,
+                            Files.rss_compare_result_file,
+                            OFLI_RSS_DB,
+                            offl_params.dest, offl_params.msgs );
+ 
+ /*
+  *    Terminate
+  */
+ 
+  exit :;
+ 
+  if (strcmp(gtoe, "OE") EQ 0)  {                      /* ps0381 */
+    CopyCAREOE( rss_parm.name,                         /* ps0381 */
+                envir_ptr->file_intoe,                 /* ps0381 */
+                Files.careoeof,                        /* ps0381 */
+                offl_params.dest, offl_params.msgs);   /* ps0381 */
+  }                                                    /* ps0381 */
+ 
+  /*WS10082A if ( offl_params.adm_load_done EQ 1)
+     ADM_free(); */
+ 
+  if ( CTSInterceptorInit_flag NE 1 )
+     goto exit_no_init;
+ 
+  if (rc NE ESA_OK) {  /* files Cleanup */
+     /*
+      *  Here we use flags:
+      *
+      *  Created/no - work file:
+      *  ----------------------
+      *  CompareUserInfo_flag
+      *  CompareGroupInfo_flag
+      *  CompareConnectionInfo_flag
+      *  CompareRSSParamsInfo_flag
+      *  CompareOEInfo_flag
+      *
+      *  Created/no - new file:
+      *  ----------------------
+      *  GetUserInfo_flag
+      *  GetGroupInfo_flag
+      *  GetConnectionInfo_flag
+      *  GetRSSParamsInfo_flag
+      *  GetOEInfo_flag
+      */
+     if (oe_file)
+     OfflineIntrcptrDBErase( oe_file, Files.oe_compare_result_file,
+                             OFLI_OE_DB,
+                             /* AS1221 GetOEInfo_flag, */ TRUE,
+                             CompareOEInfo_flag,
+                             offl_params.dest, offl_params.msgs );
+ 
+     if (user_file)
+     OfflineIntrcptrDBErase( user_file,
+		                     Files.user_compare_result_file,
+                             OFLI_USER_DB,
+                             /* AS1221 GetUserInfo_flag, */ TRUE,
+                             CompareUserInfo_flag,
+                             offl_params.dest, offl_params.msgs );
+ 
+     if (group_file)
+     OfflineIntrcptrDBErase( group_file,
+		                     Files.group_compare_result_file,
+                             OFLI_GROUP_DB,
+                             /* AS1221 GetGroupInfo_flag, */  TRUE,
+                             CompareGroupInfo_flag,
+                             offl_params.dest, offl_params.msgs );
+ 
+     if (connection_file)
+     OfflineIntrcptrDBErase( connection_file,
+                             Files.connection_compare_result_file,
+                             OFLI_CONNECTION_DB,
+                             /* AS1221 GetConnectionInfo_flag, */ TRUE,
+                             CompareConnectionInfo_flag,
+                             offl_params.dest, offl_params.msgs );
+ 
+     if (rss_file)
+     OfflineIntrcptrDBErase( rss_file, Files.rss_compare_result_file,
+                             OFLI_RSS_DB,
+                             /* AS1221 GetRSSParamsInfo_flag, */ TRUE,
+                             CompareRSSParamsInfo_flag,
+                             offl_params.dest, offl_params.msgs );
+  }
+  else {
+     /*
+      *  Print statistics
+      */
+ 
+     PrintOfflineInterceptorStatistics( &rss_parm, &stat_data,
+                                        &offl_params.admin_params);
+  }
+ 
+  /*
+   *   Free keywords memory
+   */
+ 
+  if ( user_keywords.kwds )
+     free( user_keywords.kwds);
+ 
+  if ( group_keywords.kwds )
+     free( group_keywords.kwds);
+ 
+  if ( connection_keywords.kwds )
+     free( connection_keywords.kwds);
+ 
+  if ( rss_keywords.kwds )
+     free( rss_keywords.kwds);
+ 
+  if ( oe_keywords.kwds )
+     free( oe_keywords.kwds);
+ 
+  /*
+   * set dates for RS terminate
+   */
+ 
+  if ( rc EQ ESA_OK )
+     SetEndTimeDate( time_range.end_date, time_range.end_time);
+ 
+  /*
+   *  LAST logout
+   */
+ 
+   if (first_login_done EQ 1)
+   {
+      ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+	    	"...-> rss_login_ptr: rss=%s adm=%s ug=%s mode=%s(%d).",
+			offl_params.rss_name,
+            offl_params.ofli_admin_user,
+            offl_params.ofli_admin_group,
+            "LOGOUT_MODE_LAST",LOGOUT_MODE_LAST);
+     (func_ptr.rss_logout_ptr) (offl_params.rss_name,
+                   offl_params.ofli_admin_user,
+                   offl_params.ofli_admin_group,
+                   LOGOUT_MODE_LAST,
+                   &(offl_params.admin_params.login_handle),
+                   &offl_params.admin_params,
+                   offl_params.err);
+      ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"...<- rss_login_ptr: rc=%d (%s) hndl=%p.",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK",
+			offl_params.admin_params.login_handle);
+   }
+ 
+  /*
+   *  API term if was done API Init
+   */
+ 
+  if ( apiinit_flag EQ 1)
+  {
+     ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+    		"...-> apiterm_ptr.");
+     (func_ptr.apiterm_ptr) (&offl_params.admin_params,
+                             offl_params.err);
+     ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_BASIC,
+			"...<- apiterm_ptr: rc=%d (%s).",
+			ESA_OK,"UsaApi==OK");
+  }
+  /*
+   *   Detach RSS if was attached
+   */
+ 
+  if (  OS_CS_attach_rss_flag  EQ 1 ) {
+/* for MVS */
+   /*  MF001. Removed. OS_CS_term (func, &pmsgs, &os_init_handle); */
+   /*  MF001  */
+   ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+    		"...-> OS_CS_term: func=%s hndl=%p.",
+			func, os_init_handle);
+   rc2=OS_CS_term (func, rss_parm.msg_params, &os_init_handle);
+   ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+			"...<- OS_CS_term: rc=%d (%s).",
+			rc2, (rc2 EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+ /* MVS */
+   /*
+    *  Detach RSS
+    */
+ 
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+    		"...-> OS_CS_detach_rss: hndl=%p.", attach_handle);
+    rc2=OS_CS_detach_rss(&offl_params.admin_params,
+                     offl_params.err, &attach_handle);
+    ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, DIAG_OS,
+			"...<- OS_CS_detach_rss: rc=%d (%s).",
+			rc2, (rc2 EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+  }
+ 
+ 
+  ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+  /*
+   *   Interceptor terminate if was successfull Init
+   *   or partitionally successfull
+   */
+ 
+  exit_no_init :;
+ 
+/*WSAN100128 start
+ if (offl_params.lock_done )
+    OS_CS_unlock (offl_params.lock_handle, &offl_params.msg_params);
+ 
+  *
+  *  Lock terminate
+  *
+ 
+ if ( offl_params.lock_handle )
+    OS_CS_lock_term ( &offl_params.lock_handle,
+                      &offl_params.msg_params);
+ 
+  *
+  *  Free keywords memory
+  *
+*WSAN100128 end*/
+ 
+  if ( (CTSInterceptorInit_flag EQ 1 ) OR rss_parm.handle ) {
+     if ( rc EQ ESA_OK )
+        CTSAMSG_print(MSG_OFLI_END_DATE,
+                      offl_params.msgs,
+                      NULL,
+                      offl_params.dest,
+                      rss_parm.name,
+                      time_range.end_date,
+                      time_range.end_time);
+	 else
+        CTSAMSG_print(MSG_OFLI_END_ERR,
+                      offl_params.msgs, NULL, offl_params.dest,
+                      rss_parm.name);
+ 
+     CTSInterceptorTerm( &rss_parm.handle, INTERCEPT_OFFLINE, rc,
+                         &time_range, &offl_params.admin_params);
+  }
+ 
+cleanup:
+  return rc;
+ 
+} /* main */
+ 
+ 
+/* ps0381 */
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : CopyCAREOE                                *
+*                                                             *
+* DESCRIPTION     : Copy interesting OE                       *
+*                                                             *
+* INPUT           : rss_name                                  *
+*                   file_careoe                               *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+static ESA_RC CopyCAREOE( RSS_typ                     rss_name,
+                          RESOURCE_typ                file_name_in,
+                          RESOURCE_typ                file_name_out,
+                          CTSAMSG_DEST_TABLE_rec_typ *dest,
+                          CTSAMSG_HANDLE_rec_typ     *msgs)
+{
+  static       char func[] = "CopyCAREOE";
+  ESA_RC       rc = ESA_OK;
+  char         oe_line [1024];
+  FILE        *careoe_in  = NULL;
+  FILE        *careoe_out = NULL;
+  char        ddn_with[12]="";                            /* SAS2IBMT */
+ 
+  /*
+   *  Initialize
+   */
+ 
+  ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+  ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                  "Connector name %s",rss_name);
+ 
+  /*
+   *   Open file CAREOE
+   */
+ 
+  strcpy(ddn_with,"DD:");                                 /* SAS2IBMT */
+  strcat(ddn_with, file_name_in);                         /* SAS2IBMT */
+ 
+  /* SAS2IBMT careoe_in = fopen(file_name_in , "r");                 */
+  careoe_in = fopen(ddn_with , "r");                      /* SAS2IBMT */
+  if ( !careoe_in) {
+     CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                   "fopen", file_name_in, strerror(errno) );
+     ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                     "file %s/%s error %d/%s",
+                     file_name_in, "fopen", errno,
+                     strerror(errno));
+     rc = ESA_FATAL;
+     goto exit;
+  }
+ 
+  strcpy(ddn_with,"DD:");                                 /* SAS2IBMT */
+  strcat(ddn_with, file_name_out);                        /* SAS2IBMT */
+ 
+  /* SAS2IBMT careoe_out = fopen(file_name_out, "w");                */
+  careoe_out = fopen(ddn_with, "w,recfm=*");              /* SAS2IBMT */
+  if ( !careoe_out) {
+     CTSAMSG_print(ERR_IO, msgs, NULL, dest,
+                   "fopen", file_name_out, strerror(errno) );
+     ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                     "file %s/%s error %d/%s",
+                     file_name_out, "fopen", errno,
+                     strerror(errno));
+     rc = ESA_FATAL;
+     goto exit;
+  }
+ 
+  while ( fgets( oe_line, sizeof(oe_line), careoe_in) )   {
+     HANDLE_FILE_IOERR( careoe_in, file_name_in, "fgets")
+     fputs(oe_line, careoe_out);
+     HANDLE_FILE_IOERR( careoe_out, file_name_out, "fputs")
+  } /* loop on careoe */
+ 
+  exit :;
+ 
+  if ( careoe_in)
+     fclose(careoe_in);
+ 
+  if ( careoe_out)
+     fclose(careoe_out);
+ 
+  ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+ 
+  return rc;
+ 
+}
+ 
+/* SAS2IBMN - start  */
+/*****************************************************************
+*                                                                *
+* SAS2IBMN - Remove signal processing                            *
+*                                                                *
+* Signal processing is removed because it depends on the         *
+* HANDLE_ABENDS RSSPARM ALL_RSS parameter which is always N.     *
+* If/when recovery is needed, these routines will have to be     *
+* written using the appropriate IBM C or LE services.            *
+*                                                                *
+* Considerations:                                                *
+* 1. The siginfo is not availabe in IBM C.                       *
+* 2. LE has its own recovery so we should find a way to control  *
+*    LE dump and backtrace according to our needs.               *
+*                                                                *
+******************************************************************
+void CS_signal (int signal_code)
+{
+  char   fn[]="CS_signal";
+ 
+ 
+   printf ("\n Entering CS_signal with sig id: #%d", signal_code);
+ 
+  ESA_DIAG_enter (ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, fn);
+  ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,0, "enter to %s with signal %u.",
+	    fn, (unsigned int)signal_code);
+  ESA_DIAG_exit (ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, fn, ESA_RC_VOID);
+  CG_epilog (ESA_OK, signal_code);
+ 
+}  * END - CS_signal function *
+*/
+/* SAS2IBMN - end    */

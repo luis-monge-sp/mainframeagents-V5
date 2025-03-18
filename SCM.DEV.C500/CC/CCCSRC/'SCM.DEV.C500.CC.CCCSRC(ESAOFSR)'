@@ -1,0 +1,1208 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: esaofsr.c %
+ * Instance        : %instance: 1 %
+ * Created by      : %created_by: ihoffma %
+ * Created on      : %date_created: Wed Nov 19 15:09:14 2003 %
+ * Current Version : %version: 2 %
+ * Last Modified by: %derived_by: ihoffma %
+ * Last Modified on: %date_modified: Wed Nov 19 15:09:14 2003 %
+ */
+ 
+/**************************************************************
+ * Mod.ID       Who      When       Description
+ * ============================================================
+ * IMH001       Ian H.   19-Nov-03  WSAN101432 Thread-safe code (errno)
+ * BSAN102349   Nmore    25-Jan-05  Adding RSSPARAM to ignore uppercase conversion
+ * 502839  AvnerL   25-Jun-2009  MF updates for 3.3.00
+ * SAS2IBMN NuritY  10/10/16     SAS/C to IBM C Conversion:
+ *                               dsn:dsn -> //'dsn'
+ * IS10155  NuritY  10/09/17     When RESPECT_RSS_NAME_CASE is not
+ *                               found, do not issue a messge.
+ * WS10082  AvnerL  27/11/22     Update per ADDINFO new structure
+ **************************************************************/
+ 
+#include "globs.h"
+ 
+/*
+ *   Standard header files
+ */
+ 
+#include ERRNO           /* IMH001 */
+#include STRING
+#include STDIO
+#include STDLIB
+#include TIME
+#include CTYPE           /* BSAN100840 */
+ 
+#include SYS_TYPES_H
+ 
+/*
+ *   Common code header files
+ */
+ 
+#include ESA_API
+#include ESA_DIAG
+#include ESA_API_CODES
+#include ESA_INIT
+#include ESA_CHKSUM
+#include ESA_ESAADI
+#include ESA_ADMIN
+ 
+/*
+ *   Offline Int. header files
+ */
+ 
+#include ESA_ESAOFLI
+#include ESA_ESAOFIO
+ 
+ 
+ 
+static ERR_STRUCT_rec_typ * GetErrDestPtr(
+                         CTSAMSG_DEST_TABLE_rec_typ      *dest,
+                         OFFLINE_INTERCEPT_STUFF_rec_typ *offl_params);
+ 
+static char component [] = "OFFLINE INTERCEPTOR";
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : BuildOfflParams                           *
+*                                                             *
+* DESCRIPTION     : Build Internal CTSOFLI, OSOFLI env parm   *
+*                                                             *
+* INPUT           : rss_name                                  *
+*                   rss_type                                  *
+*                   admin_params                              *
+*                                                             *
+* OUTPUT          : offl_params                               *
+*                                                             *
+* RETURN VALUE    : none                                      *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC  BuildOfflParams (OFFLINE_RUN_type                  offltype,
+                         RSS_typ                           rss_name,
+                         RSS_typ                           rss_type,
+                         ADMIN_PARAMS_rec_typ            * admin_params,
+                         OFFLINE_INTERCEPT_STUFF_rec_typ * offl_params)
+{
+  ESA_RC                rc = ESA_OK;
+  RESOURCE_typ          ofli_path;
+  char                * wptr;         /* BSAN100840 */
+  char                  str_RSS_RESPECT_CASE[4];  /* BSAN102349 */
+  char                  work[4];      /* WSAN101173 */
+  USER_typ              admin;
+  ENVIRONMENT_rec_typ * envir_ptr;
+  char   func[]="BuildOfflParams";
+ 
+  ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+  CS_get_envir_address (&envir_ptr);
+ /*
+  *  Initialize lock/unlock service vars, API func ptrs
+  */
+ 
+  offl_params->lock_done        = 0;
+  offl_params->lock_handle      = NULL;
+  offl_params->lock_file_handle = NULL;
+  offl_params->func_ptr         = NULL;
+ 
+ /*
+  *  Set rss_name, rss_type
+  */
+ 
+  strcpy((char *)offl_params->rss_type, (char *)rss_type );
+  strcpy((char *)offl_params->rss_name, (char *)rss_name );
+ 
+  /*
+   * BSAN100840 . Uppercase the RSS name
+   */
+ 
+  /*BSAN102349 [Nmore, 24/01/2006]*/
+  /*BSAN102349
+   Adding RSSPARAM to ignore uppercase conversion */
+ 
+    memset(str_RSS_RESPECT_CASE,'0',sizeof (str_RSS_RESPECT_CASE))  ;
+    strcpy (str_RSS_RESPECT_CASE,"N");
+    offl_params->respect_rss_case = 'N';
+ 
+    /* IS10155 rc = admin_params->cs_func.rssprm_get_ptr (rss_name,
+                        "RESPECT_RSS_NAME_CASE",
+                        sizeof (str_RSS_RESPECT_CASE), str_RSS_RESPECT_CASE); */
+    rc = admin_params->cs_func.rssprm_get_opt_ptr (rss_name, /* IS10155 */
+                        "RESPECT_RSS_NAME_CASE",          /* IS10155 */
+                        sizeof (str_RSS_RESPECT_CASE),    /* IS10155    */
+                        str_RSS_RESPECT_CASE,             /* IS10155    */
+                        OPT_TRUE, OPT_FALSE);             /* IS10155    */
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 11,
+                  "RESPECT_RSS_NAME_CASE=%s", str_RSS_RESPECT_CASE);
+ 
+    if ( rc NE ESA_OK )
+    {
+ 
+        offl_params->respect_rss_case = 'N';
+    }
+    else
+    {
+        if(     (strcmp(str_RSS_RESPECT_CASE,"Y") ==    0 )
+            ||  (strcmp(str_RSS_RESPECT_CASE,"y") ==    0 )
+          )
+ 
+        {/*This is only time when we should not convert uppercase*/
+            offl_params->respect_rss_case = 'Y';
+        }
+        else
+        {
+           offl_params->respect_rss_case = 'N';
+ 
+        }
+ 
+    }
+ 
+   wptr = (char *)offl_params->rss_name;    /* BSAN100840 */
+ 
+   if(offl_params->respect_rss_case == 'N')
+   {
+       ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 11,
+        "--RSS %s - converting the RSS Name to upper case",
+        offl_params->rss_name );
+ 
+      for (; *wptr; wptr++) {                  /* BSAN100840 */
+         *wptr = (char)toupper(*wptr);         /* BSAN100840 */
+      }                                        /* BSAN100840 */
+   }
+ 
+ /*
+  *  Set internal admin params var
+  */
+ 
+  memcpy((char *)&offl_params->admin_params, (char *)admin_params,
+          sizeof(ADMIN_PARAMS_rec_typ));
+ 
+  offl_params->admin_params.admin_uname[0] = NULL_CHAR;
+  offl_params->admin_params.admin_gname[0] = NULL_CHAR;
+ 
+ /*
+  *  Set internal ctsamsg params var
+  */
+ 
+  offl_params->msgs = admin_params->ctsamsg_handle;
+  offl_params->dest = admin_params->ctsamsg_dest;
+ 
+  offl_params->msg_params.ctsamsg_handle = admin_params->ctsamsg_handle;
+  offl_params->msg_params.ctsamsg_dest   = admin_params->ctsamsg_dest;
+ 
+ /*
+  *  Initialize login params var
+  */
+ 
+  offl_params->ofli_admin_user[0]        = NULL_CHAR;
+  offl_params->ofli_admin_group[0]       = NULL_CHAR;
+  offl_params->ofli_admin_pswd[0]        = NULL_CHAR;
+  offl_params->ofli_admin_login_req      = 'N'; /* Login required  */
+  offl_params->ofli_admin_pswd_req       = 'N'; /* Passwd required */
+  offl_params->login_first_done          = 0;
+  offl_params->admin_params.login_handle = NULL;
+  offl_params->adm_load_done             = 0;
+  offl_params->admin_params.apiinit_handle =
+                                admin_params->apiinit_handle;
+ 
+ /*
+  *  Initialize offline path var
+  */
+ 
+  offl_params->ofli_path[0] = NULL_CHAR;
+ 
+  /* "MAX_DELETE_PERCENT" */ /* WSAN101173 */
+  rc = admin_params->cs_func.rssprm_get_opt_ptr(rss_name,
+                      OFLI_MAX_DELETE_PERCENT,
+                      sizeof (work), work,
+                      OPT_TRUE, OPT_FALSE);
+  if ( rc EQ ESA_OK )
+     offl_params->max_del = atoi(work);
+  else
+     offl_params->max_del = 100;
+ 
+ 
+  /*
+   *  Set Login parameters defaults
+   */
+ 
+  /* "ADMIN_USER_REQ" */
+  rc = admin_params->cs_func.rssprm_get_ptr(rss_name,
+                      OFLI_ADMIN_LOGIN_REQ_PARAM,
+                      sizeof (work), work);
+   if ( rc EQ ESA_OK )
+     offl_params->ofli_admin_login_req = work[0];
+ 
+   /* "ADMIN_FILE_REQ" */
+   rc = admin_params->cs_func.rssprm_get_ptr(rss_name,
+                      OFLI_ADMIN_PSWD_REQ_PARAM,
+                      sizeof (work), work);
+  if ( rc EQ ESA_OK )
+     offl_params->ofli_admin_pswd_req = work[0];
+ 
+ /*
+  * Get OFLI_ADMIN parameter if required
+  */
+ 
+  if (offl_params->ofli_admin_login_req  EQ 'Y') {
+     /* get keyword "DEFAULT_ADMIN" */
+     if (offltype EQ OFFLINE_INTERCEPTOR)
+        strcpy (admin, DEFAULT_OFLI_ADMINISTRATOR);
+     else
+     {
+        if (envir_ptr->p_main_name EQ ESA_ACS_PROC)
+           strcpy (admin, DEFAULT_CS_ADMINISTRATOR);
+        else if (envir_ptr->p_main_name EQ ESA_ACD_PROC)
+           strcpy (admin, DEFAULT_CD_ADMINISTRATOR);
+        else
+           strcpy (admin, DEFAULT_ADMINISTRATOR);
+     }
+     rc = admin_params->cs_func.rssprm_get_opt_ptr (rss_name,
+                                admin,
+                                sizeof (offl_params->ofli_admin_user),
+                                offl_params->ofli_admin_user,
+                                OPT_TRUE,
+                                OPT_FALSE);
+     if (rc NE ESA_OK ) {
+        ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT,11,
+                 "RSS %s/%s Missing parameter %s",
+                  rss_name, rss_type, DEFAULT_OFLI_ADMINISTRATOR);
+        rc = admin_params->cs_func.rssprm_get_ptr (rss_name,
+                             DEFAULT_ADMINISTRATOR,
+                             sizeof (offl_params->ofli_admin_user),
+                             offl_params->ofli_admin_user);
+     }
+     if ( rc NE ESA_OK ) {
+        ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 11,
+                         "RSS %s/%s Missing parameter %s",
+                         rss_name, rss_type, DEFAULT_ADMINISTRATOR);
+        rc = ESA_FATAL;
+        goto cleanup;
+     }
+ 
+#ifdef OFLI_ADMIN_GROUP
+     /* Get keyword for "OFLI_ADMIN_GROUP" */
+     rc = admin_params->cs_func.rssprm_get_ptr (rss_name,
+                             OFLI_ADMIN_GROUP_PARAM,
+                             sizeof (offl_params->ofli_admin_group),
+                             offl_params->ofli_admin_group);
+ 
+     if ( rc NE ESA_OK ) {
+        ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 11,
+                         "RSS %s/%s Missing parameter %s",
+                         rss_name, rss_type, OFLI_ADMIN_GROUP_PARAM);
+        rc = ESA_FATAL;
+        goto cleanup;
+     }
+#endif
+     ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 11 ,
+                     "OFFLINE INTERCEPTOR ADMIN=%s/%s",
+                     offl_params->ofli_admin_user,
+                     offl_params->ofli_admin_group);
+  }
+ 
+  /*
+   *  Get OFFLINE work path parameters
+   */
+ 
+  rc = admin_params->cs_func.rssprm_get_ptr (rss_name,
+                        OFLI_WORK_PATH_PARAM,
+                        sizeof (ofli_path), ofli_path);
+ 
+  ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 11,
+                  "work path=%s", ofli_path);
+ 
+  if ( rc NE ESA_OK ) {
+     ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 11,
+                      "RSS %s/%s Missing parameter %s",
+                      rss_name, rss_type, OFLI_WORK_PATH_PARAM);
+     rc = ESA_FATAL;
+     goto cleanup;
+  }
+ 
+ 
+/* for MVS */
+  /* SAS2IBMN strcpy( offl_params->ofli_path, "dsn:"); */
+  strcpy( offl_params->ofli_path, "//'");                  /* SAS2IBMN */
+  strcat( offl_params->ofli_path, ofli_path);
+ /* MVS */  /*
+   *  Correct internal admin_params
+   */
+ 
+  strcpy((char *)offl_params->admin_params.rss_type, (char *)rss_type );
+  strcpy((char *)offl_params->admin_params.rss_name, (char *)rss_name );
+ 
+  strcpy((char *)offl_params->admin_params.rss_name,   /* BSAN100840 */
+         (char *)offl_params->rss_name);               /* BSAN100840 */
+ 
+  strcpy((char *)offl_params->admin_params.admin_uname,
+         (char *)offl_params->ofli_admin_user);
+  strcpy((char *)offl_params->admin_params.admin_gname,
+         (char *)offl_params->ofli_admin_group);
+ 
+  offl_params->err =  GetErrDestPtr(offl_params->dest, offl_params);
+ 
+  /*
+   *  Get administrator password
+   */
+  /*WS10082A RSSADM should never be used and ADM_load should be dropped
+  if (offl_params->ofli_admin_login_req  EQ 'Y'  AND
+      offl_params->ofli_admin_pswd_req   EQ 'Y') {
+ 
+     @*
+      *  In case OFFLINE_INTERCEPTOR we need ADM_load
+      *  before  ADM_get_passwd
+      *@
+ 
+      if (offltype EQ OFFLINE_INTERCEPTOR) {
+        rc = ADM_load();
+        if (rc NE ESA_OK) {
+          ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 11,
+                           "RSS %s/%s ADM_load failed",
+                           rss_name, rss_type);
+          rc = ESA_FATAL;
+          goto cleanup;
+        }
+        else
+          offl_params->adm_load_done = 1;
+      }
+     /@
+      *  Get administrator password
+      @/
+ 
+      rc = ADM_get_passwd(offl_params->rss_name,
+                          offl_params->ofli_admin_user,
+                          offl_params->ofli_admin_pswd,
+                          NULL);
+ 
+      if (rc NE ESA_OK) {
+         ESA_DIAG_printf (ESA_COMP_RSS_INTERCEPT, 11,
+                          "RSS %s/%s ADM_get_passwd failed",
+                           rss_name, rss_type);
+         rc = ESA_FATAL;
+         goto cleanup;
+      }
+			strcpy (offl_params->admin_params.admin_uname,
+				 offl_params->ofli_admin_user);
+			strcpy (offl_params->admin_params.admin_passwd,
+				 offl_params->ofli_admin_pswd);
+			strcpy (offl_params->admin_params.def_admin,
+				 offl_params->ofli_admin_user);
+			strcpy (offl_params->admin_params.def_admin_passwd,
+				 offl_params->ofli_admin_pswd);
+ 
+  }
+          end of WS10082A *******/
+ 
+ cleanup:;
+  ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+  return  rc;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetErrDestPtr                             *
+*                                                             *
+* DESCRIPTION     : Obtain err structure ptr from dest tbl    *
+*                                                             *
+* INPUT           : dest        - dest table                  *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ptr to err structure                      *
+*                                                             *
+**************************************************************/
+ 
+static ERR_STRUCT_rec_typ * GetErrDestPtr (
+                         CTSAMSG_DEST_TABLE_rec_typ      *dest,
+                         OFFLINE_INTERCEPT_STUFF_rec_typ *offl_params)
+{
+   ERR_STRUCT_rec_typ *err = NULL;
+   char   func[]="GetErrDestPtr";
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+   if (dest->dests[CTSAMSG_DEST_ERR].type EQ DEST_ERR)
+      err = (ERR_STRUCT_rec_typ *)dest->dests[CTSAMSG_DEST_ERR].handle;
+   else
+      CTSAMSG_print(ERR_INTERNAL2, offl_params->msgs,
+                    NULL, offl_params->dest, component, func,
+                    "Unable to obtain err destination ptr",
+                    16, __LINE__);
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, ESA_RC_VOID);
+   return err;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : my_strtok                                 *
+*                                                             *
+* DESCRIPTION     : strtok                                    *
+*                                                             *
+* INPUT           : sptr        - ptr to string               *
+*                   charset     - ptr to char set             *
+*                   handle      - ptr to handle               *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ptr to current token                      *
+*                                                             *
+**************************************************************/
+ 
+char * my_strtok (char        * sptr,
+                  const char  * charset,
+                  void       ** handle)
+{
+   char * rptr;
+   /*502839 char   func[]="my_strtok"; no ref*/
+ 
+   /*commented for offline performace*/
+ /*  ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func);*/
+ 
+   if (NOT sptr)
+      sptr = (char *)(*handle);
+ 
+   sptr += strspn  (sptr, charset);
+   rptr  = strpbrk (sptr, charset);
+ 
+   if (NOT rptr)     /* No characters from charset occurs in string */
+      goto cleanup;
+ 
+   *rptr   = '\0';      /* Set end-of-string */
+   *handle = rptr + 1;  /* Keep ptr for the next strtok */
+   rptr    = sptr;      /* Start ptr to string */
+ 
+  cleanup:;
+   /*ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func, ESA_RC_VOID);*/
+   return rptr;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : IsCheckSumKeyword                         *
+*                                                             *
+* DESCRIPTION     : Determine whether keyword belongs to      *
+*                   check sum calculated group fields         *
+*                                                             *
+* INPUT           : addinfo_typ  - addinfo typ                *
+*                   chksum_flg   - check sum flag             *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC - keyword belongs to               *
+*                            check sum calculated group fields*
+*                   ESA_ERR- no                               *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC IsCheckSumKeyword (char        *kwd_name,  /* WSAN100361 */
+                          char        *addinfo_typ,
+                          char        *chksum_flg,
+                          ADDINFO_typ *kwd_typ)
+{
+   ESA_RC rc = ESA_WARN; /* Default */
+   char   func[]="IsCheckSumKeyword";
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func);
+ 
+   if ( strcmp (addinfo_typ, M_ADDINFO_ENTITY) EQ 0 )
+      goto cleanup;
+ 
+   if (memcmp(kwd_name, "77", 2) EQ 0) {       /* WSAN100361 */
+      *kwd_typ = TYPE_1A;                      /* WSAN100361 */
+      rc = ESA_OK;  /* Accept the keyword */   /* WSAN100361 */
+      goto cleanup;                            /* WSAN100361 */
+   }                                           /* WSAN100361 */
+ 
+   if ( (chksum_flg[0] EQ KWD_FOR_ADDINFO_1A_CHECK)  OR
+        (chksum_flg[0] EQ KWD_FOR_ADDINFO_1B_CHECK)  OR
+        (chksum_flg[0] EQ KWD_FOR_ADDINFO_2A_CHECK)  OR
+        (chksum_flg[0] EQ KWD_FOR_ADDINFO_2B_CHECK)   ) {
+ 
+      switch (chksum_flg[0]) {
+        case KWD_FOR_ADDINFO_1A_CHECK:
+            *kwd_typ = TYPE_1A;
+            break;
+        case KWD_FOR_ADDINFO_1B_CHECK:
+            *kwd_typ = TYPE_1B;
+            break;
+        case KWD_FOR_ADDINFO_2A_CHECK:
+            *kwd_typ = TYPE_2A;
+            break;
+        case KWD_FOR_ADDINFO_2B_CHECK:
+            *kwd_typ = TYPE_2B;
+            break;
+      }
+      rc = ESA_OK;
+   }
+ 
+   cleanup:;
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func, rc);
+   return rc;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetAddinfo                                *
+*                                                             *
+* DESCRIPTION     : Allocate addinfo                          *
+*                                                             *
+* INPUT           : keywords                                  *
+*                                                             *
+* OUTPUT          : addinfo                                   *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC GetAddinfo (ADDINFO_rec_ptr             **addinfo,
+                   short                          num_objs,
+                   OFLI_KEYWORDS_rec_typ         *keywords,
+                   CTSAMSG_DEST_TABLE_rec_typ    *dest,
+                   CTSAMSG_HANDLE_rec_typ        *msgs)
+{
+   ESA_RC             rc = ESA_OK;
+   static             char func[]="GetAddinfo";
+   unsigned   int     size;
+   int                i;
+   unsigned int       j;
+   ADDINFO_rec_ptr   *wrk = NULL;
+   static char        empty_string [] = "";
+ 
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,11,
+                   "Num objects=%d", num_objs);
+ 
+   /*
+    *  Alloc array of pointers
+    */
+ 
+   size = num_objs * sizeof (ADDINFO_rec_ptr);
+   (*addinfo) = (ADDINFO_rec_ptr *)malloc (size);
+ 
+   if ( (*addinfo) EQ NULL) {
+      CTSAMSG_print (ERR_MALLOC, msgs, NULL, dest,
+                     "addinfo", size);
+      rc = ESA_FATAL;
+      goto cleanup;
+   }
+ 
+   wrk = (*addinfo);
+ 
+   /*
+    *  Clear ptrs
+    */
+ 
+   for ( i=0; i LT num_objs; i++)
+      wrk[i] = NULL;
+ 
+   /*
+    *  Get addinfo structures and set keywords
+    */
+ 
+   for (i = 0; i LT num_objs; i++) {
+     if ( keywords )
+        rc = ADDINFO_alloc(func,(short)keywords->cnt,
+             &(wrk[i]),dest,msgs);
+     else
+        rc = ADDINFO_alloc(func, 1, &(wrk[i]), dest, msgs);
+     if ( rc NE ESA_OK ) {
+        CTSAMSG_print (ERR_MALLOC, msgs, NULL, dest,
+                       "addinfo", size);
+      rc = ESA_FATAL;
+      goto cleanup;
+     }
+     else if ( keywords ) {
+        for (j=0; j LT keywords->cnt; j++)
+           ADDINFO_insert (keywords->kwds[j].typ,
+                           keywords->kwds[j].kwd, empty_string, wrk[i],
+                           MAX_RSS_ADDINFO_KWD_LEN,
+                           MAX_RSS_ADDINFO_VAL_LEN,
+                           UNIQUE);
+     }
+   }
+ 
+   cleanup :;
+ 
+   if ( rc NE ESA_OK )  /* Cleanup */
+      if (*addinfo)
+         FreeAddinfo (num_objs, addinfo );
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, rc);
+ 
+   return rc;
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : FreeAddinfo                               *
+*                                                             *
+* DESCRIPTION     : Free ADDINFO                              *
+*                                                             *
+* INPUT           : addinfo                                   *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : none                                      *
+*                                                             *
+**************************************************************/
+ 
+void FreeAddinfo (short              max_cnt,
+                  ADDINFO_rec_ptr ** addinfo)
+{
+   int             i;
+   ADDINFO_rec_ptr *wrk;
+   char   func[]="FreeAddinfo";
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+   wrk = (*addinfo);
+   if (wrk) {
+     for (i = 0; i LT max_cnt; i++) {
+        if ( wrk[i] )
+           ADDINFO_free( &wrk[i] );
+     }
+ 
+     free ( *addinfo );
+     *addinfo = NULL;
+   }
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, ESA_RC_VOID);
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetAddinfoCheckSum                        *
+*                                                             *
+* DESCRIPTION     : Calculate ADDINFO Check sum               *
+*                                                             *
+* INPUT           : addinfo                                   *
+*                                                             *
+* OUTPUT          : checksum                                  *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+static void GetAddinfoCheckSum (ADDINFO_rec_typ        *addinfo,
+                                void                  **CheckSumHandle,
+                                CHECKSUM_typ           *CheckSum)
+{
+   static char func[] = "GetAddinfoCheckSum";
+   int    i;
+   ONE_FIELD_rec_ptr f_ptr;
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+   /* addinfo num pairs */
+ 
+ 
+    ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 14,
+                    "num_pairs = %d, max_pairs = %d",
+                    addinfo->num_pairs,addinfo->max_pairs);
+ 
+    /* addinfo pairs */
+ 
+    i = 0;
+    f_ptr = addinfo->pair;
+    while ( i LT addinfo->num_pairs) {
+ 
+       if (memcmp(f_ptr->keyword, "77", 2) EQ 0)    /* WSAN100361 */
+         goto get_next_pair;                        /* WSAN100361 */
+ 
+       if (f_ptr->vallen GT 0 ) {
+          ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT, 18,
+                          "pair no. %3d: kwd=%s(%3d) val=%s(%3d)",
+                          i+1, f_ptr->keyword,f_ptr->keylen,
+                          f_ptr->value,f_ptr->vallen);
+ 
+       /*
+        * Calculate CheckSum
+        */
+ 
+        ChkSumL( (void *)f_ptr->value, f_ptr->vallen,
+                 CHECK_SUM_CONTINUE,
+                 CheckSumHandle, *CheckSum);
+       }
+ 
+       get_next_pair :;          /* WSAN100361 */
+ 
+       /*WS10082 f_ptr++;                                         */
+       f_ptr=ppair(f_ptr);                               /*WS10082*/
+       i++;
+    }
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, ESA_OK);
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetUserCheckSum                           *
+*                                                             *
+* DESCRIPTION     : Calculate Check sum                       *
+*                                                             *
+* INPUT           : user_params                               *
+*                   addinfo                                   *
+*                                                             *
+* OUTPUT          : checksum                                  *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+void GetUserCheckSum (CHECKSUM_typ           *CheckSum,
+                      USER_PARAMS_rec_typ    *user_params,
+                      ADDINFO_rec_typ        *addinfo)
+{
+    static char func[] = "GetUserCheckSum";
+    /* Handle for CheckSum */
+    void   *CheckSumHandle=(void *)NULL;
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+    memset( (char *)CheckSum, '0', sizeof(CHECKSUM_typ) );
+ 
+   /*
+    *  CalCulate Check sum of structure vars
+    */
+ 
+    if ( strlen(user_params->def_group ) GT 0 )
+        ChkSumL( (void *)user_params->def_group,
+                 (int)strlen(user_params->def_group),
+                 CHECK_SUM_CONTINUE,
+                 &CheckSumHandle, *CheckSum);
+ 
+    if ( strlen(user_params->parent_oe ) GT 0 )
+        ChkSumL( (void *)user_params->parent_oe,
+                 (int)strlen(user_params->parent_oe),
+                 CHECK_SUM_CONTINUE,
+                 &CheckSumHandle, *CheckSum);
+ 
+    ChkSumL( (void *)&user_params->passwd_life,
+             (int)sizeof(user_params->passwd_life),
+             CHECK_SUM_CONTINUE,
+             &CheckSumHandle, *CheckSum);
+ 
+    ChkSumL( (void *)&user_params->rev_status,
+             (int)sizeof(user_params->rev_status),
+             CHECK_SUM_CONTINUE,
+             &CheckSumHandle, *CheckSum);
+ 
+    ChkSumL( (void *)&user_params->user_admin,
+             (int)sizeof(user_params->user_admin),
+             CHECK_SUM_CONTINUE,
+             &CheckSumHandle, *CheckSum);
+ 
+   /*
+    *  CalCulate Check sum of addinfo vars
+    */
+ 
+    if (addinfo EQ NULL)
+       goto cleanup;
+ 
+    GetAddinfoCheckSum( addinfo, &CheckSumHandle, CheckSum );
+ 
+ 
+    cleanup :;
+ 
+    if ( CheckSumHandle )
+       ChkSumL( (void *)NULL , 0,
+                CHECK_SUM_LAST, &CheckSumHandle, *CheckSum);
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, ESA_OK);
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetOECheckSum                             *
+*                                                             *
+* DESCRIPTION     : Calculate Check sum                       *
+*                                                             *
+* INPUT           : oe_params                                 *
+*                   addinfo                                   *
+*                                                             *
+* OUTPUT          : checksum                                  *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+void GetOECheckSum (CHECKSUM_typ           *CheckSum,
+                    OE_PARAMS_rec_typ      *oe_params,
+                    ADDINFO_rec_typ        *addinfo)
+{
+    static char func[] = "GetOECheckSum";
+    /* Handle for CheckSum */
+    void   *CheckSumHandle=(void *)NULL;
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+    memset( (char *)CheckSum, '0', sizeof(CHECKSUM_typ) );
+ 
+   /*
+    *  CalCulate Check sum of structure vars
+    */
+ 
+    if ( strlen(oe_params->parent ) GT 0 )
+        ChkSumL( (void *)oe_params->parent,
+                 (int)strlen(oe_params->parent),
+                 CHECK_SUM_CONTINUE,
+                 &CheckSumHandle, *CheckSum);
+ 
+    ChkSumL( (void *)&oe_params->attr,
+             (int)sizeof(oe_params->attr),
+             CHECK_SUM_CONTINUE,
+             &CheckSumHandle, *CheckSum);
+ 
+   /*
+    *  CalCulate Check sum of addinfo vars
+    */
+ 
+    if (addinfo EQ NULL)
+       goto cleanup;
+ 
+    GetAddinfoCheckSum( addinfo, &CheckSumHandle, CheckSum );
+ 
+ 
+    cleanup :;
+ 
+    if ( CheckSumHandle )
+       ChkSumL( (void *)NULL , 0,
+                CHECK_SUM_LAST, &CheckSumHandle, *CheckSum);
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, ESA_OK);
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetGroupCheckSum                          *
+*                                                             *
+* DESCRIPTION     : Calculate Check sum                       *
+*                                                             *
+* INPUT           : ug_params                                 *
+*                   addinfo                                   *
+*                                                             *
+* OUTPUT          : checksum                                  *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+void GetGroupCheckSum (CHECKSUM_typ           *CheckSum,
+                       UG_PARAMS_rec_typ      *ug_params,
+                       ADDINFO_rec_typ        *addinfo)
+{
+    static char func[] = "GetGroupCheckSum";
+    /* Handle for CheckSum */
+    void   *CheckSumHandle=(void *)NULL;
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+    memset( (char *)CheckSum, '0', sizeof(CHECKSUM_typ) );
+ 
+   /*
+    *  CalCulate Check sum of structure vars
+    */
+ 
+    if ( strlen(ug_params->parent_group ) GT 0 )
+        ChkSumL( (void *)ug_params->parent_group,
+                 (int)strlen(ug_params->parent_group),
+                 CHECK_SUM_CONTINUE,
+                 &CheckSumHandle, *CheckSum);
+ 
+    if ( strlen(ug_params->parent_oe ) GT 0 )
+        ChkSumL( (void *)ug_params->parent_oe,
+                 (int)strlen(ug_params->parent_oe),
+                 CHECK_SUM_CONTINUE,
+                 &CheckSumHandle, *CheckSum);
+ 
+   /*
+    *  CalCulate Check sum of addinfo vars
+    */
+ 
+    if (addinfo EQ NULL)
+       goto cleanup;
+ 
+    GetAddinfoCheckSum( addinfo, &CheckSumHandle, CheckSum );
+ 
+    cleanup :;
+ 
+ 
+    if ( CheckSumHandle )
+       ChkSumL( (void *)NULL , 0,
+                CHECK_SUM_LAST, &CheckSumHandle, *CheckSum);
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, ESA_OK);
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetRSSCheckSum                            *
+*                                                             *
+* DESCRIPTION     : Calculate Check sum                       *
+*                                                             *
+* INPUT           : rss_params                                *
+*                   addinfo                                   *
+*                                                             *
+* OUTPUT          : checksum                                  *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+void GetRSSCheckSum (CHECKSUM_typ           *CheckSum,
+                     RSS_PARAMS_rec_typ     *rss_params,
+                     ADDINFO_rec_typ        *addinfo)
+{
+    static char func[] = "GetRSSCheckSum";
+    /* Handle for CheckSum */
+    void                   *CheckSumHandle=(void *)NULL;
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+    memset( (char *)CheckSum, '0', sizeof(CHECKSUM_typ) );
+ 
+   /*
+    *  CalCulate Check sum of structure vars
+    */
+ 
+    ChkSumL( (void *)&(rss_params->min_pass_len),
+             sizeof(rss_params->min_pass_len),
+             CHECK_SUM_CONTINUE,
+             &CheckSumHandle, *CheckSum);
+ 
+    ChkSumL( (void *)&(rss_params->max_expire),
+             sizeof(rss_params->max_expire),
+             CHECK_SUM_CONTINUE,
+             &CheckSumHandle, *CheckSum);
+ 
+    ChkSumL( (void *)&(rss_params->max_logins),
+             sizeof(rss_params->max_logins),
+             CHECK_SUM_CONTINUE,
+             &CheckSumHandle, *CheckSum);
+ 
+ 
+    /*
+     *  CalCulate Check sum of addinfo vars
+     */
+ 
+    if (addinfo EQ NULL)
+       goto cleanup;
+ 
+    GetAddinfoCheckSum( addinfo, &CheckSumHandle, CheckSum );
+ 
+    cleanup :;
+ 
+ 
+    if ( CheckSumHandle )
+       ChkSumL( (void *)NULL , 0,
+                CHECK_SUM_LAST, &CheckSumHandle, *CheckSum);
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, ESA_OK);
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : GetConnectionCheckSum                     *
+*                                                             *
+* DESCRIPTION     : Calculate Check sum                       *
+*                                                             *
+* INPUT           : u2ug_params                               *
+*                   addinfo                                   *
+*                                                             *
+* OUTPUT          : checksum                                  *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+void GetConnectionCheckSum (CHECKSUM_typ           *CheckSum,
+                            U2UG_PARAMS_rec_typ    *u2ug_params,
+                            ADDINFO_rec_typ        *addinfo)
+{
+    static char func[] = "GetConnectionCheckSum";
+    /* Handle for CheckSum */
+    void   *CheckSumHandle=(void *)NULL;
+ 
+   /*
+    *   Initialize
+    */
+ 
+    ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func);
+ 
+    memset( (char *)CheckSum, '0', sizeof(CHECKSUM_typ) );
+ 
+   /*
+    *  CalCulate Check sum of structure vars
+    */
+ 
+    if ( strlen(u2ug_params->def_group ) GT 0 )
+        ChkSumL( (void *)u2ug_params->def_group,
+                 (int)strlen(u2ug_params->def_group),
+                 CHECK_SUM_CONTINUE,
+                 &CheckSumHandle, *CheckSum);
+ 
+    ChkSumL( (void *)&u2ug_params->u2ug_admin_data,
+             sizeof(u2ug_params->u2ug_admin_data),
+             CHECK_SUM_CONTINUE,
+             &CheckSumHandle, *CheckSum);
+ 
+    ChkSumL( (void *)&u2ug_params->u2ug_attr_data,
+             sizeof(u2ug_params->u2ug_attr_data),
+             CHECK_SUM_CONTINUE,
+             &CheckSumHandle, *CheckSum);
+ 
+   /*
+    *  CalCulate Check sum of addinfo vars
+    */
+ 
+    if (addinfo EQ NULL)
+       goto cleanup;
+ 
+    GetAddinfoCheckSum( addinfo, &CheckSumHandle, CheckSum );
+ 
+ 
+    cleanup :;
+ 
+    if ( CheckSumHandle )
+       ChkSumL( (void *)NULL , 0,
+                CHECK_SUM_LAST, &CheckSumHandle, *CheckSum);
+ 
+    ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON, func, ESA_OK);
+ 
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : SaveKeywords                              *
+*                                                             *
+* DESCRIPTION     : Save keywords in internal tables          *
+*                                                             *
+* INPUT           : rss_name                                  *
+*                   user_keywords                             *
+*                   group_keywords                            *
+*                   connection_kewords                        *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : ESA_RC                                    *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC SaveKeywords (OFLI_KEYWORDS_rec_typ      *keywords,
+                     char                       *kwd_name,
+                     ADDINFO_typ                 kwd_typ,
+                     CTSAMSG_DEST_TABLE_rec_typ *dest,
+                     CTSAMSG_HANDLE_rec_typ     *msgs)
+{
+   static      char func[]="SaveKeywords";
+   ESA_RC      rc = ESA_OK;
+   unsigned    int  size;
+ 
+   ESA_DIAG_enter(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func);
+ 
+   if ( keywords->kwds EQ NULL ) {  /* First entry */
+      size = sizeof(OFLI_KWD_type_rec)  * MAX_EXPECTED_FIELDS;
+ 
+      keywords->kwds = (OFLI_KWD_type_rec *)malloc( size );
+      if ( keywords->kwds EQ NULL ) {
+           CTSAMSG_print (ERR_MALLOC, msgs, NULL, dest,
+                          "keywords", size);
+           rc = ESA_FATAL;
+           goto cleanup;
+      }
+ 
+      keywords->amount = MAX_EXPECTED_FIELDS;
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,15,
+                      "Allocated buffer %p amount=%d",
+                      keywords->kwds, keywords->amount );
+   }
+ 
+   if ( keywords->cnt GE  keywords->amount ) {
+      keywords->amount +=  MAX_EXPECTED_FIELDS;
+      size = sizeof(OFLI_KWD_type_rec) * keywords->amount;
+ 
+      keywords->kwds =
+          (OFLI_KWD_type_rec *)realloc(keywords->kwds,size);
+      if ( keywords->kwds EQ NULL ) {
+           CTSAMSG_print (ERR_MALLOC, msgs, NULL, dest,
+                          "keywords", size);
+           rc = ESA_FATAL;
+           goto cleanup;
+      }
+ 
+      ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,15,
+                      "ReAllocated buffer %p amount=%d",
+                      keywords->kwds, keywords->amount );
+   }
+ 
+ 
+   ESA_DIAG_printf(ESA_COMP_RSS_INTERCEPT,15,
+                   "Saved at %p  kwd=%s/%d cnt=%d",
+                   &(keywords->kwds[keywords->cnt]),
+                   kwd_name, kwd_typ, keywords->cnt );
+ 
+   strcpy( keywords->kwds[keywords->cnt].kwd, kwd_name );
+   keywords->kwds[keywords->cnt].typ = kwd_typ;
+   keywords->cnt++;
+ 
+   cleanup :;
+ 
+ 
+   ESA_DIAG_exit(ESA_COMP_RSS_INTERCEPT, DIAG_COMMON+ 1, func, rc);
+ 
+   return rc;
+}
+ 
+/**************************************************************
+*                                                             *
+* Subroutine name : keywords_sort_compare                     *
+*                                                             *
+* DESCRIPTION     : keywords(compare function)                *
+*                   Invoked by qsort                          *
+*                                                             *
+* INPUT           : rec1                                      *
+*                   rec2                                      *
+*                                                             *
+*                                                             *
+* OUTPUT          : none                                      *
+*                                                             *
+* RETURN VALUE    : 0, >0, <0                                 *
+*                                                             *
+**************************************************************/
+ 
+int keywords_sort_compare (const void * elem1,
+                           const void * elem2)
+{
+ const OFLI_KWD_type_rec *rec1 = (const OFLI_KWD_type_rec *)elem1;
+ const OFLI_KWD_type_rec *rec2 = (const OFLI_KWD_type_rec *)elem2;
+ 
+ return (strcmp ((const char *)rec1->kwd, (const char *)rec2->kwd));
+}

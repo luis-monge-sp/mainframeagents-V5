@@ -1,0 +1,939 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: acsproc.c %
+ * Instance        : %instance: 1 %
+ * Created by      : %created_by: leonid_s %
+ * Created on      : %date_created: Sun Jul 25 14:05:35 2004 %
+ * Current Version : %version: 2.1.1 %
+ * Last Modified by: %derived_by: leonid_s %
+ * Last Modified on: %date_modified: Wed Nov 19 18:19:24 2003 %
+ */
+ 
+/**************************************************************
+ * Mod.ID  Who      When         Description
+ * ============================================================
+ * IMH001  Ian H.   19-Nov-03    WSAN101342 Thread-safe code (ERRNO)
+ * IS10105 AvnerL   25 NOV 2013  Allow any host_id in RSSOFLI
+ * SAS2IBMA AvnerL  21-Dec-16    SAS/C to IBM C Conversion Project
+ *************************************************************/
+ 
+#include   "globs.h"
+ 
+#include   ERRNO
+#include   ESA_INIT
+#include   ESA_PROC
+#include   ESA_RSS
+#include   ESA_CS_OS
+#include   ESA_CS_SINFO
+#include   ESA_RSSF
+#include   ESA_OS_MBX
+ 
+#define CS_DAIG_RssOfli PROC101
+ 
+void CS_DAIG_RssOfli (RSSTBL_rec_typ * rsstbl,
+					  int              rsstbl_num);
+ 
+/**************************************************************
+* Procedure Name   : tbl_load
+*
+* Description      : Load process control table file
+* input/output     : rss_num - number loaded rsses
+* Return Value     : ESA_RC
+**************************************************************/
+ 
+ESA_RC tbl_load (RSSTBL_rec_typ       ** rsstbl,
+                 int                   * rsstbl_num)
+{
+  ESA_RC                rc = ESA_OK;
+  FILE                * file_handle= NULL;
+  int                   ii= 0;
+  RSSTBL_rec_typ        rec;
+  char                  fn[]="tbl_load";
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON, fn);
+  ESA_DIAG_printf (ESA_COMP_ACSPROC, DIAG_DETAILES,
+    "...-> : file_rssofli=%s envir_ptr= %p.",envir_ptr->file_rssofli, envir_ptr);
+ 
+  rc= CSA_open (envir_ptr->file_rssofli,
+                fn,
+                FILE_OPEN_FOR_UPDATE,
+                &file_handle,
+                SCOPE_REMOTE);
+  if (rc NE ESA_OK)
+    goto cleanup;
+ 
+  /*
+   *   Read process table  into buffer
+   */
+ 
+  for (*rsstbl_num= 0, ii= 0; ; ii++)
+  {
+     rc= CSA_fgets (envir_ptr->file_rssofli,
+                   (char *)(&rec),
+                   sizeof(RSSTBL_rec_typ),
+                   file_handle);
+     if (rc NE ESA_OK)
+     {
+        if (rc EQ ESA_EOF)
+            rc= ESA_OK;
+        goto cleanup;
+     }
+ 
+     ESA_DIAG_printf (ESA_COMP_ACSPROC, DIAG_DETAILES+ 1,
+                      "Input %d record %s.", ii+1, (char *)&rec);
+     if (rec.rss[0] EQ SKIP_LINE OR
+         rec.rss[0] EQ ' '       OR
+         rec.rss[0] EQ '\n'      OR
+         rec.rss[0] EQ '\0')
+     {
+        ESA_DIAG_printf (ESA_COMP_ACSPROC, 16,
+                         "Read record skipped");
+        continue;
+     }
+     rc= tbl_check (&rec);
+     if (rc EQ ESA_KEY_NOT_FOUND)
+     {
+        ESA_DIAG_printf (ESA_COMP_ACSPROC, 16,
+                         "RSS unrefernced. Read record skipped");
+		rc= ESA_OK;
+        continue;
+     }
+     if (rc NE ESA_OK)
+     {
+        CTSAMSG_print (ERR_CS_REC_ERR,
+                       envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                       envir_ptr->msg_admin_param.ctsamsg_dest,
+                       ii+1,
+                       envir_ptr->file_rssofli);
+        goto cleanup;
+     }
+     if (*rsstbl_num EQ 0)
+        rc= CSA_alloc ((char **)rsstbl, STRUC_RSSTBL,
+                       sizeof (RSSTBL_rec_typ),
+                       1, fn, "RSSTBL (OFLI) table");
+     else
+        rc= CSA_realloc ((char **)rsstbl, STRUC_RSSTBL,
+                         sizeof (RSSTBL_rec_typ),
+                         (*rsstbl_num) + 1);
+     if (rc NE ESA_OK)
+        break;
+     memcpy ((char *)((*rsstbl) + (*rsstbl_num)),
+             (char *)(&rec),
+             sizeof (RSSTBL_rec_typ));
+     (*rsstbl_num)++;
+     ESA_DIAG_printf (ESA_COMP_ACSPROC, 16,
+                      "Accepted %d/%d record %s." ,
+                       (ii+ 1),
+                       (*rsstbl_num),
+                       (char *)((*rsstbl) + (*rsstbl_num) - 1));
+  } /* for */
+ 
+  cleanup:
+  CSA_close (envir_ptr->file_rssofli, fn);
+  if (rc NE ESA_OK AND rc NE ESA_KEY_NOT_FOUND)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+  else
+    ESA_DIAG_printf (ESA_COMP_ACSPROC, DIAG_BASIC,
+      "*****>... File %s with %d parameters loaded.",
+	  envir_ptr->file_rssofli, *rsstbl_num);
+	
+  ESA_DIAG_printf (ESA_COMP_ACSPROC, 14,
+                   "From %s table accepted %d records from %d.",
+                   envir_ptr->file_rssofli,
+                   (*rsstbl_num),
+                   ii);
+  ESA_DIAG_printf (ESA_COMP_ACSPROC, DIAG_DETAILES+ 1,"        rsstbl=%p.", * rsstbl);
+  CS_DAIG_RssOfli (* rsstbl, * rsstbl_num);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON, fn, rc);
+  return rc;
+ 
+}
+ 
+/**************************************************************
+* Procedure Name   : tbl_check
+* Description      : Validity check of the process table row
+* input            : i - row number
+* Return Value     : ESA_RC
+**************************************************************/
+ 
+ESA_RC tbl_check (RSSTBL_rec_typ       * rsstbl)
+{
+  ESA_RC              rc = ESA_OK, j= 10;
+  RSS_typ             rss_type, rss;
+  char                zero_str []="00000000 000000";
+  char              * chk_ptr, * chk_ptr2;
+  char                tmp_str[sizeof (RSSTBL_rec_typ)+ 1];
+  char                fn[]="tbl_check";
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON, fn);
+  j++;
+  CLEAR (rss);
+  /* Check rss name */
+  memcpy ((char *)rss,(char *)rsstbl->rss, RSS_NAME_LEN);
+  strtok (rss, " ");
+  chk_ptr= strtok (NULL, " ");
+  if (chk_ptr NE NULL)
+  {
+      j += 10;
+      strcpy (tmp_str, (char *)rsstbl);
+      chk_ptr2= strstr (tmp_str+ strlen (rss), chk_ptr);
+      if (chk_ptr2 NE NULL) {
+          memset ((char *)rsstbl->rss+ strlen (rss), ' ',
+              sizeof (RSS_typ)- strlen (rss));
+          strcpy ((char *)rsstbl->intercept_next_date, chk_ptr2);
+      }
+      else
+          return (ESA_ERR);
+  }
+  rc= rssprm_get (rss, RSS_TYPE, RSS_NAME_LEN, rss_type);
+  if (rc NE ESA_OK)
+    return (ESA_KEY_NOT_FOUND);
+ 
+  j++;
+  if ((rc= date_check (rsstbl->intercept_next_date)) NE ESA_OK)
+    return (j);
+  if ((rc= time_check (rsstbl->intercept_next_time,
+                       TIME_REGULAR_MODE)) NE ESA_OK)
+    return (j);
+ 
+  j++;
+  if ((rc= date_check (rsstbl->intercept_end_date)) NE ESA_OK)
+    return (j);
+  if ((rc= time_check (rsstbl->intercept_end_time,
+                       TIME_REGULAR_MODE)) NE ESA_OK)
+    return (j);
+ 
+  j++;
+  if ((rc= date_check (rsstbl->sync_start_date)) NE ESA_OK)
+    return (j);
+  if ((rc= time_check (rsstbl->sync_start_time,
+                       TIME_REGULAR_MODE)) NE ESA_OK)
+    return (j);
+ 
+  j++;
+  if (memcmp ((char *)rsstbl->log_last_update_date, (char *)zero_str,
+              DATE_LEN+ TIME_LEN+ 1) NE 0) {
+    if ((rc= date_check (rsstbl->log_last_update_date)) NE ESA_OK)
+      return (j);
+    if ((rc= time_check (rsstbl->log_last_update_time,
+                         TIME_REGULAR_MODE)) NE ESA_OK)
+      return (j);
+  }
+ 
+  j++;
+  if (memcmp ((char *)rsstbl->intercept_till_date, (char *)zero_str,
+              DATE_LEN+ TIME_LEN+ 1) NE 0) {
+    if ((rc= date_check (rsstbl->intercept_till_date)) NE ESA_OK)
+      return (j);
+    if ((rc= time_check (rsstbl->intercept_till_time,
+                         TIME_REGULAR_MODE)) NE ESA_OK)
+      return (j);
+  }
+  rsstbl->fil1= rsstbl->fil2= rsstbl->fil3= rsstbl->fil4=  ' ';
+  rsstbl->fil5= rsstbl->fil6= rsstbl->fil7= ' ';
+  rsstbl->end_row= '\n';
+  rsstbl->end_string= '\0';
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON, fn, ESA_OK);
+  return (ESA_OK);
+}
+ 
+/**************************************************************
+* Procedure Name   : time_check
+* Description      : Validity check of the time field
+* input            : time  field
+* Return Value     : ESA_RC
+**************************************************************/
+ 
+ESA_RC time_check (TIME_typ      time_field,
+                   TIME_MODE_typ time_mode)
+{
+  char                  fn[]="time_check";
+  char                  hh_str [3], mm_str [3], ss_str[3];
+  int                   hh_int= 0,  mm_int= 0,  ss_int= 0;
+  ESA_RC                rc= ESA_OK;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON+ 1, fn);
+  CS_get_envir_address (&envir_ptr);
+ 
+  CLEAR (hh_str);
+  CLEAR (mm_str);
+  CLEAR (ss_str);
+  memcpy (hh_str, (char *)time_field, 2);
+  memcpy (mm_str, (char *)time_field+ 2, 2);
+  memcpy (ss_str, (char *)time_field+ 4, 2);
+  hh_int= atoi (hh_str);
+  mm_int= atoi (mm_str);
+  ss_int= atoi (ss_str);
+ 
+  if (
+        (
+           (time_mode EQ TIME_REGULAR_MODE)
+          AND
+           (hh_int GT 24)
+        )
+       OR
+        (
+           (time_mode EQ TIME_EXTENDED_MODE)
+          AND
+           (hh_int GE 100)
+        )
+     )
+          rc= ESA_ERR;
+ 
+  if (
+        (mm_int GE 60)
+       OR
+        (ss_int GE 60)
+     )
+          rc= ESA_ERR;
+ 
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_MSG_GET_FLD ,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   fn , C_TIME);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON+ 1, fn, rc);
+  return (rc);
+}
+ 
+/**************************************************************
+* Procedure Name   : date_check
+* Description      : Validity check of the date field
+* input            : date  field
+* Return Value     : ESA_RC
+**************************************************************/
+ 
+ESA_RC date_check (DATE_typ  date_field)
+{
+  char                  fn[]="date_check";
+  ESA_RC                rc= ESA_OK;
+  char                  mm_str [3], dd_str [3], yyyy_str [5];
+  int                   mm_int= 0, dd_int= 0, yyyy_int= 0;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON+ 1, fn);
+  CS_get_envir_address (&envir_ptr);
+ 
+  CLEAR  (yyyy_str);
+  CLEAR  (mm_str);
+  CLEAR  (dd_str);
+ 
+  memcpy (yyyy_str, (char *)date_field, 4);
+  memcpy (mm_str, (char *)date_field+ 4, 2);
+  memcpy (dd_str, (char *)date_field+ 6, 2);
+ 
+  yyyy_int= atoi (yyyy_str);
+ 
+  mm_int= atoi (mm_str);
+  dd_int= atoi (dd_str);
+ 
+  if (yyyy_int GT 1993 AND
+      mm_int LT 13 AND dd_int LT 32 AND
+      mm_int GT 0  AND dd_int GT 0)
+    rc= ESA_OK;
+  else {
+    CTSAMSG_print (ERR_CS_MSG_GET_FLD ,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   fn , C_DATE);
+    rc= ESA_ERR;
+  }
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON+ 1, fn, rc);
+  return (rc);
+}
+ 
+/**************************************************************
+* Procedure Name   : tbl_rebuild
+* Description      : rewrite rows from the memory buffer
+* input            : rss_num - number rows to write
+* Return Value     : ESA_RC
+**************************************************************/
+ 
+ESA_RC tbl_rebuild (RSSTBL_rec_typ       * rsstbl,
+                    int                    rsstbl_num)
+{
+  char                  fn[]="tbl_rebuild";
+  ESA_RC                rc = ESA_OK;
+  int                   i= 0;
+  FILE                * file_handle= NULL;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON, fn);
+ 
+  rc= CSA_open (envir_ptr->file_rssofli,
+                fn,
+                FILE_CREAT,
+                &file_handle,
+                SCOPE_REMOTE);
+  if (rc NE ESA_OK)
+    goto cleanup;
+ 
+  /*
+   *   Write process table from the  buffer
+   */
+ 
+  for (i= 0; i LT rsstbl_num; i++)
+  {
+    rc= CSA_fputs (envir_ptr->file_rssofli,
+                   (char*)(rsstbl+ i),
+                   file_handle);
+    if (rc NE ESA_OK)
+       goto cleanup;
+ 
+    ESA_DIAG_printf (ESA_COMP_ACSPROC, 16,
+                     "Writed %d record: %s.",
+                     i+ 1,
+                     (char *)(rsstbl+ i));
+  } /* for */
+  if (rc NE ESA_OK)
+    goto cleanup;
+ 
+  cleanup:
+  CSA_close (envir_ptr->file_rssofli, fn);
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+  ESA_DIAG_printf (ESA_COMP_ACSPROC, 14,
+          "rebuild %s file with %d records",
+           envir_ptr->file_rssofli,
+           i);
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON, fn, rc);
+  return rc;
+ 
+}
+ 
+/**************************************************************
+* Procedure Name   : to_time_tm_convert
+* Description      : Convert DATE_typ and TIME_typ data
+*                            to time_tm data
+* Return Value     : ESA_RC
+**************************************************************/
+ 
+void to_time_tm_convert (struct tm * tmtime,
+                         DATE_typ    a_date,
+                         TIME_typ    a_time)
+{
+  char   nn_str[3], nnnn_str[5];
+  char   fn[]="to_time_tm_convert";
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON+ 1, fn);
+  CLEAR  (nn_str);
+  CLEAR  (nnnn_str);
+  tmtime->tm_isdst= -1; /*01/05/2000*/
+  tmtime->tm_sec= 0;
+  memcpy (nn_str, a_time+ 2, 2);
+  tmtime->tm_min= atoi (nn_str);
+  memcpy (nn_str, a_time, 2);
+  tmtime->tm_hour= atoi (nn_str);
+  memcpy (nn_str, a_date+ 6, 2);
+  tmtime->tm_mday= atoi (nn_str);
+  memcpy (nn_str, a_date+ 4, 2);
+  tmtime->tm_mon= atoi (nn_str);
+  tmtime->tm_mon--;
+  memcpy (nnnn_str, a_date, 4);
+  tmtime->tm_year= atoi (nnnn_str);
+  tmtime->tm_year -= 1900;
+ 
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON+ 1, fn, ESA_RC_VOID);
+}
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : set_next_time                            *
+*                                                             *
+* Description      : Set time for start next interceptor      *
+*                    process                                  *
+* Return Value     : ESA_RC                                   *
+*                                                             *
+**************************************************************/
+ 
+ESA_RC set_next_time (char            * RssName,
+                      TIME_typ          interval,
+                      DATE_typ          next_date,
+                      TIME_typ          next_time)
+{
+  char                  fn[]="set_next_time";
+  long int              interval_in_min , interval_in_sec;
+  time_t                lcl_time, nxt_time;
+  struct tm             ntime;
+  ESA_RC                rc= ESA_OK;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON, fn);
+  ESA_DIAG_printf(ESA_COMP_ACSPROC, 13,
+   "input-interval=%s next_date=%.8s next_time=%.6s.",
+   (interval NE NULL) ? interval : "NULL", next_date ,next_time);
+  if (interval NE NULL)
+  {
+     rc= time_check (interval, TIME_EXTENDED_MODE);
+     if (rc NE ESA_OK)
+       goto cleanup;
+     ESA_DIAG_printf(ESA_COMP_ACSPROC, 15,
+      "after time_check");
+ 
+     if (memcmp (interval, MIN_INTERVAL, sizeof (TIME_typ)) LT 0)
+        memcpy (interval, MIN_INTERVAL, sizeof (TIME_typ));
+     ESA_DIAG_printf(ESA_COMP_ACSPROC, 13,
+        "interval=%s.",interval);
+ 
+     interval_in_min= to_min_convert (interval);
+     ESA_DIAG_printf(ESA_COMP_ACSPROC, 15,
+      "interval_in_min=%ld.", interval_in_min);
+  }
+  /*   Set local time */
+  lcl_time= time(NULL);
+  ESA_DIAG_printf(ESA_COMP_ACSPROC, 15,
+   "lcl_time=%ld.", lcl_time);
+ 
+  /*   Set old next time date */
+  to_time_tm_convert (&ntime, next_date, next_time);
+  ESA_DIAG_printf(ESA_COMP_ACSPROC, 15,
+   "convert ntime: sec=%d min=%d hour=%d.",
+        ntime.tm_sec, ntime.tm_min, ntime.tm_hour);
+  nxt_time= mktime (&ntime);
+  ESA_DIAG_printf(ESA_COMP_ACSPROC, 15,
+   "before intrval mktime of the ntime=%ld.",nxt_time);
+  /*   Find new next time date */
+  if (interval NE NULL)
+  {
+/* AVIW - 06/11/2000 - when adding the interval_in_min to ntime.tm_min
+   if result is > 59 - Tandem returns error (non ANSI)
+ 
+	  while (nxt_time LE lcl_time) {
+       ntime.tm_min += interval_in_min;
+       nxt_time= mktime (&ntime);
+       ESA_DIAG_printf(ESA_COMP_ACSPROC, 15,
+         "while < %ld ntime.tm_min=%d nxt_time=%ld.",
+	      interval_in_min, ntime.tm_min, nxt_time);
+	 }
+     ESA_DIAG_printf(ESA_COMP_ACSPROC, 15,
+       "after while");
+*/
+/* AVIW - 06/11/2000 - this replaces the next time activation calculating */
+    if (nxt_time LE lcl_time)
+	{
+      interval_in_sec = interval_in_min * 60;
+      nxt_time = lcl_time +
+		      (interval_in_sec - ((int)(lcl_time - nxt_time) % interval_in_sec));
+	}
+ 
+  }
+  else /* When interval is NULL */
+  {
+     FindNextOfliTime (RssName, &ntime);
+     nxt_time= mktime (&ntime);
+     ESA_DIAG_printf(ESA_COMP_ACSPROC, 15,
+         "Day=%d Hour=%d Min=%d nxt_time=%ld.",
+	      ntime.tm_mday, ntime.tm_hour, ntime.tm_min, nxt_time);
+  }
+  /*   Set new next time date */
+  memcpy ((char *)&ntime,
+	      (char *)ConvertTimeToTMStruct (&nxt_time, &ntime),
+		  sizeof (struct tm));
+  from_time_tm_convert (&ntime, next_date, next_time);
+  ESA_DIAG_printf(ESA_COMP_ACSPROC, 13,
+   "from_time_tm_convert: next_date=%.8s next_time=%.6s.",
+    next_date ,next_time);
+ 
+cleanup:
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON, fn, rc);
+  return (rc);
+}
+ 
+/**************************************************************
+* Procedure Name   : to_min_conevert
+* Description      : Convert hh.mm.ss to minutes
+* input            : time  field
+* Return Value     : minuts
+**************************************************************/
+ 
+long int to_min_convert (TIME_typ  time_field)
+{
+  long int  i, hh_int, mm_int;
+  char      hh_str [3], mm_str[3];
+  char      fn[]="to_min_convert";
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON, fn);
+  memcpy (hh_str, time_field, 2);
+  memcpy (mm_str, time_field+ 2, 2);
+  hh_str[2]= mm_str[2]= '\0';
+  hh_int= atoi (hh_str);
+  mm_int= atoi (mm_str);
+  i= (hh_int* 60)+ mm_int;
+ 
+  ESA_DIAG_printf(ESA_COMP_ACSPROC, 15,
+   "to_min_convert: i=%ld.", i);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON, fn, ESA_RC_VOID);
+  return (i);
+}
+ 
+/****************************************************
+ * Procedure Name: rsstbl_get
+ * Description   : Get data from RSSOFLI for specific rss
+ * Return Value  : ESA_OK             upon success
+ *                 ESA_KEY_NOT_FOUND  on any other situation
+ ****************************************************/
+ 
+ESA_RC RssTblGet (DATE_typ        TblDate,
+                  TIME_typ        TblTime,
+                  unsigned long * RecNum)
+{
+  char                  fn[]="RssTblGet";
+  ESA_RC                rc= ESA_OK;
+  RSSTBL_rec_typ      * rsstbl = NULL;
+  int                   jj= 0, rsstbl_num= 0;
+  RSS_typ               rss_id;
+  OS_host_name_typ      host_id;
+  char                  log_last_recnum[MAX_FIGURES_IN_LONG_INT+ 1];
+  char                * stopptr;
+  ENVIRONMENT_rec_typ * envir_ptr;
+  char					one_rssofli[2];		/*IS10105*/
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON, fn);
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSPROC, 13, "rss=%s host_name%s.",
+                   envir_ptr->msg_admin_param.rss_name,
+                   envir_ptr->host_name);
+ 
+  rc= tbl_load (&rsstbl, &rsstbl_num);
+  if (rc NE ESA_OK)
+    goto cleanup;
+ 
+ /* IS10105 part 1 - start - when ONE_RSSOFLI parm is Y, allow any host_id in RSSOFLI */
+	rc= envir_ptr->msg_admin_param.cs_func.rssprm_get_opt_ptr (
+			envir_ptr->msg_admin_param.rss_name,
+			"ONE_RSSOFLI" ,
+			1,
+			one_rssofli,
+			OPT_TRUE,
+			OPT_TRUE);
+     if (rc NE ESA_OK)
+        strcpy (one_rssofli, ESS_NOT_FLAG);
+	 rc= ESA_OK;
+     ESA_DIAG_printf (ESA_COMP_ACSPROC, 6,
+       "at RssTblGet ONE_RSSOFLI=<%s>.", one_rssofli);
+  /* IS10105 part 1 - end */
+ 
+  for(jj= 0; jj LT rsstbl_num; jj++) {
+    memcpy ((char *)rss_id, (char *)rsstbl[jj].rss, sizeof(RSS_typ));
+    strtok (rss_id, " ");
+    memcpy ((char *)host_id, (char *)rsstbl[jj].host,
+            sizeof(OS_host_name_typ));
+    strtok (host_id, " ");
+    strtok (host_id, "\n");
+    /* dropped by IS10105 if (My_stricmp (rss_id,
+                    envir_ptr->msg_admin_param.rss_name) NE 0 OR
+        strcmp (host_id, envir_ptr->host_name) NE 0)
+      continue; */
+	/* IS10105 part 2 - start */
+    if (My_stricmp (rss_id,envir_ptr->msg_admin_param.rss_name) NE 0) continue;
+	if ((one_rssofli[0] NE ESS_YES_SIGN) AND
+	    (strcmp (host_id, envir_ptr->host_name) NE 0)) continue;
+	/* IS10105 part 2 - end */
+ 
+    memset ((char *)TblDate, '\0', sizeof (DATE_typ));
+    memset ((char *)TblTime, '\0', sizeof (TIME_typ));
+    memset (log_last_recnum, ' ', sizeof (log_last_recnum));
+    memcpy ((char *)TblDate, rsstbl[jj].log_last_update_date, DATE_LEN);
+    memcpy ((char *)TblTime, rsstbl[jj].log_last_update_time, TIME_LEN);
+    memcpy ((char *)log_last_recnum, rsstbl[jj].log_last_recnum,
+            MAX_FIGURES_IN_LONG_INT);
+    strtok ((char *)log_last_recnum, " ");
+    *RecNum= strtoul (log_last_recnum, &stopptr, 10);
+    if (*stopptr NE '\0')
+       rc= ESA_ERR;
+    break;
+  }
+  if (jj GE rsstbl_num) {
+    rc= ESA_KEY_NOT_FOUND;
+    ESA_DIAG_printf (ESA_COMP_ACSPROC, 11,"Rss=%s not found",
+                     envir_ptr->msg_admin_param.rss_name);
+    CTSAMSG_print (ERR_CS_RSS_NOTFND,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   envir_ptr->msg_admin_param.rss_name,
+                   envir_ptr->host_name, envir_ptr->file_rssofli);
+    goto cleanup;
+  }
+ 
+cleanup:
+  if (rsstbl NE NULL)
+  {
+     CSA_free ((char **)&rsstbl);
+     rsstbl = NULL;
+  }
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON, fn, rc);
+ 
+  return (rc);
+}
+ 
+/****************************************************
+ * Procedure Name: rsstbl_set
+ * Description   : Get data from RSSOFLI for specific rss
+ * Return Value  : ESA_OK             upon success
+ *                 ESA_KEY_NOT_FOUND  on any other situation
+ ****************************************************/
+ 
+ESA_RC RssTblSet (DATE_typ      TblDate,
+                  TIME_typ      TblTime,
+                  unsigned long RecNum)
+{
+  char                  fn[]="RssTblSet";
+  ESA_RC                rc= ESA_OK;
+  RSSTBL_rec_typ      * rsstbl = NULL;
+  int                   jj= 0, rsstbl_num= 0;
+  RSS_typ               rss_id;
+  OS_host_name_typ      host_id;
+  char                  log_last_recnum[MAX_FIGURES_IN_LONG_INT+ 1];
+  ENVIRONMENT_rec_typ * envir_ptr;
+  char					one_rssofli[2];		/*IS10105*/
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON, fn);
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSPROC, 13,
+      "rss=%s host_name%s date=%s time=%s recnum=%d.",
+      envir_ptr->msg_admin_param.rss_name, envir_ptr->host_name,
+      TblDate, TblTime, (int)RecNum);
+ 
+  rc= tbl_load (&rsstbl, &rsstbl_num);
+  if (rc NE ESA_OK)
+    goto cleanup;
+ 
+  /* IS10105 part 1 - start - when ONE_RSSOFLI parm is Y, allow any host_id in RSSOFLI */
+  rc= envir_ptr->msg_admin_param.cs_func.rssprm_get_opt_ptr (
+			envir_ptr->msg_admin_param.rss_name,
+			"ONE_RSSOFLI" ,
+			1,
+			one_rssofli,
+			OPT_TRUE,
+			OPT_TRUE);
+  if (rc NE ESA_OK)
+      strcpy (one_rssofli, ESS_NOT_FLAG);
+  rc= ESA_OK;
+  ESA_DIAG_printf (ESA_COMP_ACSPROC, 6,
+	  "at RssTblSet ONE_RSSOFLI=<%s>.", one_rssofli);
+  /* IS10105 part 1 - end */
+ 
+  for(jj= 0; jj LT rsstbl_num; jj++) {
+    memcpy ((char *)rss_id, (char *)rsstbl[jj].rss, sizeof(RSS_typ));
+    strtok (rss_id, " ");
+    memcpy ((char *)host_id, (char *)rsstbl[jj].host,
+            sizeof(OS_host_name_typ));
+    strtok (host_id, " ");
+    strtok (host_id, "\n");
+ 
+    /* dropped by IS10105 if (My_stricmp (rss_id,
+                    envir_ptr->msg_admin_param.rss_name) NE 0 OR
+        strcmp (host_id, envir_ptr->host_name) NE 0)
+      continue; */
+	/* IS10105 part 2 - start */
+	if (My_stricmp (rss_id,envir_ptr->msg_admin_param.rss_name) NE 0) continue;
+	if ((one_rssofli[0] NE ESS_YES_SIGN) AND
+	    (strcmp (host_id, envir_ptr->host_name) NE 0)) continue;
+	/* IS10105 part 2 - end */
+ 
+    memset (log_last_recnum, ' ', sizeof (log_last_recnum));
+    memcpy (rsstbl[jj].log_last_update_date, (char *)TblDate, DATE_LEN);
+    memcpy (rsstbl[jj].log_last_update_time, (char *)TblTime, TIME_LEN);
+    sprintf ((char *)log_last_recnum,"%10d", (int)RecNum);
+    memcpy (rsstbl[jj].log_last_recnum, (char *)log_last_recnum,
+            MAX_FIGURES_IN_LONG_INT);
+    break;
+  }
+  if (jj GE rsstbl_num) {
+    rc= ESA_KEY_NOT_FOUND;
+    ESA_DIAG_printf (ESA_COMP_ACSPROC, 11,"Rss=%s not found",
+                     envir_ptr->msg_admin_param.rss_name);
+    CTSAMSG_print (ERR_CS_RSS_NOTFND,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   envir_ptr->msg_admin_param.rss_name,
+                   envir_ptr->host_name, envir_ptr->file_rssofli);
+    goto cleanup;
+  }
+  rc= tbl_rebuild (rsstbl, rsstbl_num);
+ 
+cleanup:
+  if (rsstbl NE NULL)
+  {
+     CSA_free ((char **)&rsstbl);
+     rsstbl = NULL;
+  }
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON, fn, rc);
+ 
+  return (rc);
+}
+ 
+/****************************************************
+ * Procedure Name:
+ * Description   :
+ * Return Value  :
+ ****************************************************/
+ 
+void FindNextOfliTime (char      * RssName,
+                       struct tm * NextTmTime)
+{
+  ESA_RC         rc= ESA_OK;
+  char           fn[]="FindNextOfliTime";
+  unsigned int   kk= 0, NextHour, NextMin;
+  char         * ChrPtr, * StopPtr;
+  char           RssPrmValue[RSSPRM_VALUE_LEN];
+  char           TmpPrmValue[RSSPRM_VALUE_LEN];
+  char         * OfliList[24];
+  unsigned int   OfliListNumber= 0;
+  time_t         CurTime;
+  struct tm      CurTmTime;
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON, fn);
+ 
+  time (&CurTime);
+  memcpy ((char *)&CurTmTime,
+	      (char *)ConvertTimeToTMStruct (&CurTime, &CurTmTime),
+		  sizeof (struct tm));
+ 
+  rc= rssprm_get_opt ((char *)RssName, OFFLI_RUN_TIME_LIST,
+         			  144, RssPrmValue,
+		    		  OPT_TRUE, OPT_FALSE);
+  if (rc NE ESA_OK)
+     strcpy (RssPrmValue, DEF_OFFLI_RUN_TIME_LIST);
+  GetOfliList (RssPrmValue, TmpPrmValue,
+	           OfliList, &OfliListNumber);
+ 
+  NextTmTime->tm_mon = CurTmTime.tm_mon;
+  NextTmTime->tm_year= CurTmTime.tm_year;
+ 
+  if (
+	    (CurTmTime.tm_year NE NextTmTime->tm_year)
+       OR
+	    (CurTmTime.tm_mon  NE NextTmTime->tm_mon)
+       OR
+        (CurTmTime.tm_mday NE NextTmTime->tm_mday)
+     )
+  {
+     NextTmTime->tm_min = 0;
+	 NextTmTime->tm_hour= -1;
+  }
+ 
+  for (kk= 0; kk LT OfliListNumber; kk++)
+  {
+     ChrPtr= strtok (OfliList[kk], ":");
+     NextHour= strtoul (ChrPtr, &StopPtr, 10);
+     NextMin = strtoul (ChrPtr+ strlen(ChrPtr)+ 1, &StopPtr, 10);
+     if (NextTmTime->tm_hour GT (int)NextHour)
+        continue;
+     else if (
+		        (NextTmTime->tm_hour EQ (int)NextHour)
+               AND
+		        (NextTmTime->tm_min GE (int)NextMin)
+             )
+        continue;
+     else
+	 {
+        NextTmTime->tm_min = NextMin;
+        NextTmTime->tm_hour= NextHour;
+        NextTmTime->tm_mday= CurTmTime.tm_mday;
+	    break;
+	 }
+  }
+ 
+  if (kk GE OfliListNumber)
+  {
+     NextHour= strtoul (OfliList[0], &StopPtr, 10);
+     NextMin = strtoul (OfliList[0]+ strlen(OfliList[0])+ 1,
+		                &StopPtr, 10);
+     NextTmTime->tm_min = NextMin;
+     NextTmTime->tm_hour= NextHour;
+     NextTmTime->tm_mday= CurTmTime.tm_mday+ 1;
+  }
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON, fn, ESA_OK);
+}
+ 
+/****************************************************
+ * Procedure Name:
+ * Description   :
+ * Return Value  :
+ ****************************************************/
+ 
+void TrnsfIntervalToNumber (char     * IntrvlStr,
+                            long int * IntrvlNum)
+{
+  long int   interval_time;
+  TIME_typ   interval;
+  char       fn[]="TrnsfIntervalToNumber";
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON, fn);
+ 
+  strcpy (interval, IntrvlStr);
+  interval_time  =   atoi(&interval[4]);
+  interval[4]    = '\0';
+  interval_time += (atoi(&interval[2]) * 60);
+  interval[2]    = '\0';
+  interval_time += (atoi(interval) * 60 * 60);
+  *IntrvlNum= interval_time;
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSCHED, DIAG_DETAILES,
+        "Inerval str %s to Interval time %d.", (char *)interval, (int)interval_time);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON, fn, ESA_OK);
+}
+ 
+void CS_DAIG_RssOfli (RSSTBL_rec_typ * rsstbl,
+					  int              rsstbl_num)
+{
+ 
+   int                   jj= 0;
+   RSSTBL_rec_typ      * RssTbl= NULL;
+   ENVIRONMENT_rec_typ * envir_ptr;
+   char                  fn[]="CS_DAIG_RssOfli";
+ 
+   ESA_DIAG_enter (ESA_COMP_ACSPROC, DIAG_COMMON, fn);
+ 
+   CS_get_envir_address (&envir_ptr);
+   if (ESA_DIAG_get_debug_level(ESA_COMP_ACSCB) LE DIAG_BASIC)
+		goto cleanup;
+ 
+   ESA_DIAG_printf (ESA_COMP_ACSCB, 0,
+	          "       -------- Rss Name --------------- - Next Ofl.Run\
+-  - Prev Ofl.Run-  -Last Sync.Run-  -Ofl Error Run-  --------------- \
+-Online NM- - Host Name ------ -");
+   for (jj= 0;
+        (rsstbl NE NULL) AND (jj LT rsstbl_num);
+		jj++)
+   {
+      RssTbl= rsstbl+ jj;
+	  ESA_DIAG_printf (ESA_COMP_ACSCB, 0,"     %d: %s.", jj+ 1, (char *)RssTbl);
+   }
+   ESA_DIAG_printf (ESA_COMP_ACSCB, 0,"     ---------------------------------");
+cleanup:
+  ESA_DIAG_exit (ESA_COMP_ACSPROC, DIAG_COMMON, fn, ESA_RC_VOID);
+  return;
+ 
+}
+ 
+ 

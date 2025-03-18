@@ -1,0 +1,3228 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: acsupdf.c %
+ * Instance        : %instance: 1 %
+ * Created by      : %created_by: leonid_s %
+ * Current Version : %version: 10 %
+ * Created on      : %date_created: Mon May 17 14:40:42 2004 %
+ * Last Modified by: %derived_by: leonid_s %
+ * Last Modified on: %date_modified: Wed Feb 11 16:49:31 2004 %
+ */
+ 
+/***********************************************
+ * Mod.ID  Who      When         Description
+ * ============================================
+ * 502839  AvnerL   25-Jun-2009  MF updates for 3.3.00
+ * IS10102 AvnerL	  29-AUG-2013  S0C4 in CD when revoke event-
+ *               	               - CS_update_usdis
+ * SAS2IBMA AvnerL  21-Dec-16    SAS/C to IBM C Conversion Project
+ * SAS2IBMN NuritY  26-Mar-17    SAS/C to IBM C Conversion Project
+ * AC001   ArunC    12-Apr-2017  CIQ#6-MF acct aggr with conns
+ * BS10086 SeligT   23-Apr-2018  QUEUE File Status Numbers Incorrect
+ * BS10129  AvnerL   28-Dec-23    Recompile due to WS10078 ESAINIT
+ * WS10082K KailasP 27-Jan-2012  Addinfo related changes
+ * BS10137  AvnerL  31-Jul-2024  Fix CTS1308E msg issue.
+ **********************************************/
+ 
+#include "globs.h"
+ 
+#include ESA_MSG
+#include ESA_CS_DBPKG
+#include ESA_CS_SINFO
+#include ESA_CS_OS
+#include ESA_RSS
+#include ESA_PROC
+#include ESA_RSSF
+#include ESA_CAREUSR
+#include ESA_ACSU
+#include ESA_ADMIN
+ 
+/* for MVS */
+#define DeleteInterceptCheck dlintck
+#define main_name          updf001   /* AvnerL 29apr2003 for MVS short name - task 7941 */
+#define QueueInfoString    updf002
+#define QueueSiidTime      updf003
+#define QueueInfoFunc      updf004
+/*BS10137 this parameter is not used by our MF agents
+#define PwdChgWithGetUser  updf005    * 502839 14June2009 for MVS short name is required*/
+ /* MVS */
+ 
+char DeleteInterceptCheck= ESS_NOT_SIGN;
+/*BS10137 char PwdChgWithGetUser= ESS_NOT_SIGN;                 *****/
+static void CS_log_intercept_msg (char * msg_id,
+	                              char * msg_prm_2,
+			                      char * msg_prm_3);
+ 
+char main_name[FUNC_NAME_LEN+ 1]="";
+char QueueInfoString[100]="";
+char QueueSiidTime[TIME_LEN+ 1]="";
+static int QueueInfoData;
+ 
+char * QueueInfoFunc(void);
+ 
+/****************************************************
+ * Procedure Name: CS_update_rss_status
+ * Description   :
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+static ESA_RC CS_update_rss_status (MSG_typ             * msg_ptr,
+                                    RSS_MSG_HDR_rec_typ * msg_hdr_cd)
+{
+  char fn[]="CS_update_rss_status";
+  ESA_RC                  rc= ESA_OK;
+  RSS_STATUS_typ          rss_status;
+  char                    rss_status_str[2];
+  int                     ii;
+  TIME_typ                cur_time;  /*start_time,*/
+  DATE_typ                cur_date;  /*start_date,*/
+  ENVIRONMENT_rec_typ   * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSUPDF, DIAG_COMMON, fn);
+ 
+  rss_status_str[0]= * msg_ptr;
+  rss_status_str[1]= '\0';
+ 
+  if (strcmp (rss_status_str, M_RSS_INACTIVE) EQ 0)
+     rss_status = RSS_DOWN;
+  else /* (rss_status_str[0] EQ M_RSS_ACTIVE */
+     rss_status = RSS_UP;
+ 
+  msg_ptr++;
+  msg_ptr = CS_get_fld (main_name,
+                        msg_ptr,
+                        FUNC_NAME_LEN,
+                        C_FUNC_NAME);
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                   "rss=%s status=%s(%d).",
+				   envir_ptr->msg_admin_param.rss_name,
+				   rss_status_str,
+				   (int)rss_status);
+ 
+  if (strcmp (main_name, ESA_MAIN_ONLI) == 0) {
+ 
+     envir_ptr->func_ptr.trnsevnt_ptr (INTERCEPT_RSSPRM,
+                                       envir_ptr->empty_oe,
+                                       envir_ptr->empty_user,
+                                       envir_ptr->empty_ug,
+                                       UPDCONN_NO,
+                                       &envir_ptr->msg_admin_param,
+                                       &envir_ptr->msg_err);
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15, "INTERCEPT_RSSPRM");
+  }
+  for (ii= 0; ii LT envir_ptr->max_rss_num; ii++) {
+      if (My_stricmp (envir_ptr->interest[ii].rss,
+         envir_ptr->msg_admin_param.rss_name) EQ 0)
+            break;
+  }
+  if (ii GE envir_ptr->max_rss_num) {
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+            "RSS %s notfound (ii=%d max_rss_num=%d)",
+            envir_ptr->msg_admin_param.rss_name,
+            ii,
+             envir_ptr->max_rss_num);
+     CTSAMSG_print (ERR_CS_RSS_NOTFND ,
+                   envir_ptr->msg_admin_param.ctsamsg_handle,
+                   NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest ,
+                   envir_ptr->msg_admin_param.rss_name,
+                   "Any" ,
+                   "SA-Agent Environment");
+    goto cleanup;
+  }
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                   "preverios status=%d.",
+                   (int)envir_ptr->interest[ii].rss_status);
+  if (rss_status EQ RSS_DOWN) {
+     envir_ptr->interest[ii].rss_status= RSS_DOWN;
+     CS_get_cur_time (cur_date, cur_time);
+     memcpy (envir_ptr->rss_status_date, cur_date, DATE_LEN);
+     memcpy (envir_ptr->rss_status_time, cur_time, TIME_LEN);
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+          "*****>... Set RSS status check time at %.6s %.8s.",
+          cur_time, cur_date);
+  }
+  else
+  {
+     envir_ptr->interest[ii].rss_status= RSS_UP;
+     memset (envir_ptr->rss_status_date, '\0', DATE_LEN);
+     memset (envir_ptr->rss_status_time, '\0', TIME_LEN);
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+		  "*****>... Set RSS status date & time to null-empty.");
+  }
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 16,
+        "Rss=%s status=%d time=%.6s date=%.8s.",
+		envir_ptr->interest[ii].rss,
+		(int)envir_ptr->interest[ii].rss_status,
+        envir_ptr->rss_status_time,
+        envir_ptr->rss_status_date);
+ 
+  rc= CS_snd_rss_msg (msg_hdr_cd,
+                      envir_ptr->msg_admin_param.rss_name,
+                      FUNC_RSS_CHECK,
+                      (char *)&rss_status,
+                      NULL);
+  cleanup:
+ 
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSUPDF, DIAG_COMMON, fn, rc);
+ 
+  return(rc);
+ 
+}/*CS_update_rss_status*/
+ 
+ 
+/****************************************************
+ * Procedure Name: CS_update_rss_definitions
+ * Description   :
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_update_rss_definitions ( MSG_typ             * msg_ptr,
+                                   RSS_MSG_HDR_rec_typ * msg_hdr_cd)
+{
+  char fn[]="CS_update_rss_definitions";
+  ESA_RC                    rc= ESA_OK, rc_log= ESA_ERR, rc_tmp;
+  RSS_MSG_HDR_rec_typ       msg_hdr;
+  TRAN_rec_typ              tran;
+  NUM_MSGS_typ              len_msg;
+  NUM_MSGS_typ              num_msgs;
+  RSS_STATUS_typ            rss_status= RSS_UP;
+  ERR_STRUCT_rec_typ        MsgErr;
+  char                      rssprm_value[RSSPRM_VALUE_LEN+ 1];
+  ENVIRONMENT_rec_typ     * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSUPDF, DIAG_COMMON, fn);
+ 
+  CSA_print_alloc_tbl (ESA_COMP_ACSUPDF, fn, FALSE);
+ 
+  main_name[0]='\0';
+  sprintf (QueueSiidTime, "%.*s", TIME_LEN, msg_hdr_cd->mhsiid);
+ 
+  if (QueueInfoData EQ 0)
+  {
+     rc_tmp= envir_ptr->msg_admin_param.cs_func.rssprm_get_opt_ptr (
+		       ALL_RSS, OCCUPIED_QUEUE_DATA, 1, rssprm_value, OPT_TRUE,OPT_TRUE);
+     if (rc_tmp EQ ESA_OK)
+	 {
+        if (rssprm_value[0] EQ ESS_NOT_SIGN)
+           QueueInfoData= -1;
+		else
+           QueueInfoData= TRUE;
+	 }
+	 else
+           QueueInfoData= FALSE;
+	 rc_tmp= ESA_OK;
+  }
+ 
+  rc = CS_get_msg_header ( msg_ptr , &msg_hdr);
+ 
+  msg_ptr = CS_get_aplic_msg (msg_ptr);
+  msg_ptr = CS_get_rss_msg (&num_msgs, msg_ptr);
+  if (msg_ptr EQ NULL) {
+    rc = ESA_ERR;
+    goto cleanup;
+  }
+  msg_ptr = CS_get_singl_msg( &len_msg , &tran , msg_ptr);
+  if (msg_ptr EQ NULL) {
+    rc = ESA_ERR;
+    goto cleanup;
+  }
+  msg_ptr= CS_get_admin_params (&envir_ptr->msg_admin_param,
+                                &envir_ptr->hot_path,
+                                msg_ptr);
+  if (msg_ptr EQ NULL)
+    goto cleanup;
+ 
+  if (
+         NOT (COND(MSG_LOGEVT_TO_ESS))
+       AND
+         NOT (COND(MSG_RSS_STATUS))
+     )
+  {
+      CLEAR_STRUCT(MsgErr);
+      ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+    		"    -> Call to CTSRSSCheck USA-API for RSS=%s.",
+			envir_ptr->msg_admin_param.rss_name);
+      rc = envir_ptr->func_ptr.rss_check_ptr (
+                                  envir_ptr->msg_admin_param.rss_name,
+                                  &rss_status,
+                                  &envir_ptr->msg_admin_param,
+                                  &MsgErr);
+      ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+			"    <- CTSRSSCheck USA-API completed with rc=%d (%s) RssStat=%s.",
+			rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK",
+			(rss_status == RSS_UP) ? "RSS_UP" : "RSS_DOWN");
+ 
+      ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+           "RSS %s check completed with return code:%s and status:%d",
+                     envir_ptr->msg_admin_param.rss_name,
+                     ESA_rc2str(rc),
+                     rss_status);
+ 
+      if (
+            (rc NE ESA_OK)
+           OR
+            (rss_status EQ RSS_DOWN)
+         )
+            rss_status= RSS_DOWN;
+      else
+            rss_status= RSS_UP;
+ 
+      envir_ptr->interest[envir_ptr->rss_num].rss_status= rss_status;
+ 
+      if (rss_status EQ RSS_DOWN)
+	  {
+          rc_tmp= CTSRssStatusEvent (
+                        envir_ptr->msg_admin_param.rss_type,
+                        envir_ptr->msg_admin_param.rss_name,
+                        NULL,
+                        &rss_status,
+                        &envir_ptr->msg_admin_param);
+          ESA_DIAG_printf (ESA_COMP_ACSUPDF, 13,
+                        "call to CTSRssStatusEvent: rc=%d.",
+                        (int)rc_tmp);
+          if (MsgErr.length GT 0)
+             memcpy ((char *)(&envir_ptr->msg_err),
+		             (char *)(&MsgErr),
+        	         sizeof(ERR_STRUCT_rec_typ));
+          goto cleanup;
+	  }
+      if (memcmp (MSG_PASSWRD_UPD, &msg_hdr.mhmtyp, 2) NE 0)
+      {
+          PASSWD_typ tmp_def_passwd;
+          PASSWD_typ tmp_passwd;
+ 
+          strcpy (tmp_def_passwd,
+                  envir_ptr->msg_admin_param.def_admin_passwd);
+          strcpy (tmp_passwd,
+                  envir_ptr->msg_admin_param.admin_passwd);
+          rc_log= ADM_loginout (LOGIN_MODE_FIRST,
+                                LOGIN_DEFAULT_ADMIN, fn);
+          if (rc_log NE ESA_OK)
+          {
+             rc= rc_log;
+             goto cleanup;
+          }
+          if (
+                (strcmp (tmp_def_passwd,
+                     envir_ptr->msg_admin_param.def_admin_passwd) NE 0)
+               OR
+                (strcmp (tmp_passwd,
+                         envir_ptr->msg_admin_param.admin_passwd) NE 0)
+             )
+          {
+             rc= CS_broadcast (CS_BRDCT_EVNT_ADMIN,
+                               EVENT_ADMIN_CHANGED);
+          if (rc NE ESA_OK)
+             goto cleanup;
+          }
+      }
+  }
+  /*BS10137 this parameter is not used by our MF agents
+  rc_tmp= envir_ptr->msg_admin_param.cs_func.rssprm_get_opt_ptr (
+		                        envir_ptr->msg_admin_param.rss_name,
+                                PWD_CHG_WITH_GET_USER,
+                                1,
+                                rssprm_value,
+                                OPT_TRUE,
+                                OPT_TRUE);
+  if (rc_tmp EQ ESA_OK)
+     PwdChgWithGetUser= rssprm_value[0];
+                                        BS10137********************/
+  rc_tmp= envir_ptr->msg_admin_param.cs_func.rssprm_get_opt_ptr (
+		                        envir_ptr->msg_admin_param.rss_name,
+                                DELETE_INTERCEPT_CHECK,
+                                1,
+                                rssprm_value,
+                                OPT_TRUE,
+                                OPT_TRUE);
+  if (rc_tmp EQ ESA_OK)
+     DeleteInterceptCheck= rssprm_value[0];
+ 
+  /* rss status function */
+  if (COND(MSG_RSS_STATUS)) {
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+        "*****>... %s - RSS status Interception transaction", MSG_RSS_STATUS);
+    rc = CS_update_rss_status(msg_ptr, msg_hdr_cd);
+  }
+  /* user function */
+  else if (COND(MSG_USER_TO_ESS)) {
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+        "*****>... %s - User Interception transaction", MSG_USER_TO_ESS);
+    rc = CS_update_user(msg_ptr, msg_hdr_cd);
+  }
+  /* container functions */
+  else if (COND(MSG_OE_TO_ESS)) {
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+        "*****>... %s - Container Interception transaction", MSG_OE_TO_ESS);
+    rc = CS_update_oe (msg_ptr,msg_hdr_cd);
+  }
+  /* user group functions */
+  else if (COND(MSG_UG_TO_ESS)) {
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+        "*****>... %s - User Group Interception transaction", MSG_UG_TO_ESS);
+    rc = CS_update_ug (msg_ptr, msg_hdr_cd);
+  }
+  /* user to user group functions */
+  else if (COND(MSG_UG2UC_TO_ESS)) {
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+        "*****>... %s - User to Group connection Interception transaction", MSG_UG2UC_TO_ESS);
+    rc = CS_update_u2ug (msg_ptr, msg_hdr_cd);
+  }
+  /* log event */
+  else if (COND(MSG_LOGEVT_TO_ESS)) {
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+        "*****>... %s - Logevent Interception transaction", MSG_LOGEVT_TO_ESS);
+    rc = CS_update_logevt (msg_ptr, msg_hdr_cd);
+  }
+  /* pwdmod */
+  else if (COND(MSG_PASSWRD_UPD)) {
+    rc = CS_update_pwdmod (msg_ptr, msg_hdr_cd);
+  }
+  /* user revoke */
+  else if (COND(MSG_USER_REVOKE)) {
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+        "*****>... %s - User Revoke Interception transaction", MSG_USER_REVOKE);
+    rc = CS_update_usdis (msg_ptr, msg_hdr_cd);
+  }
+  /* RSS parameters changed */
+  else if (COND(MSG_RSPRMMOD)) {
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+        "*****>... %s - RSS parameters Interception transaction", MSG_RSPRMMOD);
+    rc = CS_update_rsprmmod (msg_ptr, msg_hdr_cd);
+  }
+  /* service undefined*/
+  else {
+      CTSAMSG_print (ERR_CS_UNDEF_MSG_TYP,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn,
+                     &msg_hdr.mhmtyp);
+      rc = ESA_FATAL;
+      goto cleanup;
+  }
+    /* error occurred*/
+  if (rc NE ESA_OK)
+    goto cleanup;
+ 
+  cleanup:
+  if (
+        (memcmp (MSG_PASSWRD_UPD, &msg_hdr.mhmtyp, 2) NE 0)
+      AND
+        (rc_log EQ ESA_OK)
+     )
+  {
+      rc_log= ADM_loginout (LOGOUT_MODE_LAST, LOGIN_DEFAULT_ADMIN, fn);
+      if (rc EQ ESA_OK)
+          rc= rc_log;
+  }
+  CSA_print_alloc_tbl (ESA_COMP_ACSUPDF, fn, FALSE);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSUPDF, DIAG_COMMON, fn, rc);
+  return(rc);
+}
+ 
+/****************************************************
+ * Procedure Name: CS_update_user
+ * Description   :
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_update_user ( MSG_typ             * msg_ptr,
+                        RSS_MSG_HDR_rec_typ * msg_hdr_cd)
+{
+  char fn[]="CS_update_user";
+  ESA_RC                    rc= ESA_OK;
+  USER_PARAMS_rec_typ       usr_prm;
+  ESS_INTRST_typ            obj_intrst;
+  OBJ_EXISTS_typ            obj_exist;
+  ADDINFO_rec_typ         * addinfo= NULL;
+  char                      action_name[2];
+  int                       action;
+  int						originalaction;
+  short                     func= 0;
+  char                      msg_id[10]="", msg_not_found[10]="";
+  ENVIRONMENT_rec_typ     * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSUPDF, DIAG_COMMON, fn);
+ 
+  CLEAR_STRUCT(usr_prm);
+ 
+  obj_exist= OBJ_NOT_EXIST;
+  obj_intrst = ESS_DONT_CARE;
+ 
+  msg_ptr = CS_get_fld (&action_name ,msg_ptr, 2 ,
+                        C_OPERATION);
+  if (msg_ptr EQ NULL) {
+    rc = ESA_ERR;
+    goto cleanup;
+  }
+ 
+  msg_ptr = CS_get_fld (&usr_prm.user ,
+                        msg_ptr,
+                        envir_ptr->rss_limits.max_user_len,
+                        C_USER_ID);
+  if (msg_ptr EQ NULL) {
+    rc = ESA_ERR;
+    goto cleanup;
+  }
+ 
+  msg_ptr = CS_get_fld (main_name,
+                        msg_ptr,
+                        FUNC_NAME_LEN,
+                        C_FUNC_NAME);
+ 
+  action= CS_actname_to_act(action_name);
+  originalaction = action;
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                   "interceptor found rss name:%s user:%s action:%d",
+                   envir_ptr->msg_admin_param.rss_name,
+                   usr_prm.user,
+                   action);
+  if (strcmp (main_name, ESA_MAIN_ONLI) == 0) {
+     envir_ptr->func_ptr.trnsevnt_ptr (INTERCEPT_USER,
+                                       envir_ptr->empty_oe,
+                                       usr_prm.user,
+                                       envir_ptr->empty_ug,
+                                       UPDCONN_NO,
+                                       &envir_ptr->msg_admin_param,
+                                       &envir_ptr->msg_err);
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15, "INTERCEPT_USER");
+  }
+ 
+  if (
+	    (DeleteInterceptCheck EQ ESS_YES_SIGN)
+       AND
+	    (action EQ ACT_DELETE)
+     )
+     action= ACT_UPDATE;
+  strcpy (usr_prm.passwd, "\\");
+  switch (action) {
+    case ACT_DELETE:
+       func = FUNC_DELUSER;
+       rc= CSA_alloc ((char **)&addinfo,
+                 STRUC_ADDINFO,
+/*WS10082K*      sizeof(ADDINFO_rec_typ),        */
+                 1,
+/*WS10082K*/     1,
+                 fn,
+                 "addinfo");
+       if (rc NE ESA_OK)
+           goto cleanup;
+       if (envir_ptr->interest[envir_ptr->rss_num].pre_num_ugs EQ 0)
+          CARE_int_usr_find (usr_prm.user, "",
+                          M_DWNLD_NAME_REGULAR,
+                          &obj_intrst);
+       if (
+             (envir_ptr->interest[envir_ptr->rss_num].pre_num_ugs GT 0)
+            OR
+             (obj_intrst NE  ESS_DONT_CARE)
+          )
+       {
+           obj_exist= OBJ_EXIST;
+           obj_intrst= ESS_USER_CARE;
+           strcpy (msg_id, EVNT_DELUSR_SENT_AGNT);
+       }
+       else
+           strcpy (msg_id, EVNT_DELUSR_IGNORED_AGNT);
+       break;
+    case ACT_ADD:
+       rc = CS_update_user_check(&usr_prm, &obj_exist,
+                                 &obj_intrst, FALSE, &addinfo);
+       if (rc NE ESA_OK)
+          goto cleanup;
+ 
+       func = FUNC_ADDUSER;
+       if (obj_exist EQ OBJ_EXIST AND obj_intrst NE ESS_DONT_CARE)
+           strcpy (msg_id, EVNT_ADDUSR_SENT_AGNT);
+       else if (obj_exist NE OBJ_EXIST AND obj_intrst NE ESS_DONT_CARE)
+       {
+           obj_exist= OBJ_EXIST;
+           func= FUNC_DELUSER;
+           strcpy (msg_id, EVNT_DELUSR_SENT_AGNT);
+           strcpy (msg_not_found, ERR_NO_USER_AGNT);
+       }
+       else
+           strcpy (msg_id, EVNT_ADDUSR_IGNORED_AGNT);
+       break;
+    case ACT_UPDATE:
+       rc = CS_update_user_check(&usr_prm,&obj_exist,
+                                 &obj_intrst, FALSE, &addinfo);
+       if (rc NE ESA_OK)
+           goto cleanup;
+ 
+       func= FUNC_UPDUSER;
+       if ( (obj_exist EQ OBJ_EXIST) AND (obj_intrst NE ESS_DONT_CARE))
+	   {
+           strcpy (msg_id, EVNT_UPDUSR_SENT_AGNT);
+   		   if ((originalaction EQ ACT_DELETE) AND ((strcmp (main_name, ESA_MAIN_OFLI) EQ 0)))
+		   {
+                      /*entered to this function with ACT_DELETE that caused by OFLI
+                        but object exists so not onli ESS but also osf file should be updated*/
+			   envir_ptr->func_ptr.trnsevnt_ptr (INTERCEPT_USER,
+										   envir_ptr->empty_oe,
+										   usr_prm.user,
+										   envir_ptr->empty_ug,
+										   UPDCONN_NO,
+										   &envir_ptr->msg_admin_param,
+										   &envir_ptr->msg_err);
+			   ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+				   "CTSA user %s was mistakenly declared by OFLI as deleted\
+				   but actually exists so osf file should be updated",
+				   usr_prm.user);
+		   }
+	   }
+       else
+       if (
+            (obj_exist NE OBJ_EXIST)
+          AND
+            (
+               (obj_intrst NE ESS_DONT_CARE)
+             OR
+             (envir_ptr->interest[envir_ptr->rss_num].pre_num_ugs GT 0)
+            )
+          )
+       {
+           obj_intrst = ESS_USER_CARE;
+           obj_exist= OBJ_EXIST;
+           func= FUNC_DELUSER;
+           strcpy (msg_id, EVNT_DELUSR_SENT_AGNT);
+           strcpy (msg_not_found, ERR_NO_USER_AGNT);
+       }
+       else
+           strcpy (msg_id, EVNT_UPDUSR_IGNORED_AGNT);
+       break;
+    case ACT_UNKNOWN:
+       rc = CS_update_user_check(&usr_prm, &obj_exist,
+                                 &obj_intrst, FALSE, &addinfo);
+       if (rc NE ESA_OK)
+          goto cleanup;
+ 
+       if ((obj_exist EQ OBJ_EXIST) AND (obj_intrst NE ESS_DONT_CARE))
+       {
+           func = FUNC_UPDUSER;
+           strcpy (msg_id, EVNT_UPDUSR_SENT_AGNT);
+       }
+       else
+       if (
+             (obj_exist NE OBJ_EXIST)
+           AND
+             (
+               (obj_intrst NE ESS_DONT_CARE)
+              OR
+           (envir_ptr->interest[envir_ptr->rss_num].pre_num_ugs GT 0)
+             )
+          )
+       {
+           obj_intrst = ESS_USER_CARE;
+           obj_exist= OBJ_EXIST;
+           func = FUNC_DELUSER;
+           strcpy (msg_id, EVNT_DELUSR_SENT_AGNT);
+           strcpy (msg_not_found, ERR_NO_USER_AGNT);
+       }
+       else
+       {
+           func = FUNC_UPDUSER;
+           strcpy (msg_id, EVNT_UPDUSR_IGNORED_AGNT);
+       }
+       break;
+  }
+ 
+  if (obj_exist  EQ OBJ_EXIST AND
+      obj_intrst NE ESS_DONT_CARE ) {
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                     "CTSA send user %s with function %d",
+                     usr_prm.user,
+                     func);
+ 
+    rc= CS_snd_rss_msg (msg_hdr_cd,
+                        envir_ptr->msg_admin_param.rss_name,
+                        func,
+                        (char *)&usr_prm,
+                        addinfo);
+    if (rc NE ESA_OK)
+      goto cleanup;
+ 
+  }
+ 
+  else
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                     "CTSA drop user %s with function %d",
+                     usr_prm.user,
+                     func);
+  if (strlen (msg_not_found) NE 0)
+     CTSAMSG_print (msg_not_found,
+                 envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                 envir_ptr->msg_admin_param.ctsamsg_dest,
+                 usr_prm.user, QueueInfoFunc());
+  if (strlen (msg_id) NE 0)
+     CS_log_intercept_msg (msg_id, usr_prm.user, NULL);
+ 
+  cleanup:
+  CSA_free ((char **)&addinfo);
+ 
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSUPDF, DIAG_COMMON, fn, rc);
+ 
+  return(rc);
+ 
+}/*update_user*/
+ 
+/****************************************************
+ * Procedure Name: CS_update_user_check
+ * Description   :
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_update_user_check (USER_PARAMS_rec_typ   * usr_prm,
+                             OBJ_EXISTS_typ        * obj_exist,
+                             ESS_INTRST_typ        * obj_intrst,
+							 int                     AutAdmPwdCng,
+                             ADDINFO_rec_typ      ** addinfo)
+{
+  char fn[]="CS_update_user_check";
+  ESA_RC                rc= ESA_OK, rc_logout= ESA_OK, rc_pst= ESA_OK;
+  short                 actual_num;
+  HAVE_MORE_typ         have_more;
+  RSSAPIPRM_rec_typ     apiprm;
+  RSSAPIKWD_rec_typ   * bufk= NULL;
+  void                * handle, * handle_log_evnt= NULL;
+  OE_typ                oe;
+  USER_PARAMS_rec_typ   usr_prm_out;
+  KWD_typ kwd_types=    {
+      KWD_FOR_ADDINFO_1A_CHECK,
+      KWD_FOR_ADDINFO_1A,
+      KWD_FOR_ADDINFO_1B_CHECK,
+      KWD_FOR_ADDINFO_1B,
+      0,0,
+      KWD_FOR_ADDINFO_2A_CHECK,
+      KWD_FOR_ADDINFO_2A,
+      KWD_FOR_ADDINFO_2B_CHECK,
+      KWD_FOR_ADDINFO_2B};
+  ENVIRONMENT_rec_typ * envir_ptr;
+  int                  PwdChgTrans;
+  char get_conn = 'N'; /* AC001 - CIQ#6 new GetUsers parm */
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSUPDF, DIAG_COMMON, fn);
+  CS_get_envir_address (&envir_ptr);
+ 
+  /*  Get user from RSS */
+ 
+  CLEAR_STRUCT(usr_prm_out);
+  handle = NULL;
+  actual_num = 0;
+  rc = ESA_OK;
+ 
+  if (usr_prm->passwd[0] EQ '\\')
+  {
+     PwdChgTrans= FALSE;
+	 usr_prm->passwd[0]='\0';
+  }
+  else
+     PwdChgTrans= TRUE;
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+        "Update/add/Delete user : PwdChgTrans=%d.", PwdChgTrans);
+ 
+ 
+/* Check if the user is interesting */
+  if (envir_ptr->interest[envir_ptr->rss_num].pre_num_ugs EQ 0)
+  {
+     CARE_int_usr_find (usr_prm->user, "",
+                     M_DWNLD_NAME_REGULAR, obj_intrst);
+ 
+     if (*obj_intrst NE  ESS_DONT_CARE)
+        ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+        "CTSA decisions .. user %s is interesting",
+                     usr_prm->user);
+     else
+     {
+        ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+            "CTSA decisions .. user %s is not interesting", usr_prm->user);
+        if (AutAdmPwdCng EQ FALSE)
+           goto cleanup;
+	 }
+  }
+  /*BS10137
+  if ((PwdChgTrans EQ FALSE) OR (PwdChgWithGetUser EQ ESS_YES_SIGN))*/
+  if (PwdChgTrans EQ FALSE)                                /*BS10137*/
+  {
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+        "Update/add/Delete user : 1.");
+     rc=CS_db_prm_get (envir_ptr->msg_admin_param.rss_name, FUNC_GTUSERS, &apiprm);
+     if (rc NE ESA_OK)
+        goto cleanup;
+ 
+     rc= CSA_alloc ((char **)&bufk,
+	             0,
+                (sizeof(KWD_rec_typ) *
+			   envir_ptr->interest[envir_ptr->rss_num].num_usr_kwds) +
+                    sizeof(RSSAPIKWD_rec_typ),
+                 1,
+				 fn,
+				 "User- keywords");
+     if (rc NE ESA_OK)
+        goto cleanup;
+     rc= CS_db_key_get(envir_ptr->msg_admin_param.rss_name, FUNC_ADDUSER, bufk);
+     if (rc NE ESA_OK)
+        goto cleanup;
+ 
+     rc= CSA_alloc ((char **)addinfo,
+                 STRUC_ADDINFO,
+/*WS10082K*      sizeof(ADDINFO_rec_typ) *   */
+               (envir_ptr->interest[envir_ptr->rss_num].num_usr_kwds+
+                       apiprm.script_kwd_num),
+                 1,
+                 fn,
+                 "addinfo");
+     if (rc NE ESA_OK)
+       goto cleanup;
+ 
+     CS_fill_key (addinfo,
+               bufk,
+               kwd_types,
+               1,
+               envir_ptr->interest[envir_ptr->rss_num].num_usr_kwds+
+                       apiprm.script_kwd_num);
+  }
+  /*
+    LOGIN from the RSS security system.
+  */
+  if (
+   /*BS10137
+   (PwdChgTrans EQ FALSE) OR (AutAdmPwdCng EQ TRUE) OR (PwdChgWithGetUser EQ ESS_YES_SIGN)*/
+   (PwdChgTrans EQ FALSE) OR (AutAdmPwdCng EQ TRUE)        /*BS10137*/
+     )
+     rc= ADM_loginout (LOGIN_MODE, LOGIN_DEFAULT_ADMIN, fn);
+  if (rc NE ESA_OK)
+     goto cleanup;
+  /*BS10137
+  if ((PwdChgTrans EQ FALSE)OR(PwdChgWithGetUser EQ ESS_YES_SIGN))*/
+  if (PwdChgTrans EQ FALSE)                                /*BS10137*/
+  {	
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15, "Update/add/Delete user : 2.");
+     if (AutAdmPwdCng EQ FALSE)
+	 {
+        ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+			"    -> Call to CTSGetUsers USA-API for user=%s.", usr_prm->user);
+        CS_DIAG_USER_IN (ESA_COMP_ACSUPDF, GET_MANY_USERS, oe,
+	        1, 1, usr_prm, handle, addinfo);
+        rc= envir_ptr->func_ptr.gtusers_ptr (GET_MANY_USERS,
+                             oe,
+                             1,
+                             &actual_num,
+                             &have_more,
+                             &handle,
+                             1,
+                             usr_prm,
+                             &usr_prm_out,
+                             addinfo,
+                             obj_exist,
+                             &envir_ptr->msg_admin_param,
+                             &envir_ptr->msg_err,
+                             get_conn);  /* AC001 - CIQ#6 */
+        ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+			"    <- CTSGetUsers USA-API completed with rc=%d (%s).",
+		    	rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+        if (rc EQ ESA_OK)
+           CS_DIAG_USER_OUT (ESA_COMP_ACSUPDF, oe, actual_num, have_more,
+			   &usr_prm_out, obj_exist, handle, addinfo);
+        if ( (rc EQ ESA_OK) AND (*obj_exist EQ OBJ_EXIST) )
+           memcpy ((char *)usr_prm, (char *)&usr_prm_out, sizeof (USER_PARAMS_rec_typ) );
+	 }
+  }
+  if (AutAdmPwdCng EQ TRUE)
+  {
+     /*** WS10082A replace addinfo variable with dynamic allocation ***
+     ADDINFO_rec_typ       addinf2; drop addinfo var                  */
+     /* WS10082A ADDINFO_rec_typ     * set_addinfo[1];          */
+     ADDINFO_rec_typ     * set_addinfo=NULL;  /* remove vec   WS10082A*/
+     /*WS10082A addinf2.max_pairs= 0;
+     addinf2.num_pairs= 0;
+     set_addinfo[0]= &addinf2;                                        */
+     /********* WS10082A **********/
+     rc = CSA_alloc ((char **)&set_addinfo,
+               STRUC_ADDINFO,
+               1,
+               1,
+               fn,
+               "addinfo");
+     if (rc NE ESA_OK)
+       goto cleanup;
+     /***** WS10082A end *****/
+ 
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15, "Update/add/Delete user : 3.");
+     ADM_login_password_generate ((char *)usr_prm->passwd);
+ 
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+	     		"    -> Call to CTSUpdPassword USA-API for user %s.",usr_prm->user);
+     CS_DIAG_USER (ESA_COMP_ACSUPDF, 1,usr_prm,
+				           &set_addinfo, NULL, 0, TRUE);
+     /* WS10082N
+     rc= envir_ptr->func_ptr.updpass_ptr(usr_prm, set_addinfo[0],
+                            &envir_ptr->msg_admin_param, &envir_ptr->msg_err);
+     */
+     rc= envir_ptr->func_ptr.updpass_ptr(usr_prm,         /* WS10082N */
+                            set_addinfo,                  /* WS10082N */
+                            &envir_ptr->msg_admin_param,  /* WS10082N */
+                            &envir_ptr->msg_err);         /* WS10082N */
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+	     		"    <- CTSUpdPassword USA-API completed with rc=%d (%s)",
+		      rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+     if (rc EQ ESA_OK)
+        CS_DIAG_USER (ESA_COMP_ACSUPDF, 1,usr_prm,&set_addinfo, NULL, 0, TRUE);
+     CSA_free ((char **)&set_addinfo);                   /* WS10082N */
+  }
+ 
+  if (
+    /*BS10137
+    (PwdChgTrans EQ FALSE) OR (AutAdmPwdCng EQ TRUE) OR (PwdChgWithGetUser EQ ESS_YES_SIGN)*/
+    (PwdChgTrans EQ FALSE) OR (AutAdmPwdCng EQ TRUE)       /*BS10137*/
+     )
+     rc_logout= ADM_loginout (LOGOUT_MODE, LOGIN_DEFAULT_ADMIN, fn);
+  if (rc_logout NE ESA_OK)
+     goto cleanup;
+  /*BS10137
+  if ( (PwdChgTrans EQ FALSE) OR (PwdChgWithGetUser EQ ESS_YES_SIGN) )*/
+  if (PwdChgTrans EQ FALSE)                                /*BS10137*/
+  {
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15, "Update/add/Delete user : 4.");
+     if ( (apiprm.post EQ CS_YES) AND (AutAdmPwdCng EQ FALSE) )
+	 {
+  	    ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+           "*****>... Start Post script for Get user.");
+        rc_pst= CS_pre_post_users (SCRIPT_POST , 1, usr_prm,
+                addinfo, NULL, &apiprm, rc, ESA_RC_UNDEFINED, obj_exist);
+        if ( (rc_pst NE ESA_OK) AND (rc_pst NE ESA_SKIP) ) {
+           if (rc_pst EQ ESA_WARN) {
+              CTSAMSG_print (MSG_POSTSCRIPT_WARN,
+                       envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                       envir_ptr->msg_admin_param.ctsamsg_dest);
+              CTSLogEvent (envir_ptr->msg_admin_param.rss_type,
+                       envir_ptr->msg_admin_param.rss_name,
+                       handle_log_evnt,
+                       MSG_POSTSCRIPT_WARN);
+		   }
+           else {
+              CTSAMSG_print (MSG_USR_POSTSCRIPT_FAIL,
+                           envir_ptr->msg_admin_param.ctsamsg_handle,
+                           NULL,
+                           envir_ptr->msg_admin_param.ctsamsg_dest,
+                           fn, ESA_rc2str(rc_pst), usr_prm->user);
+              CTSLogEvent (envir_ptr->msg_admin_param.rss_type,
+                           envir_ptr->msg_admin_param.rss_name,
+                           handle_log_evnt,
+                           MSG_USR_POSTSCRIPT_FAIL,
+                           fn, ESA_rc2str(rc_pst), usr_prm->user);
+		   }
+		}
+  	    ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+           "<*****... End Post script.");
+	 } /* END - PosstScript is required */
+  }
+  if (rc NE ESA_OK)
+      goto cleanup;
+ 
+/* Check if the user is interesting */
+ 
+  if (envir_ptr->interest[envir_ptr->rss_num].pre_num_ugs GT 0)
+  {
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15, "Update/add/Delete user : 5.");
+     CARE_int_usr_find (usr_prm->user, usr_prm->def_group,
+                     M_DWNLD_NAME_REGULAR, obj_intrst);
+ 
+     if (*obj_intrst NE  ESS_DONT_CARE)
+        ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+        "CTSA decisions .. user %s group %s is interesting",
+                     usr_prm->user,
+                     usr_prm->def_group);
+     else
+        ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+        "CTSA decisions .. user %s group %s is not interesting",
+                     usr_prm->user,
+                     usr_prm->def_group);
+  }
+  /*BS10137
+  if ( (PwdChgTrans EQ FALSE) OR (PwdChgWithGetUser EQ ESS_YES_SIGN) )*/
+  if (PwdChgTrans EQ FALSE)                                /*BS10137*/
+  {
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15, "Update/add/Delete user : 6.");
+     if (* obj_exist EQ OBJ_NOT_EXIST)
+	 {
+        ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                     "CTSA decisions .. user %s not exists", usr_prm->user);
+        goto cleanup;
+	 }
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                   "CTSA decisions .. user %s exist", usr_prm->user);
+  }
+  else
+     (*obj_exist)= OBJ_EXIST;
+ 
+  cleanup:
+  /*BS10137
+  if ( (PwdChgTrans EQ FALSE) OR (PwdChgWithGetUser EQ ESS_YES_SIGN) )*/
+  if (PwdChgTrans EQ FALSE)                                 /*BS10137*/
+  {
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15, "Update/add/Delete user : 7.");
+     if (handle NE NULL)
+	 {
+        ESA_RC rcc;
+        ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+		   "    -> Call to CTSGetUsers USA-API with GET_FREE_HANDLE_USERS mode.");
+        CS_DIAG_USER_IN (ESA_COMP_ACSUPDF,GET_FREE_HANDLE_USERS,
+				   oe, 0, 0, usr_prm, handle, addinfo);
+        rcc= envir_ptr->func_ptr.gtusers_ptr (GET_FREE_HANDLE_USERS,
+                             oe,
+                             1,
+                             &actual_num,
+                             &have_more,
+                             &handle,
+                             1,
+                             usr_prm,
+                             &usr_prm_out,
+                             addinfo,
+                             obj_exist,
+                             &envir_ptr->msg_admin_param,
+                             &envir_ptr->msg_err,
+                             get_conn);  /* AC001 - CIQ#6 */
+        ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+			"    <- CTSGetUsers USA-API completed with rc=%d (%s).",
+		    	   rcc, (rcc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+        if (rcc EQ ESA_OK)
+           CS_DIAG_USER_OUT (ESA_COMP_ACSUPDF, oe, 0, have_more,
+			       &usr_prm_out, obj_exist, handle, addinfo);
+	 }
+  }
+  /*BS10137
+  if ( (PwdChgTrans EQ FALSE) OR (PwdChgWithGetUser EQ ESS_YES_SIGN) )*/
+  if (PwdChgTrans EQ FALSE)                               /*BS10137*/
+     CSA_free ((char **)&bufk);
+  if (rc EQ ESA_OK)
+     rc= rc_logout;
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+  ESA_DIAG_exit (ESA_COMP_ACSUPDF, DIAG_COMMON, fn, rc);
+  return (rc);
+}
+ 
+/****************************************************
+ * Procedure Name: CS_update_ug
+ * Description   :
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_update_ug ( MSG_typ             * msg_ptr,
+                      RSS_MSG_HDR_rec_typ * msg_hdr_cd)
+{
+  char fn[]="CS_update_ug";
+  ESA_RC                    rc= ESA_OK;
+  UG_PARAMS_rec_typ         ug_prm;
+  ESS_INTRST_typ            obj_intrst;
+  OBJ_EXISTS_typ            obj_exist;
+  ADDINFO_rec_typ         * addinfo= NULL;
+  char                      action_name[2];
+  int                       action;
+  int						originalaction;
+  short                     func= 0;
+  char                      msg_id[10]="", msg_not_found[10]="";
+  ENVIRONMENT_rec_typ     * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSUPDF, DIAG_COMMON, fn);
+ 
+  CLEAR_STRUCT(ug_prm);
+ 
+  obj_exist= OBJ_NOT_EXIST;
+  obj_intrst = ESS_DONT_CARE;
+ 
+  msg_ptr = CS_get_fld (&action_name ,msg_ptr, 2,
+                        C_OPERATION);
+  if (msg_ptr EQ NULL) {
+    rc = ESA_ERR;
+    goto cleanup;
+  }
+ 
+  msg_ptr = CS_get_fld (&ug_prm.group ,
+                        msg_ptr,
+                        envir_ptr->rss_limits.max_ug_len,
+                        C_GROUP_ID);
+  if (msg_ptr EQ NULL) {
+    rc = ESA_ERR;
+    goto cleanup;
+  }
+ 
+ 
+  msg_ptr = CS_get_fld (main_name,
+                        msg_ptr,
+                        FUNC_NAME_LEN,
+                        C_FUNC_NAME);
+ 
+  action= CS_actname_to_act(action_name);
+  originalaction = action;
+ 
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                   "interceptor found rss name:%s group:%s action:%d",
+                   envir_ptr->msg_admin_param.rss_name,
+                   ug_prm.group,
+                   action);
+  if (strcmp (main_name, ESA_MAIN_ONLI) == 0) {
+     envir_ptr->func_ptr.trnsevnt_ptr (INTERCEPT_GROUP,
+                                       envir_ptr->empty_oe,
+                                       envir_ptr->empty_user,
+                                       ug_prm.group,
+                                       UPDCONN_NO,
+                                       &envir_ptr->msg_admin_param,
+                                       &envir_ptr->msg_err);
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15, "INTERCEPT_GROUP");
+  }
+ 
+  if (
+	    (DeleteInterceptCheck EQ ESS_YES_SIGN)
+       AND
+	    (action EQ ACT_DELETE)
+     )
+     action= ACT_UPDATE;
+  switch (action) {
+    case ACT_DELETE:
+       func = FUNC_DELUG;
+       rc= CSA_alloc ((char **)&addinfo,
+                 STRUC_ADDINFO,
+/*WS10082K*      sizeof(ADDINFO_rec_typ),        */
+                 1,
+/*WS10082K*/     1,
+                 fn,
+                 "addinfo");
+       if (rc NE ESA_OK)
+           goto cleanup;
+       CARE_int_ug_find (ug_prm.group, M_DWNLD_NAME_REGULAR,
+                         &obj_intrst);
+       if (obj_intrst NE  ESS_DONT_CARE)
+       {
+           strcpy (msg_id, EVNT_DELGRP_SENT_AGNT);
+           obj_exist= OBJ_EXIST;
+       }
+       else
+           strcpy (msg_id, EVNT_DELGRP_IGNORED_AGNT);
+       break;
+    case ACT_ADD:
+       rc = CS_update_ug_check(&ug_prm, &obj_exist,
+                               &obj_intrst, &addinfo);
+       if (rc NE ESA_OK)
+          goto cleanup;
+ 
+       func = FUNC_ADDUG;
+       if (obj_exist EQ OBJ_EXIST AND obj_intrst NE ESS_DONT_CARE)
+           strcpy (msg_id, EVNT_ADDGRP_SENT_AGNT);
+       else if (obj_exist NE OBJ_EXIST AND obj_intrst NE ESS_DONT_CARE)
+       {
+           obj_exist= OBJ_EXIST;
+           func= FUNC_DELUG;
+           strcpy (msg_id, EVNT_DELGRP_SENT_AGNT);
+           strcpy (msg_not_found, ERR_NO_GROUP_AGNT);
+       }
+       else
+           strcpy (msg_id, EVNT_ADDGRP_IGNORED_AGNT);
+       break;
+    case ACT_UPDATE:
+       rc= CS_update_ug_check(&ug_prm, &obj_exist,
+                              &obj_intrst, &addinfo);
+       if (rc NE ESA_OK)
+          goto cleanup;
+ 
+       func = FUNC_UPDUG;
+       if (obj_exist EQ OBJ_EXIST AND obj_intrst NE ESS_DONT_CARE)
+	   {
+           strcpy (msg_id, EVNT_UPDGRP_SENT_AGNT);
+		   if ((originalaction EQ ACT_DELETE) AND ((strcmp (main_name, ESA_MAIN_OFLI) EQ 0)))
+		   {
+                      /*entered to this function with ACT_DELETE that caused by OFLI
+                        but object exists so not onli ESS but also osf file should be updated*/
+			   envir_ptr->func_ptr.trnsevnt_ptr (INTERCEPT_GROUP,
+                                       envir_ptr->empty_oe,
+                                       envir_ptr->empty_user,
+                                       ug_prm.group,
+                                       UPDCONN_NO,
+                                       &envir_ptr->msg_admin_param,
+                                       &envir_ptr->msg_err);
+			   ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+				   "CTSA group %s was mistakenly declared by OFLI as deleted\
+				   but actually exists so osf file should be updated",
+				   ug_prm.group);
+		   }
+	   }
+       else if (obj_exist NE OBJ_EXIST AND obj_intrst NE ESS_DONT_CARE)
+       {
+           obj_exist= OBJ_EXIST;
+           func= FUNC_DELUG;
+           strcpy (msg_id, EVNT_DELGRP_SENT_AGNT);
+           strcpy (msg_not_found, ERR_NO_GROUP_AGNT);
+       }
+       else
+           strcpy (msg_id, EVNT_UPDGRP_IGNORED_AGNT);
+       break;
+    case ACT_UNKNOWN:
+       rc = CS_update_ug_check(&ug_prm, &obj_exist,
+                               &obj_intrst, &addinfo);
+       if (rc NE ESA_OK)
+          goto cleanup;
+ 
+       if (obj_exist EQ OBJ_EXIST AND obj_intrst NE ESS_DONT_CARE)
+       {
+           func = FUNC_UPDUG;
+           strcpy (msg_id, EVNT_UPDGRP_SENT_AGNT);
+       }
+       else if (obj_exist NE OBJ_EXIST AND obj_intrst NE ESS_DONT_CARE)
+       {
+           obj_exist= OBJ_EXIST;
+           func = FUNC_DELUG;
+           strcpy (msg_id, EVNT_DELGRP_SENT_AGNT);
+           strcpy (msg_not_found, ERR_NO_GROUP_AGNT);
+       }
+       else
+       {
+           func = FUNC_UPDUG;
+           strcpy (msg_id, EVNT_UPDGRP_IGNORED_AGNT);
+       }
+       break;
+  }
+ 
+  if (obj_exist  EQ OBJ_EXIST AND
+      obj_intrst NE ESS_DONT_CARE ) {
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                     "CTSA send group %s with function %d",
+                     ug_prm.group,
+                     func);
+ 
+    rc= CS_snd_rss_msg (msg_hdr_cd,
+                        envir_ptr->msg_admin_param.rss_name,
+                        func,
+                        (char *)&ug_prm,
+                        addinfo);
+    if (rc NE ESA_OK)
+      goto cleanup;
+  }
+  else
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                     "CTSA drop group %s with function %d",
+                     ug_prm.group,
+                     func);
+ 
+  if (strlen (msg_not_found) NE 0)
+     CTSAMSG_print (msg_not_found,
+                 envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                 envir_ptr->msg_admin_param.ctsamsg_dest,
+                 ug_prm.group, QueueInfoFunc());
+  if (strlen (msg_id) NE 0)
+     CS_log_intercept_msg (msg_id, ug_prm.group, NULL);
+ 
+  cleanup:
+  CSA_free ((char **)&addinfo);
+ 
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+  ESA_DIAG_exit (ESA_COMP_ACSUPDF, DIAG_COMMON, fn, rc);
+ 
+  return(rc);
+}/* CS_update_ug end */
+ 
+/****************************************************
+ * Procedure Name: CS_update_oe
+ * Description   :
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_update_oe ( MSG_typ             * msg_ptr,
+                      RSS_MSG_HDR_rec_typ * msg_hdr_cd)
+{
+  char fn[]="CS_update_oe";
+  ESA_RC                    rc= ESA_OK;
+  OE_PARAMS_rec_typ         oe_prm;
+  ESS_INTRST_typ            obj_intrst;
+  OBJ_EXISTS_typ            obj_exist;
+  ADDINFO_rec_typ         * addinfo= NULL;
+  char                      action_name[2];
+  int                       action;
+  int						originalaction;
+  short                     func= 0;
+  char                      msg_id[10]="", msg_not_found[10]="";
+  ENVIRONMENT_rec_typ     * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSUPDF, DIAG_COMMON, fn);
+ 
+  CLEAR_STRUCT(oe_prm);
+ 
+  obj_exist= OBJ_NOT_EXIST;
+  obj_intrst = ESS_DONT_CARE;
+ 
+  msg_ptr = CS_get_fld (&action_name ,msg_ptr, 2,
+                        C_OPERATION);
+  if (msg_ptr EQ NULL) {
+    rc = ESA_ERR;
+    goto cleanup;
+  }
+ 
+  msg_ptr = CS_get_fld (&oe_prm.oe ,
+                        msg_ptr,
+                        envir_ptr->rss_limits.max_oe_len,
+                        C_OE_ID);
+  if (msg_ptr EQ NULL) {
+    rc = ESA_ERR;
+    goto cleanup;
+  }
+ 
+ 
+  msg_ptr = CS_get_fld (main_name,
+                        msg_ptr,
+                        FUNC_NAME_LEN,
+                        C_FUNC_NAME);
+ 
+  action= CS_actname_to_act(action_name);
+  originalaction = action;
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+      "interceptor found rss name:%s container:%s action:%d",
+      envir_ptr->msg_admin_param.rss_name,
+      oe_prm.oe,
+      action);
+ 
+  if (strcmp (main_name, ESA_MAIN_ONLI) == 0) {
+     envir_ptr->func_ptr.trnsevnt_ptr (INTERCEPT_CONTAINER,
+                                       oe_prm.oe,
+                                       envir_ptr->empty_user,
+                                       envir_ptr->empty_ug,
+                                       UPDCONN_NO,
+                                       &envir_ptr->msg_admin_param,
+                                       &envir_ptr->msg_err);
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15, "INTERCEPT_CONTAINER");
+  }
+ 
+  if (
+	    (DeleteInterceptCheck EQ ESS_YES_SIGN)
+       AND
+	    (action EQ ACT_DELETE)
+     )
+		action= ACT_UPDATE;
+  switch (action) {
+    case ACT_DELETE:
+       func = FUNC_DELOE;
+       rc= CSA_alloc ((char **)&addinfo,
+                 STRUC_ADDINFO,
+/*WS10082K*      sizeof(ADDINFO_rec_typ),        */
+                 1,
+/*WS10082K*/     1,
+                 fn,
+                 "addinfo");
+       if (rc NE ESA_OK)
+           goto cleanup;
+       CARE_int_oe_find (oe_prm.oe, &obj_intrst);
+       if (obj_intrst NE  ESS_DONT_CARE)
+       {
+           strcpy (msg_id, EVNT_DELOE_SENT_AGNT);
+           obj_exist= OBJ_EXIST;
+       }
+       else
+           strcpy (msg_id, EVNT_DELOE_IGNORED_AGNT);
+       break;
+    case ACT_ADD:
+       rc = CS_update_oe_check(&oe_prm, &obj_exist,
+                               &obj_intrst, &addinfo);
+       if (rc NE ESA_OK)
+          goto cleanup;
+ 
+       func = FUNC_ADDOE;
+       if (obj_exist EQ OBJ_EXIST AND obj_intrst NE ESS_DONT_CARE)
+           strcpy (msg_id, EVNT_ADDOE_SENT_AGNT);
+       else if (obj_exist NE OBJ_EXIST AND obj_intrst NE ESS_DONT_CARE)
+       {
+           obj_exist= OBJ_EXIST;
+           func= FUNC_DELOE;
+           strcpy (msg_id, EVNT_DELOE_SENT_AGNT);
+           strcpy (msg_not_found, ERR_NO_OE_AGNT);
+       }
+       else
+           strcpy (msg_id, EVNT_ADDOE_IGNORED_AGNT);
+       break;
+    case ACT_UPDATE:
+       rc = CS_update_oe_check(&oe_prm, &obj_exist,
+                               &obj_intrst, &addinfo);
+       if (rc NE ESA_OK)
+          goto cleanup;
+ 
+       func = FUNC_UPDOE;
+       if (obj_exist EQ OBJ_EXIST AND obj_intrst NE ESS_DONT_CARE)
+	   {
+           strcpy (msg_id, EVNT_UPDOE_SENT_AGNT);
+		   if ((originalaction EQ ACT_DELETE) AND ((strcmp (main_name, ESA_MAIN_OFLI) EQ 0)))
+		   {
+                      /*entered to this function with ACT_DELETE that caused by OFLI
+                        but object exists so not onli ESS but also osf file should be updated*/
+			   envir_ptr->func_ptr.trnsevnt_ptr (INTERCEPT_CONTAINER,
+                                       oe_prm.oe,
+                                       envir_ptr->empty_user,
+                                       envir_ptr->empty_ug,
+                                       UPDCONN_NO,
+                                       &envir_ptr->msg_admin_param,
+                                       &envir_ptr->msg_err);
+			   ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+				   "CTSA container %s was mistakenly declared by OFLI as deleted\
+				   but actually exists so osf file should be updated",
+				   oe_prm.oe);
+		   }
+	   }
+       else if (obj_exist NE OBJ_EXIST AND obj_intrst NE ESS_DONT_CARE)
+       {
+           obj_exist= OBJ_EXIST;
+           func= FUNC_DELOE;
+           strcpy (msg_id, EVNT_DELOE_SENT_AGNT);
+           strcpy (msg_not_found, ERR_NO_OE_AGNT);
+       }
+       else
+           strcpy (msg_id, EVNT_UPDOE_IGNORED_AGNT);
+       break;
+    case ACT_UNKNOWN:
+       rc = CS_update_oe_check(&oe_prm, &obj_exist,
+                               &obj_intrst, &addinfo);
+       if (rc NE ESA_OK)
+          goto cleanup;
+ 
+       ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                        "addinfo: %p", addinfo);
+ 
+       if (obj_exist EQ OBJ_EXIST AND obj_intrst NE ESS_DONT_CARE)
+       {
+           func = FUNC_UPDOE;
+           strcpy (msg_id, EVNT_UPDOE_SENT_AGNT);
+       }
+       else if (obj_exist NE OBJ_EXIST AND obj_intrst NE ESS_DONT_CARE)
+       {
+           obj_exist= OBJ_EXIST;
+           func= FUNC_DELOE;
+           strcpy (msg_id, EVNT_DELOE_SENT_AGNT);
+           strcpy (msg_not_found, ERR_NO_OE_AGNT);
+       }
+       else
+       {
+           strcpy (msg_id, EVNT_UPDOE_IGNORED_AGNT);
+           func = FUNC_UPDOE;
+       }
+       break;
+  }
+ 
+  if (obj_exist  EQ OBJ_EXIST AND
+      obj_intrst NE ESS_DONT_CARE ) {
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                     "CTSA send container %s with function %d",
+                     oe_prm.oe,
+                     func);
+ 
+    rc= CS_snd_rss_msg (msg_hdr_cd,
+                        envir_ptr->msg_admin_param.rss_name,
+                        func,
+                        (char *)&oe_prm,
+                        addinfo);
+    if (rc NE ESA_OK)
+      goto cleanup;
+ 
+  }
+ 
+  else
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                     "CTSA drop container %s with function %d",
+                     oe_prm.oe,
+                     func);
+ 
+  if (strlen (msg_not_found) NE 0)
+     CTSAMSG_print (msg_not_found,
+                 envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                 envir_ptr->msg_admin_param.ctsamsg_dest,
+                 oe_prm.oe, QueueInfoFunc());
+  if (strlen (msg_id) NE 0)
+     CS_log_intercept_msg (msg_id, oe_prm.oe, NULL);
+ 
+  cleanup:
+  CSA_free ((char **)&addinfo);
+ 
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+  ESA_DIAG_exit (ESA_COMP_ACSUPDF, DIAG_COMMON, fn, rc);
+ 
+  return(rc);
+}    /* CS_update_oe end */
+ 
+ 
+/****************************************************
+ * Procedure Name: CS_update_ug_check
+ * Description   :
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_update_ug_check (UG_PARAMS_rec_typ     * ug_prm,
+                           OBJ_EXISTS_typ        * obj_exist,
+                           ESS_INTRST_typ        * obj_intrst,
+                           ADDINFO_rec_typ      ** addinfo)
+{
+  char fn[]="CS_update_ug_check";
+  ESA_RC                rc, rc_logout= ESA_OK, rc_pst;
+  short                 actual_num;
+  HAVE_MORE_typ         have_more;
+  RSSAPIPRM_rec_typ     apiprm;
+  RSSAPIKWD_rec_typ   * bufk= NULL;
+  void                * handle, * handle_log_evnt= NULL;
+  OE_typ                oe;
+  UG_PARAMS_rec_typ     ug_prm_out;
+  KWD_typ kwd_types=    {
+      KWD_FOR_ADDINFO_1A_CHECK,
+      KWD_FOR_ADDINFO_1A,
+      KWD_FOR_ADDINFO_1B_CHECK,
+      KWD_FOR_ADDINFO_1B,
+      0,0,
+      KWD_FOR_ADDINFO_2A_CHECK,
+      KWD_FOR_ADDINFO_2A,
+      KWD_FOR_ADDINFO_2B_CHECK,
+      KWD_FOR_ADDINFO_2B};
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSUPDF, DIAG_COMMON, fn);
+  CS_get_envir_address (&envir_ptr);
+ 
+  /*  Get group from RSS */
+ 
+  CLEAR_STRUCT(ug_prm_out);
+  handle = NULL;
+  actual_num = 0;
+  rc = ESA_OK;
+ 
+/* Check if the group is interesting */
+  CARE_int_ug_find (ug_prm->group, M_DWNLD_NAME_REGULAR, obj_intrst);
+ 
+  if (*obj_intrst NE  ESS_DONT_CARE)
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                     "CTSA decisions .. group %s is interesting",
+                     ug_prm->group);
+ 
+  else
+  {
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                     "CTSA decisions .. group %s is not interesting",
+                     ug_prm->group);
+    goto cleanup;
+  }
+ 
+  rc=CS_db_prm_get (envir_ptr->msg_admin_param.rss_name, FUNC_GETUGS,
+                    &apiprm);
+  if (rc NE ESA_OK)
+     goto cleanup;
+  rc= CSA_alloc ((char **)&bufk,
+                 0,
+                 (sizeof(KWD_rec_typ) *
+              envir_ptr->interest[envir_ptr->rss_num].num_ug_kwds) +
+                    sizeof(RSSAPIKWD_rec_typ),
+                 1,
+                 fn,
+                 "Group- keywords");
+  if (rc NE ESA_OK)
+     goto cleanup;
+  rc= CS_db_key_get (envir_ptr->msg_admin_param.rss_name,
+      FUNC_ADDUG,bufk);
+  if (rc NE ESA_OK)
+    goto cleanup;
+  rc= CSA_alloc ((char **)addinfo,
+                 STRUC_ADDINFO,
+/*WS10082K*      sizeof(ADDINFO_rec_typ) *      */
+                (envir_ptr->interest[envir_ptr->rss_num].num_ug_kwds+
+                       apiprm.script_kwd_num),
+                 1,
+                 fn,
+                 "addinfo");
+  if (rc NE ESA_OK)
+    goto cleanup;
+ 
+  CS_fill_key (addinfo,
+               bufk,
+               kwd_types,
+               1,
+               envir_ptr->interest[envir_ptr->rss_num].num_ug_kwds+
+                       apiprm.script_kwd_num);
+ 
+  /*
+    LOGIN from the RSS security system.
+  */
+  rc= ADM_loginout (LOGIN_MODE, LOGIN_DEFAULT_ADMIN, fn);
+  if (rc NE ESA_OK)
+     goto cleanup;
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+			"    -> Call to CTSGetUGs USA-API for group=%s.", ug_prm->group);
+  CS_DIAG_UG_IN (ESA_COMP_ACSUPDF, GET_MANY_GROUPS, oe,
+				1, 1, ug_prm, handle, addinfo);
+  rc= envir_ptr->func_ptr.getugs_ptr (GET_MANY_GROUPS,
+                            oe,
+                            1,
+                            &actual_num,
+                            &have_more,
+                            &handle,
+                            1,
+                            ug_prm,
+                            &ug_prm_out,
+                            addinfo,
+                            obj_exist,
+                            &envir_ptr->msg_admin_param,
+                            &envir_ptr->msg_err);
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+			"    <- CTSGetUGs USA-API completed with rc=%d (%s).",
+		    	rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+  if (rc EQ ESA_OK)
+     CS_DIAG_UG_OUT (ESA_COMP_ACSUPDF, oe, actual_num, have_more,
+			   &ug_prm_out, obj_exist, handle, addinfo);
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+      "num pairs %d.",(int)(*addinfo)->num_pairs);
+ 
+  rc_logout= ADM_loginout (LOGOUT_MODE, LOGIN_DEFAULT_ADMIN, fn);
+  if (rc_logout NE ESA_OK)
+     goto cleanup;
+ 
+  if (apiprm.post EQ CS_YES)
+  {
+  	 ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+           "*****>... Start Post script for Get user group.");
+     rc_pst = CS_pre_post_ug (SCRIPT_POST , 1, ug_prm,
+                              addinfo, NULL, &apiprm, rc,
+							  ESA_RC_UNDEFINED, obj_exist);
+     if ( (rc_pst NE ESA_OK) AND (rc_pst NE ESA_SKIP) ){
+        if (rc_pst EQ ESA_WARN) {
+              CTSAMSG_print (MSG_POSTSCRIPT_WARN,
+                       envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                       envir_ptr->msg_admin_param.ctsamsg_dest);
+              CTSLogEvent (envir_ptr->msg_admin_param.rss_type,
+                       envir_ptr->msg_admin_param.rss_name,
+                       handle_log_evnt,
+                       MSG_POSTSCRIPT_WARN);
+        }
+        else {
+              CTSAMSG_print (MSG_UG_POSTSCRIPT_FAIL,
+                           envir_ptr->msg_admin_param.ctsamsg_handle,
+                           NULL,
+                           envir_ptr->msg_admin_param.ctsamsg_dest,
+                           fn, ESA_rc2str(rc_pst), ug_prm->group);
+              CTSLogEvent (envir_ptr->msg_admin_param.rss_type,
+                           envir_ptr->msg_admin_param.rss_name,
+                           handle_log_evnt,
+                           MSG_UG_POSTSCRIPT_FAIL,
+                           fn, ESA_rc2str(rc_pst), ug_prm->group);
+        }
+     }
+  	 ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+           "<*****... End Post script.");
+  } /* END - PosstScript is required */
+ 
+  /*
+    LOGOUT from the RSS security system.
+  */
+  if (rc NE ESA_OK)
+    goto cleanup;
+ 
+  if (* obj_exist EQ OBJ_NOT_EXIST) {
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                     "CTSA decisions .. group %s not exists",
+                     ug_prm->group);
+ 
+    goto cleanup;
+  }
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                   "CTSA decisions .. user %s exist",
+                   ug_prm->group);
+ 
+  memcpy ((char *)ug_prm, (char *)(&ug_prm_out),
+          sizeof(UG_PARAMS_rec_typ));
+ 
+ 
+  cleanup:
+  if (handle NE NULL)
+  {
+     ESA_RC rcc;
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+		"    -> Call to CTSGetUGs USA-API with GET_FREE_HANDLE_GROUPS mode.");
+     CS_DIAG_UG_IN (ESA_COMP_ACSUPDF, GET_FREE_HANDLE_GROUPS,
+				   oe, 0, 0, ug_prm, handle, addinfo);
+     rcc= envir_ptr->func_ptr.getugs_ptr (GET_FREE_HANDLE_GROUPS,
+                            oe,
+                            1,
+                            &actual_num,
+                            &have_more,
+                            &handle,
+                            1,
+                            ug_prm,
+                            &ug_prm_out,
+                            addinfo,
+                            obj_exist,
+                            &envir_ptr->msg_admin_param,
+                            &envir_ptr->msg_err);
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+			"    <- CTSGetUGs USA-API completed with rc=%d (%s).",
+		    	   rcc, (rcc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+     if (rcc EQ ESA_OK)
+        CS_DIAG_UG_OUT (ESA_COMP_ACSUPDF, oe, 0, have_more,
+			       &ug_prm_out, obj_exist, handle, addinfo);
+  }
+  CSA_free ((char **)&bufk);
+  if (rc EQ ESA_OK)
+     rc= rc_logout;
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSUPDF, DIAG_COMMON, fn, rc);
+  return (rc);
+ 
+}/*update_ug_check*/
+ 
+ 
+/****************************************************
+ * Procedure Name: CS_update_oe_check
+ * Description   :
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_update_oe_check (OE_PARAMS_rec_typ     * oe_prm,
+                           OBJ_EXISTS_typ        * obj_exist,
+                           ESS_INTRST_typ        * obj_intrst,
+                           ADDINFO_rec_typ      ** addinfo)
+{
+  char fn[]="CS_update_oe_check";
+  ESA_RC                rc, rc_logout= ESA_OK, rc_pst;
+  short                 actual_num;
+  HAVE_MORE_typ         have_more;
+  RSSAPIPRM_rec_typ     apiprm;
+  RSSAPIKWD_rec_typ   * bufk= NULL;
+  void                * handle, * handle_log_evnt= NULL;
+  OE_typ                oe;
+  OE_PARAMS_rec_typ     oe_prm_out;
+  KWD_typ kwd_types=    {
+      KWD_FOR_ADDINFO_1A_CHECK,
+      KWD_FOR_ADDINFO_1A,
+      KWD_FOR_ADDINFO_1B_CHECK,
+      KWD_FOR_ADDINFO_1B,
+      0,0,
+      KWD_FOR_ADDINFO_2A_CHECK,
+      KWD_FOR_ADDINFO_2A,
+      KWD_FOR_ADDINFO_2B_CHECK,
+      KWD_FOR_ADDINFO_2B};
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSUPDF, DIAG_COMMON, fn);
+  CS_get_envir_address (&envir_ptr);
+ 
+  /*  Get container from RSS */
+ 
+  CLEAR_STRUCT(oe_prm_out);
+  handle = NULL;
+  actual_num = 0;
+  rc = ESA_OK;
+ 
+  /* Check if the oe is interesting */
+  CARE_int_oe_find (oe_prm->oe, obj_intrst);
+ 
+  if (*obj_intrst NE  ESS_DONT_CARE)
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+       "CTSA decisions .. oe %s is interesting", oe_prm->oe);
+ 
+  else
+  {
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+        "CTSA decisions .. group %s is not interesting", oe_prm->oe);
+    goto cleanup;
+  }
+ 
+  rc=CS_db_prm_get (envir_ptr->msg_admin_param.rss_name, FUNC_GETOES,
+                    &apiprm);
+  if (rc NE ESA_OK)
+     goto cleanup;
+  rc= CSA_alloc ((char **)&bufk,
+                 0,
+                 (sizeof(KWD_rec_typ) *
+                envir_ptr->interest[envir_ptr->rss_num].num_oe_kwds) +
+                    sizeof(RSSAPIKWD_rec_typ),
+                 1,
+                 fn,
+                 "OE- keywords");
+  if (rc NE ESA_OK)
+     goto cleanup;
+  rc= CS_db_key_get (envir_ptr->msg_admin_param.rss_name,
+      FUNC_ADDOE,bufk);
+  if (rc NE ESA_OK)
+    goto cleanup;
+  rc= CSA_alloc ((char **)addinfo,
+                 STRUC_ADDINFO,
+/*WS10082K*      sizeof(ADDINFO_rec_typ) *    */
+                (envir_ptr->interest[envir_ptr->rss_num].num_oe_kwds+
+                       apiprm.script_kwd_num),
+                 1,
+                 fn,
+                 "addinfo");
+  if (rc NE ESA_OK)
+    goto cleanup;
+ 
+  CS_fill_key (addinfo,
+               bufk,
+               kwd_types,
+               1,
+               envir_ptr->interest[envir_ptr->rss_num].num_oe_kwds+
+                       apiprm.script_kwd_num);
+ 
+  /*
+    LOGIN from the RSS security system.
+  */
+  rc= ADM_loginout (LOGIN_MODE, LOGIN_DEFAULT_ADMIN, fn);
+  if (rc NE ESA_OK)
+     goto cleanup;
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+			"    -> Call to CTSGetOEs USA-API for container=%s.", oe_prm->oe);
+  CS_DIAG_OE_IN (ESA_COMP_ACSUPDF, GET_MANY_OES, oe,
+				1, 1, oe_prm, handle, addinfo);
+  rc= envir_ptr->func_ptr.getoes_ptr (GET_MANY_OES,
+                            oe,
+                            1,
+                            &actual_num,
+                            &have_more,
+                            &handle,
+                            1,
+                            oe_prm,
+                            &oe_prm_out,
+                            addinfo,
+                            obj_exist,
+                            &envir_ptr->msg_admin_param,
+                            &envir_ptr->msg_err);
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+			"    <- CTSGetOEs USA-API completed with rc=%d (%s).",
+		    	rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+  if (rc EQ ESA_OK)
+     CS_DIAG_OE_OUT (ESA_COMP_ACSUPDF, oe, actual_num, have_more,
+			   &oe_prm_out, obj_exist, handle, addinfo);
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+      "num pairs %d.",(int)(*addinfo)->num_pairs);
+  rc_logout= ADM_loginout (LOGOUT_MODE, LOGIN_DEFAULT_ADMIN, fn);
+  if (rc_logout NE ESA_OK)
+     goto cleanup;
+ 
+  if (apiprm.post EQ CS_YES)
+  {
+  	 ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+           "*****>... Start Post script for Get container.");
+     rc_pst = CS_pre_post_oe (SCRIPT_POST , 1, oe_prm,
+                              addinfo, NULL, &apiprm, rc,
+							  ESA_RC_UNDEFINED, obj_exist);
+     if ( (rc_pst NE ESA_OK) AND (rc_pst NE ESA_SKIP) ) {
+        if (rc_pst EQ ESA_WARN) {
+              CTSAMSG_print (MSG_POSTSCRIPT_WARN,
+                       envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                       envir_ptr->msg_admin_param.ctsamsg_dest);
+              CTSLogEvent (envir_ptr->msg_admin_param.rss_type,
+                       envir_ptr->msg_admin_param.rss_name,
+                       handle_log_evnt,
+                       MSG_POSTSCRIPT_WARN);
+        }
+        else {
+              CTSAMSG_print (MSG_OE_POSTSCRIPT_FAIL,
+                           envir_ptr->msg_admin_param.ctsamsg_handle,
+                           NULL,
+                           envir_ptr->msg_admin_param.ctsamsg_dest,
+                           fn, ESA_rc2str(rc_pst), oe_prm->oe);
+              CTSLogEvent (envir_ptr->msg_admin_param.rss_type,
+                           envir_ptr->msg_admin_param.rss_name,
+                           handle_log_evnt,
+                           MSG_OE_POSTSCRIPT_FAIL,
+                           fn, ESA_rc2str(rc_pst), oe_prm->oe);
+        }
+     }
+  	 ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+           "<*****... End Post script.");
+} /* END - PosstScript is required */
+ 
+  /*
+    LOGOUT from the RSS security system.
+  */
+  if (rc NE ESA_OK)
+    goto cleanup;
+ 
+/* Check if the container is interesting */
+  CARE_int_oe_find (oe_prm->oe, obj_intrst);
+ 
+  if (*obj_intrst NE  ESS_DONT_CARE)
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                     "CTSA decisions .. container %s is interesting",
+                     oe_prm->oe);
+ 
+  else
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                "CTSA decisions .. container %s is not interesting",
+                     oe_prm->oe);
+ 
+  if (* obj_exist EQ OBJ_NOT_EXIST) {
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                     "CTSA decisions .. container %s not exists",
+                     oe_prm->oe);
+ 
+    goto cleanup;
+  }
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                   "CTSA decisions .. user %s exist",
+                   oe_prm->oe);
+ 
+  memcpy ((char *)oe_prm, (char *)(&oe_prm_out),
+          sizeof(OE_PARAMS_rec_typ));
+ 
+  cleanup:
+  if (handle NE NULL)
+  {
+     ESA_RC rcc;
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+		"    -> Call to CTSGetOEs USA-API with GET_FREE_HANDLE_OES mode.");
+     CS_DIAG_OE_IN (ESA_COMP_ACSUPDF, GET_FREE_HANDLE_OES,oe,
+		    		0, 0, oe_prm, handle, addinfo);
+     rcc= envir_ptr->func_ptr.getoes_ptr( GET_FREE_HANDLE_OES,
+                            oe,
+                            1,
+                            &actual_num,
+                            &have_more,
+                            &handle,
+                            1,
+                            oe_prm,
+                            &oe_prm_out,
+                            addinfo,
+                            obj_exist,
+                            &envir_ptr->msg_admin_param,
+                            &envir_ptr->msg_err);
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+			"    <- CTSGetOEs USA-API completed with rc=%d (%s).",
+	    	    	rcc, (rcc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+     if (rcc EQ ESA_OK)
+        CS_DIAG_OE_OUT (ESA_COMP_ACSUPDF, oe, 0, have_more,
+		    	   &oe_prm_out, obj_exist, handle, addinfo);
+  }
+  CSA_free ((char **)&bufk);
+  if (rc EQ ESA_OK)
+      rc= rc_logout;
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSUPDF, DIAG_COMMON, fn, rc);
+  return (rc);
+ 
+}/*update_oe_check*/
+ 
+/****************************************************
+ * Procedure Name: CS_update_u2ug
+ * Description   :
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_update_u2ug ( MSG_typ             * msg_ptr,
+                        RSS_MSG_HDR_rec_typ * msg_hdr_cd)
+{
+  char fn[]="CS_update_u2ug";
+  ESA_RC                    rc= ESA_OK;
+  CONNECT_PARAMS_rec_typ    conn_prm;
+  ESS_INTRST_typ            obj_intrst;
+  OBJ_EXISTS_typ            obj_exist;
+  ADDINFO_rec_typ         * addinfo= NULL;
+  char                      action_name[2];
+  int                       action;
+  int						originalaction;
+  short                     func= 0;
+  char                      msg_id[10]="", msg_not_found[10]="";
+  ENVIRONMENT_rec_typ     * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSUPDF, DIAG_COMMON, fn);
+ 
+  CLEAR_STRUCT(conn_prm);
+ 
+  obj_exist= OBJ_NOT_EXIST;
+  obj_intrst = ESS_DONT_CARE;
+ 
+  msg_ptr = CS_get_fld (&action_name ,msg_ptr, 2,
+                        C_OPERATION);
+  if (msg_ptr EQ NULL) {
+    rc = ESA_ERR;
+    goto cleanup;
+  }
+ 
+  msg_ptr = CS_get_fld (&conn_prm.group ,
+                        msg_ptr,
+                        envir_ptr->rss_limits.max_ug_len,
+                        C_GROUP_ID);
+  if (msg_ptr EQ NULL) {
+    rc = ESA_ERR;
+    goto cleanup;
+  }
+ 
+  msg_ptr = CS_get_fld (&conn_prm.user ,
+                        msg_ptr,
+                        envir_ptr->rss_limits.max_user_len,
+                        C_USER_ID);
+  if (msg_ptr EQ NULL) {
+    rc = ESA_ERR;
+    goto cleanup;
+  }
+ 
+ 
+  msg_ptr = CS_get_fld (main_name,
+                        msg_ptr,
+                        FUNC_NAME_LEN,
+                        C_FUNC_NAME);
+ 
+  action= CS_actname_to_act(action_name);
+  originalaction = action;
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+ "interceptor found connection rss name:%s group:%s user:%s action:%d",
+                   envir_ptr->msg_admin_param.rss_name,
+                   conn_prm.group,
+                   conn_prm.user,
+                   action);
+ 
+  if (strcmp (main_name, ESA_MAIN_ONLI) == 0) {
+     envir_ptr->func_ptr.trnsevnt_ptr (INTERCEPT_CONNECTION,
+                                       envir_ptr->empty_oe,
+                                       conn_prm.user,
+                                       conn_prm.group,
+                                       UPDCONN_NO,
+                                       &envir_ptr->msg_admin_param,
+                                       &envir_ptr->msg_err);
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15, "INTERCEPT_CONNECTION");
+  }
+ 
+  if (
+	    (DeleteInterceptCheck EQ ESS_YES_SIGN)
+       AND
+	    (action EQ ACT_DELETE)
+     )
+     action= ACT_UPDATE;
+  switch (action) {
+    case ACT_DELETE:
+        func = FUNC_DELU2UG;
+        rc= CSA_alloc ((char **)&addinfo,
+                 STRUC_ADDINFO,
+/*WS10082K       sizeof(ADDINFO_rec_typ),       */
+                 1,
+/*WS10082K*/     1,
+                 fn,
+                 "addinfo");
+        if (rc NE ESA_OK)
+            goto cleanup;
+        CARE_int_ug_find (conn_prm.group,
+                          M_DWNLD_NAME_REGULAR,
+                          &obj_intrst);
+        if (obj_intrst EQ ESS_DONT_CARE)
+           strcpy (msg_id, EVNT_UPDCON_IGNORED_AGNT);
+        else
+        {
+          if (envir_ptr->interest[envir_ptr->rss_num].pre_num_ugs EQ 0)
+             CARE_int_usr_find (conn_prm.user,
+                              "",
+                              M_DWNLD_NAME_REGULAR,
+                              &obj_intrst);
+          if (
+             (envir_ptr->interest[envir_ptr->rss_num].pre_num_ugs GT 0)
+             OR
+             (obj_intrst NE  ESS_DONT_CARE)
+             )
+           {
+              strcpy (msg_id, EVNT_DELCON_SENT_AGNT);
+              obj_exist= OBJ_EXIST;
+              obj_intrst= ESS_U2UG_CARE;
+           }
+           else
+              strcpy (msg_id, EVNT_DELCON_IGNORED_AGNT);
+        }
+        break;
+    case ACT_ADD:
+       rc = CS_update_u2ug_check(&conn_prm.group, &conn_prm.user,
+                                 &conn_prm.u2ug_prm, &obj_exist,
+                                 &obj_intrst, &addinfo);
+       if (rc NE ESA_OK)
+          goto cleanup;
+ 
+       func = FUNC_ADDU2UG;
+       if (obj_exist EQ OBJ_EXIST AND obj_intrst NE ESS_DONT_CARE)
+           strcpy (msg_id, EVNT_ADDCON_SENT_AGNT);
+       else if (obj_exist NE OBJ_EXIST AND obj_intrst NE ESS_DONT_CARE)
+       {
+           obj_exist= OBJ_EXIST;
+           func= FUNC_DELU2UG;
+           strcpy (msg_id, EVNT_DELCON_SENT_AGNT);
+           strcpy (msg_not_found, ERR_ALREADY_DISCONNECTED_AGNT);
+       }
+       else
+           strcpy (msg_id, EVNT_ADDCON_IGNORED_AGNT);
+       break;
+    case ACT_UPDATE:
+       rc = CS_update_u2ug_check(&conn_prm.group, &conn_prm.user,
+                                 &conn_prm.u2ug_prm, &obj_exist,
+                                 &obj_intrst, &addinfo);
+       if (rc NE ESA_OK)
+          goto cleanup;
+ 
+       func = FUNC_UPDU2UG;
+       if (obj_exist EQ OBJ_EXIST AND obj_intrst NE ESS_DONT_CARE)
+	   {
+           strcpy (msg_id, EVNT_UPDCON_SENT_AGNT);
+   		   if ((originalaction EQ ACT_DELETE) AND ((strcmp (main_name, ESA_MAIN_OFLI) EQ 0)))
+		   {
+                      /*entered to this function with ACT_DELETE that caused by OFLI
+		       but object exists so not onli ESS but also osf file should be updated*/
+			   envir_ptr->func_ptr.trnsevnt_ptr (INTERCEPT_CONNECTION,
+                                       envir_ptr->empty_oe,
+                                       conn_prm.user,
+                                       conn_prm.group,
+                                       UPDCONN_NO,
+                                       &envir_ptr->msg_admin_param,
+                                       &envir_ptr->msg_err);
+			   ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+				   "CTSA connection user %s to group %s was mistakenly declared by OFLI as deleted\
+				   but actually exists so osf file should be updated",
+				   conn_prm.user, conn_prm.group);
+		   }
+ 
+	   }
+       else if (obj_exist NE OBJ_EXIST AND obj_intrst NE ESS_DONT_CARE)
+       {
+           obj_exist= OBJ_EXIST;
+           func= FUNC_DELU2UG;
+           strcpy (msg_id, EVNT_DELCON_SENT_AGNT);
+           strcpy (msg_not_found, ERR_ALREADY_DISCONNECTED_AGNT);
+       }
+       else
+           strcpy (msg_id, EVNT_UPDCON_IGNORED_AGNT);
+       break;
+    case ACT_UNKNOWN:
+       rc = CS_update_u2ug_check(&conn_prm.group, &conn_prm.user,
+                                 &conn_prm.u2ug_prm, &obj_exist,
+                                 &obj_intrst, &addinfo);
+       if (rc NE ESA_OK)
+          goto cleanup;
+ 
+       if (obj_exist EQ OBJ_EXIST AND obj_intrst NE ESS_DONT_CARE)
+       {
+           func = FUNC_UPDU2UG;
+           strcpy (msg_id, EVNT_UPDCON_SENT_AGNT);
+       }
+       else if (obj_exist NE OBJ_EXIST AND obj_intrst NE ESS_DONT_CARE)
+       {
+           obj_exist= OBJ_EXIST;
+           func= FUNC_DELU2UG;
+           strcpy (msg_id, EVNT_DELCON_SENT_AGNT);
+           strcpy (msg_not_found, ERR_ALREADY_DISCONNECTED_AGNT);
+ 
+       }
+       else
+       {
+           func = FUNC_UPDU2UG;
+           strcpy (msg_id, EVNT_UPDCON_IGNORED_AGNT);
+       }
+       break;
+  }
+ 
+  if (obj_exist  EQ OBJ_EXIST AND
+      obj_intrst NE ESS_DONT_CARE ) {
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+    "CTSA send connection group %s user %s with function %d",
+                     conn_prm.group,
+                     conn_prm.user,
+                     func);
+ 
+    rc= CS_snd_rss_msg (msg_hdr_cd,
+                        envir_ptr->msg_admin_param.rss_name,
+                        func,
+                        (char *)&conn_prm,
+                        addinfo);
+    if (rc NE ESA_OK)
+      goto cleanup;
+ 
+  }
+ 
+  else
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+    "CTSA drop connection group %s user %s with function %d",
+                     conn_prm.group,
+                     conn_prm.user,
+                     func);
+  if (strlen (msg_not_found) NE 0)
+     CTSAMSG_print (msg_not_found,
+                 envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                 envir_ptr->msg_admin_param.ctsamsg_dest,
+                 conn_prm.user, conn_prm.group, QueueInfoFunc());
+  if (strlen (msg_id) NE 0)
+     CS_log_intercept_msg (msg_id, conn_prm.user, conn_prm.group);
+ 
+  cleanup:
+  CSA_free ((char **)&addinfo);
+ 
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSUPDF, DIAG_COMMON, fn, rc);
+  return(rc);
+}
+ 
+/****************************************************
+ * Procedure Name: CS_update_u2ug_check
+ * Description   :
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_update_u2ug_check (UG_typ                * ug,
+                             USER_typ              * usr,
+                             U2UG_PARAMS_rec_typ   * u2ug_prm,
+                             OBJ_EXISTS_typ        * obj_exist,
+                             ESS_INTRST_typ        * obj_intrst,
+                             ADDINFO_rec_typ      ** addinfo)
+{
+  char fn[]="CS_update_u2ug_check";
+  ESA_RC                rc, rc_logout= ESA_OK, rc_pst;
+  short                 actual_num;
+  void                * handle, * handle_log_evnt= NULL;
+  KWD_typ kwd_types=    {
+      KWD_FOR_ADDINFO_1A_CHECK,
+      KWD_FOR_ADDINFO_1A,
+      KWD_FOR_ADDINFO_1B_CHECK,
+      KWD_FOR_ADDINFO_1B,
+      0,0,
+      KWD_FOR_ADDINFO_2A_CHECK,
+      KWD_FOR_ADDINFO_2A,
+      KWD_FOR_ADDINFO_2B_CHECK,
+      KWD_FOR_ADDINFO_2B};
+  HAVE_MORE_typ         have_more;
+  RSSAPIPRM_rec_typ     apiprm;
+  RSSAPIKWD_rec_typ   * bufk= NULL;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+  ESA_DIAG_enter (ESA_COMP_ACSUPDF, DIAG_COMMON, fn);
+ 
+  /*  Get group from RSS */
+ 
+  handle = NULL;
+  actual_num = 0;
+  rc = ESA_OK;
+ 
+  CARE_int_ug_find (*ug, M_DWNLD_NAME_REGULAR, obj_intrst);
+  if (*obj_intrst EQ ESS_DONT_CARE)
+  {
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+       "CTSA decisions.. conn. ug %s usr %s is not interesting",
+                     *ug,
+                     *usr);
+     goto cleanup;
+  }
+ 
+  if (envir_ptr->interest[envir_ptr->rss_num].pre_num_ugs EQ 0) {
+    CARE_int_usr_find (*usr,
+                       "",
+                       M_DWNLD_NAME_REGULAR,
+                       obj_intrst);
+    if (*obj_intrst NE  ESS_DONT_CARE)
+       ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+      "CTSA decisions.. conn. ug %s usr %s is interesting",
+                     *ug,
+                     *usr);
+    else
+    {
+       ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+       "CTSA decisions.. conn. usr %s ug %s is not interesting",
+                     *usr,
+                     *ug);
+       goto cleanup;
+    }
+  }
+ 
+  rc=CS_db_prm_get (envir_ptr->msg_admin_param.rss_name, FUNC_GTUG2UC,
+                    &apiprm);
+  if (rc NE ESA_OK)
+     goto cleanup;
+  rc= CSA_alloc ((char **)&bufk,
+                 0,
+                 (sizeof(KWD_rec_typ) *
+              envir_ptr->interest[envir_ptr->rss_num].num_u2ug_kwds) +
+                    sizeof(RSSAPIKWD_rec_typ),
+                 1,
+                 fn,
+                 "Connection- keywords");
+  if (rc NE ESA_OK)
+     goto cleanup;
+  rc= CS_db_key_get(envir_ptr->msg_admin_param.rss_name,
+      FUNC_ADDU2UG,bufk);
+  if (rc NE ESA_OK)
+    goto cleanup;
+  rc= CSA_alloc ((char **)addinfo,
+                 STRUC_ADDINFO,
+/*WS10082K*      sizeof(ADDINFO_rec_typ) *      */
+              (envir_ptr->interest[envir_ptr->rss_num].num_u2ug_kwds+
+                       apiprm.script_kwd_num),
+                 1,
+                 fn,
+                 "addinfo");
+  if (rc NE ESA_OK)
+    goto cleanup;
+ 
+  CS_fill_key (addinfo,
+               bufk,
+               kwd_types,
+               1,
+               envir_ptr->interest[envir_ptr->rss_num].num_u2ug_kwds+
+                       apiprm.script_kwd_num);
+ 
+  /*
+    LOGIN from the RSS security system.
+  */
+  rc= ADM_loginout (LOGIN_MODE, LOGIN_DEFAULT_ADMIN, fn);
+  if (rc NE ESA_OK)
+     goto cleanup;
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+			"    -> Call to CTSGetConns USA-API for user=%s to group=%s connection.",
+			*usr, *ug);
+  CS_DIAG_UG2UC_IN (ESA_COMP_ACSUPDF, GET_MANY_CONNS, 1, 1,
+		    	1, ug, usr, handle, addinfo);
+  rc= envir_ptr->func_ptr.gtug2uc_ptr ( GET_MANY_CONNS,
+                              1,
+                              &actual_num,
+                              &have_more,
+                              &handle,
+                              1,
+                              1,
+                              ug,
+                              usr,
+                              u2ug_prm,
+                              addinfo,
+                              obj_exist,
+                              &envir_ptr->msg_admin_param,
+                              &envir_ptr->msg_err);
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+			   "    <- CTSGetConns USA-API completed with rc=%d (%s).",
+			   rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+  if (rc EQ ESA_OK)
+     CS_DIAG_UG2UC_OUT (ESA_COMP_ACSUPDF, actual_num, have_more,
+			   u2ug_prm, obj_exist, handle, addinfo);
+ 
+  rc_logout= ADM_loginout (LOGOUT_MODE, LOGIN_DEFAULT_ADMIN, fn);
+  if (rc_logout NE ESA_OK)
+     goto cleanup;
+ 
+  if (apiprm.post EQ CS_YES)
+  {
+  	 ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+           "*****>... Start Post script for Get user to group connection.");
+     rc_pst = CS_pre_post_u2ug (SCRIPT_POST , 1, u2ug_prm,
+                                addinfo, NULL, &apiprm, rc,
+								ESA_RC_UNDEFINED, obj_exist);
+     if ( (rc_pst NE ESA_OK) AND (rc_pst NE ESA_SKIP) ) {
+        if (rc_pst EQ ESA_WARN) {
+              CTSAMSG_print (MSG_POSTSCRIPT_WARN,
+                       envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                       envir_ptr->msg_admin_param.ctsamsg_dest);
+              CTSLogEvent (envir_ptr->msg_admin_param.rss_type,
+                       envir_ptr->msg_admin_param.rss_name,
+                       handle_log_evnt,
+                       MSG_POSTSCRIPT_WARN);
+        }
+        else {
+              CTSAMSG_print (MSG_U2UG_POSTSCRIPT_FAIL,
+                           envir_ptr->msg_admin_param.ctsamsg_handle,
+                           NULL,
+                           envir_ptr->msg_admin_param.ctsamsg_dest,
+                           fn, ESA_rc2str(rc_pst), u2ug_prm->group,
+						   u2ug_prm->user);
+              CTSLogEvent (envir_ptr->msg_admin_param.rss_type,
+                           envir_ptr->msg_admin_param.rss_name,
+                           handle_log_evnt,
+                           MSG_U2UG_POSTSCRIPT_FAIL,
+                           fn, ESA_rc2str(rc_pst), u2ug_prm->group,
+						   u2ug_prm->user);
+        }
+     }
+   	 ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+           "<*****... End Post script.");
+} /* END - PosstScript is required */
+ 
+  if (rc NE ESA_OK)
+    goto cleanup;
+ 
+  if (envir_ptr->interest[envir_ptr->rss_num].pre_num_ugs GT 0) {
+    CARE_int_usr_find (*usr,
+                       u2ug_prm->def_group,
+                       M_DWNLD_NAME_REGULAR,
+                       obj_intrst);
+ 
+    if (*obj_intrst NE  ESS_DONT_CARE)
+       ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+      "CTSA decisions.. conn. ug %s usr %s (def_ug %s) is interesting",
+                     *ug,
+                     *usr,
+                     u2ug_prm->def_group);
+ 
+    else
+       ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+  "CTSA decisions.. conn. ug %s usr %s (def_ug %s) is not interesting",
+                     *ug,
+                     *usr,
+                     u2ug_prm->def_group);
+  }
+ 
+ 
+  if (* obj_exist EQ OBJ_NOT_EXIST) {
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+     "CTSA decisions .. connection group %s user %s not exists",
+                     ug,
+                     usr);
+    goto cleanup;
+  }
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+    "CTSA decisions .. connection group %s user %s exist",
+                   *ug,
+                   *usr);
+  cleanup:
+   if (handle NE NULL)
+   {
+      ESA_RC rcc;
+      ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+			"    -> Call to CTSGetConns with GET_FREE_HANDLE_CONNS mode.");
+      CS_DIAG_UG2UC_IN (ESA_COMP_ACSUPDF,GET_FREE_HANDLE_CONNS,
+				  0, 0, 0, ug, usr, handle, addinfo);
+      rcc= envir_ptr->func_ptr.gtug2uc_ptr ( GET_FREE_HANDLE_CONNS,
+                              1,
+                              &actual_num,
+                              &have_more,
+                              &handle,
+                              1,
+                              1,
+                              ug,
+                              usr,
+                              u2ug_prm,
+                              addinfo,
+                              obj_exist,
+                              &envir_ptr->msg_admin_param,
+                              &envir_ptr->msg_err);
+       ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+			   "    <- CTSGetConns USA-API completed with rc=%d (%s).",
+	    		   rcc, (rcc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+       if (rcc EQ ESA_OK)
+          CS_DIAG_UG2UC_OUT (ESA_COMP_ACSUPDF, 0, have_more,
+			       u2ug_prm, obj_exist, handle, addinfo);
+   }
+   CSA_free ((char **)&bufk);
+  if (rc EQ ESA_OK)
+     rc= rc_logout;
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSUPDF, DIAG_COMMON, fn, rc);
+  return (rc);
+ 
+}/*update_u2ug_check*/
+ 
+/****************************************************
+ * Procedure Name: CS_update_logevt
+ * Description   :
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_update_logevt ( MSG_typ             * msg_ptr,
+                          RSS_MSG_HDR_rec_typ * msg_hdr_cd)
+{
+  char fn[]="CS_update_logevt";
+  ESA_RC                    rc;
+  LOGEVT_PARAMS_rec_typ     logevt_prm;
+  ADDINFO_rec_typ         * addinfo= NULL;
+  int                       enum_int;
+  ENVIRONMENT_rec_typ     * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSUPDF, DIAG_COMMON, fn);
+ 
+  CLEAR_STRUCT(logevt_prm);
+ 
+  rc= CSA_alloc ((char **)&addinfo,
+                 STRUC_ADDINFO,
+/*WS10082K*      sizeof(ADDINFO_rec_typ),      */
+                 1,
+/*WS10082K*/     1,
+                 fn,
+                 "addinfo");
+  if (rc NE ESA_OK)
+    goto cleanup;
+  /*WS10082A addinfo->max_pairs = 0;                             */
+ 
+  /*WS10082A addinfo->num_pairs = 0;                             */
+ 
+ 
+  msg_ptr = CS_get_fld (logevt_prm.logevt ,msg_ptr, LOGENT_LEN,
+                        C_LOGEVT);
+  if (msg_ptr EQ NULL) {
+    rc = ESA_ERR;
+    goto cleanup;
+  }
+  msg_ptr = CS_get_enum_fld (&enum_int,
+                             FLD_SEVERITY,
+                             msg_ptr,
+                             C_SEVERITY);
+  logevt_prm.severity= (SEVERITY_typ)enum_int;
+  if (msg_ptr EQ NULL) {
+    rc = ESA_ERR;
+    goto cleanup;
+  }
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+   "CTSA send log event rss name=%s logevt=%s severity=%d.",
+                   envir_ptr->msg_admin_param.rss_name,
+                   logevt_prm.logevt,
+				   (int)logevt_prm.severity);
+ 
+  rc= CS_snd_rss_msg (msg_hdr_cd,
+                      envir_ptr->msg_admin_param.rss_name,
+                      FUNC_RSLOGEVT,
+                      (char *)&logevt_prm,
+                      addinfo);
+  if (rc NE ESA_OK)
+    goto cleanup;
+ 
+ 
+  cleanup:
+  CSA_free ((char **)&addinfo);
+ 
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSUPDF, DIAG_COMMON, fn, rc);
+  return(rc);
+ 
+}/*CS_update_logevt */
+ 
+/****************************************************
+ * Procedure Name: CS_update_pwdmod
+ * Description   :
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_update_pwdmod ( MSG_typ             * msg_ptr,
+                          RSS_MSG_HDR_rec_typ * msg_hdr_cd)
+{
+  char fn[]="CS_update_pwdmod";
+  ESA_RC                    rc, rc_log= ESA_ERR, rc_adm= ESA_OK;
+  USER_PARAMS_rec_typ       usr_prm;
+  ADDINFO_rec_typ         * addinfo= NULL;
+  ESS_INTRST_typ            obj_intrst;
+  OBJ_EXISTS_typ            obj_exist;
+  ENVIRONMENT_rec_typ     * envir_ptr;
+  int                       AutAdmPwdCng= FALSE;
+  PASSWD_typ                tmp_passwd;
+  /*WS10082A ADDINFO_rec_typ           addinf_sp;                */
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSUPDF, DIAG_COMMON, fn);
+ 
+  /*** WS10082A replace addinfo variable with dynamic allocation ***
+  addinf_sp.max_pairs= 0;
+  addinf_sp.num_pairs= 0;
+  addinfo= &addinf_sp;                                        */
+  /*BS10137 CSA_alloc ((char **)&addinfo,                     */
+  rc = CSA_alloc ((char **)&addinfo,                 /*BS10137*/
+            STRUC_ADDINFO,
+            1,
+            1,
+            fn,
+            "addinfo");
+  if (rc NE ESA_OK)
+    goto cleanup;
+  /***** WS10082A end *****/
+  obj_exist= OBJ_NOT_EXIST;
+  obj_intrst = ESS_DONT_CARE;
+ 
+  CLEAR_STRUCT(usr_prm);
+ 
+  msg_ptr = CS_get_fld (&usr_prm.user ,
+                        msg_ptr,
+                        envir_ptr->rss_limits.max_user_len,
+                        C_USER_ID);
+  if (msg_ptr EQ NULL) {
+    rc = ESA_ERR;
+    goto cleanup;
+  }
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 30,
+                   "Returned user name is : %s" ,
+                    usr_prm.user);
+ 
+  msg_ptr = CS_get_fld (&usr_prm.passwd ,
+                        msg_ptr,
+                        envir_ptr->rss_limits.max_pwd_len,
+                        C_USER_PASSWD);
+  if (msg_ptr EQ NULL) {
+      rc = ESA_ERR;
+      goto cleanup;
+  }
+ 
+  msg_ptr = CS_get_fld (main_name,
+                        msg_ptr,
+                        FUNC_NAME_LEN,
+                        C_FUNC_NAME);
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 11,
+                   "Returned user: %s pgm is : %s" ,
+                   usr_prm.user, main_name);
+ 
+  strcpy (tmp_passwd, usr_prm.passwd) ;
+ 
+  if ( (strlen (usr_prm.passwd) EQ 0) AND (strcmp (main_name, ESA_CD) EQ 0) )
+     AutAdmPwdCng= TRUE;
+ 
+  rc_log= ADM_loginout (LOGIN_MODE_FIRST,
+                        LOGIN_DEFAULT_ADMIN, fn);
+  if (rc_log NE ESA_OK)
+     goto cleanup;
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 13,
+  "Before CS_update_user_check: rss name=%s user=%s.",
+                    envir_ptr->msg_admin_param.rss_name, usr_prm.user);
+ 
+  rc = CS_update_user_check(&usr_prm, &obj_exist,
+                            &obj_intrst, AutAdmPwdCng, &addinfo);
+ 
+  /*WS10082A RSSADM file is not used in MF
+  if (rc EQ ESA_OK)
+  {
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15, "before ADM_admin_data_sync");
+     rc_adm= ADM_admin_data_sync  (usr_prm.user, usr_prm.passwd);
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15, "after ADM_admin_data_sync");
+     if (rc_adm EQ ESA_OK)
+	 {
+        rc= CS_broadcast (CS_BRDCT_EVNT_ADMIN, EVENT_ADMIN_CHANGED);
+        if (rc NE ESA_OK)
+           goto cleanup;
+	 }
+  } *** WS10082A ***/
+  if (AutAdmPwdCng EQ TRUE)
+	  goto cleanup;
+  strcpy (usr_prm.passwd, tmp_passwd) ;
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 11,
+   "After CS_update_user_check: rss name=%s user=%s.",
+                    envir_ptr->msg_admin_param.rss_name, usr_prm.user);
+ 
+  if (obj_exist  EQ OBJ_EXIST AND
+      obj_intrst NE ESS_DONT_CARE )
+  {
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                     "CTSA send pwdmod rss name:%s user:%s",
+                     envir_ptr->msg_admin_param.rss_name,
+                     usr_prm.user);
+     /*BS10137
+     if (PwdChgWithGetUser EQ ESS_YES_SIGN)
+     {
+        msg_ptr = CS_get_addinfo (&addinfo, msg_ptr);
+        if (msg_ptr EQ NULL) {
+           rc = ESA_ERR;
+           goto cleanup;
+		}
+     }
+     else
+     { BS10137******************************************************/
+        strcpy (usr_prm.parent_oe, "\\");
+        strcpy (usr_prm.def_group, "\\");
+        usr_prm.passwd_life=   PASS_LIFE_IGNORED;
+        usr_prm.rev_status=    USER_STAT_IGNORED;
+        usr_prm.user_admin=    USER_ADM_IGNORED;
+        usr_prm.def_ug_action= OLD_DEF_UG_ACT_IGNORED;
+	 /*BS10137 } */
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15, "before CS_snd_rss_msg");
+     rc= CS_snd_rss_msg (msg_hdr_cd,
+                        envir_ptr->msg_admin_param.rss_name,
+                        FUNC_RSPWDMOD,
+                        (char *)&usr_prm,
+                        addinfo);
+     if (rc NE ESA_OK)
+        goto cleanup;
+ 
+     CS_log_intercept_msg (EVNT_PASUSR_SENT_AGNT, usr_prm.user, NULL);
+  }
+ 
+  else {
+     CS_log_intercept_msg (EVNT_PASUSR_IGNORED_AGNT, usr_prm.user, NULL);
+ 
+     ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                     "CTSA drop pwdmod rss name:%s user %s",
+                     envir_ptr->msg_admin_param.rss_name,
+                     usr_prm.user);
+  }
+ 
+  cleanup:
+  /*BS10137
+  if (PwdChgWithGetUser EQ ESS_YES_SIGN)
+     CSA_free ((char **)&addinfo);              BS10137**************/
+ 
+  if (rc_log EQ ESA_OK)
+      rc_log= ADM_loginout (LOGOUT_MODE_LAST, LOGIN_DEFAULT_ADMIN, fn);
+ 
+  if (rc EQ ESA_OK)
+     rc= rc_log;
+ 
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+ 
+  CSA_free ((char **)&addinfo);                           /* WS10082A */
+  ESA_DIAG_exit (ESA_COMP_ACSUPDF, DIAG_COMMON, fn, rc);
+  return(rc);
+ 
+}/*CS_update_pwdmod */
+ 
+/****************************************************
+ * Procedure Name: CS_update_usdis
+ * Description   :
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_update_usdis ( MSG_typ             * msg_ptr,
+                         RSS_MSG_HDR_rec_typ * msg_hdr_cd)
+{
+  char fn[]="CS_userdis";
+  ESA_RC                    rc;
+  USER_PARAMS_rec_typ       usr_prm;
+  ESS_INTRST_typ            obj_intrst;
+  OBJ_EXISTS_typ            obj_exist;
+  ADDINFO_rec_typ         * addinfo= NULL;
+  ENVIRONMENT_rec_typ     * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSUPDF, DIAG_COMMON, fn);
+ 
+  CLEAR_STRUCT(usr_prm);
+ 
+  obj_exist= OBJ_NOT_EXIST;
+  obj_intrst = ESS_DONT_CARE;
+ 
+  msg_ptr = CS_get_fld (&usr_prm.user ,
+                        msg_ptr,
+                        envir_ptr->rss_limits.max_user_len,
+                        C_USER_ID);
+  if (msg_ptr EQ NULL) {
+    rc = ESA_ERR;
+    goto cleanup;
+  }
+ 
+ 
+  msg_ptr = CS_get_fld (main_name,
+                        msg_ptr,
+                        FUNC_NAME_LEN,
+                        C_FUNC_NAME);
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                   "interceptor found rss name:%s userdis:%s",
+                   envir_ptr->msg_admin_param.rss_name,
+                   usr_prm.user);
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+	  "before CS_update_user_check addinfo=<%x>",addinfo); /*IS10102*/
+  strcpy (usr_prm.passwd, "\\"); /* IS10102 */
+  rc = CS_update_user_check(&usr_prm, &obj_exist,
+                            &obj_intrst, FALSE, &addinfo);
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+	  "after CS_update_user_check addinfo=<%x>",addinfo); /*IS10102*/
+ 
+  if (obj_exist  EQ OBJ_EXIST AND
+      obj_intrst NE ESS_DONT_CARE ) {
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                     "CTSA send userdis %s",
+                     usr_prm.user);
+ 
+    rc= CS_snd_rss_msg (msg_hdr_cd,
+                        envir_ptr->msg_admin_param.rss_name,
+                        FUNC_RSUSDIS,
+                        (char *)&usr_prm,
+                        addinfo);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    CS_log_intercept_msg (EVNT_REVUSR_SENT_AGNT, usr_prm.user, NULL);
+  }
+ 
+  else {
+    CS_log_intercept_msg (EVNT_REVUSR_IGNORED_AGNT, usr_prm.user, NULL);
+    ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                     "CTSA drop userdis %s",
+                     usr_prm.user);
+  }
+  cleanup:
+  CSA_free ((char **)&addinfo);
+ 
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSUPDF, DIAG_COMMON, fn, rc);
+ 
+  return(rc);
+ 
+}/*CS_update_usdis */
+ 
+/****************************************************
+ * Procedure Name: CS_update_rsprmmod
+ * Description   :
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_update_rsprmmod ( MSG_typ             * msg_ptr,
+						    RSS_MSG_HDR_rec_typ * msg_hdr_cd)
+{
+  char fn[]="CS_update_rsprmmod";
+  ESA_RC                    rc, rc_logout= ESA_OK, rc_pst;
+  RSS_PARAMS_rec_typ        rssprm_prm;
+  ADDINFO_rec_typ          *addinfo= NULL;
+  RSSAPIPRM_rec_typ         apiprm;
+  RSSAPIKWD_rec_typ        *bufk= NULL;
+  void                     *handle_log_evnt= NULL;
+  KWD_typ kwd_types=    {
+      KWD_FOR_ADDINFO_1A_CHECK,
+      KWD_FOR_ADDINFO_1A,
+      KWD_FOR_ADDINFO_1B_CHECK,
+      KWD_FOR_ADDINFO_1B,
+      0,0,
+      KWD_FOR_ADDINFO_2A_CHECK,
+      KWD_FOR_ADDINFO_2A,
+      KWD_FOR_ADDINFO_2B_CHECK,
+      KWD_FOR_ADDINFO_2B};
+  ENVIRONMENT_rec_typ      * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSUPDF, DIAG_COMMON, fn);
+ 
+  CLEAR_STRUCT(rssprm_prm);
+ 
+  msg_ptr= CS_get_fld (main_name,
+                       msg_ptr,
+                       FUNC_NAME_LEN,
+                       C_FUNC_NAME);
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                   "interceptor found rss name:%s main_name:%s",
+                   envir_ptr->msg_admin_param.rss_name, main_name);
+ 
+  rc=CS_db_prm_get (envir_ptr->msg_admin_param.rss_name, FUNC_GTRSPRM,
+                    &apiprm);
+  if (rc NE ESA_OK)
+     goto cleanup;
+  rc= CSA_alloc ((char **)&addinfo,
+                 STRUC_ADDINFO,
+/*WS10082K*      sizeof(ADDINFO_rec_typ) *       */
+               envir_ptr->interest[envir_ptr->rss_num].num_rss_kwds,
+                 1,
+                 fn,
+                 "addinfo");
+  if (rc NE ESA_OK)
+    goto cleanup;
+ 
+  /*WS10082A addinfo->num_pairs = 0;                                */
+ 
+  /*WS10082A addinfo->max_pairs =
+      envir_ptr->interest[envir_ptr->rss_num].num_rss_kwds;         */
+ 
+  rc= CSA_alloc ((char **)&bufk,
+                 0,
+                 (sizeof(KWD_rec_typ) *
+              envir_ptr->interest[envir_ptr->rss_num].num_rss_kwds) +
+                    sizeof(RSSAPIKWD_rec_typ),
+                 1,
+                 fn,
+                 "Group- keywords");
+  if (rc NE ESA_OK)
+     goto cleanup;
+  rc= CS_db_key_get(envir_ptr->msg_admin_param.rss_name,
+      FUNC_GTRSPRM,bufk);
+  if (rc NE ESA_OK)
+    goto cleanup;
+ 
+  CS_fill_key (&addinfo,
+               bufk,
+               kwd_types,
+               1,
+               envir_ptr->interest[envir_ptr->rss_num].num_rss_kwds+
+                       apiprm.script_kwd_num);
+ 
+  /*
+    LOGIN from the RSS security system.
+  */
+  rc= ADM_loginout (LOGIN_MODE, LOGIN_DEFAULT_ADMIN, fn);
+  if (rc NE ESA_OK)
+     goto cleanup;
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+		"    -> Call to CTSGetRSSParams USA-API.");
+  CS_DIAG_ADDINFO (ESA_COMP_ACSUPDF, addinfo, 0, FALSE);
+  rc = envir_ptr->func_ptr.gtrsprm_ptr (&rssprm_prm,
+                              addinfo,
+                              &envir_ptr->msg_admin_param,
+                              &envir_ptr->msg_err);
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+	           "     MinPwdLen=%d MaxExpire=%d MaxLogins=%d Err=%.*s.",
+               rssprm_prm.min_pass_len, rssprm_prm.max_expire,
+	           rssprm_prm.max_logins, envir_ptr->msg_err.length,
+			   envir_ptr->msg_err.err_msg_text);
+  if (rc EQ ESA_OK)
+     CS_DIAG_ADDINFO (ESA_COMP_ACSUPDF, addinfo, 0, TRUE);
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+			"    <- CTSGetRSSParams USA-API completed with rc=%d (%s).",
+			   rc, (rc EQ ESA_OK) ? "UsaApi==OK" : "UsaApi##OK");
+  rc_logout= ADM_loginout (LOGOUT_MODE, LOGIN_DEFAULT_ADMIN, fn);
+  if (rc_logout NE ESA_OK)
+     goto cleanup;
+ 
+  if (apiprm.post EQ CS_YES)
+  {
+  	 ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+           "*****>... Start Post script for Get rss parameters.");
+     rc_pst = CS_pre_post_rssprm (SCRIPT_POST , &rssprm_prm,
+                 &addinfo, NULL, &apiprm, rc, ESA_RC_UNDEFINED);
+     if (rc_pst NE ESA_OK) {
+        if (rc_pst EQ ESA_WARN) {
+              CTSAMSG_print (MSG_POSTSCRIPT_WARN,
+                       envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                       envir_ptr->msg_admin_param.ctsamsg_dest);
+              CTSLogEvent (envir_ptr->msg_admin_param.rss_type,
+                       envir_ptr->msg_admin_param.rss_name,
+                       handle_log_evnt,
+                       MSG_POSTSCRIPT_WARN);
+        }
+        else {
+              CTSAMSG_print (MSG_RSPRMPOSTSCRIPT_FAIL,
+                           envir_ptr->msg_admin_param.ctsamsg_handle,
+                           NULL,
+                           envir_ptr->msg_admin_param.ctsamsg_dest,
+                           fn, rssprm_prm.min_pass_len,
+						   rssprm_prm.max_expire,
+						   rssprm_prm.max_logins, ESA_rc2str(rc_pst));
+              CTSLogEvent (envir_ptr->msg_admin_param.rss_type,
+                           envir_ptr->msg_admin_param.rss_name,
+                           handle_log_evnt,
+                           MSG_RSPRMPOSTSCRIPT_FAIL,
+                           fn, rssprm_prm.min_pass_len,
+						   rssprm_prm.max_expire,
+						   rssprm_prm.max_logins, ESA_rc2str(rc_pst));
+        }
+     }
+  	 ESA_DIAG_printf (ESA_COMP_ACSUPDF, DIAG_BASIC,
+           "<*****... End Post script.");
+  } /* END - PosstScript is required */
+ 
+  if (rc NE ESA_OK)
+    goto cleanup;
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                   "CTSA send rss prmmod rss name:%s",
+                   envir_ptr->msg_admin_param.rss_name);
+ 
+  rc= CS_snd_rss_msg (msg_hdr_cd,
+                      envir_ptr->msg_admin_param.rss_name,
+                      FUNC_GTRSPRM,
+                      (char *)&rssprm_prm,
+                      addinfo);
+  if (rc NE ESA_OK)
+    goto cleanup;
+ 
+  CS_log_intercept_msg (EVNT_UPDRSS_SENT_AGNT, NULL, NULL);
+ 
+  cleanup:
+ 
+  CSA_free ((char **)&bufk);
+  CSA_free ((char **)&addinfo);
+ 
+  if (rc EQ ESA_OK)
+      rc= rc_logout;
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSUPDF, DIAG_COMMON, fn, rc);
+ 
+  return(rc);
+ 
+}/*CS_update_rsprmmod */
+ 
+static void CS_log_intercept_msg (char * msg_id,
+	                              char * msg_prm_2,
+			                      char * msg_prm_3)
+{
+  char fn[]="CS_log_intercept_msg";
+  int                        goto_cleanup= -1;
+  ENVIRONMENT_rec_typ      * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSUPDF, DIAG_COMMON, fn);
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+     "rss=%s msg_id=%s goto_cleanup=%d rss_num=%d LogInterceptMsg=%d.",
+      envir_ptr->interest[envir_ptr->rss_num].rss,
+	  msg_id, goto_cleanup,
+	  (int)envir_ptr->rss_num,
+	  (int)envir_ptr->interest[envir_ptr->rss_num].LogInterceptMsg);
+ 
+  switch (envir_ptr->interest[envir_ptr->rss_num].LogInterceptMsg)
+  {
+     case LOG_ANY_MSG:
+        goto_cleanup= FALSE;
+        break;
+     case LOG_INTRST_MSG:
+	    if (
+		      (strcmp (msg_id, EVNT_ADDUSR_SENT_AGNT   ) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_UPDUSR_SENT_AGNT   ) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_DELUSR_SENT_AGNT   ) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_PASUSR_SENT_AGNT   ) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_REVUSR_SENT_AGNT   ) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_ADDGRP_SENT_AGNT   ) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_UPDGRP_SENT_AGNT   ) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_DELGRP_SENT_AGNT   ) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_ADDCON_SENT_AGNT   ) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_UPDCON_SENT_AGNT   ) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_DELCON_SENT_AGNT   ) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_ADDOE_SENT_AGNT    ) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_UPDOE_SENT_AGNT    ) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_DELOE_SENT_AGNT    ) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_UPDRSS_SENT_AGNT   ) == 0)
+           )
+           goto_cleanup= FALSE;
+		else
+           goto_cleanup= TRUE;
+        break;
+     case LOG_SKIPED_MSG:
+	    if (
+			  (strcmp (msg_id, EVNT_ADDUSR_IGNORED_AGNT) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_UPDUSR_IGNORED_AGNT) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_DELUSR_IGNORED_AGNT) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_PASUSR_IGNORED_AGNT) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_REVUSR_IGNORED_AGNT) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_ADDGRP_IGNORED_AGNT) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_UPDGRP_IGNORED_AGNT) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_DELGRP_IGNORED_AGNT) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_ADDCON_IGNORED_AGNT) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_UPDCON_IGNORED_AGNT) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_DELCON_IGNORED_AGNT) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_ADDOE_IGNORED_AGNT ) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_UPDOE_IGNORED_AGNT ) == 0)
+             OR
+			  (strcmp (msg_id, EVNT_DELOE_IGNORED_AGNT ) == 0)
+		   )
+           goto_cleanup= FALSE;
+		else
+           goto_cleanup= TRUE;
+	    break;
+     case DONTLOG_ANY_MSG:
+        goto_cleanup= TRUE;
+        break;
+  }
+  ESA_DIAG_printf (ESA_COMP_ACSUPDF, 15,
+                   "goto_cleanup=%d.", (int)goto_cleanup);
+ 
+  if (goto_cleanup)
+	  goto cleanup;
+ 
+  if (msg_prm_2 EQ NULL)
+     CTSAMSG_print (msg_id,
+                 envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                 envir_ptr->msg_admin_param.ctsamsg_dest,
+                 envir_ptr->msg_admin_param.rss_name,
+				 QueueInfoFunc());
+  else if (msg_prm_3 EQ NULL)
+     CTSAMSG_print (msg_id,
+                 envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                 envir_ptr->msg_admin_param.ctsamsg_dest,
+                 envir_ptr->msg_admin_param.rss_name,
+                 msg_prm_2, QueueInfoFunc());
+  else
+     CTSAMSG_print (msg_id,
+                 envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                 envir_ptr->msg_admin_param.ctsamsg_dest,
+                 envir_ptr->msg_admin_param.rss_name,
+				 msg_prm_2, msg_prm_3, QueueInfoFunc());
+cleanup:
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSUPDF, DIAG_COMMON, fn, ESA_OK);
+ 
+}
+ 
+char * QueueInfoFunc(void)
+{
+   ESA_RC     rc;
+   double     OccupiedQueueSize;
+   int        OccupiedQueuePercent, prcnt1, prcnt2;
+   int        Offset=0; /* Offset=0 - first entry */
+   Q_REC0     FirstQueueRecord;
+   ENVIRONMENT_rec_typ     * envir_ptr;
+ 
+   CS_get_envir_address (&envir_ptr);
+ 
+   QueueInfoString[0]= '\0';
+   if (QueueInfoData EQ TRUE)
+   {
+      /***** Read record0 *****/
+      /* SAS2IBMN
+      rc= OS_Q_read(NULL, &Offset, sizeof (Q_REC0), &envir_ptr->q_handle, &FirstQueueRecord);
+      */
+      rc= OS_Q_read(NULL, &Offset, sizeof(Q_REC0), &envir_ptr->q_handle,
+                    &FirstQueueRecord, 0);            /* SAS2IBMN */
+      if (rc EQ ESA_OK)
+	  {
+         if (FirstQueueRecord.get_pos LE FirstQueueRecord.put_pos)
+            OccupiedQueueSize= FirstQueueRecord.put_pos- FirstQueueRecord.get_pos;
+         else
+/* BS10086  OccupiedQueueSize= envir_ptr->queue_size-   */
+            OccupiedQueueSize= FirstQueueRecord.end_pos - /* BS10086 */
+		                     (FirstQueueRecord.get_pos- FirstQueueRecord.put_pos);
+/* BS10086
+         OccupiedQueuePercent= (int)((OccupiedQueueSize * 10000) / envir_ptr->queue_size); */
+         OccupiedQueuePercent= (int)((OccupiedQueueSize * 10000) / FirstQueueRecord.end_pos); /* BS10086 */
+		 prcnt1= (int)OccupiedQueuePercent/100;
+		 prcnt2= (int)OccupiedQueuePercent%100;
+   /* We split this diag message into 2 messages, we added LastPos,
+      EndPos, and Wrap in order to display all FirstQueueRecord fields,
+      and we are now correctly displaying the OccupiedQueueSize and
+      OccupiedQueuePercent fields.                           BS10086 */
+         ESA_DIAG_printf (ESA_COMP_ACSUPDF, 35,
+           "PutPos=%d GetPos=%d LastPos=%d EndPos=%d Wrap=%d",
+            FirstQueueRecord.put_pos, FirstQueueRecord.get_pos,
+            FirstQueueRecord.last_pos, FirstQueueRecord.end_pos,
+            FirstQueueRecord.wrap);
+         ESA_DIAG_printf (ESA_COMP_ACSUPDF, 35,
+           "Qsize=%d OccupiedQueueSize=%d OccupiedQueuePercent=%02d.%02d%%",
+	        envir_ptr->queue_size, (int)OccupiedQueueSize, prcnt1, prcnt2);
+         sprintf (QueueInfoString,
+			"(Intercepted by %s at %s. Queue status: %d Bytes (%02d.%02d%%) used)",
+	          main_name, QueueSiidTime, (int)OccupiedQueueSize, prcnt1, prcnt2);
+	  }
+   }
+   return (QueueInfoString);
+}

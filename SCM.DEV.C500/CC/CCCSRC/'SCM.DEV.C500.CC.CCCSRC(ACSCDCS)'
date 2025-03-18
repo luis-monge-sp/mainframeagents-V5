@@ -1,0 +1,755 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: acscdcs.c %
+ * Instance        : %instance: 1 %
+ * Created by      : %created_by: leonid_s %
+ * Created on      : %date_created: Sun Jul 25 15:12:39 2004 %
+ * Current Version : %version: 1.1.1 %
+ * Last Modified by: %derived_by: leonid_s %
+ * Last Modified on: %date_modified: Wed May 14 17:19:08 2003 %
+ */
+ 
+/***********************************************
+ * Mod.ID  Who      When         Description
+ * =============================================
+ * AJK001  Amir     05-Sep-2000  Minor fix wrt wrong enum
+ * SAS2IBMA AvnerL  21-Dec-16    SAS/C to IBM C Conversion Project
+ * AC001   Arun     17-Jan-2017  CONELLIS#307-Queue full issue fix
+ **********************************************/
+ 
+#include   "globs.h"
+ 
+#include ESA_INIT
+#include ESA_PROC
+#include ESA_RSSF
+#include ESA_RSS
+#include ESA_DIAG
+#include ESA_API_CODES
+#include ESA_CS_OS
+#include ESA_OS_PROC
+#include STDARG
+#include ESA_MSG
+ 
+/****************************************************
+ * Procedure Name: CTSLogEvent
+ * Description   : RSS log event has occured
+ * Input         :
+ * Output        : Log entry
+ * Input/Output  :
+ * Return Value  : ESA_RC
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+ 
+ESA_RC CTSLogEvent (RSS_typ                  rss_type,
+                    RSS_typ                  rss_name,
+                    void                   * handle,
+                    const char             * msgid,
+                    ...)
+{
+  char fn[]="CTSLogEvent";
+  ESA_RC                rc;
+  LOGENT_typ            logevt_str;
+  va_list               arg_list;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSCDCS, DIAG_COMMON, fn);
+  ESA_DIAG_printf(ESA_COMP_ACSCDCS, 13,
+                  "msgid=%s type=%s name=%s envir,p_main_name=%d.",
+                  msgid,
+                  rss_type,
+                  rss_name,
+                  (int)envir_ptr->p_main_name);
+ 
+  va_start(arg_list, msgid);
+ 
+  CTSAMSG_print_direct (
+               msgid,
+               envir_ptr->msg_admin_param.ctsamsg_handle,
+               logevt_str , NULL , arg_list);
+  ESA_DIAG_printf (ESA_COMP_ACSCDCS, 15,
+                   "logevt_str=%s.", logevt_str);
+  va_end(arg_list);
+ 
+  rc= LogEvent (msgid, logevt_str);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSCDCS, DIAG_COMMON, fn, rc);
+ 
+  return(rc);
+}
+ 
+/****************************************************
+ * Procedure Name: LogEvent
+ * Description   : Prepare data and call to RSLogAlert
+ * Input         : msgid
+ *               : Logevt_str
+ * Input/Output  :
+ * Return Value  : ESA_RC
+ ***************************************************/
+ 
+ESA_RC LogEvent (const char             * msgid,
+                 LOGENT_typ               logevt_str)
+{
+  char fn[]="LogEvent";
+  ESA_RC                rc;
+  OS_pid_str_typ        pid;
+  DATE_STR_typ          date_buffer;
+  TIME_STR_typ          time_buffer;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSCDCS, DIAG_COMMON, fn);
+  ESA_DIAG_printf(ESA_COMP_ACSCDCS, 13,
+                  "msgid=%s logevt_str=%s.",msgid, logevt_str);
+ 
+  /*
+   *   Call the real print function
+   */
+ 
+  date_buffer[0]= '\0';
+  time_buffer[0]= '\0';
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSCDCS, DIAG_OS,
+                   "...-> OS_PROC_get_pid: os_proc_handle=%p.",
+				   envir_ptr->os_proc_handle);
+  rc = OS_PROC_get_pid (pid, envir_ptr->os_proc_handle);
+  if (rc NE ESA_OK)
+    strcpy (pid , "????");
+  ESA_DIAG_printf (ESA_COMP_ACSCDCS, DIAG_OS,
+	"...<- OS_PROC_get_pid: rc=%d (%s) pid=%s.",
+			rc, (rc EQ ESA_OK) ? "OS==OK" : "OS##OK", pid);
+ 
+  rc= RSLogAlert (envir_ptr->msg_admin_param.rss_type,
+                  envir_ptr->msg_admin_param.rss_name,
+                  NULL,
+                  &envir_ptr->msg_params,
+                  date_buffer,
+                  time_buffer,
+                  envir_ptr->host_name,
+                  pid,
+                  CG_main_name (envir_ptr->p_main_name),
+                  LOGEVENT,
+                  OPT_TRUE,
+                  logevt_str);
+ 
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                   envir_ptr->msg_params.ctsamsg_handle, NULL,
+                   envir_ptr->msg_params.ctsamsg_dest, fn);
+  ESA_DIAG_exit (ESA_COMP_ACSCDCS, DIAG_COMMON, fn, rc);
+  return(rc);
+}
+ 
+/****************************************************
+ * Procedure Name: rss_queue_put
+ * Description   : send the message to the queue
+ * Input         :
+ * Output        :
+ * Input/Output  :
+ * Return Value  : ESA_RC
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+ 
+ESA_RC rss_queue_put (void         * handle,
+                      MSG_typ      * msg,
+                      NUM_MSGS_typ   msg_len)
+{
+  char                  fn[]="rss_queue_put";
+  MSG_typ             * msg_out;
+  int                   encryption_out_len;
+  int                   total_msg_len;
+  ESA_RC                rc= ESA_OK;
+  ENC_ERR_rec_typ       encryption_err;
+  RSS_MSG_HDR_rec_typ   msg_hdr;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSCDCS, DIAG_COMMON, fn);
+  ESA_DIAG_printf (ESA_COMP_ACSCDCS, 13,
+                   "msg_len=%d.", (int)msg_len);
+ 
+  if (handle EQ NULL) /* Parameter 'handle' unreferenced. */
+    rc= ESA_OK;       /* Must be removed !!!!!!!!!!!!!!!*/
+ 
+  msg_out = NULL;
+  encryption_out_len = 0;
+ 
+  /* Queue put */
+ 
+  total_msg_len = msg_len + sizeof(RSS_MSG_HDR_rec_typ)+ STRUCT_LEN;
+ 
+  memcpy ((char *)&msg_hdr, msg, sizeof (RSS_MSG_HDR_rec_typ));
+ 
+  /* encryption */
+  ESA_DIAG_printf (ESA_COMP_ACSCDCS, 15,
+                   "message=%c%c encr_int_act=%c.",
+                   msg_hdr.mhmtyp,
+                   msg_hdr.mhrtyp,
+                   envir_ptr->encr_int_act);
+ 
+  if ((memcmp(&msg_hdr.mhmtyp, MSG_PASSWRD_UPD,
+              strlen(MSG_PASSWRD_UPD)) EQ 0) AND
+      (envir_ptr->encr_int_act NE NOT_ACT_ENCR))
+    msg_hdr.mhcmrs = MH_ENCR_ON;
+  else
+    msg_hdr.mhcmrs = MH_ENCR_OFF;
+ 
+  memcpy (msg, (char *)&msg_hdr, sizeof (RSS_MSG_HDR_rec_typ));
+ 
+  /* Should we encrypt the message ? */
+  ESA_DIAG_printf (ESA_COMP_QUEUE, DIAG_MSGHDR,
+		"...-> OS_Q_put : Hndl=%p Msg=%.400s Stat=%d MsgLen=%d.",
+		&envir_ptr->q_handle, msg, envir_ptr->q_wait,
+		(unsigned int)total_msg_len);
+  CS_DIAG_MSG (ESA_COMP_QUEUE, 0, msg, total_msg_len, TRUE);
+  CS_DIAG_MSG (ESA_COMP_QUEUE, 0, msg, total_msg_len, FALSE);
+ 
+  if ((memcmp (&msg_hdr.mhmtyp,MSG_PASSWRD_UPD,
+             strlen (MSG_PASSWRD_UPD)) EQ 0) AND
+      (envir_ptr->encr_int_act NE NOT_ACT_ENCR)) {        /* Yes */
+ 
+    rc= CSA_alloc ((char **)&msg_out, 0, envir_ptr->max_msg_size,
+                    1, fn, "Msg space");
+    if (rc NE ESA_OK)
+      goto cleanup;
+    ESA_DIAG_printf (ESA_COMP_ACSCDCS, 15,
+        "envir_ptr: max_msg_size=%d hdr size=%d encr len=%d msg=%.*s.",
+         (int)envir_ptr->max_msg_size,
+         (int)sizeof (RSS_MSG_HDR_rec_typ),
+         (int)(total_msg_len - sizeof (RSS_MSG_HDR_rec_typ)),
+         (int)msg_len+ sizeof(RSS_MSG_HDR_rec_typ)+ STRUCT_LEN, msg);
+ 
+    encryption_out_len= envir_ptr->max_msg_size;
+    rc = ENC_encr(envir_ptr->enc_internal_handle,
+                  msg+sizeof (RSS_MSG_HDR_rec_typ),
+                  (int)(total_msg_len - sizeof (RSS_MSG_HDR_rec_typ)),
+                  ENC_DES, /*was ENC_SMALLBUFF,*/   /* AJK001 */
+                  msg_out,
+                  &encryption_out_len,
+                  &encryption_err);
+ 
+    if (rc NE ESA_OK) {
+      CS_encr_msg (&encryption_err);
+      goto cleanup;
+    }
+ 
+    ESA_DIAG_printf (ESA_COMP_ACSCDCS, 15,
+        "encryption_out_len=%d.",(int)encryption_out_len);
+ 
+    memcpy (msg+sizeof (RSS_MSG_HDR_rec_typ),
+            msg_out, (unsigned)encryption_out_len);
+ 
+    CSA_free ((char **)&msg_out);
+ 
+    if (rc NE ESA_OK)
+      goto cleanup;
+    total_msg_len= sizeof (RSS_MSG_HDR_rec_typ)+ encryption_out_len;
+  }
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSCDCS, 15,
+                   "total_msg_len=%d envir_ptr->q_wait=%d.",
+                   (int)total_msg_len, (int)envir_ptr->q_wait);
+ 
+  rc= OS_Q_put ((void *) msg,
+    total_msg_len,
+    envir_ptr->q_wait ,
+    &envir_ptr->q_handle);
+  ESA_DIAG_printf (ESA_COMP_QUEUE, DIAG_MSGHDR,
+			"...<- ESA_MBX_write: rc=%d (%s).",
+	        rc, (rc EQ ESA_OK) ? "OS==OK" : "OS##OK");
+  if (rc NE ESA_OK) {
+    ESA_DIAG_printf (ESA_COMP_ACSCDCS, 15,
+                     "OS_Q_put:rc=%d", (int)rc);
+    goto cleanup;
+  }
+ 
+cleanup:
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+  ESA_DIAG_exit (ESA_COMP_ACSCDCS, DIAG_COMMON, fn, rc);
+  return(rc);
+} /* rss_queue_put */
+ 
+/****************************************************
+ * Procedure Name: rss_msg_headr
+ * Description   : creat msg header
+ * Input         :
+ * Output        :
+ * Input/Output  :
+ * Return Value  : ESA_RC
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+ 
+MSG_typ * rss_msg_headr (RSS_typ                  rss_name,
+                         RSS_typ                  rss_type,
+                         MSG_typ                * msg,
+                         int                      func_name,
+                         NUM_MSGS_typ           * msg_len)
+{
+  char                  fn[]="rss_msg_header";
+  ESA_RC                rc;
+  RSS_MSG_HDR_rec_typ   msg_hdr_cd;
+  char                  rss_get_str[RSSPRM_VALUE_LEN];
+  RSS_typ               rss_fin_name;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSCDCS, DIAG_COMMON, fn);
+  ESA_DIAG_printf(ESA_COMP_ACSCDCS, 13,
+                  "func_name=%d type=%s name=%s.",
+                  func_name,
+                  rss_type,
+                  rss_name);
+ 
+  CLEAR(rss_get_str);
+ 
+  /* communication header */
+ 
+  CS_creat_cd_header (&msg_hdr_cd);
+  ESA_DIAG_printf(ESA_COMP_ACSCDCS, 13,
+   "after CS_creat_cd_header");
+ 
+  memcpy (msg, (char *)&msg_hdr_cd, sizeof (RSS_MSG_HDR_rec_typ));
+  CS_api_to_capi_id ((short)func_name, msg);
+  ESA_DIAG_printf(ESA_COMP_ACSCDCS, 13,
+   "after CS_api_to_capi_id");
+ 
+  msg += sizeof (RSS_MSG_HDR_rec_typ);
+ 
+  /* application structure */
+ 
+  memcpy (msg,MH_NMBR_MSGS,strlen(MH_NMBR_MSGS));
+  ESA_DIAG_printf(ESA_COMP_ACSCDCS, 13,
+   "after MH_NMBR_MSGS");
+ 
+  msg += strlen(MH_NMBR_MSGS);
+ 
+  /* RSS structure */
+ 
+  memcpy (msg,MH_TRANSACTION,strlen(MH_TRANSACTION));
+  msg += strlen(MH_TRANSACTION);
+  * msg_len= strlen(MH_TRANSACTION);
+ 
+  ESA_DIAG_printf(ESA_COMP_ACSCDCS, 13,
+   "after MH_TRANSACTION: msg_len=%d.", *msg_len);
+ 
+  /* start of service structure */
+  /* get rss name... if rss name is empty */
+ 
+  if (rss_name[0] EQ NULL_CHAR) {
+    rc = rssprm_get_name (rss_type, RSS_TYPE, rss_get_str);
+    if (rc NE ESA_OK) {
+      msg= NULL;
+      goto cleanup;
+    }
+    strcpy(rss_fin_name,rss_get_str);
+ 
+    ESA_DIAG_printf(ESA_COMP_ACSCDCS, 13,
+      "rss_fin_name=%s.", rss_fin_name);
+  }
+  else  strcpy(rss_fin_name,rss_name);
+ 
+  msg= CS_set_fld (rss_fin_name, msg, msg_len, RSS_NAME_LEN,
+                   C_RSS_NAME);
+  ESA_DIAG_printf(ESA_COMP_ACSCDCS, DIAG_DETAILES+ 1,
+   "%s=%s.", C_RSS_NAME, rss_fin_name);
+ 
+  msg= CS_set_fld (rss_type, msg, msg_len, RSS_NAME_LEN,
+                   C_RSS_TYPE);
+  ESA_DIAG_printf(ESA_COMP_ACSCDCS, DIAG_DETAILES+ 1,
+   "%s=%s.", C_RSS_TYPE, rss_type);
+ 
+  memcpy (msg,MH_NOT_SRVMSG,strlen(MH_NOT_SRVMSG));
+  msg += strlen(MH_NOT_SRVMSG);
+  * msg_len += strlen(MH_NOT_SRVMSG);
+  ESA_DIAG_printf(ESA_COMP_ACSCDCS, 13,
+   "after MH_NOT_SRVMSG: msg_len=%d.", *msg_len);
+ 
+  memcpy (msg,MH_HOTPASOFF,strlen(MH_HOTPASOFF));
+  msg += strlen(MH_HOTPASOFF);
+  * msg_len += strlen(MH_HOTPASOFF);
+  ESA_DIAG_printf(ESA_COMP_ACSCDCS, 13,
+   "after MH_HOTPASOFF: msg_len=%d.", *msg_len);
+ 
+cleanup:
+  if (msg EQ NULL)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+  ESA_DIAG_exit (ESA_COMP_ACSCDCS, DIAG_COMMON, fn, ESA_RC_VOID);
+  return(msg);
+}
+ 
+ 
+/****************************************************
+ * Procedure Name: RsLogAlert
+ * Description   : RSS log event OR alert has occured
+ * Input         : date_buffer,
+                   time_buffer,
+                   host_name,
+                   pid,
+                   process,
+                   severity,
+                   quiet,
+                   message,
+ * Output        : Log entry
+ * Input/Output  :
+ * Return Value  : ESA_RC
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+ 
+ESA_RC RSLogAlert (RSS_typ                  rss_type,
+                   RSS_typ                  rss_name,
+                   void                   * handle,
+                   CTSAMSG_PARAMS_rec_typ * msg_param,
+                   DATE_STR_typ             date_buffer,
+                   TIME_STR_typ             time_buffer,
+                   OS_host_name_typ         host_name,
+                   OS_pid_str_typ           pid,
+                   const char             * process,
+                   SEVERITY_typ             severity,
+                   OPTION_typ               quiet,
+                   char                   * message)
+{
+  char      fn[]="RSLlogAlert";
+  char      const_ID[6]=  "ID = ";
+  char      const_on[4]=  "on ";
+  char      comma_str[2]= ",";
+  MSG_typ * msg_ptr;
+  char    * temp_msg;
+  NUM_MSGS_typ          msg_len;
+  ESA_RC                rc;
+  time_t                current_time;
+  struct tm             tm_space;
+  char                  pid_str[sizeof (OS_pid_str_typ)+ 6];
+  char                  host_name_str[sizeof (OS_host_name_typ)+ 4];
+  char                * process_ptr;
+  RESOURCE_typ          proc_name;
+  CTSAMSG_MSGID_typ     msg_code;
+  DATE_STR_typ          date_msg_buffer;
+  TIME_STR_typ          time_msg_buffer;
+  LOGEVT_PARAMS_rec_typ logevt_prm;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSCDCS, DIAG_COMMON, fn);
+  ESA_DIAG_printf(ESA_COMP_ACSCDCS, 13,
+   "dat=%s.%s msg=%s typ=%s nam=%s pr=%s sev=%d qu=%d pid=%s hst=%s.",
+                  date_buffer,
+                  time_buffer,
+                  message,
+                  rss_type,
+                  rss_name,
+                  (process EQ NULL) ? "NULL" : process,
+                  (int)severity,
+                  (int)quiet,
+                  pid,
+                  host_name,
+                  (int)envir_ptr->max_msg_size);
+ 
+  rc= CSA_alloc ((char **)&temp_msg, 0, envir_ptr->max_msg_size,
+                   1, fn, "event space");
+  if (rc NE ESA_OK)
+    goto cleanup;
+  ESA_DIAG_printf (ESA_COMP_ACSCDCS, 15,
+                   "rc=ESA_OK after CSA_alloc");
+ 
+  if (strlen (message) GT LOGENT_LEN)
+  {
+     CTSAMSG_print (ERR_CS_MSG_CHKSIZE,
+                    msg_param->ctsamsg_handle, NULL,
+                    msg_param->ctsamsg_dest,
+                    fn,
+                    "LOGEVENT/ALERT",
+                    strlen (message),
+                    LOGENT_LEN);
+     rc= ESA_ERR;
+     goto cleanup;
+  }
+ 
+  msg_ptr= temp_msg;
+ 
+  msg_len=0;
+ 
+  time (&current_time);
+  memcpy ((char *)&tm_space,
+	      (char *)ConvertTimeToTMStruct (&current_time, &tm_space),
+		  sizeof (struct tm));
+  strftime (date_msg_buffer, DATE_STR_LEN+ 1, "%Y/%m/%d",&tm_space);
+  strftime (time_msg_buffer, TIME_STR_LEN+ 1, "%H:%M:%S",&tm_space);
+  ESA_DIAG_printf (ESA_COMP_ACSCDCS, 15,
+                   "date_msg_buffer=%s time_buffer=%s.",
+                   date_msg_buffer, time_buffer);
+  if (strlen (date_buffer) NE 0)
+     strncpy (date_msg_buffer,
+              date_buffer,
+              sizeof (DATE_STR_typ));
+  if (strlen (time_buffer) NE 0)
+     strncpy (time_msg_buffer,
+              time_buffer,
+              sizeof (TIME_STR_typ));
+  ESA_DIAG_printf (ESA_COMP_ACSCDCS, 15,
+                   "date_msg_buffer=%s time_buffer=%s.",
+                   date_msg_buffer, time_buffer);
+ 
+  if (strlen (pid) NE 0) {
+     strcpy (pid_str, const_ID);
+     strcat (pid_str, pid);
+     strcat (pid_str, comma_str);
+     ESA_DIAG_printf (ESA_COMP_ACSCDCS, 15,
+                     "pid_str=%s.", pid_str);
+  }
+  else
+     pid_str[0]= '\0';
+ 
+  if (strlen (host_name) NE 0) {
+     strcpy (host_name_str, const_on);
+     strcat (host_name_str, host_name);
+     ESA_DIAG_printf (ESA_COMP_ACSCDCS, 15,
+                     "host_name_str=%s.", host_name_str);
+  }
+  else
+     host_name_str[0]= '\0';
+ 
+  if (
+      (process EQ NULL)
+          OR
+      (strlen (process) EQ 0)
+     )
+ 
+  {
+     ESA_DIAG_printf (ESA_COMP_ACSCDCS, DIAG_OS,
+    "...-> OS_PROC_get_process_name: proc_name=%s (size=%d) hndl=%p.",
+			proc_name, sizeof (proc_name), envir_ptr->os_proc_handle);
+     rc= OS_PROC_get_process_name (proc_name,
+                                   sizeof (proc_name)-1,  /* AJK */
+                                   envir_ptr->os_proc_handle);
+      if (rc EQ ESA_OK)
+         process_ptr= proc_name;
+      else
+         process_ptr= (char *)CG_main_name (ESA_EXTERNAL);
+      ESA_DIAG_printf (ESA_COMP_ACSCDCS, DIAG_OS,
+	    "...<- OS_PROC_get_process_name: rc=%d (%s).",
+			rc, (rc EQ ESA_OK) ? "OS==OK" : "OS##OK");
+  }
+  else
+     process_ptr= (char *)process;
+ 
+  if (severity EQ LOGEVENT)
+     strcpy (msg_code, MSG_LOG_EVENT);
+  else
+     strcpy (msg_code, MSG_ALERT);
+  ESA_DIAG_printf (ESA_COMP_ACSCDCS, 15,
+                   "msg_code=%s.", msg_code);
+ 
+  rc = CTSAMSG_print (msg_code,
+                      msg_param->ctsamsg_handle,
+                      logevt_prm.logevt,
+                      NULL,
+                      date_msg_buffer,
+                      time_msg_buffer,
+                      process_ptr,
+                      pid_str,
+                      host_name_str,
+                      message);
+ 
+  if (quiet EQ OPT_FALSE)
+  {
+     CTSAMSG_print (MSG_ISSUING_ALERT,
+                    msg_param->ctsamsg_handle, NULL,
+                    msg_param->ctsamsg_dest,
+                    rss_name,
+                    (int)severity,
+                    process_ptr);
+ 
+     CTSAMSG_print (ERR_UL_STRING,
+                    msg_param->ctsamsg_handle, NULL,
+                    msg_param->ctsamsg_dest,
+                    (char *)logevt_prm.logevt    +
+                    sizeof (date_msg_buffer) +
+                    sizeof (time_msg_buffer) );
+  }
+  ESA_DIAG_printf (ESA_COMP_ACSCDCS, 15,
+                   "logevt=%s len=%d rc=ESA_OK after CTSAMSG_print",
+                   logevt_prm.logevt, (int)strlen(logevt_prm.logevt));
+ 
+  /* creat message header */
+ 
+  msg_ptr = rss_msg_headr(rss_name,
+                          rss_type,
+                          msg_ptr,
+                          FUNC_RSLOGEVT,
+                          &msg_len);
+ 
+  if (msg_ptr EQ NULL) {
+    rc= ESA_ERR;
+    goto cleanup;
+  }
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSCDCS, 15,
+      "rss_msg_headr: msg=%.*s hdr_len=%d msg_len=%d LOGENT_LEN=%d.",
+          (int)msg_len+ sizeof (RSS_MSG_HDR_rec_typ)+ RSS_NUM_MSGS,
+                   temp_msg, (int)sizeof (RSS_MSG_HDR_rec_typ),
+                   (int)msg_len, (int)LOGENT_LEN);
+ 
+  logevt_prm.severity= severity;
+  msg_ptr= CS_set_logevt (msg_ptr, &logevt_prm, &msg_len);
+ 
+  msg_ptr= CS_set_fld (envir_ptr->msg_admin_param.program_name,
+                       msg_ptr, &msg_len, FUNC_NAME_LEN, C_FUNC_NAME);
+  ESA_DIAG_printf(ESA_COMP_ACSCDCS, DIAG_DETAILES+ 1,
+   "%s=%s.", C_FUNC_NAME, envir_ptr->msg_admin_param.program_name);
+  if (msg_ptr EQ NULL) {
+    rc= ESA_ERR;
+    goto cleanup;
+  }
+ 
+  rc= CS_set_sngl_msg_len (temp_msg+
+                           sizeof (RSS_MSG_HDR_rec_typ)+
+                           RSS_NUM_MSGS,
+                           msg_len);
+  if (rc NE ESA_OK)
+    goto cleanup;
+  ESA_DIAG_printf (ESA_COMP_ACSCDCS, 15,
+           "CS_set_sngl_msg_len: msg=%.*s msg_len=%d",
+            (int)msg_len+ sizeof (RSS_MSG_HDR_rec_typ)+ RSS_NUM_MSGS,
+            temp_msg, (int)msg_len);
+ 
+  /* AC001 rc = rss_queue_put (handle,temp_msg,msg_len); */
+  if (envir_ptr->write_to_queue == 'Y') /*AC001-CONELLIS#307*/
+      rc = rss_queue_put (handle,temp_msg,msg_len);
+ 
+  cleanup:
+  CSA_free ((char **)&temp_msg);
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                   msg_param->ctsamsg_handle, NULL,
+                   msg_param->ctsamsg_dest, fn);
+  else
+    ESA_DIAG_printf (ESA_COMP_ACSCDCS, DIAG_BASIC,
+      "*****>... %s for RSS=%s TYPE=%s Event=%s-%s PGM=%s wrote to queue.",
+      fn, rss_name, rss_type, msg_code, message,
+	  envir_ptr->msg_admin_param.program_name);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSCDCS, DIAG_COMMON, fn, rc);
+  return(rc);
+}
+ 
+/****************************************************
+ * Procedure Name: CS_set_logevt
+ * Description   : build logevt/alert message
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ *********************************************************************/
+ 
+MSG_typ * CS_set_logevt (MSG_typ               * buffer,
+                         LOGEVT_PARAMS_rec_typ * logevt_prm,
+                         NUM_MSGS_typ          * msg_len)
+{
+  char                  fn[]="CS_set_logevt";
+  char                * tmp_buffer;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSCDCS, DIAG_COMMON, fn);
+  ESA_DIAG_printf (ESA_COMP_ACSCDCS, 13,
+                   "logevt buffer=%s severity=%d.",
+                   logevt_prm->logevt, (int)logevt_prm->severity);
+  tmp_buffer= buffer;
+ 
+  buffer = CS_set_fld (logevt_prm->logevt, buffer, msg_len,
+                       LOGENT_LEN , C_LOGEVT);
+  ESA_DIAG_printf(ESA_COMP_ACSCDCS, DIAG_DETAILES+ 1,
+   "%s=%s.", C_LOGEVT, logevt_prm->logevt);
+ 
+  if (buffer EQ NULL)
+     goto cleanup;
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSCDCS, 15,
+                   "buffer=%.*s len=%d.",
+                   (int)(*msg_len), tmp_buffer, (int)(*msg_len));
+ 
+  buffer = CS_set_enum_fld ((int)logevt_prm->severity,
+                            FLD_SEVERITY,
+                            buffer ,
+                            msg_len,
+                            C_SEVERITY);
+  ESA_DIAG_printf(ESA_COMP_ACSCDCS, DIAG_DETAILES+ 1,
+   "%s=%d.", C_SEVERITY, (int)logevt_prm->severity);
+  if (buffer EQ NULL)
+     goto cleanup;
+  ESA_DIAG_printf (ESA_COMP_ACSCDCS, 15,
+                   "buffer=%.*s len=%d.",
+                   (int)(*msg_len), tmp_buffer, (int)(*msg_len));
+ 
+cleanup:
+ 
+  if (buffer EQ NULL)
+      CTSAMSG_print (ERR_CS_MSG_SET_STRUCT ,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     fn);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSCDCS, DIAG_COMMON, fn, ESA_OK);
+  return(buffer);
+ 
+} /* END - CS_set_logevt function */
+ 
+ 
+ 
+/****************************************************
+ * Procedure Name: rslogevt
+ * Description   : RSS log event has occured
+ * Input         :
+ * Output        : Log entry
+ * Input/Output  :
+ * Return Value  : ESA_RC
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+ 
+ESA_RC LOG_event (const char  * msgid, ...)
+{
+ 
+    ESA_RC     rc;
+    LOGENT_typ logevt_str;
+    va_list    arg_list;
+    ENVIRONMENT_rec_typ * envir_ptr;
+    char       fn[]="LOG_event";
+ 
+  CS_get_envir_address (&envir_ptr);
+  ESA_DIAG_enter (ESA_COMP_ACSCDCS, DIAG_COMMON, fn);
+ 
+ 
+  va_start(arg_list, msgid);
+ 
+  CTSAMSG_print_direct ( msgid,
+                              envir_ptr->msg_params.ctsamsg_handle,
+                              logevt_str , NULL , arg_list);
+  ESA_DIAG_printf (ESA_COMP_ACSCDCS, 15,
+                   "logevt_str=%s.", logevt_str);
+  va_end(arg_list);
+ 
+  rc= LogEvent (msgid, logevt_str);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSCDCS, DIAG_COMMON, fn, rc);
+  return (rc);
+ 
+}

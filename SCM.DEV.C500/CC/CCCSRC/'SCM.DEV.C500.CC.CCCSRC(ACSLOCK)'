@@ -1,0 +1,863 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: acslock.c %
+ * Instance        : %instance: 1 %
+ * Created by      : %created_by: ihoffma %
+ * Created on      : %date_created: Wed Nov 19 18:18:40 2003 %
+ * Current Version : %version: 2 %
+ * Last Modified by: %derived_by: ihoffma %
+ * Last Modified on: %date_modified: Wed Nov 19 18:18:40 2003 %
+ */
+ 
+/**************************************************************
+ * Mod.ID  Who      When         Description
+ * ============================================================
+ * IMH001  Ian H.   19-Nov-03    WSAN101342 Thread-safe code (ERRNO)
+ * SAS2IBMT SeligT  30/06/2016   SAS/C to IBM C Conversion Project
+ * BS10076  SeligT  11/12/2017   Organize Connector Locking
+ *                               Functions and Structures
+ *************************************************************/
+ 
+#include "globs.h"
+ 
+ 
+#include ERRNO
+#include ESA_INIT
+#include ESA_CS_SINFO
+#include ESA_RSS
+#include ESA_CS_OS
+ 
+#define TBL_ROWS_LOCK  10
+ 
+/****************************************************
+ * Procedure Name: CSA_lock
+ * Description   : lock file
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CSA_lock (char           * file_name,
+                 char           * func_name,
+                 LOCK_SCOPE_typ   lock_scope)
+{
+  int                   ii;
+  ESA_RC                rc= ESA_OK;
+  ENVIRONMENT_rec_typ * envir_ptr;
+  char                  fn[]="CSA_lock";
+  char                  wait_lock_char[10] = " ";         /* BS10076 */
+  char                  wait_lock_interval_char[10] = " ";/* BS10076 */
+  int                   wait_lock_value;                  /* BS10076 */
+  int                   wait_lock_interval_value;         /* BS10076 */
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSLOCK, DIAG_COMMON, fn);
+  CS_get_envir_address (&envir_ptr);
+ 
+  if (envir_ptr->lock_rows EQ 0) {
+    rc= CSA_alloc ((char **)&envir_ptr->lock, STRUC_LOCK_REC,
+                   sizeof(LOCK_TBL_rec_typ), TBL_ROWS_LOCK,
+                   fn, "lock_tbl");
+    if (rc NE ESA_OK)
+      goto cleanup;
+    memset ((char *)envir_ptr->lock, '\0',
+            sizeof(LOCK_TBL_rec_typ)* TBL_ROWS_LOCK);
+    envir_ptr->lock_rows= TBL_ROWS_LOCK;
+  }
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_DETAILES,
+       "file %s (func %s) scope=%s.", file_name, func_name,
+	   (lock_scope EQ SCOPE_LOCAL) ? "SCOPE_LOCAL" : "SCOPE_REMOTE");
+ 
+  for (ii= 0; ii LT envir_ptr->lock_rows; ii++ ) {
+    if (strcmp(envir_ptr->lock[ii].file_name, file_name) EQ 0)
+      break;
+  }
+  if (ii LT envir_ptr->lock_rows AND envir_ptr->lock[ii].sw_lock NE 0) {
+    CTSAMSG_print (ERR_CS_LOCK_LOCKED_FILE,
+                   envir_ptr->ctsamsg_handle, NULL,
+                   envir_ptr->ctsamsg_dest,
+                   fn, func_name, file_name) ;
+    rc= ESA_ERR;
+    goto cleanup;
+  }
+ 
+  if (ii GE envir_ptr->lock_rows)
+    for (ii= 0; ii LT envir_ptr->lock_rows; ii++ ) {
+      if (envir_ptr->lock[ii].sw_init EQ 0)
+        break;
+    }
+ 
+  if (ii GE envir_ptr->lock_rows) {
+    rc= CSA_realloc ((char **)&envir_ptr->lock, STRUC_LOCK_REC,
+                   sizeof(LOCK_TBL_rec_typ),
+                   envir_ptr->lock_rows+ TBL_ROWS_LOCK);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    memset ((char *)(envir_ptr->lock+envir_ptr->lock_rows), '\0',
+            sizeof(LOCK_TBL_rec_typ)* TBL_ROWS_LOCK);
+    envir_ptr->lock_rows += TBL_ROWS_LOCK;
+  }
+ 
+  if (envir_ptr->lock[ii].sw_init EQ 0) {
+    envir_ptr->lock[ii].file_handle= NULL;
+    ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_OS,
+"...-> OS_CS_lock_init: file=%s(LOCK_RES_FILE) hdl=%p scope=%s ln=%d.",
+	  file_name, envir_ptr->lock[ii].file_handle,
+	  (lock_scope EQ SCOPE_LOCAL) ? "SCOPE_LOCAL" : "SCOPE_REMOTE",
+	  __LINE__);
+ 
+   /* * * * * * * BS10076 start * * * * * * */
+   rc = rssprm_get_opt (ALL_RSS, "WAIT_LOCK",
+                    sizeof(wait_lock_char),
+                    wait_lock_char,
+                    OPT_TRUE,
+                    OPT_FALSE);
+ 
+   if (rc EQ ESA_OK)
+      wait_lock_value = atoi(wait_lock_char);
+   else
+      wait_lock_value = WAIT_LOCK_TOTAL;
+ 
+   ESA_DIAG_printf (ESA_COMP_ACSLOCK, 6,
+                    "WAIT_LOCK parm = <%s> = <%d>",
+                    wait_lock_char,
+                    wait_lock_value);
+ 
+   rc = rssprm_get_opt (ALL_RSS, "WAIT_LOCK_INTERVAL",
+                    sizeof(wait_lock_interval_char),
+                    wait_lock_interval_char,
+                    OPT_TRUE,
+                    OPT_FALSE);
+ 
+   if (rc EQ ESA_OK)
+      wait_lock_interval_value = atoi(wait_lock_interval_char);
+   else
+      wait_lock_interval_value = WAIT_LOCK_INTERVAL_DFLT;
+ 
+   ESA_DIAG_printf (ESA_COMP_ACSLOCK, 6,
+                    "WAIT_LOCK_INTERVAL parm = <%s> = <%d>",
+                    wait_lock_interval_char,
+                    wait_lock_interval_value);
+   /* * * * * * * BS10076 end * * * * * * */
+ 
+    rc = OS_CS_lock_init (file_name,
+               /* BS10076 LOCK_RES_FILE,                             */
+                          &envir_ptr->lock[ii].lock_handle,
+               /* BS10076 envir_ptr->lock[ii].file_handle,           */
+                          wait_lock_value,                /* BS10076 */
+                          wait_lock_interval_value,       /* BS10076 */
+                          lock_scope,
+                          &envir_ptr->msg_params);
+    ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_OS,
+     "...<- OS_CS_lock_init: rc=%d (%s) hndl=%p.",
+			rc, (rc EQ ESA_OK) ? "OS==OK" : "OS##OK",
+			envir_ptr->lock[ii].lock_handle);
+    if (rc NE ESA_OK) {
+      CTSAMSG_print (ERR_CS_INIT_FILE,
+                     envir_ptr->ctsamsg_handle, NULL,
+                     envir_ptr->ctsamsg_dest,
+                     fn, file_name, func_name) ;
+      if (rc EQ ESA_FATAL)
+         rc= ESA_TERM_CTSA;
+      goto cleanup;
+    }
+    envir_ptr->lock[ii].sw_init= 1;
+    envir_ptr->lock[ii].sw_lock= 0;
+    strncpy (envir_ptr->lock[ii].func_name, func_name,
+             MAX_RSS_RESOURCE_NAME_LEN);
+    strncpy (envir_ptr->lock[ii].file_name, file_name,
+             MAX_RSS_RESOURCE_NAME_LEN);
+  }
+  ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_OS,
+    "...-> OS_CS_lock: hndl=%p wait=%d / %d line=%d.",    /* BS10076 */
+	  envir_ptr->lock[ii].lock_handle, /* BS10076 envir_ptr->lock_wait, */
+   wait_lock_value, wait_lock_interval_value,             /* BS10076 */
+	  __LINE__);
+  rc= OS_CS_lock (envir_ptr->lock[ii].lock_handle,
+       /* BS10076 envir_ptr->lock_wait,                              */
+                  &envir_ptr->msg_params);
+  ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_OS,
+     "...<- OS_CS_lock: rc=%d (%s)",
+			rc, (rc EQ ESA_OK) ? "OS==OK" : "OS##OK");
+  if (rc NE ESA_OK) {
+     CTSAMSG_print (ERR_CS_LOCK_FILE,
+                   envir_ptr->ctsamsg_handle, NULL,
+                   envir_ptr->ctsamsg_dest,
+                   fn, file_name, func_name) ;
+     if (rc EQ ESA_FATAL)
+		rc= ESA_TERM_CTSA;
+     goto cleanup;
+  }
+  envir_ptr->lock[ii].sw_lock= 1;
+ 
+ cleanup:
+  if (rc NE ESA_OK)
+     CTSAMSG_print (ERR_CS_FUNCTION,
+                   envir_ptr->ctsamsg_handle, NULL,
+                   envir_ptr->ctsamsg_dest, fn);
+  if (rc EQ ESA_TERM_CTSA)
+     CTSAMSG_print (MSG_WAIT_TERMINATE_OUT,
+                   envir_ptr->ctsamsg_handle, NULL,
+                   envir_ptr->ctsamsg_dest, fn) ;
+  if (ESA_DIAG_get_debug_level(ESA_COMP_ACSLOCK) GE DIAG_MORE)
+     CSA_print_lock_tbl ();
+  ESA_DIAG_exit (ESA_COMP_ACSLOCK, DIAG_COMMON, fn, rc);
+ 
+  return (rc);
+}
+ 
+/****************************************************
+ * Procedure Name: CSA_print_lock_tbl
+ * Description   : Print  information about locked files
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+void CSA_print_lock_tbl (void)
+{
+  int                   ii, jj;
+  ENVIRONMENT_rec_typ * envir_ptr;
+  char                  fn[]="CSA_print_lock_tbl";
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSLOCK, DIAG_COMMON, fn);
+  CS_get_envir_address (&envir_ptr);
+ 
+  for (ii= 0, jj= 0; ii LT envir_ptr->lock_rows; ii++ ) {
+     if (envir_ptr->lock[ii].sw_init NE 0 ) {
+      ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_DETAILES,
+     "Lock tbl: Row %d: file=%s func=%s init=%d lock=%d open=%d",
+                       ii+ 1, envir_ptr->lock[ii].file_name,
+                       envir_ptr->lock[ii].func_name,
+                       (int)envir_ptr->lock[ii].sw_init,
+                       (int)envir_ptr->lock[ii].sw_lock,
+                       (int)envir_ptr->lock[ii].sw_open);
+      jj++;
+    }
+  }
+ 
+  if (jj EQ 0)
+      ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_DETAILES,
+      "Lock table is empty");
+  ESA_DIAG_exit (ESA_COMP_ACSLOCK, DIAG_COMMON, fn, ESA_RC_VOID);
+}
+ 
+/****************************************************
+ * Procedure Name: CSA_unlock
+ * Description   : Unlock file
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CSA_unlock (char * file_name,
+                   char * func_name)
+{
+  char                  fn[]="CSA_unlock";
+  int                   ii= 0;
+  ESA_RC                rc= ESA_OK;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSLOCK, DIAG_COMMON, fn);
+  ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_DETAILES,
+      "file=%s (func=%s)", file_name, func_name);
+  if (envir_ptr->lock_rows EQ 0) {
+    ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_DETAILES,
+                     "LOCK_TBL is empty");
+    goto cleanup;
+  }
+ 
+  for (ii= 0; ii LT envir_ptr->lock_rows; ii++ ) {
+    if (strcmp (envir_ptr->lock[ii].file_name, file_name) EQ 0)
+      break;
+  }
+ 
+  if (ii LT envir_ptr->lock_rows) {
+    if (envir_ptr->lock[ii].sw_lock EQ 0) {
+      ESA_DIAG_printf (ESA_COMP_ACSLOCK, 13,
+                       "file %s is not locked(func %s)",
+                       file_name, func_name);
+      goto cleanup;
+    }
+    ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_OS,
+      "...-> OS_CS_unlock: hndl=%p line=%d.",
+	  envir_ptr->lock[ii].lock_handle, __LINE__);
+    rc= OS_CS_unlock    (envir_ptr->lock[ii].lock_handle,
+                     &envir_ptr->msg_params);
+    ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_OS,
+     "...<- OS_CS_unlock: rc=%d (%s).",
+			rc, (rc EQ ESA_OK) ? "OS==OK" : "OS##OK");
+    if (rc NE ESA_OK) {
+      CTSAMSG_print (ERR_CS_UNLOCK_FILE,
+                     envir_ptr->ctsamsg_handle, NULL,
+                     envir_ptr->ctsamsg_dest,
+                     fn, file_name, func_name) ;
+      goto cleanup;
+    }
+    envir_ptr->lock[ii].sw_lock= 0;
+    if (envir_ptr->lock[ii].sw_init NE 0) {
+      ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_OS,
+        "...-> OS_CS_lock_term: hndl=%p line=%d.",
+	    envir_ptr->lock[ii].lock_handle, __LINE__);
+      rc= OS_CS_lock_term (&envir_ptr->lock[ii].lock_handle,
+                       &envir_ptr->msg_params);
+      ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_OS,
+       "...<- OS_CS_lock_term: rc=%d (%s).",
+			rc, (rc EQ ESA_OK) ? "OS==OK" : "OS##OK");
+      if (rc NE ESA_OK)
+        CTSAMSG_print (ERR_CS_TERM_FILE,
+                       envir_ptr->ctsamsg_handle, NULL,
+                       envir_ptr->ctsamsg_dest, fn,
+                       envir_ptr->lock[ii].file_name,
+                       envir_ptr->lock[ii].func_name);
+      else
+        envir_ptr->lock[ii].sw_init= 0;
+    }
+  }
+  else
+    CTSAMSG_print (ERR_CS_FILE_NOTFOUND,
+                   envir_ptr->ctsamsg_handle, NULL,
+                   envir_ptr->ctsamsg_dest, fn,
+                   func_name, file_name);
+ 
+  cleanup:
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                   envir_ptr->ctsamsg_handle, NULL,
+                   envir_ptr->ctsamsg_dest, fn);
+  if (ESA_DIAG_get_debug_level(ESA_COMP_ACSLOCK) GE DIAG_MORE)
+     CSA_print_lock_tbl ();
+  ESA_DIAG_exit (ESA_COMP_ACSLOCK, DIAG_COMMON, fn, rc);
+  return (rc);
+}
+ 
+/****************************************************
+ * Procedure Name: CSA_open
+ * Description   : open file
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CSA_open ( char            * file_name,
+                  char            * func_name,
+                  char const      * open_code,
+                  FILE           ** open_handle,
+                  LOCK_SCOPE_typ    lock_scope)
+{
+  char                  fn[]="CSA_open";
+  char                  ddn_with[12]="";                  /* SAS2IBMT */
+  int                   ii;
+  ESA_RC                rc= ESA_OK;
+  ENVIRONMENT_rec_typ * envir_ptr;
+  char                  wait_lock_char[10] = " ";         /* BS10076 */
+  char                  wait_lock_interval_char[10] = " ";/* BS10076 */
+  int                   wait_lock_value;                  /* BS10076 */
+  int                   wait_lock_interval_value;         /* BS10076 */
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSLOCK, DIAG_COMMON, fn);
+  *open_handle= NULL;
+ 
+  if (envir_ptr->lock_rows EQ 0) {
+    rc= CSA_alloc ((char **)&envir_ptr->lock, STRUC_LOCK_REC,
+                   sizeof(LOCK_TBL_rec_typ), TBL_ROWS_LOCK,
+                   fn, "lock_tbl");
+    if (rc NE ESA_OK)
+      goto cleanup;
+    memset ((char *)envir_ptr->lock, '\0',
+            sizeof(LOCK_TBL_rec_typ)* TBL_ROWS_LOCK);
+    envir_ptr->lock_rows= TBL_ROWS_LOCK;
+  }
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_DETAILES,
+     "file %s open code %s (func %s) scope=%s.",
+      file_name, open_code, func_name,
+   (lock_scope EQ SCOPE_LOCAL) ? "SCOPE_LOCAL" : "SCOPE_REMOTE");
+ 
+  for (ii= 0; ii LT envir_ptr->lock_rows; ii++ ) {
+    if (strcmp(envir_ptr->lock[ii].file_name, file_name) EQ 0)
+      break;
+  }
+  if (ii LT envir_ptr->lock_rows AND envir_ptr->lock[ii].sw_open NE 0) {
+    CTSAMSG_print (ERR_CS_OPEN_OPENED_FILE,
+                   envir_ptr->ctsamsg_handle, NULL,
+                   envir_ptr->ctsamsg_dest, fn,
+                   file_name, func_name, open_code) ;
+    rc= ESA_ERR;
+    goto cleanup;
+  }
+ 
+  if (ii GE envir_ptr->lock_rows)
+    for (ii= 0; ii LT envir_ptr->lock_rows; ii++ ) {
+      if (envir_ptr->lock[ii].sw_init EQ 0)
+        break;
+    }
+ 
+  if (ii GE envir_ptr->lock_rows) {
+    rc= CSA_realloc ((char **)&envir_ptr->lock, STRUC_LOCK_REC,
+                   sizeof(LOCK_TBL_rec_typ),
+                   envir_ptr->lock_rows+ TBL_ROWS_LOCK);
+    if (rc NE ESA_OK)
+      goto cleanup;
+    memset ((char *)(envir_ptr->lock+ envir_ptr->lock_rows), '\0',
+            sizeof(LOCK_TBL_rec_typ)* TBL_ROWS_LOCK);
+    envir_ptr->lock_rows += TBL_ROWS_LOCK;
+  }
+ 
+  strncpy (envir_ptr->lock[ii].func_name, func_name,
+           MAX_RSS_RESOURCE_NAME_LEN);
+  strncpy (envir_ptr->lock[ii].file_name, file_name,
+           MAX_RSS_RESOURCE_NAME_LEN);
+  envir_ptr->lock[ii].sw_open= 0;
+  envir_ptr->lock[ii].open_handle= NULL;
+ 
+  if (envir_ptr->lock[ii].sw_init EQ 0) {
+    envir_ptr->lock[ii].sw_lock= 0;
+    if (strcmp (open_code, FILE_OPEN_FOR_READ) NE 0) {
+/*      envir_ptr->lock[ii].file_handle= NULL;*/
+      envir_ptr->lock[ii].file_handle= envir_ptr->lock[ii].open_handle;
+ 
+      ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_OS,
+"...-> OS_CS_lock_init: file=%s(LOCK_RES_FILE) hdl=%p scope=%s ln=%d.",
+	  file_name, envir_ptr->lock[ii].file_handle,
+	  (lock_scope EQ SCOPE_LOCAL) ? "SCOPE_LOCAL" : "SCOPE_REMOTE",
+	  __LINE__);
+ 
+   /* * * * * * * BS10076 start * * * * * * */
+   rc = rssprm_get_opt (ALL_RSS, "WAIT_LOCK",
+                    sizeof(wait_lock_char),
+                    wait_lock_char,
+                    OPT_TRUE,
+                    OPT_FALSE);
+ 
+   if (rc EQ ESA_OK)
+      wait_lock_value = atoi(wait_lock_char);
+   else
+      wait_lock_value = WAIT_LOCK_TOTAL;
+ 
+   ESA_DIAG_printf (ESA_COMP_ACSLOCK, 6,
+                    "WAIT_LOCK parm = <%s> = <%d>",
+                    wait_lock_char,
+                    wait_lock_value);
+ 
+   rc = rssprm_get_opt (ALL_RSS, "WAIT_LOCK_INTERVAL",
+                    sizeof(wait_lock_interval_char),
+                    wait_lock_interval_char,
+                    OPT_TRUE,
+                    OPT_FALSE);
+ 
+   if (rc EQ ESA_OK)
+      wait_lock_interval_value = atoi(wait_lock_interval_char);
+   else
+      wait_lock_interval_value = WAIT_LOCK_INTERVAL_DFLT;
+ 
+   ESA_DIAG_printf (ESA_COMP_ACSLOCK, 6,
+                    "WAIT_LOCK_INTERVAL parm = <%s> = <%d>",
+                    wait_lock_interval_char,
+                    wait_lock_interval_value);
+   /* * * * * * * BS10076 end * * * * * * */
+ 
+      rc = OS_CS_lock_init (file_name,
+                 /* BS10076 LOCK_RES_FILE,                           */
+                            &envir_ptr->lock[ii].lock_handle,
+                 /* BS10076 envir_ptr->lock[ii].file_handle,         */
+                            wait_lock_value,              /* BS10076 */
+                            wait_lock_interval_value,     /* BS10076 */
+                            lock_scope,
+                            &envir_ptr->msg_params);
+      ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_OS,
+       "...<- OS_CS_lock_init: rc=%d (%s) hndl=%p.",
+			rc, (rc EQ ESA_OK) ? "OS==OK" : "OS##OK",
+			envir_ptr->lock[ii].lock_handle);
+      if (rc NE ESA_OK) {
+        CTSAMSG_print (ERR_CS_INIT_FILE,
+                       envir_ptr->ctsamsg_handle, NULL,
+                       envir_ptr->ctsamsg_dest,
+                       fn, file_name, func_name) ;
+        if (rc EQ ESA_FATAL)
+           rc= ESA_TERM_CTSA;
+        goto cleanup;
+      }
+      envir_ptr->lock[ii].sw_init= 1;
+    }
+  }
+ 
+  if (envir_ptr->lock[ii].sw_lock EQ 0) {
+    if (strcmp (open_code, FILE_OPEN_FOR_READ) NE 0) {
+      ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_OS,
+    "...-> OS_CS_lock: hndl=%p wait=%d / %d line=%d.",    /* BS10076 */
+	  envir_ptr->lock[ii].lock_handle, /* BS10076 envir_ptr->lock_wait, */
+   wait_lock_value, wait_lock_interval_value,             /* BS10076 */
+	  __LINE__);
+      rc= OS_CS_lock (envir_ptr->lock[ii].lock_handle,
+           /* BS10076 envir_ptr->lock_wait,                          */
+                      &envir_ptr->msg_params);
+      ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_OS,
+        "...<- OS_CS_lock: rc=%d (%s)",
+			rc, (rc EQ ESA_OK) ? "OS==OK" : "OS##OK");
+      if (rc NE ESA_OK) {
+        CTSAMSG_print (ERR_CS_LOCK_FILE,
+                       envir_ptr->ctsamsg_handle, NULL,
+                       envir_ptr->ctsamsg_dest,
+                       fn, file_name, func_name) ;
+        if (rc EQ ESA_FATAL)
+           rc= ESA_TERM_CTSA;
+        goto cleanup;
+      }
+      envir_ptr->lock[ii].sw_lock= 1;
+    }
+  }
+ 
+  strcpy(ddn_with,"DD:");                                 /* SAS2IBMT */
+  strcat(ddn_with, file_name);                            /* SAS2IBMT */
+ 
+  /* SAS2IBMT *open_handle= fopen(file_name, open_code);             */
+  *open_handle= fopen(ddn_with, open_code);               /* SAS2IBMT */
+ 
+  if (*open_handle EQ NULL) {
+    CTSAMSG_print (ERR_FILE,
+                   envir_ptr->ctsamsg_handle, NULL,
+                   envir_ptr->ctsamsg_dest,
+                   fn, "open",
+                   file_name, strerror(errno));
+    rc= ESA_ERR;
+    goto cleanup;
+  }
+ 
+  envir_ptr->lock[ii].sw_open= 1;
+  envir_ptr->lock[ii].open_handle= *open_handle;
+ 
+ cleanup:
+  if (rc NE ESA_OK)
+     CTSAMSG_print (ERR_CS_FUNCTION,
+                   envir_ptr->ctsamsg_handle, NULL,
+                   envir_ptr->ctsamsg_dest, fn);
+  if (rc EQ ESA_TERM_CTSA)
+     CTSAMSG_print (MSG_WAIT_TERMINATE_OUT,
+                   envir_ptr->ctsamsg_handle, NULL,
+                   envir_ptr->ctsamsg_dest, fn) ;
+  ESA_DIAG_exit (ESA_COMP_ACSLOCK, DIAG_COMMON, fn, rc);
+ 
+  return (rc);
+}
+ 
+/****************************************************
+ * Procedure Name: CSA_close
+ * Description   : close file
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CSA_close (char * file_name,
+                  char * func_name)
+{
+  char                  fn[]="CSA_close";
+  int                   ii= 0;
+  ESA_RC                rc= ESA_OK;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSLOCK, DIAG_COMMON, fn);
+  ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_DETAILES,
+	  "file=%s (func=%s)", file_name, func_name);
+  if (envir_ptr->lock_rows EQ 0) {
+    ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_DETAILES,
+                     "LOCK_TBL is empty");
+    goto cleanup;
+  }
+ 
+  for (ii= 0; ii LT envir_ptr->lock_rows; ii++ ) {
+    if (strcmp (envir_ptr->lock[ii].file_name, file_name) EQ 0)
+      break;
+  }
+ 
+  if (ii LT envir_ptr->lock_rows) {
+    if (envir_ptr->lock[ii].sw_open EQ 0) {
+      ESA_DIAG_printf (ESA_COMP_ACSLOCK, 11,
+          "file %s is not opened(func %s)",
+                     file_name, func_name);
+      goto cleanup;
+    }
+ 
+    rc= fclose (envir_ptr->lock[ii].open_handle);
+    if (rc NE ESA_OK) {
+       envir_ptr->msg_dest->dests[CTSAMSG_DEST_CNSL].active= FLAG_YES;
+       CTSAMSG_print (ERR_CS_CLOSE_FILE,
+                      envir_ptr->ctsamsg_handle, NULL,
+                      envir_ptr->ctsamsg_dest,
+                      fn, file_name ,func_name, strerror(errno)) ;
+       envir_ptr->msg_dest->dests[CTSAMSG_DEST_CNSL].active= FLAG_NO;
+    }
+    envir_ptr->lock[ii].sw_open= 0;
+    envir_ptr->lock[ii].open_handle= NULL;
+ 
+    if (envir_ptr->lock[ii].sw_lock NE 0) {
+      ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_OS,
+        "...-> OS_CS_unlock: hndl=%p line=%d.",
+        envir_ptr->lock[ii].lock_handle, __LINE__);
+      rc= OS_CS_unlock  (envir_ptr->lock[ii].lock_handle,
+                     &envir_ptr->msg_params);
+      ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_OS,
+        "...<- OS_CS_unlock: rc=%d (%s).",
+			rc, (rc EQ ESA_OK) ? "OS==OK" : "OS##OK");
+      if (rc NE ESA_OK) {
+        CTSAMSG_print (ERR_CS_UNLOCK_FILE,
+                       envir_ptr->ctsamsg_handle, NULL,
+                       envir_ptr->ctsamsg_dest,
+                       fn, file_name, func_name) ;
+        goto cleanup;
+      }
+      envir_ptr->lock[ii].sw_lock= 0;
+    }
+    if (envir_ptr->lock[ii].sw_init NE 0) {
+      ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_OS,
+        "...-> OS_CS_lock_term: hndl=%p line=%d.",
+	    envir_ptr->lock[ii].lock_handle, __LINE__);
+      rc= OS_CS_lock_term (&envir_ptr->lock[ii].lock_handle,
+                       &envir_ptr->msg_params);
+      ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_OS,
+       "...<- OS_CS_lock_term: rc=%d (%s).",
+			rc, (rc EQ ESA_OK) ? "OS==OK" : "OS##OK");
+      if (rc NE ESA_OK)
+        CTSAMSG_print (ERR_CS_TERM_FILE,
+                       envir_ptr->ctsamsg_handle, NULL,
+                       envir_ptr->ctsamsg_dest, fn,
+                       envir_ptr->lock[ii].file_name,
+                       envir_ptr->lock[ii].func_name);
+      else
+        envir_ptr->lock[ii].sw_init= 0;
+    }
+  }
+  else
+    CTSAMSG_print (ERR_CS_FILE_NOTFOUND,
+                   envir_ptr->ctsamsg_handle, NULL,
+                   envir_ptr->ctsamsg_dest, fn,
+                   func_name, file_name);
+ 
+ cleanup:
+  if (rc NE ESA_OK)
+    CTSAMSG_print (ERR_CS_FUNCTION,
+                   envir_ptr->ctsamsg_handle, NULL,
+                   envir_ptr->ctsamsg_dest, fn);
+  ESA_DIAG_exit (ESA_COMP_ACSLOCK, DIAG_COMMON, fn, rc);
+  return(rc);
+}
+ 
+/****************************************************
+ * Procedure Name: CSA_close_all
+ * Description   : Close all opened files
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+void  CSA_close_all (void)
+{
+  char                  fn[]="CSA_close_all";
+  int                   ii;
+  ESA_RC                rc= ESA_OK;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSLOCK, DIAG_COMMON, fn);
+ 
+  if (envir_ptr->lock_rows EQ 0)
+    goto cleanup;
+ 
+  for (ii= 0; ii LT envir_ptr->lock_rows; ii++ ) {
+ 
+     if (envir_ptr->lock[ii].sw_open NE 0) {
+      fclose (envir_ptr->lock[ii].open_handle);
+      CTSAMSG_print (ERR_CS_NOT_CLOSED_FILE,
+                     envir_ptr->ctsamsg_handle, NULL,
+                     envir_ptr->ctsamsg_dest,
+                     fn, envir_ptr->lock[ii].file_name,
+                     envir_ptr->lock[ii].func_name);
+      envir_ptr->lock[ii].sw_open= 0;
+      envir_ptr->lock[ii].open_handle= NULL;
+    }
+    if (envir_ptr->lock[ii].sw_lock NE 0) {
+      CTSAMSG_print (ERR_CS_NOT_UNLOCKED_FILE,
+                     envir_ptr->ctsamsg_handle, NULL,
+                     envir_ptr->ctsamsg_dest,
+                     fn, envir_ptr->lock[ii].file_name,
+                     envir_ptr->lock[ii].func_name);
+      ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_OS,
+        "...-> OS_CS_unlock: hndl=%p line=%d.",
+        envir_ptr->lock[ii].lock_handle, __LINE__);
+      rc= OS_CS_unlock  (envir_ptr->lock[ii].lock_handle,
+                         &envir_ptr->msg_params);
+      ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_OS,
+        "...<- OS_CS_unlock: rc=%d (%s).",
+			rc, (rc EQ ESA_OK) ? "OS==OK" : "OS##OK");
+      if (rc NE ESA_OK)
+        CTSAMSG_print (ERR_CS_UNLOCK_FILE,
+                       envir_ptr->ctsamsg_handle, NULL,
+                       envir_ptr->ctsamsg_dest, fn,
+                       envir_ptr->lock[ii].file_name,
+                       envir_ptr->lock[ii].func_name);
+      else
+        envir_ptr->lock[ii].sw_lock= 0;
+    }
+    if (envir_ptr->lock[ii].sw_init NE 0) {
+      ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_OS,
+        "...-> OS_CS_lock_term: hndl=%p line=%d.",
+	    envir_ptr->lock[ii].lock_handle, __LINE__);
+      rc= OS_CS_lock_term (&envir_ptr->lock[ii].lock_handle,
+                       &envir_ptr->msg_params);
+      ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_OS,
+       "...<- OS_CS_lock_term: rc=%d (%s).",
+			rc, (rc EQ ESA_OK) ? "OS==OK" : "OS##OK");
+      if (rc NE ESA_OK)
+        CTSAMSG_print (ERR_CS_TERM_FILE,
+                       envir_ptr->ctsamsg_handle, NULL,
+                       envir_ptr->ctsamsg_dest, fn,
+                       envir_ptr->lock[ii].file_name,
+                       envir_ptr->lock[ii].func_name);
+      else
+        envir_ptr->lock[ii].sw_init= 0;
+    }
+  }
+ 
+ cleanup:
+  ESA_DIAG_exit (ESA_COMP_ACSLOCK, DIAG_COMMON, fn,
+                 ESA_RC_VOID);
+  return;
+}
+ 
+ 
+/****************************************************
+ * Procedure Name: CSA_fgets
+ * Description   : Read table row
+ * Input         : tbl_name
+ *                 tbl_row_len
+ *                 tbl_handle
+ * Output        : tbl_row
+ * Return Value  : rc   ESA_EOF if end of file
+ *                      ESA_OK  if readed row
+ *                      ESA_ERR other case
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CSA_fgets (char         * tbl_name,
+                  char         * tbl_row,
+                  int            tbl_row_max_len,
+                  FILE         * tbl_handle)
+{
+  char                  fn[]="CSA_fgets";
+  ESA_RC                rc= ESA_OK;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSLOCK, DIAG_COMMON+ 1, fn);
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSLOCK, 13,
+                   "tbl_name=%s tbl_row_max_len=%d.",
+                   tbl_name, tbl_row_max_len);
+ 
+  fgets(tbl_row,
+        tbl_row_max_len,
+        tbl_handle);
+ 
+  if (feof(tbl_handle) NE 0)
+  {
+     ESA_DIAG_printf (ESA_COMP_ACSLOCK, 16,
+                      "Endof file");
+     rc= ESA_EOF;
+     goto cleanup;
+  }
+ 
+  /* Beware from I/O errors */
+  if (ferror(tbl_handle))
+  {
+     CTSAMSG_print (ERR_FILE,
+                    envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                    envir_ptr->msg_admin_param.ctsamsg_dest,
+                    "read",
+                    fn,
+                    tbl_name,
+                    strerror(errno));
+     rc= ESA_ERR;
+     goto cleanup;
+  } /* if i/o error */
+  ESA_DIAG_printf (ESA_COMP_ACSLOCK, 14,
+                   "tbl_row=%s.", tbl_row);
+ 
+cleanup:
+  ESA_DIAG_exit (ESA_COMP_ACSLOCK, DIAG_COMMON+ 1, fn, rc);
+ 
+  return (rc);
+}
+ 
+ 
+ 
+/****************************************************
+ * Procedure Name: CSA_fputs
+ * Description   : Write table row
+ * Input         : tbl_name
+ *                 tbl_handle
+ * Return Value  : rc   ESA_OK  if readed row
+ *                      ESA_ERR other case
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CSA_fputs (char         * tbl_name,
+                  char         * tbl_row,
+                  FILE         * tbl_handle)
+{
+  char                  fn[]="CSA_fputs";
+  ESA_RC                rc= ESA_OK;
+  int                   jj;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSLOCK, DIAG_COMMON, fn);
+  ESA_DIAG_printf (ESA_COMP_ACSLOCK, DIAG_OS,
+                   "File %s: Add row=%s.", tbl_name, tbl_row);
+ 
+  if ((jj= fputs(tbl_row,
+                 tbl_handle)) EQ EOF)
+  {
+     CTSAMSG_print (ERR_FILE,
+                    envir_ptr->msg_admin_param.ctsamsg_handle,
+                    NULL,
+                    envir_ptr->msg_admin_param.ctsamsg_dest,
+                    "write",
+                    fn,
+                    tbl_name,
+                    strerror(errno));
+    rc= ESA_ERR;
+  } /* if i/o error */
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSLOCK, DIAG_COMMON, fn, rc);
+ 
+  return (rc);
+ 
+}

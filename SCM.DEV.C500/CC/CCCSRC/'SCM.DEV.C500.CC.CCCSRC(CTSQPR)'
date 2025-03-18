@@ -1,0 +1,616 @@
+/**************************************************************
+* Title            : Control-SA Queue dump utility            *
+* File Name        : ctsqpr.c                                 *
+* Author           : Alexander Shvartsman                     *
+* Creation Date    : 30.10.94                                 *
+* Description      : Dump QUEUE file contents without         *
+*                    affecting the queue in any way.          *
+* Parameters       : queue file name                          *
+* Assumptions and                                             *
+*   Considerations : None.                                    *
+* $Author:   doron  $
+* $Workfile:   CTSQPR.C  $
+* $Revision:   1.10  $
+* $Log:   //netapp-nt1/versions/300/utils/src/ctsqpr.c_v  $
+ *
+ *    Rev 1.10   13 Apr 1999 15:17:36   doron
+ * Changes for Tandem
+ *
+ *    Rev 1.9   Aug 17 1998 11:52:30   ajk
+ * Fixed SCCSID for Unix 'what' command
+ *
+ *    Rev 1.8   Aug 04 1998 14:45:34   leonid_s
+ *
+**************************************************************/
+/********************************************************************
+* Mod.ID  Who            When         Description
+* ===================================================================
+* IMH001  Ian H.   17/9/03      Add support for CheckAndPrintVersion
+* IMH002  Ian H.   16/11/03     Thread-safe code (ERRNO)
+*SAS2IBMT SeligT   30/06/16     SAS/C to IBM C Conversion Project
+*SAS2IBMN NuritY   02/03/17     SAS/C to IBM C Conversion Project
+********************************************************************/
+ 
+#define    THIS_IS_MAIN
+#include   "globs.h"
+ 
+/*
+ *   Standard include files
+ */
+ 
+#include   ERRNO   /* IMH002 */
+#include   CTYPE
+ 
+#include   FCNTL
+#include   STDARG
+#include   STDIO
+#include   STDLIB
+#include   STRING
+ 
+/*
+ *   CONTROL-SA include files
+ */
+ 
+#include   ESA_API
+#include   ESA_CTSAMSG
+#include   ESA_QUEUE
+#include   ESA_CS_OS
+#include   ESA_INIT
+#include   ESA_RSS
+#include   ESA_API_CODES
+#include   ESA_VER
+ 
+ 
+    SCCSID("@(#) ctsqpr.c \
+$Revision:   1.10  $\
+$Date:   13 Apr 1999 15:17:36  $\
+$Author:   doron  $")
+ 
+ 
+/**************************************************************
+*                                                             *
+*   Defines                                                   *
+*                                                             *
+**************************************************************/
+ 
+#define QBUFSIZE                 512
+ 
+#define PRINT_REC0               "REC0"
+#define PRINT_SHORT              "SHORT"
+#define PRINT_LONG               "FULL"
+#define PRINT_NUMBER_OF_RECORDS  "RECNUM"
+#define PRINT_FILE_NAME_DEFAULT  "PRTQUE"
+ 
+#define PRINT_SHORT_LEN          80
+ 
+#define header_line_start1  "Queue printing utility started at %s"
+#define header_line_start2  "Print mode %s"
+#define header_line_end_ok  "Queue printing utility ended at %s"
+#define header_line_end_err  "Queue printing \
+ utility ended at %s with error"
+#define header_rec_proc     "%d messages were processed \n "
+#define header_no_rec       "No messages were processed-Queue is empty \n "
+#define header_line1        "Record 0 data: "
+#define header_line2        "Next read=%d Next write=%d "
+#define header_line3        "Max used=%d Max size=%d "
+#define header_line4        "Position Length   Data"
+#define print_wrn           "Record is too long"
+ 
+/**************************************************************
+*                                                             *
+*   Local Variables                                           *
+*                                                             *
+**************************************************************/
+ 
+static Q_HANDLE               q_handle;
+static Q_REC0                 q_rec0;
+static Q_REC0                 q_rec00;
+static char                   print_kind[10];
+static char                   print_file_name[100];
+static FILE                  *print = NULL;
+static int                    record_counter;
+static char                   blanks[]="                  ";  /* 18 */
+static char print_kind_default[] = PRINT_REC0;
+ 
+/****************************************************
+ * Procedure Name: get_current_time
+ * Description   : Returns a pointer to a string that contains
+ *                 the current time.
+ * Input         : None
+ * Output        : None
+ * Return Value  : Current time, string, format yy/mm/dd-hh:mm:ss
+ * Scope         : Stolen from ESADIAG package
+ * Side Effects  :
+ ****************************************************/
+ 
+static char * get_current_time (void)
+{
+   time_t      time_1970;
+   struct tm   time_rec;
+   static char time_str [24]; /* enough to contain formatted string */
+ 
+ 
+   time (&time_1970);
+ 
+   memcpy ((char *)&time_rec,
+           (char *)localtime (&time_1970),
+           sizeof (time_rec));
+ 
+   sprintf (time_str,
+            "%4d/%02d/%02d %02d:%02d:%02d",
+            1900+time_rec.tm_year, time_rec.tm_mon+1, time_rec.tm_mday,
+            time_rec.tm_hour, time_rec.tm_min,   time_rec.tm_sec);
+ 
+   return time_str;
+ 
+} /* get_current_time */
+ 
+/**************************************************************
+*                                                             *
+*   update crypt unprintable symbols                          *
+*                                                             *
+**************************************************************/
+ 
+static void update_crypt_symb (char  *buf,
+                               int    len,
+                               char   smb)
+{
+   int    i;
+ 
+   for (i=0; i LT len ; i++, buf++ ) {
+      if ( isprint( *buf ) EQ 0 )   /* Unprintable symbol */
+         *buf = smb ;
+    }
+} /* update_crypt_symb */
+ 
+/**************************************************************
+*                                                             *
+*   Print start                                               *
+*                                                             *
+**************************************************************/
+ 
+static int print_start (void)
+{
+    int    i;
+    char   line[100];
+ 
+   /*
+    *    Print header lines
+    */
+ 
+    sprintf(line, header_line_start1 , get_current_time() );
+    i=fwrite(line, strlen(line), 1, print);
+    putc(NEWLINE, print);
+    fflush(print);
+ 
+    i=fwrite(blanks, strlen(blanks), 1, print);
+    putc(NEWLINE, print);
+    fflush(print);
+ 
+    sprintf(line, header_line_start2 , print_kind );
+    i=fwrite(line, strlen(line), 1, print);
+    putc(NEWLINE, print);
+    fflush(print);
+ 
+    i=fwrite(blanks, strlen(blanks), 1, print);
+    putc(NEWLINE, print);
+    fflush(print);
+ 
+    return i;
+ } /* print_start */
+ 
+/**************************************************************
+*                                                             *
+*   Print end                                                 *
+*                                                             *
+**************************************************************/
+ 
+static void print_end (int  k, ESA_RC  rc)
+{
+    int                     i;
+    char                    line[100];
+    ENVIRONMENT_rec_typ   * envir_ptr;
+ 
+    CS_get_envir_address (&envir_ptr);
+ 
+   /*
+    *    Print bottom lines
+    */
+ 
+    i=fwrite(blanks, strlen(blanks), 1, print);
+    putc(NEWLINE, print);
+    fflush(print);
+ 
+    if ( strcmp( print_kind, PRINT_REC0 ) NE 0 ) {
+ 
+      if ( record_counter EQ 0 ) {
+ 
+          CTSAMSG_print(WRN_QPR_NO_RECORDS,
+                        envir_ptr->ctsamsg_handle,
+                        NULL,
+                        envir_ptr->ctsamsg_dest);
+ 
+          strcpy(line, header_no_rec ) ;
+      }
+      else {
+ 
+          CTSAMSG_print(MSG_QPR_NUM_RECORDS,
+                        envir_ptr->ctsamsg_handle,
+                        NULL,
+                        envir_ptr->ctsamsg_dest,
+                        record_counter );
+ 
+          sprintf(line, header_rec_proc, record_counter );
+ 
+      }
+    }    /* no print_rec0 */
+    else  {
+          CTSAMSG_print(MSG_QPR_NUM_RECORDS,
+                        envir_ptr->ctsamsg_handle,
+                        NULL,
+                        envir_ptr->ctsamsg_dest,
+                        record_counter );
+ 
+          sprintf(line, header_rec_proc, record_counter );
+    }      /* print rec0    */
+ 
+    i=fwrite(line, strlen(line), 1, print);
+    putc(NEWLINE, print);
+    fflush(print);
+ 
+    /* Print termination message */
+ 
+    if ((k EQ 1) AND ((rc EQ ESA_OK) OR (rc EQ ESA_EOF)))
+       sprintf(line, header_line_end_ok , get_current_time() );
+    else
+       sprintf(line, header_line_end_err, get_current_time() );
+ 
+    i=fwrite(line, strlen(line), 1, print);
+    putc(NEWLINE, print);
+    fflush(print);
+ 
+ } /* print_end */
+ 
+/**************************************************************
+*                                                             *
+*   Print record0                                             *
+*                                                             *
+**************************************************************/
+ 
+static void print_record0 (void)
+{
+    char line[100];
+    int  i;
+ 
+   /*
+    *    Print header lines
+    */
+ 
+    i=fwrite(header_line1, strlen(header_line1), 1, print);
+ 
+    sprintf(line, header_line2, (int)q_rec0.get_pos,
+            (int)q_rec0.put_pos);
+    i=fwrite(line, strlen(line), 1, print);
+ 
+    sprintf(line, header_line3, (int)q_rec0.last_pos,
+            (int)q_rec0.end_pos);
+    i=fwrite(line, strlen(line), 1, print);
+    putc(NEWLINE, print);
+    fflush(print);
+ 
+ } /* print_record0 */
+ 
+/**************************************************************
+*                                                             *
+*   Print header lines                                        *
+*                                                             *
+**************************************************************/
+ 
+static int print_header_lines (void)
+{
+    char line[100];
+    int  i;
+ 
+   /*
+    *    Queue is empty
+    */
+ 
+    if ((NOT q_rec0.wrap) AND (q_rec0.get_pos EQ q_rec0.put_pos)) {
+      strcpy(line,"Queue is empty");
+      i=fwrite(line, strlen(line), 1, print);
+      putc(NEWLINE, print);
+      fflush(print);
+    }
+ 
+   /*
+    *    Queue with information. Print header lines
+    */
+ 
+    else {
+       i=fwrite(blanks, strlen(blanks), 1, print);
+       putc(NEWLINE, print);
+       fflush(print);
+ 
+       i=fwrite(header_line4, strlen(header_line4), 1, print);
+       putc(NEWLINE, print);
+       fflush(print);
+ 
+       memset(line,'-',sizeof(line));
+       line[8] = BLANK;
+       line[17]= BLANK;
+ 
+       i=fwrite(line, sizeof(line), 1, print);
+       putc(NEWLINE, print);
+       fflush(print);
+ 
+    }
+ 
+    return i;
+ 
+  } /* print_header_lines */
+ 
+/**************************************************************
+*                                                             *
+*   Print buffer                                              *
+*                                                             *
+**************************************************************/
+ 
+static int print_buffer (char * buf, int len)
+{
+   char   header[50];
+   int    i;
+   int    print_len;
+ 
+  /*
+   *    Preparing position and length of data for print
+   */
+ 
+   sprintf(header,"%08d %08d ", (int)q_rec0.get_pos, len);
+ 
+   i=fwrite(header, strlen(header), 1, print);
+   if ( i NE 1 )
+     goto exit ;
+ 
+   update_crypt_symb(buf, len,  '.' );
+ 
+  /*
+   *    If SHORT print required
+   */
+ 
+   if ( ( strcmp(print_kind, PRINT_SHORT ) EQ 0 ) AND
+        ( len GT PRINT_SHORT_LEN )                  )
+     len=PRINT_SHORT_LEN;
+ 
+   if ( len GT PRINT_SHORT_LEN )
+     print_len = PRINT_SHORT_LEN ;
+   else
+     print_len = len;    /*  PRINT_LONG  */
+ 
+   do {
+      i=fwrite(buf, (unsigned)print_len, 1, print);
+      putc(NEWLINE, print);
+      fflush(print);
+      if ( i NE 1 )
+         goto exit ;
+      len -= PRINT_SHORT_LEN;
+      buf += PRINT_SHORT_LEN;
+ 
+      if ( len GT PRINT_SHORT_LEN )
+         print_len = PRINT_SHORT_LEN ;
+      else
+         print_len = len;
+ 
+      if ( len GT 0 )  {
+         i=fwrite(blanks, strlen(blanks), 1, print);
+         if ( i NE 1 )
+            goto exit ;
+      }
+   }  while ( len GT 0 ) ;
+ 
+  exit :;
+   return i;
+} /* print_buffer */
+ 
+/**************************************************************
+*                                                             *
+*   Convert string to Uppercase                               *
+*                                                             *
+**************************************************************/
+ 
+static void upper (char * str)
+{
+   while (*str)  {
+      *str = toupper(*str);
+      str++;
+   }
+}
+ 
+/**************************************************************
+*                                                             *
+*   Dump queue                                                *
+*                                                             *
+**************************************************************/
+ 
+static int dump_queue (void)
+{
+   char buf [QBUFSIZE];
+   int  i=0;
+   char line[100];
+   char ddn_with[12]="";                                  /* SAS2IBMT */
+   int  len=0;             /* len=0 - first entry */
+                           /* will be read rec0   */
+   ESA_RC  rc     = ESA_OK ;
+ 
+   record_counter = 0 ;
+ 
+   strcpy(ddn_with,"DD:");                                /* SAS2IBMT */
+   strcat(ddn_with, print_file_name);                     /* SAS2IBMT */
+ 
+   /* SAS2IBMT print = fopen( print_file_name,"w");                  */
+   print = fopen(ddn_with,"w,recfm=*");                   /* SAS2IBMT */
+   if (print EQ NULL) {
+       fprintf (stderr, "Failed to open print QUEUE file %s\n",
+               strerror(errno));
+       goto exit;
+   }
+ 
+   i=print_start();   /* print start information */
+   if ( i NE 1 )  {   /* i/o error               */
+      rc=ESA_FATAL;
+      goto exit ;
+   }
+ 
+   /***** Read record0 *****/
+ 
+   rc = OS_Q_read(buf, &len, QBUFSIZE, &q_handle, &q_rec0,
+                  TRUE);                                 /* SAS2IBMN */
+ 
+   memcpy((char *)&q_rec00, (char *)&q_rec0 , sizeof(Q_REC0) );
+ 
+   if ( rc NE ESA_FATAL )  /* print record0 */
+      print_record0();
+ 
+  /*
+   *    If only print rec0 required -> exit
+   */
+ 
+   if ( strcmp(print_kind,PRINT_REC0) EQ 0 )
+      goto exit ;
+ 
+   if ( strcmp(print_kind,PRINT_NUMBER_OF_RECORDS) NE 0 )
+   {
+      i=print_header_lines();
+      if ( i NE 1 )  {   /* i/o error               */
+         rc=ESA_FATAL;
+         goto exit ;
+	  }
+   }
+   /***** loop on all queue items *****/
+   len=1;
+ 
+   while ( rc EQ ESA_OK ) {
+ 
+    /* read an item from the queue */
+ 
+     memcpy((char *)&q_rec0, (char *)&q_rec00, sizeof(Q_REC0) );
+     rc = OS_Q_read(buf, &len, QBUFSIZE, &q_handle, &q_rec00,
+                    TRUE);                               /* SAS2IBMN */
+ 
+    /* print the item */
+ 
+     if ( rc EQ ESA_OK) {
+         record_counter++;
+         if ( strcmp(print_kind,PRINT_NUMBER_OF_RECORDS) EQ 0 )
+	        continue;
+         i=print_buffer(buf,len);
+         if ( i NE 1 ) {
+            fprintf(stderr,"Failed to put print %s\n", strerror(errno));
+            goto exit ;
+         }
+     }
+ 
+    /*
+     *    rc NE ESA_OK
+     */
+ 
+     else  if ( rc EQ ESA_ERR ) {    /* Record is too long */
+        record_counter++;
+        rc = ESA_OK ;
+        sprintf(line,"%08d %08d  %s", (int)q_rec0.get_pos, len,
+                print_wrn);
+        i=fwrite(line, strlen(line), 1, print);
+        putc(NEWLINE, print);
+        fflush(print);
+     }
+ 
+   }
+  exit:;
+ 
+   print_end(i,rc);     /* print end information */
+ 
+   fclose(print);
+ 
+   return rc;
+} /* dump_queue */
+ 
+/**************************************************************
+*                                                             *
+*   ESAQPR Main                                               *
+*                                                             *
+**************************************************************/
+ 
+int main (int argc, char **argv)
+{
+ 
+   ESA_RC                  rc;
+   char                    qname[MAX_FILENAME_LEN];
+   ENVIRONMENT_rec_typ   * envir_ptr;
+ 
+   /*
+   *  Print and analysis parameters
+   */
+ 
+   qname[0]           = NULL_CHAR;  /* Queue DD name                */
+   print_kind[0]      = NULL_CHAR;  /* Kind of print:SHORT/LONG/REC0*/
+   print_file_name[0] = NULL_CHAR;  /* print file DD                */
+ 
+   if ( argc GT 1 ) {               /* kind of print:SHORT/LONG/REC0*/
+     strcpy(print_kind,argv[1]);
+     upper(print_kind);
+   }
+ 
+   if ( print_kind[0] EQ NULL_CHAR )
+      strcpy(print_kind, print_kind_default );
+  /*
+   *    Prolog
+   */
+ 
+   rc= CG_prolog (ESA_QPR_PROC, argc, argv);
+ 
+   CS_get_envir_address (&envir_ptr);
+ 
+   if (rc NE ESA_OK) {
+      fprintf (stderr, PROLOG_INIT_ERROR, ESA_MAIN_QPR,
+               ESA_rc2str(rc));
+      goto exit;
+   }
+ 
+/* IMH001 start */
+ 
+   rc = CheckAndPrintVersion (argc, argv);
+   if (rc EQ ESA_OK)
+       goto exit;
+ 
+    rc = ESA_OK;
+/* IMH001 end */
+ 
+  /*
+   *    Get parameters from environment
+   */
+ 
+   if ( envir_ptr->file_queue[0] NE NULL_CHAR ) /* queue file       */
+      strcpy(qname, envir_ptr->file_queue);
+ 
+   if ( envir_ptr->print_queue[0] NE NULL_CHAR )/* print queue file */
+      strcpy(print_file_name,envir_ptr->print_queue);
+ 
+   if ( print_file_name[0] EQ NULL_CHAR )
+      strcpy(print_file_name, PRINT_FILE_NAME_DEFAULT );
+ 
+   rc = OS_Q_open(qname,&q_handle,&(envir_ptr->msg_params) );
+   if (rc NE ESA_OK ) {
+      fprintf(stderr, "Failed to open QUEUE file %s\n", qname);
+      goto exit;
+   }
+ 
+   dump_queue();
+ 
+   rc = OS_Q_close(&q_handle);
+ 
+exit:;
+ 
+   CG_epilog(rc, 0);
+ 
+   return (rc EQ ESA_OK ? PLAT_OK_STAT : PLAT_FAIL_STAT) ;
+ 
+} /* QPR main */

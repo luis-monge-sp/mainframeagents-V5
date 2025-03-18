@@ -1,0 +1,1318 @@
+/*
+ * Version Information:
+ * ====================
+ * File name       : %name: acsgpcf.c %
+ * Instance        : %instance: 1 %
+ * Created by      : %created_by: leonid_s %
+ * Created on      : %date_created: Sun Jul 25 15:03:44 2004 %
+ * Current Version : %version: 2.1.1 %
+ * Last Modified by: %derived_by: leonid_s %
+ * Last Modified on: %date_modified: Tue Feb 24 13:34:49 2004 %
+ */
+ 
+/***********************************************
+ * Mod.ID   Who      When         Description
+ * =============================================
+ * SAS2IBMA AvnerL   21-Dec-16    SAS/C to IBM C Conversion Project
+ * WS10078KG KailasP 23-Apr-20    Support Role and Source
+ * BS10108  KailasP  12-Oct-20    Add function name for Role and Source
+ * WS10080  KailasP  29-Jul-21    Support MSGSIZE Greater than 32K
+ **********************************************/
+ 
+#include "globs.h"
+ 
+ 
+#include ESA_INIT
+#include ESA_PROC
+#include ESA_RSSF
+#include ESA_RSS
+#include ESA_DIAG
+#include ESA_API_CODES
+#include ESA_CS_OS
+#include ESA_OS_PROC
+#include ESA_QUEUE
+#include ENC_API
+ 
+/****************************************************
+ * Procedure Name: CS_set_fld
+ * Description   : set field to
+ *
+ * Input         :
+ *
+ * Input/Output  :
+ *
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+MSG_typ * CS_set_fld (const char         * field,
+                      MSG_typ            * msg_ptr,
+                      NUM_MSGS_typ       * msg_len,
+                      int                  max_len,
+                      const char         * fld_name)
+{
+  char                  fn[]="CS_set_fld";
+  int                   length;
+  ESA_RC                rc= ESA_OK;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSGPCF, DIAG_COMMON, fn);
+  CS_get_envir_address (&envir_ptr);
+ 
+  length  = strlen(field);
+  if (length GT max_len) {
+    CTSAMSG_print (ERR_CS_MSG_SET_FLD,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   fn, fld_name,
+	   (strcmp (fld_name, C_USER_PASSWD)) ? field : "****",
+	               max_len);
+ 
+    rc= ESA_ERR;
+    goto cleanup;
+  }
+  if (envir_ptr->max_msg_size- ENC_ADD_MAX_LEN LT
+      (*msg_len)+ length +STRUCT_LEN) {
+      CTSAMSG_print (ERR_CS_MSG_SET_CHK,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   fn, fld_name, envir_ptr->max_msg_size);
+ 
+    rc= ESA_ERR;
+    goto cleanup;
+  }
+  sprintf(msg_ptr,"%03X", length);
+  msg_ptr +=STRUCT_LEN;
+  * msg_len +=STRUCT_LEN;
+  strcpy (msg_ptr, field);
+  msg_ptr +=length;
+  * msg_len +=length;
+ 
+  cleanup:
+  ESA_DIAG_exit (ESA_COMP_ACSGPCF, DIAG_COMMON, fn, ESA_RC_VOID);
+  if (rc NE ESA_OK)
+    return ((MSG_typ *)NULL);
+  else
+    return(msg_ptr);
+}
+ 
+/****************************************************
+ * Procedure Name: CS_time
+ * Description   : find the curent time
+ *
+ * Input         :
+ *
+ * Input/Output  :
+ *
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+char * CS_time (void)
+{
+  struct tm         uxtime;
+  time_t            ltime;
+  static CS_TIME    time_trn;
+  char              ntime[7];
+  char fn[]="CS_time";
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSGPCF, DIAG_COMMON, fn);
+  time (&ltime);
+ 
+  memcpy ((char *)&uxtime,
+	      (char *)ConvertTimeToTMStruct (&ltime, &uxtime),
+		  sizeof (struct tm));
+ 
+  sprintf (ntime, "%02d%02d%02d",
+           uxtime.tm_hour % 100,
+           uxtime.tm_min  % 100,
+           uxtime.tm_sec  % 100);
+ 
+  memcpy ((char *)(&time_trn),(char *)ntime,sizeof(CS_TIME));
+  ESA_DIAG_exit (ESA_COMP_ACSGPCF, DIAG_COMMON, fn, ESA_RC_VOID);
+  return (time_trn);
+}
+ 
+/****************************************************
+ * Procedure Name: CS_gensiid
+ * Description   :
+ *
+ * Input         :
+ *
+ * Input/Output  :
+ *
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+char * CS_gensiid (void)
+{
+  long int              siid;
+  static char           result [10];
+  char                  cstime [sizeof(CS_TIME)+1];
+  ENVIRONMENT_rec_typ * envir_ptr;
+  char fn[]="CS_gensiid";
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSGPCF, DIAG_COMMON, fn);
+  CS_get_envir_address (&envir_ptr);
+ 
+  CLEAR(result);
+  CLEAR(cstime); /* larger by 1 char than CS_TIME */
+ 
+  memcpy ((char *)cstime, CS_time(), sizeof (CS_TIME));
+ 
+  sscanf (cstime, "%ld", (int *) &siid);
+ 
+  /* generate the integer siid */
+ 
+  siid = siid  * 1000 + envir_ptr->last_siid;
+ 
+  envir_ptr->last_siid +=2;
+ 
+  /* generate only ODD SIIDs; Even SIIDs are reserved for ESS */
+ 
+  if (siid % 2) {
+    siid++;
+  }
+ 
+  sprintf(result, "%09ld", siid);
+  ESA_DIAG_exit (ESA_COMP_ACSGPCF, DIAG_COMMON, fn, ESA_RC_VOID);
+  return (result);
+}
+ 
+/****************************************************
+ * Procedure Name: CS_creat_cd_header
+ * Description   : used to creat rss message header on
+ *                 the begining of every rss service
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+void CS_creat_cd_header (RSS_MSG_HDR_rec_typ * msg_hdr_cd)
+{
+  ENVIRONMENT_rec_typ * envir_ptr;
+  char fn[]="CS_creat_cd_header";
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSGPCF, DIAG_COMMON, fn);
+  CS_get_envir_address (&envir_ptr);
+ 
+  msg_hdr_cd->mhsid= UPDATE_ESS_SERVICE;
+  memcpy((char *)(&msg_hdr_cd->mhsiid),
+         CS_gensiid(), sizeof(MH_siid));
+  memcpy((char *)(&msg_hdr_cd->mhseq),
+         MH_FIRST_MSG,sizeof(MH_seq));
+  memcpy((char *)(&msg_hdr_cd->mhcid),
+         (char *)(&envir_ptr->dcid),sizeof(MH_dcid));
+  msg_hdr_cd->mhaid = envir_ptr->aid;
+  memcpy((char *)(&msg_hdr_cd->mhwslid),
+         (char *)(&envir_ptr->wslid),sizeof(MH_wslid));
+  memcpy((char *)msg_hdr_cd->mhwsuid,
+         (char *)(&envir_ptr->wsuid),sizeof(MH_wsuid));
+  msg_hdr_cd->mhltl = MH_MESSAGE_LAST_NOT;
+  msg_hdr_cd->mhcmrs = envir_ptr->cmrs;
+  memcpy((char *)(&msg_hdr_cd->mhmtyp),"?",sizeof(MH_mtyp));
+  memcpy((char *)(&msg_hdr_cd->mhrtyp),"?",sizeof(MH_rtyp));
+  ESA_DIAG_exit (ESA_COMP_ACSGPCF, DIAG_COMMON, fn, ESA_RC_VOID);
+}
+ 
+ 
+/****************************************************
+ * Procedure Name: CS_set_last_msg
+ * Description   : copy last message indication to message
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+void CS_set_last_msg (MSG_typ       * msg_ptr)
+{
+  RSS_MSG_HDR_rec_typ * msg_hdr;
+  char fn[]="CS_set_last_msg";
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSGPCF, DIAG_COMMON, fn);
+  msg_hdr= (RSS_MSG_HDR_rec_typ * )msg_ptr;
+  msg_hdr->mhltl = MH_MESSAGE_LAST;
+  ESA_DIAG_exit (ESA_COMP_ACSGPCF, DIAG_COMMON, fn, ESA_RC_VOID);
+}
+ 
+ 
+/****************************************************
+ * Procedure Name: CS_api_to_capi_id
+ * Description   : convert api to comm api id
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_api_to_capi_id (short     api,
+                          MSG_typ * msg_ptr)
+{
+  char                  msgcode[3];
+  RSS_MSG_HDR_rec_typ * msg_hdr;
+  ESA_RC                rc= ESA_OK;
+  char fn[]="CS_api_to_capi_id";
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSGPCF, DIAG_COMMON, fn);
+  msg_hdr= (RSS_MSG_HDR_rec_typ * )msg_ptr;
+ 
+  rc= CS_api_to_msg_code (api,msgcode);
+ 
+  if ((msg_ptr NE NULL) AND (rc EQ ESA_OK) ) {
+    msg_hdr->mhmtyp = msgcode[0];
+    msg_hdr->mhrtyp = msgcode[1];
+  }
+  ESA_DIAG_exit (ESA_COMP_ACSGPCF, DIAG_COMMON, fn, rc);
+  return(rc);
+}
+ 
+ 
+/****************************************************
+ * Procedure Name: CS_api_to_msg_code
+ * Description   : Change Api code to Msg code
+ * Input         : api     - Func code as a number
+ * Output        : msgcode - Msg code as a string
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_api_to_msg_code (short     api,
+                           char    * msgcode)
+ 
+{
+  char                  fn[]="CS_api_to_msg_code";
+  ESA_RC                rc= ESA_OK;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSGPCF, DIAG_COMMON+ 1, fn);
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSGPCF, 15, "%s:api %hu.", fn, api);
+  *msgcode= '\0';
+  switch (api) {
+    case FUNC_ADDUSER:
+     strcpy (msgcode, MSG_USER_ADD);
+     break;
+    case FUNC_DELUSER:
+     strcpy (msgcode, MSG_USER_DEL);
+     break;
+    case FUNC_UPDUSER:
+     strcpy (msgcode, MSG_USER_UPD);
+     break;
+    case FUNC_REVUSER:
+     strcpy (msgcode, MSG_USER_REVOKE);
+     break;
+    case FUNC_UPD_PASS:
+     strcpy (msgcode, MSG_PASSWRD_UPD);
+     break;
+    case FUNC_ADDUG:
+     strcpy (msgcode, MSG_UG_ADD);
+     break;
+    case FUNC_DELUG:
+     strcpy (msgcode, MSG_UG_DEL);
+     break;
+    case FUNC_UPDUG:
+     strcpy (msgcode, MSG_UG_UPD);
+     break;
+    case FUNC_ADDU2UG:
+     strcpy (msgcode, MSG_UG2UC_ADD);
+     break;
+    case FUNC_DELU2UG:
+     strcpy (msgcode, MSG_UG2UC_DEL);
+     break;
+    case FUNC_UPDU2UG:
+     strcpy (msgcode, MSG_UG2UC_UPD);
+     break;
+    case FUNC_ADDACE:
+     strcpy (msgcode, MSG_ACE_ADD);
+     break;
+    case FUNC_DELACE:
+     strcpy (msgcode, MSG_ACE_DEL);
+     break;
+    case FUNC_UPDACE:
+     strcpy (msgcode, MSG_ACE_UPD);
+     break;
+    case FUNC_ADDRES:
+     strcpy (msgcode, MSG_RES_ADD);
+     break;
+    case FUNC_DELRES:
+     strcpy (msgcode, MSG_RES_DEL);
+     break;
+    case FUNC_UPDRES:
+     strcpy (msgcode, MSG_RES_UPD);
+     break;
+    case FUNC_GTUSERS:
+     strcpy (msgcode, MSG_USER_GET);
+     break;
+    case FUNC_GETUGS:
+     strcpy (msgcode, MSG_UG_GET);
+     break;
+    case FUNC_GTUG2UC:
+     strcpy (msgcode, MSG_UG2UC_GET);
+     break;
+    case FUNC_GETRES:
+     strcpy (msgcode, MSG_RES_GET);
+     break;
+    case FUNC_GTRSACL:
+     strcpy (msgcode, MSG_RSACL_GET);
+     break;
+    case FUNC_GTRSPRM:
+     strcpy (msgcode, MSG_RSPRM_GET);
+     break;
+    case FUNC_RSUSER:
+     strcpy (msgcode, MSG_USER_TO_ESS);
+     break;
+    case FUNC_RSUG:
+     strcpy (msgcode, MSG_UG_TO_ESS);
+     break;
+    case FUNC_RSOE:
+     strcpy (msgcode, MSG_OE_TO_ESS);
+     break;
+    case FUNC_RSU2UG:
+     strcpy (msgcode, MSG_UG2UC_TO_ESS);
+     break;
+    case FUNC_RSUSDIS:
+     strcpy (msgcode, MSG_USER_REVOKE);
+     break;
+    case FUNC_RSPWDMOD:
+     strcpy (msgcode, MSG_PASSWRD_UPD);
+     break;
+    case FUNC_RSPRMMOD:
+     strcpy (msgcode, MSG_RSPRMMOD);
+     break;
+    case FUNC_RSLOGEVT:
+     strcpy (msgcode, MSG_LOGEVT_TO_ESS);
+     break;
+    case FUNC_PLATFORM_DETAIL:
+     strcpy (msgcode, MSG_PLATFORM_DETAIL);
+     break;
+    case FUNC_STRSPRM:
+     strcpy (msgcode, MSG_RSPRM_UPD);
+     break;
+    case FUNC_RSSKWD:
+     strcpy (msgcode, MSG_RSSAPIKWD_ADD);
+     break;
+    case FUNC_GETOES:
+     strcpy (msgcode, MSG_OE_GET);
+     break;
+    case FUNC_ADDOE:
+     strcpy (msgcode, MSG_OE_ADD);
+     break;
+    case FUNC_DELOE:
+     strcpy (msgcode, MSG_OE_DEL);
+     break;
+    case FUNC_UPDOE:
+     strcpy (msgcode, MSG_OE_UPD);
+     break;
+    case FUNC_ADDADMIN:
+     strcpy (msgcode, MSG_ADMIN_ADD);
+     break;
+    case FUNC_DELADMIN:
+     strcpy (msgcode, MSG_ADMIN_DEL);
+     break;
+    case FUNC_UPDADMIN:
+     strcpy (msgcode, MSG_ADMIN_UPD);
+     break;
+    case FUNC_RSS_CHECK:
+     strcpy (msgcode, MSG_RSS_STATUS);
+     break;
+    /* WS10078KG - Start */
+    case FUNC_ADDXROL:
+     strcpy (msgcode, MSG_XROL_ADD);
+     break;
+    case FUNC_ADDXSGP:
+     strcpy (msgcode, MSG_XSGP_ADD);
+     break;
+    case FUNC_GETXROL:
+     strcpy (msgcode, MSG_XROL_GET);
+     break;
+    case FUNC_GETXSGP:
+     strcpy (msgcode, MSG_XSGP_GET);
+     break;
+    /* WS10078KG - End */
+    default:
+     CTSAMSG_print (ERR_CS_NBR2STR,
+                    envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                    envir_ptr->msg_admin_param.ctsamsg_dest,
+                    fn, C_API, (int)api);
+     rc= ESA_FATAL;
+     break;
+   } /* switch */
+ 
+   ESA_DIAG_printf (ESA_COMP_ACSGPCF, 15,"msgcode %s.", msgcode);
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSGPCF, DIAG_COMMON+ 1, fn, rc);
+  return(rc);
+}
+ 
+/****************************************************
+ * Procedure Name: CS_set_sngl_msg_len
+ * Description   : set message length
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_set_sngl_msg_len (MSG_typ          * buffer_tmp,
+                            NUM_MSGS_typ       sngl_msg_len)
+{
+  char                  fn[]="CS_set_sngl_msg_len";
+  /*char                  tmp_len[RSS_MSG_LEN+ 1];*/   /*WS10080*/
+  char                  tmp_len[RSS_MSG_LEN_L+ 1];     /*WS10080*/
+  ESA_RC                rc= ESA_OK;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSGPCF, DIAG_COMMON, fn);
+  CS_get_envir_address (&envir_ptr);
+ 
+  /* WS10080: Start - If iiq version is 04 or higher the      *
+   *           message size should be 5 char long instead of  *
+   *           4. transaction length is 3 char instead of 4.   */
+   if(envir_ptr->iiq_version GE 04)
+   {
+      sprintf(tmp_len,"%05X",sngl_msg_len);
+      memcpy((char *)buffer_tmp, tmp_len,RSS_MSG_LEN_L);
+   }
+   else
+   {
+      /*No change in below two lines but corrected indentation*/
+      sprintf(tmp_len,"%04X",sngl_msg_len);
+      memcpy((char *)buffer_tmp, tmp_len,RSS_MSG_LEN);
+   } /* WS10080 - End */
+ 
+  if (envir_ptr->max_msg_size- ENC_ADD_MAX_LEN LT
+      sngl_msg_len+ sizeof (RSS_MSG_HDR_rec_typ)) {
+      CTSAMSG_print (ERR_CS_MSG_SET_CHK,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     fn, C_SNGL_MSG, envir_ptr->max_msg_size);
+    rc= ESA_ERR;
+  }
+  ESA_DIAG_exit (ESA_COMP_ACSGPCF, DIAG_COMMON, fn, rc);
+  return (rc);
+}
+ 
+/****************************************************
+ * Procedure Name: CS_act_nmbr_to_act_name
+ * Description   : convert  api to string
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :ver 2.0.1.1
+ * Scope         :
+ ****************************************************/
+ 
+const char * CS_act_nmbr_to_act_name (short * act)
+{
+   const char  * return_ptr;
+   char fn[]="CS_act_nmbr_to_act_name";
+ 
+   ESA_DIAG_enter (ESA_COMP_ACSGPCF, DIAG_COMMON, fn);
+   switch ( * act) {
+     case SCRIPT_PRE:
+         return_ptr = ACTION_SCRIPTPRE;
+         break;
+ 
+     case SCRIPT_POST:
+         return_ptr = ACTION_SCRIPTPOST;
+         break;
+ 
+     default:
+         return_ptr = ACTION_UNDEFINED;
+   }
+ 
+   ESA_DIAG_exit (ESA_COMP_ACSGPCF, DIAG_COMMON, fn, ESA_RC_VOID);
+   return (return_ptr);
+} /* end of CS_act_nmbr_to_act_name */
+ 
+/****************************************************
+ * Procedure Name: CS_func_nmbr_to_func_name
+ * Description   : convert  api to string
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :ver 2.0.1.1
+ * Scope         :
+ ****************************************************/
+ 
+const char * CS_func_nmbr_to_func_name (short api)
+{
+  const char  * return_ptr;
+  char fn[]="CS_func_nmbr_to_func_name";
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSGPCF, DIAG_COMMON, fn);
+  switch (api) {
+    case FUNC_ADDUSER:
+     return_ptr = FUNC_NAME_ADDUSER;
+     break;
+ 
+    case FUNC_DELUSER:
+     return_ptr = FUNC_NAME_DELUSER;
+     break;
+ 
+    case FUNC_UPDUSER:
+     return_ptr = FUNC_NAME_UPDUSER;
+     break;
+ 
+    case FUNC_REVUSER:
+     return_ptr = FUNC_NAME_REVUSER;
+     break;
+ 
+    case FUNC_UPD_PASS:
+     return_ptr = FUNC_NAME_UPD_PASS;
+     break;
+ 
+    case FUNC_ADDUG:
+     return_ptr = FUNC_NAME_ADDUG;
+     break;
+ 
+    case FUNC_DELUG:
+     return_ptr = FUNC_NAME_DELUG;
+     break;
+ 
+    case FUNC_UPDUG:
+     return_ptr = FUNC_NAME_UPDUG;
+     break;
+ 
+    case FUNC_ADDOE:
+     return_ptr = FUNC_NAME_ADDOE;
+     break;
+ 
+    case FUNC_DELOE:
+     return_ptr = FUNC_NAME_DELOE;
+     break;
+ 
+    case FUNC_UPDOE:
+     return_ptr = FUNC_NAME_UPDOE;
+     break;
+ 
+    case FUNC_ADDU2UG:
+     return_ptr = FUNC_NAME_ADDU2UG;
+     break;
+ 
+    case FUNC_DELU2UG:
+     return_ptr = FUNC_NAME_DELU2UG;
+     break;
+ 
+    case FUNC_UPDU2UG:
+     return_ptr = FUNC_NAME_UPDU2UG;
+     break;
+ 
+    case FUNC_ADDACE:
+     return_ptr = FUNC_NAME_ADDACE;
+     break;
+ 
+    case FUNC_DELACE:
+     return_ptr = FUNC_NAME_DELACE;
+     break;
+ 
+    case FUNC_UPDACE:
+     return_ptr = FUNC_NAME_UPDACE;
+     break;
+ 
+    case FUNC_ADDRES:
+     return_ptr = FUNC_NAME_ADDRES;
+     break;
+ 
+    case FUNC_DELRES:
+     return_ptr = FUNC_NAME_DELRES;
+     break;
+ 
+    case FUNC_UPDRES:
+     return_ptr = FUNC_NAME_UPDRES;
+     break;
+ 
+    case FUNC_GTUSERS:
+     return_ptr = FUNC_NAME_GTUSERS;
+     break;
+ 
+    case FUNC_GETUGS:
+     return_ptr = FUNC_NAME_GETUGS;
+     break;
+ 
+    case FUNC_GETOES:
+     return_ptr = FUNC_NAME_GETOES;
+     break;
+ 
+    case FUNC_GTUG2UC:
+     return_ptr = FUNC_NAME_GTUG2UC;
+     break;
+ 
+    case FUNC_GETRES:
+     return_ptr = FUNC_NAME_GETRES;
+     break;
+ 
+    case FUNC_GTRSACL:
+     return_ptr = FUNC_NAME_GTRSACL;
+     break;
+ 
+    case FUNC_GTRSPRM:
+     return_ptr = FUNC_NAME_GTRSPRM;
+     break;
+ 
+    case FUNC_STRSPRM:
+     return_ptr = FUNC_NAME_STRSPRM;
+     break;
+ 
+    case FUNC_PLATFORM_DETAIL:
+     return_ptr = FUNC_NAME_PLATF_DETAIL;
+     break;
+ 
+    /* BS10108 - start */
+    case FUNC_GETXROL:
+     return_ptr = FUNC_NAME_GETXROL;
+     break;
+ 
+    case FUNC_GETXSGP:
+     return_ptr = FUNC_NAME_GETXSGP;
+     break;
+ 
+    case FUNC_ADDXROL:
+     return_ptr = FUNC_NAME_ADDXROL;
+     break;
+ 
+    case FUNC_ADDXSGP:
+     return_ptr = FUNC_NAME_ADDXSGP;
+     break;
+    /* BS10108 - end */
+ 
+    default:
+     return_ptr = FUNC_UNDEFINED;
+  }
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSGPCF, DIAG_COMMON, fn, ESA_RC_VOID);
+  return (return_ptr);
+ 
+} /* End of CS_func_nmbr_to_func_name */
+ 
+/****************************************************
+ * Procedure Name: CS_func_name_to_func_nmbr
+ * Description   : convert  string to api
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+short CS_func_name_to_func_nmbr (char *func_name)
+{
+  short                 func_code= 0;
+  ENVIRONMENT_rec_typ * envir_ptr;
+  char fn[]="CS_func_name_to_func_nmbr";
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSGPCF, DIAG_COMMON+ 1, fn);
+  CS_get_envir_address (&envir_ptr);
+ 
+  if      (strcmp (func_name, FUNC_NAME_ADDUSER) EQ 0)
+    func_code= FUNC_ADDUSER;
+  else if (strcmp (func_name, FUNC_NAME_DELUSER) EQ 0)
+    func_code= FUNC_DELUSER;
+  else if (strcmp (func_name, FUNC_NAME_UPDUSER) EQ 0)
+    func_code= FUNC_UPDUSER;
+  else if (strcmp (func_name, FUNC_NAME_REVUSER) EQ 0)
+    func_code= FUNC_REVUSER;
+  else if (strcmp (func_name, FUNC_NAME_UPD_PASS) EQ 0)
+    func_code= FUNC_UPD_PASS;
+  else if (strcmp (func_name, FUNC_NAME_ADDUG) EQ 0)
+    func_code= FUNC_ADDUG;
+  else if (strcmp (func_name, FUNC_NAME_DELUG) EQ 0)
+    func_code= FUNC_DELUG;
+  else if (strcmp (func_name, FUNC_NAME_UPDUG) EQ 0)
+    func_code= FUNC_UPDUG;
+  else if (strcmp (func_name, FUNC_NAME_ADDOE) EQ 0)
+    func_code= FUNC_ADDOE;
+  else if (strcmp (func_name, FUNC_NAME_DELOE) EQ 0)
+    func_code= FUNC_DELOE;
+  else if (strcmp (func_name, FUNC_NAME_UPDOE) EQ 0)
+    func_code= FUNC_UPDOE;
+  else if (strcmp (func_name, FUNC_NAME_ADDU2UG) EQ 0)
+    func_code= FUNC_ADDU2UG;
+  else if (strcmp (func_name, FUNC_NAME_DELU2UG) EQ 0)
+    func_code= FUNC_DELU2UG;
+  else if (strcmp (func_name, FUNC_NAME_UPDU2UG) EQ 0)
+    func_code= FUNC_UPDU2UG;
+  else if (strcmp (func_name, FUNC_NAME_ADDACE) EQ 0)
+    func_code= FUNC_ADDACE;
+  else if (strcmp (func_name, FUNC_NAME_DELACE) EQ 0)
+    func_code= FUNC_DELACE;
+  else if (strcmp (func_name, FUNC_NAME_UPDACE) EQ 0)
+    func_code= FUNC_UPDACE;
+  else if (strcmp (func_name, FUNC_NAME_UPDRES) EQ 0)
+    func_code= FUNC_UPDRES;
+  else if (strcmp (func_name, FUNC_NAME_ADDRES) EQ 0)
+    func_code= FUNC_ADDRES;
+  else if (strcmp (func_name, FUNC_NAME_DELRES) EQ 0)
+    func_code= FUNC_DELRES;
+  else if (strcmp (func_name, FUNC_NAME_GTUSERS) EQ 0)
+    func_code= FUNC_GTUSERS;
+  else if (strcmp (func_name, FUNC_NAME_GETUGS) EQ 0)
+    func_code= FUNC_GETUGS;
+  else if (strcmp (func_name, FUNC_NAME_GETOES) EQ 0)
+    func_code= FUNC_GETOES;
+  else if (strcmp (func_name, FUNC_NAME_GTUG2UC) EQ 0)
+    func_code= FUNC_GTUG2UC;
+  else if (strcmp (func_name, FUNC_NAME_GETRES) EQ 0)
+    func_code= FUNC_GETRES;
+  else if (strcmp (func_name, FUNC_NAME_GTRSACL) EQ 0)
+    func_code= FUNC_GTRSACL;
+  else if (strcmp (func_name, FUNC_NAME_GTRSPRM) EQ 0)
+    func_code= FUNC_GTRSPRM;
+  else if (strcmp (func_name, FUNC_NAME_STRSPRM) EQ 0)
+    func_code= FUNC_STRSPRM;
+  else if (strcmp (func_name, FUNC_NAME_PLATF_DETAIL) EQ 0)
+    func_code= FUNC_PLATFORM_DETAIL;
+  else {
+    func_code= 0;
+    CTSAMSG_print (ERR_CS_INVL_API_FUNC,
+                     envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                     envir_ptr->msg_admin_param.ctsamsg_dest,
+                     func_name, envir_ptr->file_rssapi);
+  }
+  ESA_DIAG_exit (ESA_COMP_ACSGPCF, DIAG_COMMON+ 1, fn, ESA_RC_VOID);
+  return(func_code);
+}
+ 
+/****************************************************
+ * Procedure Name: CS_check_nmb
+ * Description   : Check if string in the message is valid x-number
+ *
+ * Input         :
+ *
+ * Input/Output  :
+ *
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_check_nmb (MSG_typ           * str,
+                     MSG_typ           * msg_ptr,
+                     unsigned long int   max_nmb,
+                     const char        * fld_name)
+{
+  char                  fn[]="CS_check_nmb";
+  size_t                i;
+  unsigned int          str_len;
+  char                * end_msg_ptr, * current_msg_ptr;
+  ESA_RC                rc= ESA_OK;
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSGPCF, DIAG_COMMON, fn);
+  CS_get_envir_address (&envir_ptr);
+ 
+  end_msg_ptr= envir_ptr->msg_ptr+ envir_ptr->msg_size;
+ 
+  if ( (strlen (str) EQ RSS_MSG_LEN) AND (max_nmb EQ 0) )
+    current_msg_ptr= msg_ptr+ strlen(str)+ 9;
+  else
+    current_msg_ptr= msg_ptr+ strlen(str);
+  if (current_msg_ptr GT end_msg_ptr) {
+    *((char *)end_msg_ptr)= '\0';
+    rc= ESA_FATAL;
+    goto cleanup;
+  }
+ 
+  i= strspn (str, HEXA_VALUE);
+  if (i NE strlen (str)) {
+    *((char *)msg_ptr+ strlen(str)+ 1)= '\0';
+    rc= ESA_WARN;
+    goto cleanup;
+  }
+ 
+  if (max_nmb NE 0) {
+    sscanf (str, "%x",&str_len);
+    if (str_len GT max_nmb) {
+      *((char *)msg_ptr+ strlen(str)+ 1)= '\0';
+      rc= ESA_ERR;
+      goto cleanup;
+    }
+  }
+  else
+    str_len= 0;
+ 
+  current_msg_ptr= msg_ptr+ strlen(str)+
+	               MIN(str_len, envir_ptr->rss_limits.max_addinfo_val_len);
+  if (current_msg_ptr GT end_msg_ptr) {
+    *((char *)end_msg_ptr)= '\0';
+    rc= ESA_FATAL;
+    goto cleanup;
+  }
+ 
+  cleanup:
+  switch ((int)rc) {
+    case  ESA_WARN:
+        CTSAMSG_print (ERR_CS_MSG_CHKNBR,
+                       envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                       envir_ptr->msg_admin_param.ctsamsg_dest,
+                       fn, str);
+        break;
+    case ESA_ERR:
+        CTSAMSG_print (ERR_CS_MSG_CHKSIZE,
+                       envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                       envir_ptr->msg_admin_param.ctsamsg_dest,
+                       fn, fld_name,(int)str_len, max_nmb);
+        break;
+    case ESA_FATAL:
+        CTSAMSG_print (ERR_CS_MSG_CHKOVERFLOW,
+                       envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                       envir_ptr->msg_admin_param.ctsamsg_dest,
+                       fn, msg_ptr, envir_ptr->msg_size);
+  }
+  ESA_DIAG_exit (ESA_COMP_ACSGPCF, DIAG_COMMON, fn, rc);
+  return (rc);
+}
+/****************************************************
+ * Procedure Name: CS_act_to_actname
+ * Description   : convert action to action name
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :ver 2.0.1.1
+ * Scope         :
+ ****************************************************/
+ 
+const char * CS_act_to_actname (int act)
+{
+  const char  * return_ptr;
+  char fn[]="CS_act_to_actname";
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSGPCF, DIAG_COMMON, fn);
+  switch (act) {
+    case ACT_UNKNOWN:
+     return_ptr = M_ACT_UNKNOWN;
+     break;
+ 
+    case ACT_ADD:
+     return_ptr = M_ACT_ADD;
+     break;
+ 
+    case ACT_UPDATE:
+     return_ptr = M_ACT_UPDATE;
+     break;
+ 
+    case ACT_DELETE:
+     return_ptr = M_ACT_DELETE;
+     break;
+ 
+    case ACT_REVOKE:
+     return_ptr = M_ACT_REVOKE;
+     break;
+ 
+    case ACT_PWD_UPD:
+     return_ptr = M_ACT_PWD_UPD;
+     break;
+ 
+    case ACT_CONN_UPD:
+     return_ptr = M_ACT_CONN_UPD;
+     break;
+ 
+    default:
+     return_ptr = M_ACT_UNKNOWN;
+  }
+ 
+  ESA_DIAG_exit (ESA_COMP_ACSGPCF, DIAG_COMMON, fn, ESA_RC_VOID);
+  return (return_ptr);
+ 
+} /* end of CS_act_to_actname */
+ 
+/****************************************************
+ * Procedure Name: CS_actname_to_act
+ * Description   : convert action name to action
+ * Input         :
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Scope         :
+ ****************************************************/
+ 
+int CS_actname_to_act (char * actname)
+{
+  char fn[]="CS_actname_to_act";
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSGPCF, DIAG_COMMON+ 1, fn);
+  ESA_DIAG_exit (ESA_COMP_ACSGPCF, DIAG_COMMON+ 1, fn, ESA_RC_VOID);
+  if (strcmp(actname,M_ACT_UNKNOWN) EQ 0)
+    return(ACT_UNKNOWN);
+  else if (strcmp(actname,M_ACT_ADD) EQ 0)
+    return(ACT_ADD);
+  else if (strcmp(actname,M_ACT_UPDATE) EQ 0)
+    return(ACT_UPDATE);
+  else if (strcmp(actname,M_ACT_DELETE) EQ 0)
+    return(ACT_DELETE);
+  else if (strcmp(actname,M_ACT_REVOKE) EQ 0)
+    return(ACT_REVOKE);
+  else if (strcmp(actname,M_ACT_PWD_UPD) EQ 0)
+    return(ACT_PWD_UPD);
+  else if (strcmp(actname,M_ACT_CONN_UPD) EQ 0)
+    return(ACT_CONN_UPD);
+ 
+  return(ACT_UNKNOWN);
+} /* end of CS_actname_to_act */
+ 
+/****************************************************
+ * Procedure Name: CS_os_file_name
+ * Description   :
+ *
+ * Input         :
+ *
+ * Input/Output  :
+ *
+ * Return Value  :
+ * Comments      :ver 2.0.1.1
+ * Scope         :
+ ****************************************************/
+ 
+ESA_RC CS_os_file_name (RESOURCE_typ  name_in,
+                        RESOURCE_typ  name_out)
+{
+  ESA_RC                rc;
+  char                  fn[]= "CS_os_file_name";
+  ENVIRONMENT_rec_typ * envir_ptr;
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSGPCF, DIAG_COMMON, fn);
+  CS_get_envir_address (&envir_ptr);
+ 
+  ESA_DIAG_printf (ESA_COMP_ACSGPCF, DIAG_OS,
+                   "...-> OS_PROC_fmt_name:%s name_in=%s, hndl=%p.",
+				   fn, name_in, envir_ptr->os_proc_handle);
+  rc = OS_PROC_fmt_name(name_in,
+                        sizeof(RESOURCE_typ),
+                        name_out,
+                        envir_ptr->os_proc_handle);
+  ESA_DIAG_printf (ESA_COMP_ACSGPCF, DIAG_OS,
+	"...<- OS_PROC_fmt_name:%s rc=%d (%s) name_out=%s.",
+	fn, rc, (rc EQ ESA_OK) ? "OS==OK" : "OS##OK", name_out);
+  if (rc NE ESA_OK)
+     CTSAMSG_print (ERR_CS_FUNCTION,
+                    envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                    envir_ptr->msg_admin_param.ctsamsg_dest, fn);
+  ESA_DIAG_exit (ESA_COMP_ACSGPCF, DIAG_COMMON, fn, rc);
+  return(rc);
+}
+ 
+/****************************************************
+ * Procedure Name: CS_encr_msg
+ * Description   : Translate encription error to CTSAMSG
+ * Input         : encr_err structure
+ * Input/Output  :
+ * Return Value  :
+ * Comments      :
+ * Side Effects  : An CTSAMSG message is isuued
+ * Scope         : global
+ ****************************************************/
+ 
+void CS_encr_msg (ENC_ERR_rec_typ * encr_err)
+{
+  int                   ii;
+  char                * ptr[5]; /* number 5 !!! in this and next rows*/
+  ENVIRONMENT_rec_typ * envir_ptr;
+  char fn[]="CS_encr_msg";
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSGPCF, DIAG_COMMON, fn);
+  CS_get_envir_address (&envir_ptr);
+ 
+  ptr[0]= (char *)encr_err->err_buff;
+  for (ii= 0; ii LT 5 AND strlen(ptr[ii]) NE 0; ii++) {
+    ptr[ii+ 1]= ptr[ii]+ strlen(ptr[ii])+ 1;
+  }
+ 
+  switch (encr_err->err_code) {
+    case ENC_FUNC_FAIL:
+      /*%s location %d: Call to %s failed with %d code E */
+        CTSAMSG_print (ERR_ENC_FUNC,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   ptr[0], ptr[1], ptr[2], ptr[3]);
+        break;
+    case ENC_IO_OPEN_ERR:
+      /* %s location %d: I/O OPEN error file %s code %d E*/
+        CTSAMSG_print (ERR_ENC_OPEN,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   ptr[0], ptr[1], ptr[2], ptr[3]);
+        break;
+    case ENC_IO_READ_ERR:
+      /* %s location %d: I/O READ error file %s code %d, items %d E*/
+        CTSAMSG_print (ERR_ENC_READ,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   ptr[0], ptr[1], ptr[2], ptr[3], ptr[4]);
+        break;
+    case ENC_IO_WRITE_ERR:
+      /* %s location %d: I/O WRITE error file %s code %d, items %d E*/
+        CTSAMSG_print (ERR_ENC_WRITE,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   ptr[0], ptr[1], ptr[2], ptr[3], ptr[4]);
+        break;
+    case ENC_DECR_AUTH_FAIL:
+     /* %s location %d: Decryption authentication failed, code %d W*/
+        CTSAMSG_print (ERR_ENC_DECR_AUTH,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   ptr[0], ptr[1], ptr[2]);
+        break;
+    case ENC_DECR_INVL_KEY:
+     /* %s location %d: Decryption failed - requested key id %d W*/
+        CTSAMSG_print (ERR_ENC_DECR_KEY,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   ptr[0], ptr[1], ptr[2]);
+        break;
+    case ENC_IN_SYNC:
+ /* %s location %d: Request denied session key synchronization now W*/
+        CTSAMSG_print (ERR_ENC_SYNC,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   ptr[0], ptr[1]);
+        break;
+    case ENC_MALLOC_FAIL:
+     /* %s location %d: Malloc to %s size %d failed with code %d E*/
+        CTSAMSG_print (ERR_ENC_MALLOC,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   ptr[0], ptr[1], ptr[2], ptr[3], ptr[4]);
+        break;
+    case ENC_INITKX_FAIL:
+     /* %s location %d: AR_init_kx  for %s key failed with code %d E*/
+        CTSAMSG_print (ERR_ENC_INITKX,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   ptr[0], ptr[1], ptr[2], ptr[3]);
+        break;
+    case ENC_MSGTYP_MSMTCH:
+     /* %s location %d: Expected msg type %d - received type %d I*/
+        CTSAMSG_print (ERR_ENC_MSGTYP,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   ptr[0], ptr[1], ptr[2], ptr[3]);
+        break;
+    case ENC_ACTIVE_MSMTCH:
+     /* %s location %d: %s ESS vs. %s Host encryption E*/
+        CTSAMSG_print (ERR_ENC_ACTIVE,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   ptr[0], ptr[1], ptr[2], ptr[3]);
+        break;
+    case ENC_KEYTYP_MSMTCH:
+     /* %s location %d: %s key on ESS vs. %s key on Host  E*/
+        CTSAMSG_print (ERR_ENC_KEYTYP,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   ptr[0], ptr[1], ptr[2], ptr[3]);
+        break;
+    case ENC_SYNC_ABORT:
+     /* %s location %d: Sync msg %d aborted. Keyid %d received %d I*/
+        CTSAMSG_print (ERR_ENC_SYNC_ABORT,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   ptr[0], ptr[1], ptr[2], ptr[3], ptr[4]);
+        break;
+    case ENC_PRTCL_RSTRT:
+     /* %s loc. %d: Restart. Curr # %d Prv # %d - Exp. %d msg I*/
+        CTSAMSG_print (ERR_ENC_RSTRT,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   ptr[0], ptr[1], ptr[2], ptr[3], ptr[4]);
+        break;
+    case ENC_KEYSET:
+        /* %s loc. %d: Sync start session key# %d, prv key is %d I*/
+        CTSAMSG_print (ERR_ENC_KEYSET,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   ptr[0], ptr[1], ptr[2], ptr[3]);
+        break;
+    case ENC_FILE_CORRUPT:
+        /* %s location %s: Key file %s is corrupt */
+        CTSAMSG_print (ERR_ENC_CORRUPT,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   ptr[0], ptr[1], ptr[2]);
+       break;
+    case ENC_OUTBUF_SMALL:
+        /* %s output buffer size (%d) too small. Required size is %d*/
+        CTSAMSG_print (ERR_ENC_OUTBUF,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   ptr[0], ptr[1], ptr[2]);
+       break;
+    case ENC_DECR_NOSMALLBUF:
+     /* %s small buffer decrypt requested for buffer of size %d not
+        divided by 16 */
+ 
+        CTSAMSG_print (ERR_ENC_NOSMALLBUF,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   ptr[0], ptr[1]);
+       break;
+    case ENC_DECR_ORIGLEN:
+     /* %s small buffer decrypt - original buffer length %d is
+        corrupted (%d) */
+ 
+        CTSAMSG_print (ERR_ENC_ORIGLEN,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   ptr[0], ptr[1], ptr[2]);
+       break;
+    default:
+        CTSAMSG_print (ERR_ENC_ERRCODE,
+                   envir_ptr->msg_admin_param.ctsamsg_handle, NULL,
+                   envir_ptr->msg_admin_param.ctsamsg_dest,
+                   encr_err->err_code);
+        break;
+  }
+  ESA_DIAG_exit (ESA_COMP_ACSGPCF, DIAG_COMMON, fn, ESA_RC_VOID);
+}
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : CS_get_cur_time                          *
+*                                                             *
+* Description      : Get current time                         *
+*                                                             *
+* input            : date  field                              *
+*                    time  field                              *
+* Return Value     : ESA_RC                                   *
+**************************************************************/
+ 
+void CS_get_cur_time (DATE_typ  date_field,
+                      TIME_typ  time_field)
+{
+  time_t       ltime;
+  struct tm    uxtime;
+  char fn[]="CS_get_cur_time";
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSGPCF, DIAG_COMMON, fn);
+  time (&ltime);
+  memcpy ((char *)&uxtime,
+	      (char *)ConvertTimeToTMStruct (&ltime, &uxtime),
+		  sizeof (struct tm));
+ 
+  from_time_tm_convert (&uxtime, date_field, time_field);
+  ESA_DIAG_exit (ESA_COMP_ACSGPCF, DIAG_COMMON, fn, ESA_RC_VOID);
+}
+ 
+/**************************************************************
+* Procedure Name   : from_time_tm_convert
+* Description      : Convert to DATE_typ and TIME_typ data
+*                            from time_tm data
+* Return Value     : ESA_RC
+**************************************************************/
+ 
+void from_time_tm_convert (struct tm * tmtime,
+                           DATE_typ    a_date,
+                           TIME_typ    a_time)
+{
+  char fn[]="from_time_tm_convert";
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSGPCF, DIAG_COMMON, fn);
+  sprintf (a_date, "%04d%02d%02d",
+           tmtime->tm_year+ 1900, tmtime->tm_mon+ 1, tmtime->tm_mday);
+  sprintf (a_time, "%02d%02d%02d", tmtime->tm_hour,  tmtime->tm_min,
+           tmtime->tm_sec);
+  ESA_DIAG_exit (ESA_COMP_ACSGPCF, DIAG_COMMON, fn, ESA_RC_VOID);
+}
+ 
+/****************************************************
+ * Procedure Name: ebc2asc
+ * Description   : ebcdic to ascii conversion
+ * Input         :
+ * Output        :
+ * Input/Output  :
+ * Return Value  :
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+ 
+void ebc2asc (char * ebcdic,
+              char * ascii,
+              int    length)
+{
+  static unsigned char e2a_table [256] =
+     {
+         0x00, 0x01, 0x02, 0x03,  /* 0x00  NUL, SOH, STX, ETX */
+         0xFF, 0x09, 0xFF, 0x7F,  /* 0x04  (PF), HT, (LC), DEL */
+         0xFF, 0xFF, 0xFF, 0x0B,  /* 0x08  (), (RLF), (SMM), VT */
+         0x0C, 0x0D, 0x0E, 0x0F,  /* 0x0C  FF, CR, SO, SI  */
+         0x10, 0x11, 0x12, 0xFF,  /* 0x10  DLE, DC1, DC2, (TM) */
+         0xFF, 0x0A, 0x08, 0xFF,  /* 0x14  (RES), (NL)LF, BS, (IL) */
+         0x18, 0x19, 0xFF, 0xFF,  /* 0x18  CAN, EM, (CC), (CU1) */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0x1C  (IFS), (IGS), (IRS), (IUS)*/
+         0xFF, 0xFF, 0x1C, 0xFF,  /* 0x20  (DS), (SOS), FS, () */
+         0xFF, 0x1F, 0x17, 0x1B,  /* 0x24  (BYP),(LF)US, ETB, ESC */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0x28  (), (), (SM), (CU2) */
+         0xFF, 0x05, 0x06, 0x07,  /* 0x2C  (), ENQ, ACK, BEL */
+         0xFF, 0xFF, 0x16, 0xFF,  /* 0x30  (), (), SYN, ()  */
+         0xFF, 0x1E, 0xFF, 0x04,  /* 0x34  (PN), (RS), (UC), EOT */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0x38  (), (), (), (CU3) */
+         0x14, 0x15, 0xFF, 0x1A,  /* 0x3C  DC4, NAK, (), SUB */
+         0x20, 0xFF, 0xFF, 0xFF,  /* 0x40  SPC, (), (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0x44  (), (), (), ()  */
+         0xFF, 0xFF, 0xFF, 0x2E,  /* 0x48  (), (), (), .   */
+         0x3C, 0x28, 0x2B, 0x5D,  /* 0x4C  < , ( , + , ]   */
+         0x26, 0xFF, 0xFF, 0xFF,  /* 0x50  & , (), (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0x54  (), (), (), ()  */
+         0xFF, 0xFF, 0x21, 0x24,  /* 0x58  (), (), ! , $   */
+         0x2A, 0x29, 0x3B, 0xFF,  /* 0x5C  * , ) , ; , ()  */
+         0x2D, 0x2F, 0xFF, 0xFF,  /* 0x60  - , / , (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0x64  (), (), (), ()  */
+         0xFF, 0xFF, 0x7C, 0x2C,  /* 0x68  (), (), | , ,   */
+         0x25, 0x5F, 0x3E, 0x3F,  /* 0x6C  % , _ , > , ?   */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0x70  (), (), (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0x74  (), (), (), ()  */
+         0xFF, 0xFF, 0x3A, 0x23,  /* 0x78  (), (), : , #   */
+         0x40, 0x27, 0x3D, 0x22,  /* 0x7C  @ , ' , = , "   */
+         0xFF, 0x61, 0x62, 0x63,  /* 0x80  (), a , b , c   */
+         0x64, 0x65, 0x66, 0x67,  /* 0x84  d , e , f , g   */
+         0x68, 0x69, 0xFF, 0xFF,  /* 0x88  h , i , (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0x8C  (), (), (), ()  */
+         0xFF, 0x6A, 0x6B, 0x6C,  /* 0x90  (), j , k , l   */
+         0x6D, 0x6E, 0x6F, 0x70,  /* 0x94  m , n , o , p   */
+         0x71, 0x72, 0xFF, 0xFF,  /* 0x98  q , r , (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0x9C  (), (), (), ()  */
+         0xFF, 0x7E, 0x73, 0x74,  /* 0xA0  (), ~ , s , t   */
+         0x75, 0x76, 0x77, 0x78,  /* 0xA4  u , v , w , x   */
+         0x79, 0x7A, 0xFF, 0xFF,  /* 0xA8  y , z , (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0xAC  (), (), (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0xB0  (), (), (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0xB4  (), (), (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0xB8  (), (), (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0xBC  (), (), (), ()  */
+         0x7B, 0x41, 0x42, 0x43,  /* 0xC0  { , A , B , C   */
+         0x44, 0x45, 0x46, 0x47,  /* 0xC4  D , E , F , G   */
+         0x48, 0x49, 0xFF, 0xFF,  /* 0xC8  H , I , (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0xCC  (), (), (), ()  */
+         0x7D, 0x4A, 0x4B, 0x4C,  /* 0xD0  } , J , K , L   */
+         0x4D, 0x4E, 0x4F, 0x50,  /* 0xD4  M , N , O , P   */
+         0x51, 0x52, 0xFF, 0xFF,  /* 0xD8  Q , R , (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0xDC  (), (), (), ()  */
+         0x5C, 0xFF, 0x53, 0x54,  /* 0xE0  \ , (), S , T   */
+         0x55, 0x56, 0x57, 0x58,  /* 0xE4  U , V , W , X   */
+         0x59, 0x5A, 0xFF, 0xFF,  /* 0xE8  Y , Z , (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0xEC  (), (), (), ()  */
+         0x30, 0x31, 0x32, 0x33,  /* 0xF0  0 , 1 , 2 , 3   */
+         0x34, 0x35, 0x36, 0x37,  /* 0xF4  4 , 5 , 6 , 7   */
+         0x38, 0x39, 0xFF, 0xFF,  /* 0xF8  8 , 9 , (LVM), () */
+         0xFF, 0xFF, 0x5B, 0xFF   /* 0xFC  (), (), (), ()  */
+     };
+  char fn[]="ebc2asc";
+ 
+  ESA_DIAG_enter (ESA_COMP_ACSGPCF, DIAG_COMMON+ 1, fn);
+  while (--length GE 0)
+       *ascii++ = e2a_table [*ebcdic++ & 0xff];
+  ESA_DIAG_exit (ESA_COMP_ACSGPCF, DIAG_COMMON+ 1, fn, ESA_RC_VOID);
+ 
+} /* END - CS_sync_ebc2asc function */

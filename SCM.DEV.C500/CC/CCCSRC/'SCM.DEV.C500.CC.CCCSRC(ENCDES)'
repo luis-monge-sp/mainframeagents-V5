@@ -1,0 +1,3179 @@
+/**********************************************************************
+*
+* C Source: encdes.c
+* Description: ENCRYPTION services
+* %created_by: ihoffma %
+* %date_created: Wed Nov 19 18:40:23 2003 %
+* %full_filespec: encdes.c#2:csrc:1 %
+*
+**********************************************************************/
+/**************************************************************
+ * Mod.ID  Who      When         Description
+ * ============================================================
+ * IMH001  Ian H.   19-Nov-03    WSAN101342 Thread-safe code (ERRNO)
+ * AV001   Ajay V.  24-Feb-09	 The patch is for changes made in CL-499203 (was not included in patch2)
+ * IS10103 AvnerL   22-SEP-13    S0C4 in CD due encryption file differ on both sides
+ * SAS2IBMN NuritY  07/11/16  Compile with IBM XL C/C++:
+ *                            1. Remove #if for __STDC__ and leave
+ *                               the code for the defined part.
+ *                               The code generated when not defined
+ *                               will be needed if we change the
+ *                               LANGLVL compiler option to be
+ *                               COMMONC. If this happens, we will
+ *                               look in the SAS/C source for needed
+ *                               code.
+ * SAS2IBMT SeligT  30/06/16  SAS/C to IBM C Conversion Project
+ *************************************************************/
+ 
+#include   "globs.h"
+ 
+#include   ERRNO     /* IMH001 */
+#include   ENC_API
+#include   STDLIB
+#include   STDIO
+#include   STRING
+#include   AR_DES
+#include   ESA_CHKSUM
+#include   TIME
+#include   CTYPE
+ 
+#include   MATH
+ 
+ 
+#ifdef ARDEBUG
+ static FILE    * fout= NULL;
+#endif
+ 
+/********************************************/
+/*  Return codes from AR functions          */
+/********************************************/
+ 
+#define  AR_OK    1
+ 
+/********************************************/
+/*  Length values for entity names          */
+/********************************************/
+ 
+#define   ENC_AR_MSG_LEN           256
+ 
+/**************************************/
+/*  typedefs for entities             */
+/**************************************/
+ 
+typedef char  ENC_AR_MSG_typ      [ENC_AR_MSG_LEN];
+ 
+typedef enum
+ {
+   ENC_GTW , ENC_HOST, ENC_GUI
+ }  ENC_plat_typ ;
+ 
+typedef enum
+ {
+   ENC_NONE,  /* No message type */
+   ENC_MSG1,  /* 1st message from Host/GUI to Gateway */
+   ENC_MSG2,  /* 2nd message from Gateway to Host/GUI */
+   ENC_MSG3,  /* 3rd message from Host/GUI to Gateway */
+   ENC_MSG4,  /* 4th message from Gateway to Host/GUI */
+   ENC_MSG_RESTART, /* PROTOCOL RESTART request from Gateway to
+                       Host/GUI */
+   ENC_MSG_SYNCED  /* The platform is synchronized */
+ } ENC_MSG_TYPE_typ ;
+ 
+typedef struct  {
+/**/    ENC_plat_typ         platform_type ;
+    ENC_BOOLEAN          active ;
+/**/    ENC_BOOLEAN          is_des ;
+/*?*/    ENC_MSG_TYPE_typ     next_msg ;
+/**/    int                  session_id ;
+/**/    ENC_KD_typ           key_data ;
+/**/    ENC_KD_typ           ar_key_data ; /*?????*/
+/*?*/    void                *os_handle ;
+/**/    int                  kid ;
+/*?*/    char            *name ; /* Pointer to key name on Host, to
+                                   Black list filename - on Gateway */
+    ENC_BOOLEAN          internal_key ;
+    DESR                 des_tbl ;
+    DESR                 des_tbl2 ;
+    DESR                 des_decr_tbl;
+    DESR                 des_decr_tbl2;
+} ENC_SYNC_DTLS_rec_typ , *ENC_SYNC_DTLS_rec_ptr;
+ 
+typedef struct {
+    int  num_keys ;
+    ENC_DESK_typ des_key[1] ; /* The actual number of keys will
+                                 be determind according to
+                                 the actual value of num_keys. */
+} ENC_KEYS_rec_typ , *ENC_KEYS_rec_ptr ;
+ 
+typedef struct  {
+    ENC_MSG_TYPE_typ      msg_type ;
+    int                   session_id ;
+    ENC_BOOLEAN           active ;  /* is valid only on ENC_MSG1 */
+    ENC_BOOLEAN           is_des ;  /* is valid only on ENC_MSG1 */
+    ENC_AR_MSG_typ        ar_msg ;
+} ENC_SYNC_MSG_typ ;
+ 
+ESA_RC ENC_smallbuf_enc (
+         DESR             des_tbl ,
+         void            *buf_in ,          /*in*/
+         int              in_len ,          /*in*/
+         ENC_BOOLEAN      add_len ,         /*in*/
+         void            *buf_out ,         /*out*/
+         int             *out_len ,         /*in-out*/
+         ENC_ERR_rec_ptr  err              /*inout*/
+         );
+ 
+ESA_RC ENC_smallbuf_decr (
+         DESR             des_tbl ,
+         void            *buf_in ,          /*in*/
+         int              in_len ,          /*in*/
+         ENC_BOOLEAN      ret_orig_len ,    /*in*/
+         void            *buf_out ,         /*out*/
+         int             *out_len ,         /*in-out*/
+         ENC_ERR_rec_ptr  err              /*inout*/
+         );
+ 
+ESA_RC ENC_des_encr (
+         DESR             des_tbl ,
+         DESR             des_tbl2 ,
+		 ENC_ENCR_ALGRTM  enc_algorithm ,
+         void            *buf_in ,          /*in*/
+         int              in_len ,          /*in*/
+         ENC_BOOLEAN      add_len ,         /*in*/
+         ENC_BOOLEAN      chksum ,          /*in*/
+         void            *buf_out ,         /*out*/
+         int             *out_len ,         /*in-out*/
+         ENC_ERR_rec_ptr  err              /*inout*/
+         );
+ 
+ESA_RC ENC_des_decr (
+         DESR             des_tbl ,
+         DESR             des_tbl2 ,
+		 ENC_ENCR_ALGRTM  enc_algorithm ,
+         void            *buf_in ,          /*in*/
+         int              in_len ,          /*in*/
+         ENC_BOOLEAN      ret_orig_len ,    /*in*/
+         ENC_BOOLEAN      chksum ,          /*in*/
+         void            *buf_out ,         /*out*/
+         int             *out_len ,         /*in-out*/
+         ENC_ERR_rec_ptr  err              /*inout*/
+         );
+ 
+/****************************************************
+ * Procedure Name: ENC_ebc2asc
+ * Description   : ebcdic to ascii conversion
+ * Input         :
+ * Output        :
+ * Input/Output  :
+ * Return Value  :
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+ 
+/* for MVS */
+ static unsigned char e2a_table [256] =
+     {
+         0x00, 0x01, 0x02, 0x03,  /* 0x00  NUL, SOH, STX, ETX */
+         0xFF, 0x09, 0xFF, 0x7F,  /* 0x04  (PF), HT, (LC), DEL */
+         0xFF, 0xFF, 0xFF, 0x0B,  /* 0x08  (), (RLF), (SMM), VT */
+         0x0C, 0x0D, 0x0E, 0x0F,  /* 0x0C  FF, CR, SO, SI  */
+         0x10, 0x11, 0x12, 0xFF,  /* 0x10  DLE, DC1, DC2, (TM) */
+         0xFF, 0x0A, 0x08, 0xFF,  /* 0x14  (RES), (NL)LF, BS, (IL) */
+         0x18, 0x19, 0xFF, 0xFF,  /* 0x18  CAN, EM, (CC), (CU1) */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0x1C  (IFS), (IGS), (IRS), (IUS)*/
+         0xFF, 0xFF, 0x1C, 0xFF,  /* 0x20  (DS), (SOS), FS, () */
+         0xFF, 0x1F, 0x17, 0x1B,  /* 0x24  (BYP),(LF)US, ETB, ESC */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0x28  (), (), (SM), (CU2) */
+         0xFF, 0x05, 0x06, 0x07,  /* 0x2C  (), ENQ, ACK, BEL */
+         0xFF, 0xFF, 0x16, 0xFF,  /* 0x30  (), (), SYN, ()  */
+         0xFF, 0x1E, 0xFF, 0x04,  /* 0x34  (PN), (RS), (UC), EOT */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0x38  (), (), (), (CU3) */
+         0x14, 0x15, 0xFF, 0x1A,  /* 0x3C  DC4, NAK, (), SUB */
+         0x20, 0xFF, 0xFF, 0xFF,  /* 0x40  SPC, (), (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0x44  (), (), (), ()  */
+         0xFF, 0xFF, 0xFF, 0x2E,  /* 0x48  (), (), (), .   */
+         0x3C, 0x28, 0x2B, 0x5D,  /* 0x4C  < , ( , + , ]   */
+         0x26, 0xFF, 0xFF, 0xFF,  /* 0x50  & , (), (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0x54  (), (), (), ()  */
+         0xFF, 0xFF, 0x21, 0x24,  /* 0x58  (), (), ! , $   */
+         0x2A, 0x29, 0x3B, 0xFF,  /* 0x5C  * , ) , ; , ()  */
+         0x2D, 0x2F, 0xFF, 0xFF,  /* 0x60  - , / , (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0x64  (), (), (), ()  */
+         0xFF, 0xFF, 0x7C, 0x2C,  /* 0x68  (), (), | , ,   */
+         0x25, 0x5F, 0x3E, 0x3F,  /* 0x6C  % , _ , > , ?   */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0x70  (), (), (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0x74  (), (), (), ()  */
+         0xFF, 0xFF, 0x3A, 0x23,  /* 0x78  (), (), : , #   */
+         0x40, 0x27, 0x3D, 0x22,  /* 0x7C  @ , ' , = , "   */
+         0xFF, 0x61, 0x62, 0x63,  /* 0x80  (), a , b , c   */
+         0x64, 0x65, 0x66, 0x67,  /* 0x84  d , e , f , g   */
+         0x68, 0x69, 0xFF, 0xFF,  /* 0x88  h , i , (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0x8C  (), (), (), ()  */
+         0xFF, 0x6A, 0x6B, 0x6C,  /* 0x90  (), j , k , l   */
+         0x6D, 0x6E, 0x6F, 0x70,  /* 0x94  m , n , o , p   */
+         0x71, 0x72, 0xFF, 0xFF,  /* 0x98  q , r , (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0x9C  (), (), (), ()  */
+         0xFF, 0x7E, 0x73, 0x74,  /* 0xA0  (), ~ , s , t   */
+         0x75, 0x76, 0x77, 0x78,  /* 0xA4  u , v , w , x   */
+         0x79, 0x7A, 0xFF, 0xFF,  /* 0xA8  y , z , (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0xAC  (), (), (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0xB0  (), (), (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0xB4  (), (), (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0xB8  (), (), (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0xBC  (), (), (), ()  */
+         0x7B, 0x41, 0x42, 0x43,  /* 0xC0  { , A , B , C   */
+         0x44, 0x45, 0x46, 0x47,  /* 0xC4  D , E , F , G   */
+         0x48, 0x49, 0xFF, 0xFF,  /* 0xC8  H , I , (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0xCC  (), (), (), ()  */
+         0x7D, 0x4A, 0x4B, 0x4C,  /* 0xD0  } , J , K , L   */
+         0x4D, 0x4E, 0x4F, 0x50,  /* 0xD4  M , N , O , P   */
+         0x51, 0x52, 0xFF, 0xFF,  /* 0xD8  Q , R , (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0xDC  (), (), (), ()  */
+         0x5C, 0xFF, 0x53, 0x54,  /* 0xE0  \ , (), S , T   */
+         0x55, 0x56, 0x57, 0x58,  /* 0xE4  U , V , W , X   */
+         0x59, 0x5A, 0xFF, 0xFF,  /* 0xE8  Y , Z , (), ()  */
+         0xFF, 0xFF, 0xFF, 0xFF,  /* 0xEC  (), (), (), ()  */
+         0x30, 0x31, 0x32, 0x33,  /* 0xF0  0 , 1 , 2 , 3   */
+         0x34, 0x35, 0x36, 0x37,  /* 0xF4  4 , 5 , 6 , 7   */
+         0x38, 0x39, 0xFF, 0xFF,  /* 0xF8  8 , 9 , (LVM), () */
+         0xFF, 0xFF, 0x5B, 0xFF   /* 0xFC  (), (), (), ()  */
+     };
+ 
+static void ENC_ebc2asc (char * ebcdic,
+                  char * ascii,
+                  int    length)
+{
+ 
+ while (--length GE 0)
+   *ascii++ = e2a_table [*ebcdic++ & 0xff];
+ 
+} /* END - CS_sync_ebc2asc function */
+ /* MVS */
+ 
+/****************************************************
+ * Procedure Name: asc2ebc
+ * Description   : ASCII to EBCDIC conversion
+ * Input         :
+ * Output        :
+ * Input/Output  :
+ * Return Value  :
+ * Side Effects  :
+ * Scope         :
+ ***************************************************/
+ 
+/* for MVS */
+ 
+static unsigned char a2e_table [128] =
+{
+	0x00, 0x01, 0x02, 0x03,         /* 0x00  NUL, SOH, STX, ETX */
+	0x37, 0x2D, 0x2E, 0x2F,         /* 0x04  EOT, ENQ, ACK, BEL */
+	0x16, 0x05, 0x15, 0x0B,         /* 0x08  BS , HT , (LF)NL, VT */
+	0x0C, 0x0D, 0x0E, 0x0F,         /* 0x0C  FF , CR , SO , SI  */
+	0x10, 0x11, 0x12, 0xFF,         /* 0x10  DLE, DC1, DC2, (DC3) */
+	0x3C, 0x3D, 0x32, 0x26,         /* 0x14  DC4, NAK, SYN, ETB */
+	0x18, 0x19, 0x3F, 0x27,         /* 0x18  CAN, EM , SUB, ESC */
+	0x22, 0xFF, 0x35, 0x25,         /* 0x1C  FS , (GS), RS , (US)LF */
+	0x40, 0x5A, 0x7F, 0x7B,         /* 0x20  SPC, !  , "  , #   */
+	0x5B, 0x6C, 0x50, 0x7D,         /* 0x24  $  , %  , &  , '   */
+	0x4D, 0x5D, 0x5C, 0x4E,         /* 0x28  (  , )  , *  , +   */
+	0x6B, 0x60, 0x4B, 0x61,         /* 0x2C  ,  , -  , .  , /   */
+	0xF0, 0xF1, 0xF2, 0xF3,         /* 0x30  0  , 1  , 2  , 3   */
+	0xF4, 0xF5, 0xF6, 0xF7,         /* 0x34  4  , 5  , 6  , 7   */
+	0xF8, 0xF9, 0x7A, 0x5E,         /* 0x38  8  , 9  , :  , ;   */
+	0x4C, 0x7E, 0x6E, 0x6F,         /* 0x3C  <  , =  , >  , ?   */
+	0x7C, 0xC1, 0xC2, 0xC3,         /* 0x40  @  , A  , B  , C   */
+	0xC4, 0xC5, 0xC6, 0xC7,         /* 0x44  D  , E  , F  , G   */
+	0xC8, 0xC9, 0xD1, 0xD2,         /* 0x48  H  , I  , J  , K   */
+	0xD3, 0xD4, 0xD5, 0xD6,         /* 0x4C  L  , M  , N  , O   */
+	0xD7, 0xD8, 0xD9, 0xE2,         /* 0x50  P  , Q  , R  , S   */
+	0xE3, 0xE4, 0xE5, 0xE6,         /* 0x54  T  , U  , V  , W   */
+	0xE7, 0xE8, 0xE9, 0xFE,         /* 0x58  X  , Y  , Z  , ([) */
+	0xE0, 0x4F, 0xFF, 0x6D,         /* 0x5C  \  , ]  , (^), _   */
+	0xFF, 0x81, 0x82, 0x83,         /* 0x60  () , a  , b  , c   */
+	0x84, 0x85, 0x86, 0x87,         /* 0x64  d  , e  , f  , g   */
+	0x88, 0x89, 0x91, 0x92,         /* 0x68  h  , i  , j  , k   */
+	0x93, 0x94, 0x95, 0x96,         /* 0x6C  l  , m  , n  , o   */
+	0x97, 0x98, 0x99, 0xA2,         /* 0x70  p  , q  , r  , s   */
+	0xA3, 0xA4, 0xA5, 0xA6,         /* 0x74  t  , u  , v  , w   */
+	0xA7, 0xA8, 0xA9, 0xC0,         /* 0x78  x  , y  , z  , {   */
+	0x6A, 0xD0, 0xA1, 0x07          /* 0x7C  |  , }  , ~  , DEL */
+};
+static void ENC_asc2ebc (char * ascii,
+                         char * ebcdic,
+                         int    length)
+{
+   while (--length GE 0)
+      *ebcdic++ = a2e_table [*ascii++ & 0x7f];
+} /* asc2ebc */
+ /* MVS */
+ 
+/********************************************************************
+ * Procedure Name   : ENC_adderr  (beta)
+ * Description      : Prepare an error buffer.
+ * Input            :
+ *
+ * Output           :
+ *                    .
+ * Input/Output     :
+ * Input assumptions:
+ * Output assertions:
+ * Return Value   : ESA_RC
+ * Side Effects   :
+ *
+ * Function description
+ * ====================
+ * The function is used to generate an error buffer.
+ ********************************************************************/
+ 
+static void ENC_adderr (
+                        char         **ptr ,
+                        int           *left_len ,
+                        ENC_BOOLEAN    is_str ,
+                        const char    *str_prm ,
+                        int            int_prm)
+{
+   char       int_str[10];
+   size_t     len_2cpy ;
+ 
+#ifdef ARDEBUG
+     printf ("\nEntering ENC_aderr...");
+#endif
+ 
+   if (*left_len EQ 0)
+      return ;
+ 
+   if (is_str EQ ENC_FALSE)
+   {
+      sprintf (int_str , "%d" , int_prm);
+      if ((unsigned int)*left_len LT strlen(int_str))
+         return ;
+      strcpy (*ptr , int_str);
+      *left_len -= (strlen(int_str) + 1) ;
+      *ptr += (strlen(int_str) + 1);
+   }
+  else
+   {
+      if (strlen(str_prm) GT (unsigned int)*left_len)
+         len_2cpy = *left_len ;
+     else
+         len_2cpy = strlen(str_prm);
+ 
+      strncpy (*ptr , str_prm , len_2cpy);
+      (*ptr)[len_2cpy] = '\0';
+      *left_len -= (len_2cpy + 1);
+      if (*left_len LT 0)
+         *left_len = 0;
+      *ptr += (len_2cpy + 1);
+   }
+ 
+   return ;
+ 
+} /* END - ENC_adderr */
+ 
+/********************************************************************
+ * Procedure Name   : ENC_gtrnd  (beta)
+ * Description      : Generate weak random buffer.
+ * Input            : min_len - minimum buffer length;
+ *                    max_len - maximum buffer length
+ *                    in_loop - Boolean indicating that the function
+ *                     is used in loop (TRUE) or first time (FALSE)
+ * Output           : weak - weak random buffer
+ *                    len - the output buffer length.
+ * Input/Output     :
+ * Input assumptions:
+ * Output assertions: The output buffer must be pre-alocated by the
+ *                    calling function with the maximum length.
+ * Return Value   : ESA_RC
+ * Side Effects   :
+ *
+ * Function description
+ * ====================
+ * The function is used to generate a weak random buffer.
+ *******************************************************************/
+ 
+void ENC_gtrnd (
+                int          min_len ,
+                int          max_len ,
+                UNSBYTE        *weak ,
+                int         *len,
+                ENC_BOOLEAN  in_loop)
+{
+ 
+/* for MVS only */
+ 
+  memcpy (weak, 0, min_len + 10);
+  *len = min_len + 10 ;
+ 
+ /* MVS */
+ 
+  return;
+ 
+} /* END - ENC_gtrnd */
+ 
+/*********************************************************************
+ * Procedure Name   : ENC_intrn_key_gen (ikgn)  (beta)
+ * Description      : Host internal key generator.
+ * Input            :
+ * Output           : hik_file - The host internal des key file.
+ * Input/Output     :
+ * Input assumptions:
+ * Output assertions:
+ * Return Value   : ESA_RC
+ * Side Effects   :
+ *
+ * Function description
+ * ====================
+ * The function is used to generate a host internal key table. The
+ * DES key is randomally created and should be saved in protected
+ * file by the caller.
+ ********************************************************************/
+ 
+ESA_RC ENC_intrn_key_gen (
+         char            *hik_file ,  /*in*/
+         ENC_ERR_rec_ptr  err)        /*inout*/
+{
+ 
+   ESA_RC                       Rc ;
+   FILE                        *HIK ;
+   UNSBYTE                  weak_rand_buf[ENC_MAX_RAND_BUF_LEN] ;
+   int                      rand_len ;
+   ENC_STRNG_RNDBUF_typ         strong_rand_buf ;
+   size_t                   num_keys ;
+   int                          left_err_len ;
+   char                         *err_ptr;
+   char                     ddn_with[50]="";              /* SAS2IBMT */
+ 
+   memset ((char *)err, 0 , sizeof (ENC_ERR_rec_typ));
+   left_err_len = ENC_ERR_TXT_LEN - 1;
+   err_ptr = err->err_buff;
+ 
+   ENC_gtrnd (ENC_MIN_RAND_BUF_LEN ,
+              ENC_MAX_RAND_BUF_LEN ,
+              weak_rand_buf ,
+              &rand_len,
+              ENC_FALSE) ;
+ 
+   AR_make_random (weak_rand_buf , rand_len , strong_rand_buf);
+ 
+   strcpy(ddn_with,"DD:");                                /* SAS2IBMT */
+   strcat(ddn_with, hik_file);                            /* SAS2IBMT */
+   /* strcpy(ddn_with,"//'");                                SAS2IBMT */
+   /* strcat(ddn_with, hik_file);                            SAS2IBMT */
+   /* strcat(ddn_with,"'");                                  SAS2IBMT */
+   #ifdef ARDEBUG
+         printf ("\n ENCDES: About to fopen %s \n" , hik_file);   /* SAS2IBMT */
+   #endif
+   /* SAS2IBMT HIK = fopen (hik_file , "w") ;                        */
+   HIK = fopen (ddn_with , "w,recfm=*") ;                 /* SAS2IBMT */
+   if (HIK EQ NULL)
+   {
+      err->err_code = ENC_IO_OPEN_ERR ;
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  "ENC_intern_key_gen" , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , 1);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  hik_file , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , errno);
+       return (ESA_FATAL) ;
+   }
+ 
+   num_keys = fwrite (strong_rand_buf ,
+                      sizeof (ENC_DESK_typ) ,
+                      1 ,
+                      HIK) ;
+   Rc = fclose (HIK) ;
+ 
+   if (num_keys NE 1)
+   {
+      err->err_code = ENC_IO_WRITE_ERR ;
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  "ENC_intern_key_gen" , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , 2);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  hik_file , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , errno);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , (int)num_keys );
+      return (ESA_FATAL) ;
+   }
+ 
+   return (ESA_OK);
+ 
+} /* END - ENC_intrn_key_gen */
+ 
+/*********************************************************************
+ * Procedure Name   : ENC_init_intrn_key (iint) (beta)
+ * Description      : Host Internal key encryption initialization
+ * Input            : hik_file - The HIK filename.
+ *                    Active - a Boolean indicating if real
+ *                             encryption is active (TRUE) or not
+ *                             (FALSE).
+ * Output           :
+ * Input/Output     : enc_handle - A pointer to the des key
+ *                                 information.
+ * Input assumptions: The current process has read access permission
+ *                    to the HIK file (the ENC_ikgn input).
+ * Output assertions: The enc_handle segment will be delivered upon
+ *                    internal encryption/decryption of data.
+ * Return Value     : ESA_RC
+ * Side Effects     :
+ *
+ * Function description
+ * ====================
+ * This function is used to initialized, as part of CD and Password
+ * Interceptor processes, the Host Internal Des key information.
+ ********************************************************************/
+ 
+ESA_RC ENC_init_intrn_key (
+         char             *hik_file ,       /*in*/
+         ENC_BOOLEAN       active ,         /*in*/
+         void            **enc_handle ,     /*InOut*/
+         ENC_ERR_rec_ptr   err)             /*inout*/
+{
+  int        Rc ;
+  int              num_keys ;
+  FILE                          *HIK ;
+  DWORD                        des_key_num[2];
+  UNSBYTE                     *des_key = (UNSBYTE *)des_key_num;
+  DWORD                        des_num ;
+  char                         des_key_str[16] , destr[9];
+  ENC_SYNC_DTLS_rec_ptr        sync_dtls_ptr ;
+  int                          left_err_len ;
+  char                         *err_ptr;
+  char                         ddn_with[50]="";           /* SAS2IBMT */
+ 
+#ifdef ARDEBUG
+  printf ("Entering ENC_init_intrn_key...\n");
+#endif
+ 
+  memset ((char *)err, 0 , sizeof (ENC_ERR_rec_typ));
+  left_err_len = ENC_ERR_TXT_LEN - 1;
+  err_ptr = err->err_buff;
+ 
+  strcpy(ddn_with,"DD:");                                 /* SAS2IBMT */
+  strcat(ddn_with, hik_file);                             /* SAS2IBMT */
+  /* strcpy(ddn_with,"//'");                                 SAS2IBMT */
+  /* strcat(ddn_with, hik_file);                             SAS2IBMT */
+  /* strcat(ddn_with,"'");                                   SAS2IBMT */
+  #ifdef ARDEBUG
+        printf ("\n ENCDES: About to fopen %s \n" , hik_file);    /* SAS2IBMT */
+  #endif
+ 
+  /* SAS2IBMT HIK = fopen (hik_file , "r") ;                         */
+  HIK = fopen (ddn_with , "r") ;                          /* SAS2IBMT */
+  if (HIK EQ NULL)
+  {
+      err->err_code = ENC_IO_OPEN_ERR ;
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  "ENC_init_intrn_key" , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , 1);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  hik_file , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , errno);
+      return (ESA_FATAL) ;
+  }
+ 
+  num_keys = fread (des_key_str ,
+                    sizeof (des_key_str) ,
+                    1 ,
+                    HIK) ;
+ 
+  Rc = fclose (HIK) ;
+ 
+  if (num_keys NE 1)
+  {
+      err->err_code = ENC_IO_READ_ERR ;
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  "ENC_init_intrn_key" , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , 2);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  hik_file , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , errno);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , num_keys) ;
+      return (ESA_FATAL) ;
+  }
+ 
+  strncpy (destr , des_key_str , 8);
+  destr[8] = '\0';
+  sscanf (destr , "%x" , (unsigned int *)&des_num);
+ 
+  des_key_num[0] = des_num;
+ 
+  strncpy (destr , &des_key_str[8] ,8);
+  destr[8] = '\0';
+  sscanf (destr , "%x" , (unsigned int *)&des_num);
+ 
+  des_key_num[1] = des_num;
+ 
+  sync_dtls_ptr=
+      (ENC_SYNC_DTLS_rec_ptr)malloc(sizeof(ENC_SYNC_DTLS_rec_typ));
+  if (sync_dtls_ptr EQ NULL)
+  {
+      err->err_code = ENC_MALLOC_FAIL ;
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  "ENC_init_intrn_key" , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , 3);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  "ENC_SYNC_DTLS" , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , (int)sizeof(ENC_SYNC_DTLS_rec_typ));
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , errno);
+      return (ESA_FATAL) ;
+  }
+ 
+  sync_dtls_ptr->active = active ;
+  sync_dtls_ptr->os_handle = NULL ;
+  sync_dtls_ptr->name = NULL;
+  sync_dtls_ptr->is_des = ENC_TRUE;
+  sync_dtls_ptr->next_msg = ENC_MSG_SYNCED ;
+  sync_dtls_ptr->internal_key = ENC_TRUE ;
+ 
+  if (active EQ ENC_TRUE)
+  {
+      AR_ks (des_key ,
+            sync_dtls_ptr->des_tbl ,
+            1);
+      AR_ks (des_key ,
+            sync_dtls_ptr->des_decr_tbl ,
+            -1);
+  }
+ else
+ {
+     memset ((char *)(sync_dtls_ptr->des_tbl),' ', sizeof(DESR));
+     memset ((char *)(sync_dtls_ptr->des_decr_tbl),' ', sizeof(DESR));
+ }
+ 
+ *enc_handle = (void *)sync_dtls_ptr ;
+ 
+#ifdef ARDEBUG
+  printf ("Exiting ENC_init_intrn_key...\n");
+#endif
+ 
+  return (ESA_OK);
+ 
+} /* END - ENC_init_intrn_key */
+ 
+/*********************************************************************
+ * Procedure Name   : ENC_encr (beta)
+ * Description      : Message encryption.
+ * Input            : kt_ptr - The des key table details.
+ *                    buf_in - buffer for encryption.
+ *                    in_len - input buffer length
+ * Output           : buf_out - encrypted buffer.
+ *                    out_len - output buffer actual length.
+ * Input/Output     :
+ * Input assumptions:
+ * Output assertions: The output buffer should be pre allocated by the
+ *                    calling process with the in_len +
+ *                    ENC_ADD_MSG_LEN length !!!
+ *                    The out len will be equal to or higher than the
+ *                    in_len.
+ * Return Value   : ESA_OK - Encryption o.k
+ *                  ESA_WARN - Encryption failed - key synchronization
+ *                         encryption/decryption should be halted.
+ * Side Effects   :
+ *
+ * Function description
+ * ====================
+ * This function is used to encrypt a buffer for the following two
+ * resons:
+ * 1) The message is to be transmitted on the network - in that case
+ *    the session key must be used by the caller and the "internal"
+ *    indication in the key will be FALSE. In that case the function
+ *    encrypts the buffer and adds MAC indication at it's tail.
+ *    Another additional info might be added to the output buffer if
+ *    such need will be detected.
+ * 2) On the Host in case when a sensitive information (user's
+ *    passowrd) is placed on a disk backedup memory. In this case the
+ *    HID will be used by the caller peocess as the key data and the
+ *    "internal" indicator will be TRUE. In that case no additional
+ *    info will be added to the buffer and the output buffer's length
+ *    will be equal to the input buffer length.
+ ********************************************************************/
+ 
+ESA_RC ENC_encr (
+         void            *enc_handle ,  /*in*/
+         void            *buf_in ,      /*in*/
+         int              in_len ,      /*in*/
+         ENC_ENCR_ALGRTM  enc_algorithm,  /*in*/
+         void            *buf_out ,     /*out*/
+         int             *out_len ,     /*in-out*/
+         ENC_ERR_rec_ptr  err)          /*inout*/
+{
+  ESA_RC                        rc ;
+  ENC_SYNC_DTLS_rec_ptr         sync_dtls_ptr ;
+  int                           auth , add_len, left_err_len ;
+  ENC_BOOLEAN                   BAuth;
+  STRCHN                        chain ;
+  char                          *err_ptr;
+ 
+#ifdef ARDEBUG
+  char                         *ptr;
+  int                          i;
+ 
+ 
+  printf ("\nEntering ENC_encr...\n");
+  printf ("In len = %d, buf_out addr = %p\n", in_len, buf_out);
+  if (enc_algorithm EQ ENC_DES)
+    printf ("Algorithm = DES\n");
+  else
+	  if (enc_algorithm EQ ENC_SMALLBUFF)
+         printf ("Algorithm = DES Small buffer\n");
+	  else
+         printf ("Algorithm = Triple DES\n");
+  printf("\n The input buffer is:\n");
+  ptr = buf_in;
+  printf ("%.*s" , in_len , ptr);
+ 
+  printf("\n The input buffer (hexa) is:\n");
+  for (i = 0;i < in_len ; i++)
+  {
+	  printf ((i%2 == 0) ? "%2.2X" : "%2.2X ", (unsigned char)ptr[i]);
+      if (((i + 1) % 20) == 0)
+		  printf ("\n");
+  }
+  printf ("\n");
+ 
+#endif
+ 
+  rc = ESA_OK;
+  memset ((char *)err, 0 , sizeof (ENC_ERR_rec_typ));
+  left_err_len= ENC_ERR_TXT_LEN- 1;
+  err_ptr = err->err_buff;
+ 
+  memset ((char *)&chain , 0 , sizeof(STRCHN));
+  sync_dtls_ptr = enc_handle ;
+ 
+  if (sync_dtls_ptr->next_msg NE ENC_MSG_SYNCED)
+  {
+      err->err_code = ENC_IN_SYNC ;
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  "ENC_encr" , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , 1);
+     return (ESA_WARN) ;
+  }
+ 
+  if (in_len EQ 0)
+  {
+     *out_len = 0;
+     return (ESA_OK);
+  }
+ 
+  if (sync_dtls_ptr->internal_key EQ ENC_TRUE)
+  {
+     auth = 0 ;
+     BAuth = ENC_FALSE;
+     add_len = 0;
+  }
+ else
+  {
+     auth = 1;
+	 BAuth = ENC_TRUE;
+     add_len = ENC_ADD_MSG_LEN ;
+  }
+ 
+  if (sync_dtls_ptr->active EQ ENC_FALSE)
+  {
+    memcpy (buf_out , buf_in ,(size_t)in_len) ;
+    *out_len = in_len + add_len;
+ 
+#ifdef ARDEBUG
+    printf ("\n Encryption NOT ACTIVE !!, Output length = %d\n",
+            *out_len);
+#endif
+ 
+    return (ESA_OK) ;
+  }
+ 
+  if (enc_algorithm EQ ENC_SMALLBUFF)
+  {
+     rc = ENC_smallbuf_enc (sync_dtls_ptr->des_tbl ,
+                            buf_in ,
+                            in_len ,
+                            ENC_TRUE ,
+                            buf_out ,
+                            out_len ,
+                            err);
+     if (rc EQ ESA_OK)
+        rc = ENC_smallbuf_enc (sync_dtls_ptr->des_tbl ,
+							   buf_out ,
+                               *out_len ,
+                               ENC_FALSE ,
+                               buf_out ,
+                               out_len ,
+                               err);
+  }
+else
+  if (enc_algorithm EQ ENC_TDES)
+  {
+     rc = ENC_des_encr (sync_dtls_ptr->des_tbl ,
+                        sync_dtls_ptr->des_decr_tbl2 ,
+						ENC_TDES ,
+                        buf_in ,
+                        in_len ,
+                        ENC_TRUE ,
+                        BAuth ,
+                        buf_out ,
+                        out_len ,
+                        err);
+  }
+else
+ {
+     AR_strenc (buf_in ,
+             buf_out ,
+             (unsigned int)in_len ,
+             &chain ,
+             sync_dtls_ptr->des_tbl ,
+             auth) ;
+ 
+      *out_len = in_len + add_len;
+ }
+ 
+#ifdef ARDEBUG
+  if (rc EQ ESA_OK)
+  {
+     ptr = buf_out;
+     printf ("\nENC_encr terminated, out buf length = %d, buf_out addr %p" ,
+      *out_len , buf_out);
+     printf ("\nThe output buffer is:\n");
+     for (i = 0; i LT *out_len ; i++)
+     {
+        printf (((i % 2) EQ 0) ?
+                   "%2.2X"
+                  :
+                   "%2.2X " ,
+                  (unsigned char )ptr[i]);
+        if (((i + 1) % 20) EQ 0)
+		{
+            printf ("\n");
+        }
+     }
+     printf ("\n");
+  }
+#endif
+ 
+  return (rc) ;
+ 
+} /* END - ENC_encr */
+ 
+/********************************************************************
+ * Procedure Name   : ENC_decr (beta)
+ * Description      : Message decryption.
+ * Input            : kt_ptr - The des key table details.
+ *                    buf_in - buffer for encryption.
+ *                    in_len - input buffer length
+ * Output           : buf_out - decrypted buffer.
+ *                    out_len - output buffer actual length.
+ *                    opr_msg - A message to operator.
+ *                    err     - An error message to log
+ * Input/Output     :
+ * Input assumptions:
+ * Output assertions: The output buffer should be pre allocated by the
+ *                    calling process with the in_len length !!!
+ *                    The out len will be equal to or less than the
+ *                    in_len.
+ * Return Value   : ESA_OK - Message decrypted ok.
+ *                  ESA_WARN - Message not decrypted key
+ *                           synchronization in progress - halt all
+ *                           encryption/decryption until resumed
+ *                  ESA_ERR - Message authentication error -
+ *                           possible BREAKIN attempt - send message
+ *                           to operator.
+ * Side Effects   :
+ *
+ * Function description
+ * ====================
+ * This function is used to decrypt an encrypted buffer for the
+ * following two resons:
+ * 1) The message was received from the network - in that case the
+ *    session key must be used by the caller and the "internal"
+ *    indication in the key will be FALSE. In that case the function
+ *    decrypts the actual message buffer itself (might be less than
+ *    the input buffer) and the resultant decrypted buffer will be at
+ *    least 4 characters shorter than the input buffer due to the MAC
+ *    indication that was added to the message's tail.
+ * 2) On the Host in case when a sensitive information (user's
+ *    passowrd) is received on a disk backedup memory. In this case
+ *    the HID will be used by the caller process as the key data and
+ *    the "internal" indicator will be TRUE. In that case no info will
+ *    be removed from the buffer and the output buffer's length will
+ *    be equal to the input buffer length.
+ ********************************************************************/
+ 
+ESA_RC ENC_decr (
+         void            *enc_handle,   /*in*/
+         void            *buf_in ,      /*in*/
+         int              in_len ,      /*in*/
+         ENC_ENCR_ALGRTM  enc_algorithm,  /*in*/
+         void            *buf_out ,     /*out*/
+         int             *out_len ,     /*in-out*/
+         ENC_ERR_rec_ptr  err)          /*out*/
+{
+  ESA_RC                        rc ;
+  ENC_SYNC_DTLS_rec_ptr         sync_dtls_ptr ;
+  int                           auth , add_len ;
+  ENC_BOOLEAN                   BAuth;
+  STRCHN                        chain ;
+  int                           left_err_len ;
+  char                          *err_ptr;
+  void                          *tmp_buf;
+ 
+ 
+#ifdef ARDEBUG
+  int                           i;
+  char                         *ptr;
+ 
+  ptr = buf_in;
+  printf ("\nENC_decr activated\n");
+  if (enc_algorithm EQ ENC_DES)
+    printf ("Algorithm = DES\n");
+  else
+	  if (enc_algorithm EQ ENC_SMALLBUFF)
+         printf ("Algorithm = DES Small buffer\n");
+	  else
+         printf ("Algorithm = Triple DES\n");
+  printf("input buffer len=%d. \nThe buffer is:\n" ,in_len);
+  for (i = 0; i LT in_len ; i++)
+  {
+     printf (((i % 2) EQ 0) ?
+                "%2.2X"
+               :
+                "%2.2X " ,
+               (unsigned char)ptr[i]);
+     if (((i +1) % 20) EQ 0)
+     {
+         printf ("\n");
+     }
+  }
+  printf ("\n");
+#endif
+ 
+  rc = ESA_OK;
+ 
+  memset ((char *)err, 0 , sizeof (ENC_ERR_rec_typ));
+  left_err_len = ENC_ERR_TXT_LEN - 1;
+  err_ptr = err->err_buff;
+ 
+  memset ((char *)&chain , 0 , sizeof(STRCHN));
+ 
+  sync_dtls_ptr = enc_handle ;
+ 
+  if (sync_dtls_ptr->next_msg NE ENC_MSG_SYNCED)
+  {
+      err->err_code = ENC_IN_SYNC ;
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  "ENC_decr" , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , 1);
+ 
+#ifdef ARDEBUG
+      printf ("\n DECRYPTION inactive-key NOT synchronized!\n");
+#endif
+ 
+      return (ESA_WARN);
+  }
+ 
+  if (in_len EQ 0)
+  {
+     *out_len = 0;
+     return (ESA_OK);
+  }
+ 
+  if (sync_dtls_ptr->internal_key EQ ENC_TRUE)
+  {
+     auth = 0 ;
+     BAuth = ENC_FALSE;
+     add_len = 0;
+  }
+ else
+  {
+     auth = 1;
+	 BAuth = ENC_TRUE;
+     add_len = ENC_ADD_MSG_LEN ;
+  }
+ 
+  if (sync_dtls_ptr->active EQ ENC_FALSE)
+  {
+    memcpy (buf_out , buf_in , (size_t)in_len) ;
+    *out_len = in_len - add_len ;
+ 
+#ifdef ARDEBUG
+    printf ("\n ENC_decr is NOT ACTIVE, Out length = %d\n",
+            *out_len);
+#endif
+ 
+    return (ESA_OK) ;
+  }
+ 
+  if (enc_algorithm EQ ENC_SMALLBUFF)
+  {
+#ifdef ARDEBUG
+    printf ("\n Decr call to ENC_smallbuf_decr 1 out_len=%d.",
+            *out_len);
+#endif
+ 
+    tmp_buf = malloc(in_len);
+    if (tmp_buf EQ NULL)
+    {
+       err->err_code = ENC_MALLOC_FAIL ;
+       ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                   "ENC_decr" , 0);
+       ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                    NULL , 3);
+       ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  "Tmp_buf" , 0);
+       ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                   NULL , in_len);
+       ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                   NULL , errno);
+       return (ESA_FATAL) ;
+    }
+ 
+    rc = ENC_smallbuf_decr (
+             sync_dtls_ptr->des_decr_tbl ,
+             buf_in ,
+             in_len ,
+             ENC_FALSE ,
+             tmp_buf ,
+             out_len,
+             err);
+#ifdef ARDEBUG
+    printf ("\n Decr call to ENC_smallbuf_decr 2 out_len=%d.",
+            *out_len);
+#endif
+     if (rc EQ ESA_OK)
+       rc = ENC_smallbuf_decr (
+                sync_dtls_ptr->des_decr_tbl ,
+                tmp_buf ,
+                *out_len ,
+                ENC_TRUE ,
+                buf_out ,
+                out_len ,
+                err);
+#ifdef ARDEBUG
+    printf ("\n Decr call to ENC_smallbuf_decr 3 out_len=%d.",
+            *out_len);
+#endif
+ 
+    free(tmp_buf);
+ 
+  }
+ else
+  if (enc_algorithm EQ ENC_TDES)
+  {
+       rc = ENC_des_decr (
+                sync_dtls_ptr->des_decr_tbl ,
+                sync_dtls_ptr->des_tbl2 ,
+                ENC_TDES ,
+                buf_in ,
+                in_len ,
+                ENC_TRUE ,
+                BAuth ,
+                buf_out ,
+                out_len ,
+                err);
+#ifdef ARDEBUG
+    printf ("\n Decr call to ENC_tdes_decr 3 out_len=%d.",
+            *out_len);
+#endif
+ 
+  }
+ else
+ {
+#ifdef ARDEBUG
+    printf ("\n Decription call AR_strdec .");
+#endif
+ 
+    rc = AR_strdec (buf_in ,
+                    buf_out ,
+                    (unsigned int)in_len - add_len ,
+                    &chain ,
+                    sync_dtls_ptr->des_tbl ,
+                    auth) ;
+ 
+    if (rc NE AR_OK)
+    {
+        err->err_code = ENC_DECR_AUTH_FAIL ;
+        ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                    "ENC_decr" , 0);
+        ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                    NULL , 2);
+        ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                    NULL , rc);
+        return (ESA_ERR) ;
+    }
+    else
+        rc= ESA_OK;
+ 
+    *out_len = in_len - add_len ;
+ }
+#ifdef ARDEBUG
+    printf ("\n Decription exiting .");
+#endif
+ 
+ return (rc);
+ 
+} /* END - ENC_decr */
+ 
+/*********************************************************************
+ * Procedure Name   : ENC_crypt_direct
+ * Description      : Message encryption/decryption useing des key.
+ * Input            : des_key - The des key (8 bytes)
+ *                    buf_in  - buffer for encryption/decryption.
+ *                    in_len - input buffer length
+ *                    action - requirec action encryption or decryption.
+ *                    mac_req - boolean indicating if MAC verification
+ *                             is required.
+ * Output           : buf_out - encrypted/decrypted buffer.
+ *                    out_len - output buffer actual length.
+ * Input/Output     :
+ * Input assumptions:
+ * Output assertions: The output buffer should be pre allocated by the
+ *                    calling process with the in_len +
+ *                    ENC_ADD_MSG_LEN length (if MAC required)!!!
+ *                    The out len will be equal to or higher than the
+ *                    in_len.
+ * Return Value   : ESA_OK - Encryption o.k
+ *                  ESA_WARN - Action failed - key synchronization
+ *                         encryption/decryption should be halted.
+ * Side Effects   :
+ ********************************************************************/
+ 
+ESA_RC ENC_crypt_direct (
+         ENC_DESK_typ           des_key[],    /*in*/
+         void                  *buf_in ,      /*in*/
+         int                    in_len ,      /*in*/
+         ENC_CRYPT_ACTION_typ   action ,      /*in*/
+         ENC_BOOLEAN            mac_req ,     /*in*/
+         ENC_ENCR_ALGRTM        enc_algorithm,  /*in*/
+         ENC_LOCAL_REMOTE       l_r ,         /*in*/
+         void                  *buf_out ,     /*in*/
+         int                   *out_len ,     /*in-out*/
+         ENC_ERR_rec_ptr        err)          /*inout*/
+{
+  int                           Rc ;
+  int                           auth , add_len ;
+  ENC_BOOLEAN                   BAuth ;
+  STRCHN                        chain ;
+  int                           left_err_len ;
+  char                          *err_ptr;
+  DESR                          des_tbl , des_decr_tbl , des_tbl2 ,
+	                            des_decr_tbl2;
+  void                          *tmp_buf;
+#ifdef ARDEBUG
+  int                           i;
+  char                         *ptr;
+ 
+  ptr = buf_in;
+  printf (
+   "\nENC_crypt direct activ. for %s with%s MAC.In len=%d.\nDes key=" ,
+       (action EQ ENC_ENCRYPT) ? "ENCRYPTION" : "DECRYPTION" ,
+       (mac_req) ? "" : "OUT" ,
+       in_len );
+  for (i = 0; i LT sizeof(ENC_DESK_typ) ; i++)
+     printf ( ((i % 2) EQ 0) ?
+                  "%2.2X "
+                 :
+                  "%2.2X" ,
+              des_key[0][i]);
+ 
+   printf ("\nThe input buf. is:\n");
+      for (i = 0; i LT in_len ; i++)
+    {
+       printf (((i % 2) EQ 0) ?
+                  "%2.2X "
+                 :
+                  "%2.2X" ,
+                 ptr[i]);
+        if (((i +1) % 20) EQ 0)
+           printf ("\n");
+  }
+  printf ("l 1294\n");
+#endif
+ 
+  memset ((char *)err, 0 , sizeof (ENC_ERR_rec_typ));
+  left_err_len = ENC_ERR_TXT_LEN - 1;
+  err_ptr = err->err_buff;
+ 
+  memset ((char *)&chain , 0 , sizeof(STRCHN));
+ 
+  AR_ks (des_key[0] ,
+         des_tbl ,
+         1);
+ 
+  AR_ks (des_key[0] ,
+         des_decr_tbl ,
+         -1);
+ 
+  AR_ks (des_key[1] ,
+         des_tbl2 ,
+         1);
+ 
+  AR_ks (des_key[1] ,
+         des_decr_tbl2 ,
+         -1);
+ 
+  if (in_len EQ 0)
+  {
+     *out_len = 0;
+     return (ESA_OK);
+  }
+ 
+  if (mac_req EQ ENC_TRUE)
+  {
+     auth = 1;
+	 BAuth = ENC_TRUE;
+     add_len = ENC_ADD_MSG_LEN ;
+  }
+ else
+  {
+     auth = 0 ;
+	 BAuth = ENC_FALSE;
+     add_len = 0;
+  }
+ 
+  if (action EQ ENC_ENCRYPT)
+  {
+     if (enc_algorithm EQ ENC_SMALLBUFF)
+     {
+         if (l_r EQ ENC_REMOTE)
+         {
+            Rc = ENC_des_encr (des_tbl ,
+				               des_tbl ,
+							   ENC_SMALLBUFF ,
+                               buf_in ,
+                               in_len ,
+                               ENC_TRUE ,
+                               BAuth ,
+                               buf_out ,
+                               out_len ,
+                               err);
+             if (Rc EQ ESA_OK)
+                Rc = ENC_des_encr (des_tbl ,
+				                   des_tbl ,
+								   ENC_SMALLBUFF ,
+                                   buf_out ,
+                                   *out_len ,
+                                   ENC_FALSE ,
+                                   BAuth ,
+                                   buf_out ,
+                                   out_len ,
+                                   err);
+             if (Rc NE ESA_OK)
+             return (Rc) ;
+         }
+        else
+         {
+            Rc = ENC_smallbuf_enc (des_tbl ,
+                                   buf_in ,
+                                   in_len ,
+                                   ENC_TRUE ,
+                                   buf_out ,
+                                   out_len ,
+                                   err);
+             if (Rc EQ ESA_OK)
+                Rc = ENC_smallbuf_enc (des_tbl ,
+                                       buf_out ,
+                                       *out_len ,
+                                       ENC_FALSE ,
+                                       buf_out ,
+                                       out_len ,
+                                       err);
+             if (Rc NE ESA_OK)
+             return (Rc) ;
+         }
+     }
+	else
+     if (enc_algorithm EQ ENC_TDES)
+     {
+         Rc = ENC_des_encr (des_tbl ,
+				            des_decr_tbl2 ,
+							ENC_TDES,
+                            buf_in ,
+                            in_len ,
+                            ENC_TRUE ,
+							BAuth ,
+                            buf_out ,
+                            out_len ,
+                            err);
+	 }
+	else
+     {
+        AR_strenc (buf_in ,
+                   buf_out ,
+                  (unsigned int)in_len ,
+                  &chain ,
+                   des_tbl ,
+                   auth) ;
+ 
+        *out_len = in_len + add_len;
+     }
+  }
+  else
+  {
+     if (enc_algorithm EQ ENC_SMALLBUFF)
+     {
+        tmp_buf = malloc(in_len);
+ 
+        if (tmp_buf EQ NULL)
+        {
+           err->err_code = ENC_MALLOC_FAIL ;
+           ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                       "ENC_crypt_direct" , 0);
+           ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                        NULL , 3);
+           ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                      "Tmp_buf" , 0);
+           ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                       NULL , in_len);
+           ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                       NULL , errno);
+           return (ESA_FATAL) ;
+        }
+ 
+        if (l_r EQ ENC_REMOTE)
+        {
+ 
+           Rc = ENC_des_decr (
+                   des_decr_tbl ,
+                   des_decr_tbl ,
+                   ENC_SMALLBUFF ,
+                   buf_in ,
+                   in_len ,
+                   ENC_FALSE ,
+				   BAuth ,
+                   tmp_buf ,
+                   out_len ,
+                   err);
+           if (Rc EQ ESA_OK)
+              Rc = ENC_des_decr (
+                      des_decr_tbl ,
+                      des_decr_tbl ,
+                      ENC_SMALLBUFF ,
+                      tmp_buf ,
+                      *out_len ,
+                      ENC_TRUE ,
+					  BAuth ,
+                      buf_out ,
+                      out_len,
+                      err);
+        }
+       else
+       {
+           Rc = ENC_smallbuf_decr (
+                   des_decr_tbl ,
+                   buf_in ,
+                   in_len ,
+                   ENC_FALSE ,
+                   tmp_buf ,
+                   out_len ,
+                   err);
+           if (Rc EQ ESA_OK)
+              Rc = ENC_smallbuf_decr (
+                      des_decr_tbl ,
+                      tmp_buf ,
+                      *out_len ,
+                      ENC_TRUE ,
+                      buf_out ,
+                      out_len,
+                      err);
+       }
+ 
+       free(tmp_buf);
+ 
+       if (Rc NE ESA_OK)
+            return (Rc);
+     }
+    else
+     if (enc_algorithm EQ ENC_TDES)
+     {
+        Rc = ENC_des_decr (
+                   des_decr_tbl ,
+                   des_tbl2 ,
+                   ENC_TDES,
+                   buf_in ,
+                   in_len ,
+                   ENC_TRUE ,
+				   BAuth ,
+                   buf_out ,
+                   out_len ,
+                   err);
+ 
+       if (Rc NE ESA_OK)
+            return (Rc);
+     }
+ 
+    else
+     {
+        Rc = AR_strdec (buf_in ,
+                       buf_out ,
+                       (unsigned int)in_len - add_len ,
+                       &chain ,
+                       des_tbl ,
+                       auth) ;
+ 
+        if (Rc NE AR_OK)
+        {
+           err->err_code = ENC_DECR_AUTH_FAIL ;
+           ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                       "ENC_decr" , 0);
+           ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                       NULL , 2);
+           ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                       NULL , Rc);
+           return (ESA_ERR) ;
+        }
+ 
+        *out_len = in_len - add_len ;
+    }
+  }
+ 
+#ifdef ARDEBUG
+ 
+  ptr = buf_out;
+  printf (
+   "\nENC_crypt_direct terminated, output buf.length=%d,",*out_len);
+  printf ("The output buffer is:\n");
+ 
+  for (i = 0; i LT *out_len ; i++)
+  {
+     printf (((i % 2) EQ 0) ?
+                "%2.2X"
+               :
+                "%2.2X " ,
+               (unsigned char)ptr[i]);
+     if (((i +1) % 20) EQ 0)
+         printf ("\n");
+  }
+  printf ("\n");
+ 
+#endif
+ 
+  return (ESA_OK) ;
+ 
+} /* END - ENC_crypt_direct */
+ 
+/*********************************************************************
+ * Procedure Name   : ENC_init_fixed_key (1key) (beta)
+ * Description      : Prepare a DES TABLE record for specific known
+ *                    des key.
+ * Input            : active - A boolean indicating if the encryption
+ *                             is active (TRUE) or not (FALSE).
+ *                    key_file - The DES key filename.
+ * Output           : kt_ptr - The des key table record.
+ * Input/Output     :
+ * Input assumptions: The input key file should contain a buffer of 8
+ *                    characters that are used as DES key. The
+ *                    process must have read access to that file.
+ * Output assertions:
+ * Return Value   : ESA_RC
+ * Side Effects   :
+ *
+ * Function description
+ * ====================
+ * This function is used to create a DES KEY table for specific des
+ * key. The output buffer will always contain a FALSE "internal"
+ * indicator.
+ ********************************************************************/
+ 
+ESA_RC ENC_init_fixed_key (
+         char             *key_file ,   /*in*/
+         ENC_BOOLEAN       active ,     /*in*/
+         void            **enc_handle , /*out*/
+         ENC_ERR_rec_ptr   err)         /*inout*/
+{
+  int                Rc ;
+  int                num_keys ;
+  FILE                           *KF ;
+  DWORD                         des_key_num[2];
+  UNSBYTE                      *des_key = (UNSBYTE *)des_key_num;
+  int                           des_num  ;
+  char                          des_key_str[16] , destr[9];
+  ENC_SYNC_DTLS_rec_ptr         sync_dtls_ptr ;
+  int                           left_err_len ;
+  char                         *err_ptr;
+  char                          ddn_with[50]="";          /* SAS2IBMT */
+ 
+ memset ((char *)err, 0 , sizeof (ENC_ERR_rec_typ));
+ left_err_len = ENC_ERR_TXT_LEN - 1;
+ err_ptr = err->err_buff;
+ 
+ strcpy(ddn_with,"DD:");                                  /* SAS2IBMT */
+ strcat(ddn_with, key_file);                              /* SAS2IBMT */
+ /* strcpy(ddn_with,"//'");                                  SAS2IBMT */
+ /* strcat(ddn_with, key_file);                              SAS2IBMT */
+ /* strcat(ddn_with,"'");                                    SAS2IBMT */
+ #ifdef ARDEBUG
+       printf ("\n ENCDES: About to fopen %s \n" , key_file);     /* SAS2IBMT */
+ #endif
+ 
+ /* SAS2IBMT KF = fopen (key_file , "r") ;                           */
+ KF = fopen (ddn_with , "r") ;                            /* SAS2IBMT */
+  if (KF EQ NULL)
+  {
+      err->err_code = ENC_IO_OPEN_ERR ;
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  "ENC_init_fixed_key" , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , 1);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  key_file , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , errno);
+      return (ESA_FATAL) ;
+  }
+ 
+  num_keys = fread (des_key_str ,
+                    sizeof (des_key_str) ,
+                    1 ,
+                    KF) ;
+ 
+  Rc = fclose (KF) ;
+ 
+  if (num_keys NE 1)
+  {
+      err->err_code = ENC_IO_READ_ERR ;
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  "ENC_init_fixed_key" , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , 2);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  key_file , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , errno);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , (int)num_keys);
+      return (ESA_FATAL) ;
+  }
+ 
+  strncpy (destr , des_key_str , 8);
+  destr[8] = '\0';
+  sscanf (destr , "%x" , &des_num);
+ 
+  des_key_num[0] = des_num;
+ 
+  strncpy (destr , &des_key_str[8] ,8);
+  destr[8] = '\0';
+  sscanf (destr , "%x" , &des_num);
+ 
+  des_key_num[1] = des_num;
+ 
+  sync_dtls_ptr=
+      (ENC_SYNC_DTLS_rec_ptr)malloc(sizeof(ENC_SYNC_DTLS_rec_typ));
+  if (sync_dtls_ptr EQ NULL)
+  {
+      err->err_code = ENC_MALLOC_FAIL ;
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  "ENC_init_fixed_key" , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , 3);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  "ENC_SYNC_DTLS" , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , (int)sizeof(ENC_SYNC_DTLS_rec_typ));
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , errno);
+      return (ESA_FATAL) ;
+  }
+ 
+  sync_dtls_ptr->active = active ;
+  sync_dtls_ptr->os_handle = NULL ;
+  sync_dtls_ptr->name = NULL;
+  sync_dtls_ptr->is_des = ENC_TRUE;
+  sync_dtls_ptr->next_msg = ENC_MSG_SYNCED ;
+  sync_dtls_ptr->internal_key = ENC_FALSE ;
+ 
+  if (active EQ ENC_TRUE)
+     AR_ks (des_key ,
+            sync_dtls_ptr->des_tbl ,
+            1);
+ else
+     memset ((char *)sync_dtls_ptr->des_tbl , ' ' , sizeof(DESR)) ;
+ 
+  *enc_handle = (void *)sync_dtls_ptr ;
+ 
+  return (ESA_OK);
+ 
+} /* END - ENC_init_fixed_key */
+ 
+/*********************************************************************
+ * Procedure Name   : ENC_term (beta)
+ * Description      : Free all prealocated memory.
+ * Input            :
+ * Output           :
+ * Input/Output     : enc_handle - pointer to allocated memory
+ * Input assumptions: The pointer points to memory prealocated
+ *                    by the encryption package.
+ * Output assertions:
+ * Return Value     : void
+ * Side Effects     :
+ *
+ * Function description
+ * ====================
+ * This function is used to free all memory that was pre allocated
+ * by the encryption package - as part of process rundown.
+ ********************************************************************/
+ 
+void  ENC_term (
+                 void  **enc_handle) /*inout*/
+{
+   ENC_SYNC_DTLS_rec_ptr sync_dtls;
+ 
+   if (*enc_handle EQ NULL)
+      return ;
+ 
+   sync_dtls = *enc_handle;
+   if (sync_dtls->name NE NULL)
+      free (sync_dtls->name);
+   if (sync_dtls->os_handle NE NULL)
+      free (sync_dtls->os_handle);  /* ?????? */
+   free (*enc_handle);
+   *enc_handle = NULL;
+   return ;
+ 
+} /* END - ENC_term */
+ 
+/*********************************************************************
+ * Procedure Name   : ENC_init_keys
+ * Description      : Loads the DES keys file to memory.
+ * Input            : key_file - The DES key filename.
+ * Output           : keys_hndl - The pointer to memory allocated.
+ * Input/Output     :
+ * Input assumptions: The input key file first includes the number of
+ *                    used keys and then the above mentioned DES keys
+ *                    formatted in 16 characters hexadecimal strings.
+ * Output assertions: The keys_hndl should be given as input to the
+ *                   ENCR_init_fixed_key and ENCR_term_keys functions.
+ * Return Value   : ESA_RC
+ * Side Effects   :
+ *
+ * Function description
+ * ====================
+ * This function is used to load the DES keys file to memory.
+ ********************************************************************/
+ 
+ESA_RC ENC_init_keys (
+         char             *key_file ,    /*in*/
+         void            **keys_handle , /*out*/
+         ENC_ERR_rec_ptr   err)          /*inout*/
+{
+  int                             rc_close , rc ;
+  int                    num_keys ;
+  ENC_KEYS_rec_ptr              key_arr_ptr ;
+  ENC_DESK_typ                 *key_ptr;
+  FILE                           *KF ;
+  char                          num_keys_str[5];
+  DWORD                         des_key_num[2];
+  UNSBYTE                      *des_key = (UNSBYTE *)des_key_num;
+  int                           des_num  ;
+  char                          des_key_str[17] , destr[9] , lf[2];
+  int                           left_err_len ;
+  char                         *err_ptr;
+  int                           i , j;
+  char                          ddn_with[50]="";          /* SAS2IBMT */
+ 
+ memset ((char *)err, 0 , sizeof (ENC_ERR_rec_typ));
+ left_err_len = ENC_ERR_TXT_LEN - 1;
+ err_ptr = err->err_buff;
+ 
+ strcpy(ddn_with,"DD:");                                  /* SAS2IBMT */
+ strcat(ddn_with, key_file);                              /* SAS2IBMT */
+ /* strcpy(ddn_with,"//'");                                  SAS2IBMT */
+ /* strcat(ddn_with, key_file);                              SAS2IBMT */
+ /* strcat(ddn_with,"'");                                    SAS2IBMT */
+ #ifdef ARDEBUG
+       printf ("\n ENCDES: About to fopen %s \n" , key_file);     /* SAS2IBMT */
+ #endif
+ 
+ /* SAS2IBMT KF = fopen (key_file , "r") ;                           */
+ KF = fopen (ddn_with , "r") ;                            /* SAS2IBMT */
+ if (KF EQ NULL)
+ {
+     err->err_code = ENC_IO_OPEN_ERR ;
+     ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                 "ENC_init_keys" , 0);
+     ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                 NULL , 1);
+     ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                 key_file , 0);
+     ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                 NULL , errno);
+     return (ESA_FATAL) ;
+ 
+ }
+ 
+ memset (num_keys_str , 0 , sizeof(num_keys_str));
+ 
+ if (fgets (num_keys_str ,
+            sizeof (num_keys_str) ,
+            KF)  EQ NULL)
+ {
+     err->err_code = ENC_IO_READ_ERR ;
+     ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                 "ENC_init_keys" , 0);
+     ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                 NULL , 2);
+     ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                 key_file , 0);
+     ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                 NULL , errno);
+     ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                 NULL , 0);
+     rc =  ESA_FATAL ;
+     goto cleanup;
+ }
+ 
+ fgets (lf , 2 , KF) ;
+ 
+ if (strlen(num_keys_str) NE ENC_NUM_KEYS_STR_LEN)
+ {
+      err->err_code = ENC_FILE_CORRUPT ;
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  "ENC_init_keys" , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , 3);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                 key_file , 0);
+      rc =  ESA_FATAL ;
+      goto cleanup;
+ }
+ 
+ for (i = 0; i LT ENC_NUM_KEYS_STR_LEN ; i++)
+ {
+    if (NOT(isdigit(num_keys_str[i])))
+    {
+      err->err_code = ENC_FILE_CORRUPT ;
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  "ENC_init_keys" , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , 4);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                 key_file , 0);
+      rc =  ESA_FATAL ;
+      goto cleanup;
+   }
+ 
+ }
+ 
+ sscanf (num_keys_str , "%d" , &num_keys);
+ 
+#ifdef ARDEBUG
+  printf ("ENC_init_keys activated.%d keys are expected.\n",
+           num_keys);
+#endif
+ 
+ 
+if ((num_keys LT ENC_DES_MIN_KEYS) OR (num_keys GT ENC_DES_MAX_KEYS))
+{
+   err->err_code = ENC_FILE_CORRUPT ;
+   ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+               "ENC_init_keys" , 0);
+   ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+               NULL , 5);
+   ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+              key_file , 0);
+   rc =  ESA_FATAL ;
+   goto cleanup;
+}
+ 
+ 
+key_arr_ptr = (ENC_KEYS_rec_ptr)malloc(sizeof(ENC_KEYS_rec_typ)+
+                      (sizeof(ENC_DESK_typ) * num_keys));
+ 
+ if (key_arr_ptr EQ NULL)
+ {
+      err->err_code = ENC_MALLOC_FAIL ;
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  "ENC_init_keys" , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , 6);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  "ENC_SYNC_DTLS" , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , (int)sizeof(ENC_SYNC_DTLS_rec_typ));
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , errno);
+      rc = ESA_FATAL ;
+      goto cleanup;
+ }
+ 
+ *keys_handle = key_arr_ptr ;
+ 
+ key_arr_ptr->num_keys = num_keys;
+ 
+ for (i = 0 , key_ptr = key_arr_ptr->des_key; i LT num_keys ;
+    i++ , key_ptr++)
+ {
+    if (fgets  (des_key_str ,
+             sizeof (des_key_str) ,
+             KF) EQ NULL )
+   {
+        err->err_code = ENC_FILE_CORRUPT ;
+          ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                    "ENC_init_keys" , 0);
+          ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                    NULL , 7);
+        ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                    key_file , 0);
+        rc = ESA_FATAL ;
+        goto cleanup;
+    }
+ 
+    fgets (lf , 2 , KF) ;
+ 
+    if (strlen(des_key_str) NE 16)
+    {
+         err->err_code = ENC_FILE_CORRUPT ;
+         ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                     "ENC_init_keys" , 0);
+         ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                     NULL , 8);
+         ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                    key_file , 0);
+         rc =  ESA_FATAL ;
+         goto cleanup;
+    }
+ 
+    for (j = 0; j LT 16 ; j++)
+    {
+       if (NOT(isxdigit(des_key_str[j])))
+       {
+         err->err_code = ENC_FILE_CORRUPT ;
+         ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                     "ENC_init_keys" , 0);
+         ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                     NULL , 9);
+         ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                    key_file , 0);
+         rc =  ESA_FATAL ;
+         goto cleanup;
+      }
+ 
+    }
+ 
+    strncpy (destr , des_key_str , 8);
+    destr[8] = '\0';
+    sscanf (destr , "%x" , &des_num);
+ 
+    des_key_num[0] = des_num;
+ 
+   strncpy (destr , &des_key_str[8] ,8);
+   destr[8] = '\0';
+   sscanf (destr , "%x" , &des_num);
+ 
+   des_key_num[1] = des_num;
+ 
+   memcpy ((char *)key_ptr  , (char *)des_key , sizeof(des_key_num));
+ 
+ } /* end - FOR */
+ 
+ rc = ESA_OK ;
+ 
+cleanup:
+ 
+ rc_close = fclose (KF) ;
+ 
+ return (rc);
+ 
+} /* END - ENC_init_keys */
+ 
+/*********************************************************************
+ * Procedure Name   : ENC_term_keys
+ * Description      : Release DES keys array from memory.
+ * Input            : keys_hndl - pointer to the array.
+ * Output           :
+ * Input/Output     :
+ * Input assumptions:
+ * Output assertions: The keys_hndl should have been allocated by
+ *                    ENC_init_keys function.
+ * Return Value   : ESA_RC
+ * Side Effects   :
+ *
+ * Function description
+ * ====================
+ * This function is used to deallocate the DES keys array from memory.
+ ********************************************************************/
+ 
+ 
+ESA_RC ENC_term_keys (
+         void            **keys_handle , /*out*/
+         ENC_ERR_rec_ptr   err)          /*inout*/
+{
+ 
+ free (*keys_handle) ;
+ *keys_handle = NULL ;
+ return (ESA_OK);
+ 
+} /* END - ENC_term_keys */
+ 
+ 
+/*********************************************************************
+ * Procedure Name   : ENC_init_key (beta)
+ * Description      : Prepare a DES TABLE record for specific des key.
+ * Input            : key id - a buffer that will be used to create
+ *                             key index - in order to select DES key.
+ *                             This buffer usually should contained
+ *                             string of SIID chained with the SHORT
+ *                             CODE of RSS.
+ *                    key_id_len - length (in bytes) of key_id.
+ *                    active - A boolean indicating if the encryption
+ *                             is active (TRUE) or not (FALSE).
+ *                  keys_hndl - The handle returned from ENC_init_keys
+ *                                function.
+ * Output           : enc_handle - Pointer to the des key table + some
+ *                            more information required by the encrypt
+ *                                /decrypt functions.
+ * Input/Output     :
+ * Input assumptions:
+ * Output assertions:The enc_handle will be freed by calling ENC_term
+ * Return Value   : ESA_RC
+ * Side Effects   :
+ *
+ * Function description
+ * ====================
+ * This function is used to create a DES KEY table for specific des
+ * key. The output buffer will always contain a FALSE "internal"
+ * indicator.
+ * PLEASE NOTE !!!! This function is in use INSTEAD of
+ * ENC_init_fixed_key function - as long as the encryption will work
+ * with    keys according to service's siid.
+ ********************************************************************/
+ 
+ESA_RC ENC_init_key    (
+     char             *key_id ,     /*in*/
+     int               key_id_len , /*in*/
+     ENC_BOOLEAN       active ,     /*in*/
+     void             *keys_hndl ,  /*in*/
+     void            **enc_handle , /*out*/
+     ENC_ERR_rec_ptr   err)         /*inout*/
+{
+  int                           key_idx ;
+  ENC_SYNC_DTLS_rec_ptr         sync_dtls_ptr ;
+  int                           left_err_len ;
+  char                         *err_ptr;
+  unsigned char                 key1[16];
+  unsigned int                  k1 , k2 , k3;
+  ENC_KEYS_rec_ptr              keys_ptr;
+  ENC_DESK_typ                 *key_ptr ;
+  int                           i;
+ 
+  i = 0;
+  memset ((char *)err, 0 , sizeof (ENC_ERR_rec_typ));
+  left_err_len = ENC_ERR_TXT_LEN - 1;
+  err_ptr = err->err_buff;
+ 
+  /* CALCULATE the key index number */
+ 
+   keys_ptr = keys_hndl;
+ 
+   AR_make_random ((unsigned char *)key_id , key_id_len , key1);
+ 
+#ifdef ARDEBUG
+ 
+   printf ("ENC_init_key activated.\n    Key id ->%.*s<-.\n",
+           key_id_len ,
+           key_id);
+   printf ("Key id (hex)->");
+   for (i=0 ; i<key_id_len ; i++)
+	   printf (
+	   ( i % 2 == 0) ? "%2.2X" : "%2.2X " , (unsigned char)key_id[i]);
+ 
+   printf ("\nResultant random buffer is : ");
+     for (i = 0; i < 8 ; i++)
+     printf ("%2.2X " , key1[i]);
+   printf ("\n");
+#endif
+ 
+   memcpy ((char *)&k1 , (char *)key1 , 4);
+   memcpy ((char *)&k2 , (char *)(&key1[4]) , 4);
+ 
+   k3 = k1 ^ k2 ;
+   key_idx = k3 % keys_ptr->num_keys;
+ 
+   key_ptr = keys_ptr->des_key;
+   key_ptr += key_idx;
+ 
+#ifdef ARDEBUG
+   printf ("The resultant key index is : %d\n" , key_idx) ;
+   printf ("The selected key will be : ");
+     for (i = 0 ; i < 8 ; i++)
+     printf ("%2.2X " , (*key_ptr)[i]);
+#endif
+ 
+sync_dtls_ptr =
+ (ENC_SYNC_DTLS_rec_ptr)malloc (sizeof (ENC_SYNC_DTLS_rec_typ) );
+  if (sync_dtls_ptr EQ NULL)
+  {
+      err->err_code = ENC_MALLOC_FAIL ;
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  "ENC_init_key" , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , 3);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  "ENC_SYNC_DTLS" , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , (int)sizeof(ENC_SYNC_DTLS_rec_typ));
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , errno);
+      return (ESA_FATAL) ;
+  }
+ 
+  sync_dtls_ptr->active = active ;
+  sync_dtls_ptr->os_handle = NULL ;
+  sync_dtls_ptr->name = NULL;
+  sync_dtls_ptr->is_des = ENC_TRUE;
+  sync_dtls_ptr->next_msg = ENC_MSG_SYNCED ;
+  sync_dtls_ptr->internal_key = ENC_FALSE ;
+ 
+  if (active EQ ENC_TRUE)
+  {
+	  AR_ks (*key_ptr ,
+             sync_dtls_ptr->des_tbl ,
+             1);
+ 
+  	  AR_ks (*key_ptr ,
+             sync_dtls_ptr->des_decr_tbl ,
+             -1);
+ 
+	  /* Aviw 22/5/2000 - addedd next key KS for TDES */
+ 
+	  key_idx++ ;
+	  key_idx = key_idx % keys_ptr->num_keys;
+ 
+      key_ptr = keys_ptr->des_key;
+      key_ptr += key_idx;
+ 
+#ifdef ARDEBUG
+   printf ("\n\nThe resultant 2nd key index is : %d\n" , key_idx) ;
+   printf ("The selected 2nd key will be : ");
+     for (i = 0 ; i < 8 ; i++)
+     printf ("%2.2X " , (*key_ptr)[i]);
+#endif
+	  AR_ks (*key_ptr ,
+             sync_dtls_ptr->des_tbl2 ,
+             1);
+ 
+  	  AR_ks (*key_ptr ,
+             sync_dtls_ptr->des_decr_tbl2 ,
+             -1);
+ 
+  }
+ else
+ {
+    memset ((char *)sync_dtls_ptr->des_tbl , ' ' , sizeof(DESR)) ;
+    memset ((char *)sync_dtls_ptr->des_decr_tbl , ' ' , sizeof(DESR)) ;
+    memset ((char *)sync_dtls_ptr->des_tbl2 , ' ' , sizeof(DESR)) ;
+    memset ((char *)sync_dtls_ptr->des_decr_tbl2 , ' ' , sizeof(DESR)) ;
+ 
+ }
+ 
+  *enc_handle = (void *)sync_dtls_ptr ;
+ 
+  return (ESA_OK);
+ 
+} /* END - ENC_init_key */
+ 
+/*********************************************************************
+ * Procedure Name   : ENC_smallbuf_enc
+ * Description      : Encryption for small buffer using directly DES
+ *                    function and XORing. Optionally the function
+ *                    inserts the original message length in the last
+ *                    4 bytes of the encrypted message. The output
+ *                    buffer length is the original message length +
+ *                    size of integer rounded up to the closet muliply
+ *                    of 16 bytes.
+ * Input            : kt_ptr - The des key table details.
+ *                    buf_in - buffer for encryption.
+ *                    in_len - input buffer length
+ * Output           : buf_out - encrypted buffer.
+ *                    out_len - output buffer actual length.
+ * Input/Output     :
+ * Input assumptions:
+ * Output assertions: The output buffer should be pre allocated by the
+ *                    calling process with the in_len +
+ *                    ENC_ADD_MSG_LEN length !!!
+ *                    The out len will be equal to or higher than the
+ *                    in_len.
+ * Return Value   : ESA_OK - Encryption o.k
+ *                  ESA_WARN - Encryption failed - key synchronization
+ *                         encryption/decryption should be halted.
+ * Side Effects   :
+ *
+ * Function description
+ * ====================
+ * This encryption function is used for small buffer using directly DES
+ * function and XORing. Optionally the function inserts the original
+ * message length in the last 4 bytes of the encrypted msg., the output
+ * buffer length, in this case, is the original msg. length + size of
+ * integer rounded up to the close muliply of 16 bytes, otherwise - the
+ * input buffer length is expected to be divided by 16 with no reminder
+ * and the outbut buffer length will be the input buffer length.
+ ********************************************************************/
+ 
+ESA_RC ENC_smallbuf_enc (
+         DESR             des_tbl ,
+         void            *buf_in ,          /*in*/
+         int              in_len ,          /*in*/
+         ENC_BOOLEAN      add_len ,         /*in*/
+         void            *buf_out ,         /*out*/
+         int             *out_len ,         /*in-out*/
+         ENC_ERR_rec_ptr  err)              /*inout*/
+{
+  int                           calc_len, left_err_len ;
+  void                         *tmp_buf;
+  int                           i , j , *orig_len;
+  char                         *err_ptr;
+ 
+#ifdef ARDEBUG
+  char                         *ptr ;
+ 
+  printf ("\nEntering ENC_smallbuf_enc.Des table is ");
+#endif
+ 
+  memset ((char *)err, 0 , sizeof (ENC_ERR_rec_typ));
+  err_ptr = err->err_buff;
+ 
+  if (add_len EQ ENC_TRUE)
+  {
+     calc_len = (((in_len + sizeof(int)) % 16) EQ 0) ?
+        in_len + sizeof(int)
+        :
+        in_len + sizeof(int) +(16 - ((in_len + sizeof(int))% 16));
+ 
+#ifdef ARDEBUG
+      printf ("\n Encryption - calc_len = %d" , calc_len);
+#endif
+     if (*out_len LT calc_len)
+     {
+#ifdef ARDEBUG
+    printf ("\nError !!! Out buf len (%d) too small, req=%d." ,
+                *out_len , calc_len);
+#endif
+        err->err_code = ENC_OUTBUF_SMALL;
+        ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                    "ENC_smallbuf_encr" , 0);
+        ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                    NULL , *out_len);
+        ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                    NULL , calc_len);
+        return (ESA_ERR) ;
+     }
+ 
+ 
+#ifdef ARDEBUG
+      printf ("\n Encryption - calc_len found ok...");
+#endif
+  }
+  else
+      calc_len = in_len;
+ 
+     tmp_buf = malloc (calc_len) ;
+ 
+     if (tmp_buf EQ NULL)
+     {
+#ifdef ARDEBUG
+  printf ("\nError !!! Malloc failed. errno = %d" , errno);
+#endif
+         err->err_code = ENC_MALLOC_FAIL ;
+         ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                     "ENC_smallbuf_enc" , 0);
+         ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                     NULL , 5);
+         ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                     "ENC_TMP_BUF" , 0);
+         ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                     NULL , calc_len);
+         ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                     NULL , errno);
+         return (ESA_FATAL) ;
+     }
+ 
+#ifdef ARDEBUG
+  printf ("\n Encryption - tmp_buf allocated at %p" , tmp_buf);
+#endif
+ 
+     memset (tmp_buf , 0 , calc_len);
+     memcpy (tmp_buf , buf_in , in_len) ;
+ 
+#ifdef ARDEBUG
+  printf("\n calc_len %d in_len=%d.",(int)calc_len,(int)in_len);
+#endif
+  if (add_len EQ ENC_TRUE)
+  {
+     orig_len = (int *)&(((char *)tmp_buf)[calc_len - sizeof(int)]) ;
+#ifdef ARDEBUG
+      printf ("\n Encryption - orig_len %d." , (int)orig_len);
+#endif
+     *orig_len = in_len;
+  }
+ 
+ 
+#ifdef ARDEBUG
+  printf ("\nEncr-inbuf copied into tmp_buf.Calc_len in buf=%d",
+         *orig_len);
+#endif
+ 
+     for (i = 0; i < ((calc_len / 8) - 1) ; i++)
+     {
+         AR_des ((void *)&((char *)tmp_buf)[i*8] ,
+                 (void *)&((char *)buf_out)[i*8] ,
+                 des_tbl);
+         for (j = 0 ; j < 8 ; j++)
+           ((char *)tmp_buf)[(i+1)*8 + j] ^=((char *)buf_out)[(i*8)+j];
+     }
+ 
+     i = (calc_len / 8) - 1;
+ 
+     AR_des ((void *)&((char *)tmp_buf)[i*8] ,
+             (void *)&((char *)buf_out)[i*8] ,
+             des_tbl);
+ 
+     *out_len = calc_len ;
+     free (tmp_buf);
+ 
+#ifdef ARDEBUG
+  ptr = buf_out;
+  printf ("\nENC_smallbuf_encr term.Output buffer length=%d.",*out_len)
+  printf ("The output buffer is:\n");
+  for (i = 0; i LT *out_len ; i++)
+  {
+     printf ( ((i % 2) EQ 0) ?
+                "%2.2X"
+               :
+                "%2.2X " ,
+               (unsigned char)ptr[i]);
+     if (((i + 1) % 20) EQ 0)
+	 {
+         printf ("\n");
+     }
+  }
+  printf ("\nExiting ENC_smallbuf_encr...");
+#endif
+ 
+  return (ESA_OK) ;
+ 
+} /* END - ENC_smallbuf_encr */
+ 
+/*********************************************************************
+ * Procedure Name   : ENC_smallbuf_decr
+ * Description      : Decryption for small buffer.
+ * Input            : kt_ptr - The des key table details.
+ *                    buf_in - buffer for encryption.
+ *                    in_len - input buffer length
+ * Output           : buf_out - encrypted buffer.
+ *                    out_len - output buffer actual length.
+ * Input/Output     :
+ * Input assumptions:
+ * Output assertions: The output buffer should be pre allocated by the
+ *                    calling process with the in_len +
+ *                    ENC_ADD_MSG_LEN length !!!
+ *                    The out len will be equal to or higher than the
+ *                    in_len.
+ * Return Value   : ESA_OK - Encryption o.k
+ *                  ESA_WARN - Encryption failed - key synchronization
+ *                         encryption/decryption should be halted.
+ * Side Effects   :
+ *
+ * Function description
+ * ====================
+ * This decryption function is used for small buffer, that was
+ * encrypted using the ENC_smallbuf_enc function. It uses directly DES
+ * function and XORing. Optionally the function returns the original
+ * message length that was stored in the last 4 bytes of the encrypted
+ * message,the output buffer length, in this case, is the less than the
+ * original encryppted buffer lenth-otherwise, the input buffer length
+ * is expected to be divided by 16 with no reminder , and the outbut
+ * buffer length will be the input buffer length.
+ ********************************************************************/
+ 
+ESA_RC ENC_smallbuf_decr (
+         DESR             des_tbl ,
+         void            *buf_in ,          /*in*/
+         int              in_len ,          /*in*/
+         ENC_BOOLEAN      ret_orig_len ,    /*in*/
+         void            *buf_out ,         /*out*/
+         int             *out_len,          /*in-out*/
+         ENC_ERR_rec_ptr  err)              /*inout*/
+ 
+{
+  void                         *tmp_buf;
+  int                           i , j , *orig_len , left_err_len;
+  char                         *err_ptr;
+ 
+  memset ((char *)err, 0 , sizeof (ENC_ERR_rec_typ));
+  err_ptr = err->err_buff;
+ 
+#ifdef ARDEBUG
+  printf ("\nEntering ENC_smallbuf_dec...");
+#endif
+ 
+/*VALIDATE that input buffer length is divided by 16 with no reminder*/
+ 
+  if ((in_len % 16) NE 0)
+  {
+      err->err_code = ENC_DECR_NOSMALLBUF;
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  "ENC_smallbuf_decr" , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , in_len);
+      return (ESA_ERR) ;
+  }
+ 
+ 
+  tmp_buf = malloc (in_len) ;
+  if (tmp_buf EQ NULL)
+  {
+#ifdef ARDEBUG
+         printf (
+                  "\nError !!! Malloc failed. errno = %d" ,
+                  errno);
+#endif
+         err->err_code = ENC_MALLOC_FAIL ;
+         ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                     "ENC_smallbuf_decr" , 0);
+         ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                     NULL , 5);
+         ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                     "ENC_TMP_BUF" , 0);
+         ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                     NULL , in_len);
+         ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                     NULL , errno);
+         return (ESA_FATAL) ;
+  }
+ 
+  memcpy (tmp_buf , buf_in , in_len) ;
+#ifdef ARDEBUG
+  printf ("\nENC_smallbuf_dec: after memcpy.");
+#endif
+ 
+  for (i = 0; i < (in_len / 8) ; i++)
+    AR_des ((void *)&((char *)buf_in)[i*8] ,
+            (void *)&((char *)tmp_buf)[i*8] ,
+            des_tbl);
+ 
+#ifdef ARDEBUG
+  printf ("\nENC_smallbuf_dec: after for 1.");
+#endif
+  for (i = 1; i < (in_len / 8) ; i++)
+  {
+     for (j = 0 ; j < 8 ; j++)
+       ((char *)tmp_buf)[(i*8) + j] ^= ((char *)buf_in)[((i-1)*8) + j];
+  }
+#ifdef ARDEBUG
+  printf ("\nENC_smallbuf_dec: after for 2.");
+#endif
+ 
+  if (ret_orig_len EQ ENC_TRUE)
+  {
+     orig_len = (int *)&(((char *)tmp_buf)[in_len - sizeof(int)]) ;
+     *out_len = *orig_len ;
+#ifdef ARDEBUG
+  printf("\nENC_smallbuf_dec: before memcpy.buf out=%p,orig=%d",
+            buf_out , *orig_len);
+#endif
+ 
+/* VALIDATE that original buffer length is not longer than input buffer
+   length less the size of integer (the original buffer length stored
+   in it) */
+ 
+     if ((*orig_len GT (in_len - (int)sizeof(int)))
+        OR
+         (*orig_len LT 0))
+     {
+        err->err_code = ENC_DECR_ORIGLEN;
+        ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                    "ENC_smallbuf_decr" , 0);
+        ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                    NULL , *orig_len);
+        ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                    NULL , in_len);
+        return (ESA_ERR) ;
+     }
+ 
+     memcpy (buf_out , tmp_buf , *orig_len);
+  }
+ else
+  {
+     *out_len = in_len ;
+     memcpy (buf_out , tmp_buf , in_len);
+  }
+#ifdef ARDEBUG
+  printf ("\nENC_smallbuf_dec: before free.");
+#endif
+ 
+  free (tmp_buf);
+ 
+  return (ESA_OK) ;
+ 
+} /* END - ENC_smallbuf_decr */
+ 
+/*********************************************************************
+ * Procedure Name   : ENC_des_encr
+ * Description      : Encryption for DES and 3DES using directly DES
+ *                    function and XORing for buffers to decrypted in
+ *                    remote computer. Optionally the function
+ *                    inserts the original message length (text) in the
+ *                    last 4/8 bytes (4-DES,8-3DES)of the encrypted
+ *                    message. The output buffer length is the original
+ *                    message length + size of integer rounded up to
+ *                    the closet muliply of 16 bytes. In this case, of
+ *                    remote decryption the buffer length inserted in
+ *                    ascii format (0000000 - 0009999) so there will be
+ *                    no problem to translate integer length according
+ *                    to HIGH_BYTE_FIRST or LOW_BYTE_FIRST.
+ * Input            : des_tbl- The des key table for encryption details
+ *                              (for 3DES - first 8 bytes of key).
+ *                    des_tbl2- The 3DES second key table (last key 8
+ *                              bytes) for decryption
+ *                    enc_algorithm - ENC_SMALLBUFF -for DES encryption
+ *                                    ENC_TDES  - for 3DES encryption
+ *                    buf_in - buffer for encryption.
+ *                    in_len - input buffer length
+ *                    add_len - boolean indicating if the original
+ *                              length should be added to the buffer.
+ * Output           : buf_out - encrypted buffer.
+ * InOut:           : out_len - In - allocated output buffer size. Out-
+ *                              actual size used.
+ * Input/Output     :
+ * Input assumptions:
+ * Output assertions: The output buffer should be pre allocated by the
+ *                    calling process. The size of the buffer can be
+ *                    determind by activating ENC_outbuf_len function.
+ * Return Value   : ESA_OK - Encryption o.k
+ *                  ESA_WARN - Encryption failed - key synchronization
+ *                         encryption/decryption should be halted.
+ * Side Effects   :
+ *
+ * Function description
+ * ====================
+ * This encryption function is used for DES on small buffer or 3DES
+ * using directly (T)DES function and XORing. Optionally the function
+ * inserts the original message length in the last 4/8 bytes of the
+ * encrypted msg. The output buffer length, in greater than the
+ * original buffer length.
+ ********************************************************************/
+ 
+ESA_RC ENC_des_encr (
+         DESR             des_tbl ,
+         DESR             des_tbl2 ,
+		 ENC_ENCR_ALGRTM  enc_algorithm ,
+         void            *buf_in ,          /*in*/
+         int              in_len ,          /*in*/
+         ENC_BOOLEAN      add_len ,         /*in*/
+         ENC_BOOLEAN      chksum ,          /*in*/
+         void            *buf_out ,         /*out*/
+         int             *out_len ,         /*in-out*/
+         ENC_ERR_rec_ptr  err)              /*inout*/
+{
+  char                         *fn = "ENC_des_encr";
+  int                           calc_len, left_err_len ;
+  void                         *tmp_buf;
+  int                           i , j ;
+  char                         *err_ptr , *orig_len , tmp_buf1[8];
+/* for MVS only */
+  char                         orig_len_ascii[10] , iv_tmp[9];
+  CHECKSUM_typ                 chksum_buff_ascii ;
+ /* MVS */
+  CHECKSUM_typ                 chksum_buff;
+  char                         iv[9];
+ 
+#ifdef ARDEBUG
+  char                         *ptr ;
+  unsigned char                *charbuf;
+ 
+  printf ("\nEntering %s." , fn);
+#endif
+ 
+  strcpy (iv , "EagleEye");		/*AV001*/
+ 
+/* for MVS */
+  ENC_ebc2asc (iv , iv_tmp , 8);
+  memcpy (iv, iv_tmp , 8);
+ /* MVS */
+ 
+#ifdef ARDEBUG
+  printf ("\n IV in hex is: ");
+  for (i = 0; i LT 8 ; i++)
+  {
+     printf ( ((i % 2) EQ 0) ?
+                "%2.2X"
+               :
+                "%2.2X " ,
+               (unsigned char)iv[i]);
+  }
+  printf ("\n");
+#endif
+ 
+  memset ((char *)err, 0 , sizeof (ENC_ERR_rec_typ));
+  err_ptr = err->err_buff;
+ 
+  if (add_len EQ ENC_TRUE)
+  {
+      if (enc_algorithm EQ ENC_SMALLBUFF)
+	     calc_len = (((in_len + 4) % 16) EQ 0) ?
+           in_len + 4
+          :
+           in_len + 4 +
+		    	(16 - ((in_len + 4)% 16));
+      else
+         if (chksum)
+            calc_len = (((in_len + ENC_BUFLEN_SIZE + CHECKSUM_LEN)
+			             % 16) EQ 0) ?
+               in_len + ENC_BUFLEN_SIZE + CHECKSUM_LEN
+             :
+               in_len + ENC_BUFLEN_SIZE + CHECKSUM_LEN +
+		            	(16 - ((in_len + ENC_BUFLEN_SIZE +
+						    CHECKSUM_LEN)% 16));
+         else
+            calc_len = (((in_len + ENC_BUFLEN_SIZE) % 16) EQ 0) ?
+               in_len + ENC_BUFLEN_SIZE
+             :
+               in_len + ENC_BUFLEN_SIZE +
+		            	(16 - ((in_len + ENC_BUFLEN_SIZE)% 16));
+ 
+ 
+#ifdef ARDEBUG
+      printf ("\n Encryption - calc_len = %d" , calc_len);
+#endif
+      if (*out_len LT calc_len)
+      {
+#ifdef ARDEBUG
+         printf ("\nError !!! Out buf len (%d) too small, req=%d." ,
+                 *out_len , calc_len);
+#endif
+         err->err_code = ENC_OUTBUF_SMALL;
+         ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                     fn , 0);
+         ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                     NULL , *out_len);
+         ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                     NULL , calc_len);
+         return (ESA_ERR) ;
+      }
+ 
+ 
+#ifdef ARDEBUG
+      printf ("\n Encryption - calc_len found ok...");
+#endif
+  }
+ else
+      calc_len = in_len;
+ 
+  tmp_buf = malloc (calc_len + 4) ;
+ 
+  if (tmp_buf EQ NULL)
+  {
+#ifdef ARDEBUG
+      printf ("\nError !!! Malloc failed. errno = %d" , errno);
+#endif
+      err->err_code = ENC_MALLOC_FAIL ;
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  fn , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , 5);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  "ENC_TMP_BUF" , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , calc_len);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , errno);
+      return (ESA_FATAL) ;
+  }
+ 
+#ifdef ARDEBUG
+  printf ("\n Encryption - tmp_buf allocated at %p" , tmp_buf);
+#endif
+ 
+  memset (tmp_buf , 0 , calc_len + 4);
+  memcpy (tmp_buf , buf_in , in_len) ;
+ 
+#ifdef ARDEBUG
+  printf(
+	      "\n calc_len %d in_len=%d.",
+		  (int)calc_len,
+	      (int)in_len);
+#endif
+ 
+  if (add_len EQ ENC_TRUE)
+  {
+      if (enc_algorithm EQ ENC_SMALLBUFF)
+	  {
+		  orig_len = &(((char *)tmp_buf)[calc_len - 4]) ;
+          sprintf (orig_len , "%04d" , in_len);
+/* for MVS only */
+             ENC_ebc2asc (orig_len, orig_len_ascii, 5);
+			 memcpy (orig_len, orig_len_ascii , 5);
+ /* MVS */
+	  }
+     else
+	  {
+         if (chksum)
+		 {
+             orig_len =
+		       &(((char *)tmp_buf)[calc_len - ENC_BUFLEN_SIZE -
+			                                          CHECKSUM_LEN]);
+             sprintf (orig_len , "%07d" , in_len);
+/* for MVS only */
+             ENC_ebc2asc (orig_len, orig_len_ascii, ENC_BUFLEN_SIZE);
+			 memcpy (orig_len, orig_len_ascii , ENC_BUFLEN_SIZE);
+ /* MVS */
+             ChkSum(tmp_buf , calc_len - CHECKSUM_LEN , chksum_buff);
+ 
+#ifdef ARDEBUG
+   printf ("\nCalculated checksum is %.*s", CHECKSUM_LEN, chksum_bu);
+#endif
+ 
+/* for MVS */
+             ENC_ebc2asc (chksum_buff, chksum_buff_ascii,CHECKSUM_LEN);
+			 memcpy (chksum_buff , chksum_buff_ascii , CHECKSUM_LEN);
+ /* MVS */
+			 memcpy (&(((char *)tmp_buf)[calc_len - CHECKSUM_LEN]) ,
+				     chksum_buff ,
+					 CHECKSUM_LEN);
+		 }
+		else
+		 {
+		     orig_len =
+				 &(((char *)tmp_buf)[calc_len - ENC_BUFLEN_SIZE]);
+             sprintf (orig_len , "%07d" , in_len);
+/* for MVS */
+             ENC_ebc2asc (orig_len, orig_len_ascii, ENC_BUFLEN_SIZE);
+			 memcpy (orig_len, orig_len_ascii , ENC_BUFLEN_SIZE);
+ /* MVS */
+		 }
+	  }
+#ifdef ARDEBUG
+     printf ("\n Encryption - orig_len %s." , orig_len);
+#endif
+ 
+  }
+ 
+ 
+#ifdef ARDEBUG
+ 
+  printf ("\n The buffer to encrypt is\n");
+  charbuf = tmp_buf;
+ 
+  for (i = 0; i LT calc_len ; i++)
+  {
+     printf ( ((i % 2) EQ 0) ?
+                "%2.2X"
+               :
+                "%2.2X " ,
+               charbuf[i]);
+     if (((i + 1)% 20) EQ 0)
+	 {
+         printf ("\n");
+     }
+  }
+ 
+#endif
+ 
+     if (enc_algorithm EQ ENC_TDES)
+        for (i = 0 ; i < 8 ; i++)
+			((char *)tmp_buf)[i] ^= iv[i] ;
+ 
+     for (i = 0; i < ((calc_len / 8) - 1) ; i++)
+     {
+         AR_des ((void *)&((char *)tmp_buf)[i*8] ,
+                 (void *)&((char *)buf_out)[i*8] ,
+                 des_tbl);
+         if (enc_algorithm EQ ENC_TDES)
+		 {
+             memcpy(tmp_buf1 , (void *)&((char *)buf_out)[i*8] , 8);
+ 
+	         AR_des ((void *)tmp_buf1 ,
+                     (void *)&((char *)buf_out)[i*8] ,
+                     des_tbl2);
+ 
+             memcpy(tmp_buf1 , (void *)&((char *)buf_out)[i*8] , 8);
+ 
+	         AR_des ((void *)tmp_buf1 ,
+                     (void *)&((char *)buf_out)[i*8] ,
+                     des_tbl);
+		 }
+ 
+         for (j = 0 ; j < 8 ; j++)
+          ((char *)tmp_buf)[(i+1)*8 + j] ^=((char *)buf_out)[(i*8)+j];
+     }
+ 
+     i = (calc_len / 8) - 1;
+ 
+     AR_des ((void *)&((char *)tmp_buf)[i*8] ,
+             (void *)&((char *)buf_out)[i*8] ,
+             des_tbl);
+ 
+     if (enc_algorithm EQ ENC_TDES)
+	 {
+         memcpy(tmp_buf1 , (void *)&((char *)buf_out)[i*8] , 8);
+ 
+	     AR_des ((void *)tmp_buf1 ,
+                 (void *)&((char *)buf_out)[i*8] ,
+                 des_tbl2);
+ 
+         memcpy(tmp_buf1 , (void *)&((char *)buf_out)[i*8] , 8);
+ 
+	     AR_des ((void *)tmp_buf1 ,
+                 (void *)&((char *)buf_out)[i*8] ,
+                 des_tbl);
+	 }
+ 
+     *out_len = calc_len ;
+     free (tmp_buf);
+ 
+#ifdef ARDEBUG
+  ptr = buf_out;
+  printf (
+   "\n%s term., output buffer length = %d,"
+   , fn , *out_len);
+  printf ("\nThe output buffer is:\n");
+  for (i = 0; i LT *out_len ; i++)
+  {
+     printf ( ((i % 2) EQ 0) ?
+                "%2.2X"
+               :
+                "%2.2X " ,
+               (unsigned char)ptr[i]);
+     if (((i + 1) % 20) EQ 0)
+	 {
+         printf ("\n");
+     }
+  }
+  printf ("\nExiting %s..." , fn);
+#endif
+ 
+  return (ESA_OK) ;
+ 
+} /* END - ENC_des_encr */
+ 
+/*********************************************************************
+ * Procedure Name   : ENC_des_decr
+ * Description      : Decryption for DES and 3DES using directly DES
+ *                    function and XORing for buffers that was
+ *                    encrypted in remote computer. Optionally the
+ *                    function examins the decrypted buffer for the
+ *                    original buffer length that was originally
+ *                    stored in the last 4/8 (4-DES,8-3DES) bytes of
+ *                    the encrypted buffer.
+ * Input            : des_tbl - The des key table for decryption
+ *                              details (for 3DES - first 8 bytes of
+ *                              key).
+ *                    des_tbl2- The 3DES second key table (last key 8
+ *                              bytes) for encryption
+ *                    enc_algorithm- ENC_SMALLBUFF- for DES encryption
+ *                                    ENC_TDES  - for 3DES encryption
+ *                    buf_in - buffer for decryption.
+ *                    in_len - input buffer length
+ *                    add_len - boolean indicating if the original
+ *                              length should be added to the buffer.
+ * Output           : buf_out - encrypted buffer.
+ * InOut            : out_len - In - outbuffer allocation size, Out-
+ *                              output buffer actual length.
+ * Input/Output     :
+ * Input assumptions:
+ * Output assertions: The output buffer is equal or less than input
+ *                    buffer size
+ * Return Value   : ESA_OK - Encryption o.k
+ *                  ESA_WARN - Encryption failed - key synchronization
+ *                         encryption/decryption should be halted.
+ * Side Effects   :
+ *
+ ********************************************************************/
+ 
+ESA_RC ENC_des_decr (
+         DESR             des_tbl ,         /*in*/
+         DESR             des_tbl2 ,        /*in*/
+		 ENC_ENCR_ALGRTM  enc_algorithm ,   /*in*/
+         void            *buf_in ,          /*in*/
+         int              in_len ,          /*in*/
+         ENC_BOOLEAN      ret_orig_len ,    /*in*/
+         ENC_BOOLEAN      chksum ,          /*in*/
+         void            *buf_out ,         /*out*/
+         int             *out_len,          /*in-out*/
+         ENC_ERR_rec_ptr  err)              /*inout*/
+ 
+{
+  char                         *fn = "ENC_des_decr";
+  void                         *tmp_buf;
+  int                           i , j , orig_len , left_err_len;
+  char                         *err_ptr , *orig_len_str , orig_len_trnsl[10];
+  unsigned char                 tmp_buf_in[8];
+  CHECKSUM_typ                  chksum_buff;
+/* for MVS only */
+  CHECKSUM_typ                  chksum_buff_ascii;
+  char                          iv_tmp[9];
+ /* MVS */
+  char                         iv[9];
+#ifdef ARDEBUG
+  unsigned char                *ubuf;
+ 
+  printf ("\nEntering %s..." , fn);
+#endif
+ 
+  left_err_len = ENC_ERR_TXT_LEN - 1;  /* IS10103 */
+  memset ((char *)err, 0 , sizeof (ENC_ERR_rec_typ));
+  err_ptr = err->err_buff;
+ 
+  strcpy (iv , "EagleEye");			/*AV001*/
+ 
+/* for MVS only */
+  ENC_ebc2asc (iv , iv_tmp , 8);
+  memcpy (iv, iv_tmp , 8);
+ /* MVS */
+ 
+#ifdef ARDEBUG
+  printf ("\n IV in hex is: ");
+  for (i = 0; i LT 8; i++)
+  {
+     printf ( ((i % 2) EQ 0) ?
+                "%2.2X"
+               :
+                "%2.2X " ,
+               (unsigned char)iv[i]);
+  }
+  printf ("\n");
+#endif
+ 
+/* VALIDATE that input buffer length is divided by 16 with no
+   reminder */
+ 
+  if ((in_len % 16) NE 0)
+  {
+      err->err_code = ENC_DECR_NOSMALLBUF;
+      ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                  fn , 0);
+      ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                  NULL , in_len);
+      return (ESA_ERR) ;
+  }
+ 
+ 
+  tmp_buf = malloc (in_len +4) ;
+ 
+  if (tmp_buf EQ NULL)
+  {
+#ifdef ARDEBUG
+         printf (
+                  "\nError !!! Malloc failed. errno = %d" ,
+                  errno);
+#endif
+         err->err_code = ENC_MALLOC_FAIL ;
+         ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                     fn , 0);
+         ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                     NULL , 5);
+         ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                     "ENC_TMP_BUF" , 0);
+         ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                     NULL , in_len);
+         ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                     NULL , errno);
+         return (ESA_FATAL) ;
+  }
+ 
+  memset (tmp_buf, 0 , in_len +4) ;
+  memcpy (tmp_buf , buf_in , in_len) ;
+ 
+#ifdef ARDEBUG
+  printf ("\n The buffer to decrypt is\n");
+  ubuf = tmp_buf;
+  for (i = 0; i LT in_len ; i++)
+  {
+     printf ( ((i % 2) EQ 0) ?
+                "%2.2X"
+               :
+                "%2.2X " ,
+               ubuf[i]);
+     if (((i + 1) % 20) EQ 0)
+         printf ("\n");
+  }
+#endif
+ 
+  for (i = 0; i < (in_len / 8) ; i++)
+  {
+      memcpy (tmp_buf_in , (void *)&((char *)buf_in)[i*8] , 8);
+ 
+	  AR_des (tmp_buf_in ,
+            (void *)&((char *)tmp_buf)[i*8] ,
+            des_tbl);
+ 
+      if (enc_algorithm EQ ENC_TDES)
+	  {
+ 
+    	  memcpy (tmp_buf_in , (void *)&((char *)tmp_buf)[i*8] , 8);
+ 
+	      AR_des (tmp_buf_in ,
+                  (void *)&((char *)tmp_buf)[i*8] ,
+                  des_tbl2);
+ 
+          memcpy (tmp_buf_in , (void *)&((char *)tmp_buf)[i*8] , 8);
+ 
+	      AR_des (tmp_buf_in ,
+                  (void *)&((char *)tmp_buf)[i*8] ,
+                  des_tbl);
+	  }
+  }
+ 
+#ifdef ARDEBUG
+  printf ("\n%s: after for 1." , fn);
+#endif
+ 
+  for (i = 1; i < (in_len / 8) ; i++)
+  {
+     for (j = 0 ; j < 8 ; j++)
+       ((char *)tmp_buf)[(i*8) + j] ^= ((char *)buf_in)[((i-1)*8) + j];
+  }
+ 
+  if (enc_algorithm EQ ENC_TDES)
+     for (i = 0 ; i < 8 ; i++)
+       ((char *)tmp_buf)[i] ^= iv[i];
+ 
+#ifdef ARDEBUG
+  printf ("\n%s : after for 2." , fn);
+  printf ("\n The buffer after decrypt is\n");
+  ubuf = tmp_buf;
+  for (i = 0; i LT in_len ; i++)
+  {
+     printf ( ((i % 2) EQ 0) ?
+                "%2.2X"
+               :
+                "%2.2X " ,
+                ubuf[i]);
+     if (((i + 1) % 20) EQ 0)
+         printf ("\n");
+  }
+  printf ("\nThe buffer after decryption is:\n%.*s.",
+	  in_len,(char *)ubuf);
+#endif
+ 
+  if (ret_orig_len EQ ENC_TRUE)
+  {
+      if (enc_algorithm EQ ENC_SMALLBUFF)
+	  {
+          orig_len_str = &(((char *)tmp_buf)[in_len - 4]) ;
+          memset (orig_len_trnsl , 0 , sizeof(orig_len_trnsl));
+/* for MVS only */
+             ENC_asc2ebc (orig_len_str, orig_len_trnsl, 4);
+ /* MVS */
+          sscanf (orig_len_trnsl , "%d" , &orig_len);
+          *out_len = orig_len ;
+ 
+/* VALIDATE that original buffer length is not longer than input buffer
+   length less the size of integer (the original buffer length stored
+   in it) */
+ 
+          if ((orig_len GT (in_len - 4))
+         OR
+              (orig_len LT 0))
+		  {
+              err->err_code = ENC_DECR_ORIGLEN;
+              ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                          fn , 0);
+              ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                          NULL , orig_len);
+              ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                          NULL , in_len);
+              return (ESA_ERR) ;
+		  }
+ 
+	  }
+	 else
+	  {
+          if (chksum)
+		  {
+			  ChkSum (tmp_buf , in_len - CHECKSUM_LEN , chksum_buff);
+			
+/* for MVS only */
+#ifdef ARDEBUG
+              printf("\nchecksum ebc=%.*s",CHECKSUM_LEN,chksum_buff);
+#endif	
+			  ENC_ebc2asc (chksum_buff, chksum_buff_ascii,CHECKSUM_LEN);
+ 
+			  memcpy (chksum_buff , chksum_buff_ascii , CHECKSUM_LEN);
+ /* MVS */
+#ifdef ARDEBUG
+			  printf("\n checksum asc is=\n");
+				
+              for (i = 0; i LT CHECKSUM_LEN ; i++)
+			  {
+                  printf ( ((i % 2) EQ 0) ?
+                           "%2.2X "
+                          :
+                           "%2.2X" ,
+                           chksum_buff[i]);
+ 
+			  }
+ 
+              printf("\n checksum input asc=\n");
+				
+              for (i = 0; i LT CHECKSUM_LEN ; i++)
+			  {
+                printf ( ((i % 2) EQ 0) ?
+                         "%2.2X "
+                         :
+                         "%2.2X" ,
+                         ((char *)tmp_buf)[in_len - CHECKSUM_LEN + i]);
+			  }
+ 
+              printf ("\n");
+#endif
+ 
+              if (memcmp(chksum_buff ,
+				         &(((char *)tmp_buf)[in_len - CHECKSUM_LEN]),
+						 CHECKSUM_LEN) NE 0)
+			  {
+ 
+#ifdef ARDEBUG
+     			  printf("\n Decrypt failed - checksum mismatch...\n");
+#endif
+			
+                  err->err_code = ENC_DECR_AUTH_FAIL ;
+                  ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                              "ENC_des_decr" , 0);
+                  ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                              NULL , 2);
+                  ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                              NULL , ENC_DECR_AUTH_FAIL); /* IS10103 */
+                  return (ESA_ERR) ;
+			  }
+       		  orig_len_str =
+			      &(((char *)tmp_buf)[in_len - ENC_BUFLEN_SIZE
+				                      - CHECKSUM_LEN]) ;
+		  }
+		  else
+     		  orig_len_str =
+			     &(((char *)tmp_buf)[in_len - ENC_BUFLEN_SIZE]) ;
+ 
+		  memset(orig_len_trnsl , 0 , sizeof(orig_len_trnsl));
+/* for MVS only */
+          ENC_asc2ebc (orig_len_str, orig_len_trnsl, ENC_BUFLEN_SIZE);
+ /* MVS */
+ 
+          sscanf (orig_len_trnsl , "%d" , &orig_len);
+          *out_len = orig_len ;
+ 
+/* VALIDATE that original buffer length is not longer than input buffer
+   length less the size of integer (the original buffer length stored
+   in it) */
+ 
+          if ( (chksum AND (orig_len GT
+			               (in_len - ENC_BUFLEN_SIZE - CHECKSUM_LEN)))
+             OR
+			   ((chksum EQ ENC_FALSE) AND (orig_len GT
+			                              (in_len - ENC_BUFLEN_SIZE)))
+			 OR
+               (orig_len LT 0)
+             )
+ 
+		  {
+#ifdef ARDEBUG
+	   		  printf("\n Decrypt failed - invalid buffer length\n");
+#endif				
+              err->err_code = ENC_DECR_ORIGLEN;
+              ENC_adderr (&err_ptr , &left_err_len , ENC_TRUE ,
+                          fn , 0);
+              ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                          NULL , orig_len);
+              ENC_adderr (&err_ptr , &left_err_len , ENC_FALSE ,
+                          NULL , in_len);
+              return (ESA_ERR) ;
+		  }
+	 }
+#ifdef ARDEBUG
+     printf(
+             "\n%s: before memcpy.buf out=%p,orig=%d",
+             fn , buf_out , orig_len);
+#endif
+ 
+     memcpy (buf_out , tmp_buf , orig_len);
+  }
+ else
+  {
+     *out_len = in_len ;
+     memcpy (buf_out , tmp_buf , in_len);
+  }
+#ifdef ARDEBUG
+  printf ("\n%s: before free.", fn);
+#endif
+ 
+  free (tmp_buf);
+ 
+  return (ESA_OK) ;
+ 
+} /* END - ENC_des_decr */
+ 
+/**********************************************************************
+ * Procedure Name : ENC_outbuf_len
+ * Description    : Calculates the required output buffer length of
+ *                  encryption function.
+ * Input          : in_len - input buffer length for strings-it should
+ *                           contain the trailing zero.
+ *                  mac_req - indication if MAC is required (for none
+ *                            TDES/small buffer encryption only).
+ *                  enc_algorithm - ENC_DES - DES string encyption.
+ *                            ENC_SMALLBUFF - DES of smallbuf
+ *                            ENC_TDES      - 3DES.
+ * Output           :
+ * Input/Output     :
+ * Input assumptions:
+ * Output assertions:
+ * Return Value   : The required buffer length
+ * Side Effects   :
+ ********************************************************************/
+ 
+int ENC_outbuf_len (
+         int               in_len,      /*in*/
+         ENC_BOOLEAN       mac_req,     /*in*/
+         ENC_ENCR_ALGRTM   enc_algorithm)  /*in*/
+{
+  if (in_len EQ 0)
+      return (0);
+ 
+  if (enc_algorithm EQ ENC_DES)
+     if (mac_req EQ ENC_FALSE)
+        return (in_len) ;
+    else
+        return (in_len + (int)ENC_ADD_MSG_LEN);
+ else
+  if (enc_algorithm EQ ENC_SMALLBUFF)
+  {
+     if (((in_len + (int)sizeof(int)) % 16) EQ 0)
+        return (in_len + (int)sizeof(int));
+    else
+        return(in_len + (int)sizeof(int) +
+          (16 - ((in_len + (int)sizeof(int))% 16)));
+  }
+ else
+     if (mac_req)
+	 {
+		 if (((in_len + ENC_BUFLEN_SIZE + CHECKSUM_LEN) % 16) EQ 0)
+            return (in_len + ENC_BUFLEN_SIZE + CHECKSUM_LEN);
+	    else
+             return (in_len + ENC_BUFLEN_SIZE + CHECKSUM_LEN +
+			         (16 -
+					   ((in_len + ENC_BUFLEN_SIZE + CHECKSUM_LEN)% 16)
+					 ));
+	 }
+	else
+	 {
+	     if (((in_len + ENC_BUFLEN_SIZE) % 16) EQ 0)
+            return (in_len + ENC_BUFLEN_SIZE);
+	    else
+            return (in_len + ENC_BUFLEN_SIZE + (16 -
+		            ((in_len + ENC_BUFLEN_SIZE)% 16)));
+	 }
+}
+ 

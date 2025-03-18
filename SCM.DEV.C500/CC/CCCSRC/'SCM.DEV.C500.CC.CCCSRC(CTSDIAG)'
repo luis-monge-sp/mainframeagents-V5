@@ -1,0 +1,329 @@
+/***************************************************************
+* Title            : Set diag. levels                         *
+* File Name        : ctsdiag.c                                *
+* Author           : Leonid S.                                *
+* Creation Date    : 28/07/94                                 *
+* Description      : Read text file (format similar to        *
+*                    esa/inc/esacomp.h) and create binary file*
+*                    with array of diag levels.               *
+* Assumptions and                                             *
+*   Considerations :                                          *
+* $Author:   doron  $
+* $Workfile:   CTSDIAG.C  $
+* $Revision:   1.7  $
+* $Log:   //netapp-nt1/versions/300/utils/src/ctsdiag.c_v  $
+ *
+ *    Rev 1.7   13 Apr 1999 15:17:36   doron
+ * Changes for Tandem
+ *
+ *    Rev 1.6   Aug 17 1998 11:52:26   ajk
+ * Fixed SCCSID for Unix 'what' command
+ *
+ *    Rev 1.5   Aug 04 1998 14:45:32   leonid_s
+ *
+ *
+ *    Rev 1.4   Apr 20 1998 14:23:20   leonid_s
+ *
+ *
+ *    Rev 1.3   Jan 21 1998 18:57:58   leonid_s
+ * 300-Beta with AS400 & VMS changes
+ *
+ *    Rev 1.2   Jul 24 1997 08:48:04   leonid_s
+ *     SCCSID("%Z%%M% \
+ *
+ *
+ *    Rev 1.1   Jul 08 1997 18:35:30   avi_w
+ *
+**************************************************************/
+ 
+/***********************************************************************
+ * Mod.ID  Who      When         Description
+ * =====================================================================
+ * IMH001  Ian H.   17/9/03      Add support for CheckAndPrintVersion.
+ *                               Old -v flag (for displaying diag info)
+ *                                  changed to -i
+ * SAS2IBMT SeligT  9/11/16      SAS/C to IBM C Conversion Project
+ * SAS2IBMN NuritY  18/1/17      SAS/C to IBM C Conversion Project
+ **********************************************************************/
+ 
+#define ESAMSG_OWNER
+#define THIS_IS_MAIN
+ 
+#include "globs.h"
+ 
+#include   ESA_INIT
+#include   ESA_PROC
+#include   ESA_RSS
+#include   ESA_CS_OS
+#include   ESA_OS_CONSOLE
+#include   ESA_RSSF
+#include   ESA_OS_EVENT
+#include   ESA_VER
+ 
+#define  MAX_DIAG_LEVEL  256
+#define  DIAG_LINE_LEN   256
+ 
+ 
+    SCCSID("@(#) ctsdiag.c \
+$Revision:   1.7  $\
+$Date:   13 Apr 1999 15:17:36  $\
+$Author:   doron  $")
+ 
+ 
+/**************************************************************
+*                                                             *
+* Procedure Name   : main                                     *
+*                                                             *
+* Description      : Build binary file for diag               *
+*                                                             *
+* Return Value     : 0 if OK, 1 otherwise                     *
+*                                                             *
+**************************************************************/
+ 
+int main (int argc, char *argv[])
+{
+   ESA_RC               rc= ESA_OK, event_rc;
+   char                 failmsg [512];
+   FILE               * diagtxt = NULL, * diaglvl = NULL;
+   int                  comp_number, level_number;
+   char               * id_start, * id_end;
+   char                 line[DIAG_LINE_LEN];
+   int                  levels_array [ESA_MAX_COMPS];
+   size_t               rec_len;
+   int                  i;
+   char                 inform[3]= "-i";       /* IMH001 */
+   char                 infile[3]= "-f";
+   int                  sw_inform= 0, sw_infile= 0;
+   ESA_EVENT_typ        events[1];
+   ESA_MAIN_NAME_typ    main_prog[1];
+   void               * event_data[1];
+   int                  prolog_done = FALSE;
+   char                 ddn_with[12]="";                  /* SAS2IBMT */
+   ENVIRONMENT_rec_typ * envir_ptr;
+ 
+   rc= CG_prolog (ESA_ACSDIAG_PROC, argc, argv);
+ 
+   CS_get_envir_address (&envir_ptr);
+ 
+   if (rc NE ESA_OK) {
+ 
+      sprintf (failmsg, PROLOG_PROC_INIT_ERROR,
+               CG_name (envir_ptr->p_main_name),
+               ESA_rc2str(rc));
+      fprintf (stderr,failmsg);
+      OS_CONSOLE_print (failmsg,
+                        OS_CONS_ROLLABLE_YES,
+                        OS_CONS_SEV_ERROR);
+      goto the_exit;
+   }
+ 
+   prolog_done = TRUE;
+ 
+/* IMH001 start */
+ 
+   rc = CheckAndPrintVersion (argc, argv);
+   if (rc EQ ESA_OK)
+       goto the_exit;
+ 
+    rc = ESA_OK;
+/* IMH001 end */
+ 
+   rc = OS_EVENT_init (&envir_ptr->event_handle,
+                       envir_ptr->p_main_name,
+                       &envir_ptr->msg_admin_param,
+                       &envir_ptr->msg_params);
+ 
+   if (rc EQ ESA_OK)
+      envir_ptr->event_active = TRUE;
+   else {
+      if (rc EQ ESA_NOT_SUPP) {
+         envir_ptr->event_active = FALSE;
+         rc = ESA_OK;                  /* AJK001 */
+      }
+      else
+         goto the_exit;
+   }
+ 
+   for (i= 1; i LT argc; i++) {
+      if (strcmp (argv[i], inform) EQ 0) {
+         sw_inform= 1;
+         continue;
+      }
+      if (strcmp (argv[i], infile) EQ 0) {
+         sw_infile= 1;
+         continue;
+      }
+      if (sw_infile NE 0) {
+         strcpy (envir_ptr->file_diagtxt, argv[i]);
+         break;
+      }
+   }
+ 
+   for (i= 0; i LT ESA_MAX_COMPS; i++)
+      levels_array [i]= -1;
+ 
+   strcpy(ddn_with,"DD:");                                /* SAS2IBMT */
+   strcat(ddn_with, envir_ptr->file_diagtxt);             /* SAS2IBMT */
+ 
+   /* SAS2IBMT diagtxt= fopen(envir_ptr->file_diagtxt, "r");         */
+   diagtxt= fopen(ddn_with, "r");                         /* SAS2IBMT */
+   if (diagtxt EQ NULL) {
+      fprintf (stderr, "Failed to open input file '%s'. ",
+               envir_ptr->file_diagtxt);
+      perror ("Reason");
+      rc= ESA_ERR;
+      goto the_exit;
+   }
+ 
+   strcpy(ddn_with,"DD:");                                /* SAS2IBMT */
+   strcat(ddn_with, envir_ptr->file_diaglvl);             /* SAS2IBMT */
+ 
+   /* SAS2IBMT diaglvl= fopen(envir_ptr->file_diaglvl, FILE_CREAT);  */
+   diaglvl= fopen(ddn_with, "r+");  /* w+ is invalid for a member SAS2IBMN */
+   if (diaglvl EQ NULL) {
+      fprintf (stderr, "Failed to open output file '%s'. ",
+               envir_ptr->file_diaglvl);
+      perror ("Reason");
+      rc= ESA_ERR;
+      goto the_exit;
+   }
+ 
+   while (rc EQ ESA_OK) {
+      fgets (line, DIAG_LINE_LEN, diagtxt);
+ 
+      if (feof (diagtxt) NE 0)
+         break;
+ 
+      /* Beware of I/O errors */
+ 
+      if (ferror( diagtxt)) {
+         rc= ESA_ERR;
+         goto the_exit;
+      }
+ 
+      /*
+       * If line starts with '#define' string
+       */
+ 
+      if (memcmp (line, "#define ", 8) NE 0 AND
+          memcmp (line, "#DEFINE ", 8) NE 0)
+         continue;
+ 
+      id_end  = strpbrk (line, WHITECHARS);
+      if (id_end EQ NULL)
+         continue;
+ 
+      /*
+       * Skip next word (ESA_COMP_??????? ) in the line
+       */
+      id_start= id_end+ strspn(id_end, WHITECHARS);
+      id_end  = strpbrk (id_start, WHITECHARS);
+      if (id_end EQ NULL)
+         continue;
+ 
+      /*
+       * Transform  next word (comp_number) in the line
+       */
+ 
+      id_start= id_end+ strspn(id_end, WHITECHARS);
+      id_end  = strpbrk (id_start, WHITECHARS);
+      if (id_end EQ NULL)
+         continue;
+      (*id_end) = NULL_CHAR;
+      id_end++;
+ 
+      comp_number= atoi (id_start);
+      if (comp_number GE ESA_MAX_COMPS OR comp_number LT 0)
+         continue;
+ 
+      /*
+       * Transform  next (last) word (level_number) in the line
+       */
+ 
+      id_start= id_end+ strspn(id_end, WHITECHARS);
+      id_end  = strpbrk (id_start, WHITECHARS);
+      if (id_end NE NULL)
+         (*id_end) = NULL_CHAR;
+      id_end  = strpbrk (id_start, "\n");
+      if (id_end NE NULL)
+         (*id_end) = NULL_CHAR;
+ 
+      if (strlen (id_start) EQ 0)
+         continue;
+ 
+      level_number= atoi (id_start);
+/*      if (level_number LT 0 OR level_number GT MAX_DIAG_LEVEL)
+         continue;
+*/
+      /*
+       * Set new level_number in comp_number index of levels_array
+       */
+      levels_array [comp_number]= level_number;
+      if (sw_inform NE 0)
+         printf ("%s  -> diag.level %s\n",line, id_start);
+   } /* for */
+ 
+   if (levels_array [0] EQ -1)
+       levels_array [0]= 0;
+   for (i= 0; i LT ESA_MAX_COMPS; i++)
+   {
+	  if (levels_array [i] EQ -1) {
+         if (i LT ESA_COMP_DIAG_KEEP_OPEN)
+            levels_array [i]= levels_array [0];
+         else
+            levels_array [i]= 0;
+	  }
+   }
+   /* Write out all in one fell swoop */
+ 
+   rec_len= fwrite (levels_array, sizeof (int)* ESA_MAX_COMPS, 1,
+                    diaglvl);
+ 
+   if (rec_len EQ 0)
+      rc= ESA_ERR;
+ 
+the_exit:
+ 
+   if (diagtxt)
+      fclose (diagtxt);
+ 
+   if (diaglvl) {
+      fclose (diaglvl);
+   }
+ 
+   if (rc EQ ESA_OK) {
+      events[0] = EVENT_DIAG_CHANGED;
+      main_prog[0] = ESA_ALL_PROC;
+      event_data[0] = NULL;
+ 
+      if (envir_ptr->event_active) {
+         event_rc = OS_EVENT_broadcast (1,
+                                        events,
+                                        1,
+                                        main_prog,
+                                        event_data,
+                                        envir_ptr->event_handle,
+                                        &envir_ptr->msg_params);
+         if (event_rc NE ESA_OK)
+            fprintf (
+                stderr,
+          "OS_EVENT_broadcast for DIAG chage event failed with rc=%d",
+                    (int)event_rc);
+      }
+   }
+ 
+   if (envir_ptr->event_active)
+      event_rc = OS_EVENT_term (&envir_ptr->event_handle,
+                                &envir_ptr->msg_params);
+ 
+   envir_ptr->event_handle = NULL;
+ 
+   if (prolog_done)
+       CG_epilog (rc, 0);
+ 
+   return (rc EQ ESA_OK) ?
+       PLAT_OK_STAT
+     :
+       PLAT_FAIL_STAT;   /* PLATFORM-conformant return code */
+ 
+} /* CTSDIAG main */
