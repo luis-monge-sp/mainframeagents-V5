@@ -1,0 +1,795 @@
+         START
+         TITLE 'SA-AGENT IEFU84 EXIT FOR RACF SYSTEMS'
+*
+***********************************************************************
+****                                                               ****
+****   SA-AGENT VERSION 4.0.XX                                     ****
+****                                                               ****
+****   (C) COPYRIGHT 1999-2000 BMC SOFTWARE INC.                   ****
+****                                                               ****
+***********************************************************************
+*
+***********************************************************************
+*                                                                     *
+* MODULE NAME : CTSU84A                                               *
+*                                                                     *
+* DESCRIPTION : SA-AGENT IEFU84 EXIT FOR RACF SYSTEMS                 *
+*                                                                     *
+* FUNCTION:                                                           *
+*                                                                     *
+*    THIS MODULE EXAMINES TYPE 80 SMF RECORD AND WHEN RECOGNIZES      *
+*    REVOKE\RESUME EVENTS FROM CONSUL ZADMIN IT NOTIFIES THE EVENT    *
+*    TO THE ONLINE INTERCEPTOR SERVER VIA CROSS MEMORY SERVICES.      *
+*                                                                     *
+******************************* WS10013 *******************************
+*    THIS MODULE EXAMINES TYPE 30 SMF RECORD AND WHEN RECOGNIZES      *
+*    TSO START (SUBTYPE=1) IT NOTIFIES THE EVENT TO THE ONLINE        *
+*    INTERCEPTOR SERVER VIA CROSS MEMORY SERVICES.                    *
+******************************* WS10013 *******************************
+*                                                                     *
+*    THIS MOUDLE WAS CREATED AS A RESULT OF WS2558.                   *
+*                                                                     *
+* ATTRIBUTES  : THIS ROUTINE SHOULD BE LINK-EDITED WITH RMODE 24      *
+*               AND AMODE 31 .                                        *
+*                                                                     *
+* RESTRICTIONS : NONE                                                 *
+*                                                                     *
+* REGISTER USAGE :  R0  - TEMPORARY WORK REGISTER                     *
+*                   R1  - TEMPORARY WORK REGISTER                     *
+*                   R2  - TEMPORARY WORK REGISTER                     *
+*                   R3  - SMF RECORD                                  *
+*                   R4  - LOCAL RQC                                   *
+*                   R5  - EVENT BLOCK IN RQC                          *
+*                   R6  - CURRENT RELOCATABLE SECTION                 *
+*                   R7  - CURRENT SECTION DATA                        *
+*                   R8  - NOT USED                                    *
+*                   R9  - REMAINING SECT IN RECORD                    *
+*                   R11 - PARAMETERS LIST                             *
+*                   R10 - NOT USED                                    *
+*                   R12 - PROGRAM BASE REGISTER                       *
+*                   R13 - LOCAL SAVE AREA (GETMAINED)                 *
+*                   R14 - RETURN ADDRESS                              *
+*                   R15 - RETURN CODE (ALWAYS 0)                      *
+*                                                                     *
+* INPUT :                                                             *
+*                                                                     *
+*    REGISTER 1 POINTS TO A LIST OF 4 BYTE ADDRESSES FOR THE          *
+*    FOLLOWING TWO PARAMETERS:                                        *
+*                                                                     *
+*    1 - THE SMF RECORD TO BE PROCESSED BY THE EXIT                   *
+*    2 - THE SECOND ADDRESS IN THE LIST IS 0, NO 2ND PARAMETER        *
+*                                                                     *
+*                                                                     *
+* OUTPUT:                                                             *
+*                                                                     *
+*    0 - WRITE THE SMF RECORD (KEEP)                                  *
+*    4 - DON'T WRITE THE SMF RECORD (DELETE)                          *
+*                                                                     *
+*    REGISTER 15 ALWAYS CONTAINS ZERO                                 *
+*                                                                     *
+* CHANGE ACTIVITY :                                                   *
+*                                                                     *
+* WS2558 05 APR 2006 CREATED                                          *
+* WS2561 17 MAY 2006 EM - SUPPORT RESUME\REVOKE FOR CONSUL ZADMIN     *
+*WS10013 29 OCT 2007 AL - INTERCEPT LOGIN EVENTS.                     *
+*IS10117 06 MAR 2014 AL - INTERCEPT AUTOPROF EVENTS (FTP LOGIN)       *
+*SAS2IBMN 17 JAN 2017 NY - RMODE CHANGED FROM 24 TO ANY               *
+*BS10096  18 OCT 2017 ST - ABEND S0C4-04 OCCURS AT IEFU84+18A         *
+*                          WHEN THE EXIT IS ACTIVATED FROM LPA        *
+***********************************************************************
+*
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R11      EQU   11
+R10      EQU   10
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+*
+****************************************************************
+*        CONFIGURATIONS DEFINITION                             *
+****************************************************************
+*
+****************************************************************
+*        PROLOG CODE                                           *
+****************************************************************
+*
+CTSU84A  CSECT
+CTSU84A  AMODE 31
+*SAS2IBMN CTSU84A  RMODE 24
+CTSU84A  RMODE ANY                                             SAS2IBMN
+*
+         SAVE  (14,12),,CTSU84A-&SYSDATE-&SYSTIME
+         LR    R12,R15
+         USING CTSU84A,R12
+         CTSLEVEL ,
+         LR    R11,R1                   SAVE PTR TO PARMS
+         USING PARMLIST,R11
+*
+****************************************************************
+*        FILTER NON-INTERSETING RECORDS
+****************************************************************
+*
+         L     R3,PARMSMF              R3 -> SMF RECORD
+         USING SMFRCD30,R3             SMF REC   ADDRESSABILITY WS10013
+         CLI   SMF30RTY,30             RECORD TYPE 30 ?         WS10013
+         BNE   SKIP30                  N,RETURN                 WS10013
+*        WTO   LINKAGE=BRANCH,MF=(E,SMF30) TEMP FOR DEBUG       WS10013
+         CLC   SMF30WID,=CL4'TSO '     TSO USER?                WS10013
+         BNE   RETURN                  NO, NOTHING TO REPORT... WS10013
+         CLC   SMF30STP,=XL2'0001'     START OPERATION?         WS10013
+         BNE   RETURN                  NO, NOTHING TO REPORT... WS10013
+         B     SKIP80                  YES, OBTAIN WORKAREA...  WS10013
+         DROP  R3                                               WS10013
+SKIP30   DS    0H                                               WS10013
+         USING SMFREC80,R3             SMF REC ADDRESSABILITY   WS10013
+         CLI   SMF80RTY,80             RECORD TYPE 80 ?
+         BNE   RETURN                  N,RETURN
+*        WTO   LINKAGE=BRANCH,MF=(E,SMF80)                      WS10013
+         TRT   SMF80EVT,EVENTCDS       FILTER USING EVENTS TABLE
+         BZ    RETURN                  NON-INTERESTING EVENT
+         TM    SMF80ERR,X'40'          NO PROFILE UPDATES WERE MADE
+         BO    RETURN                  BECAUSE OF ERROR IN RACF
+         CLC   SMF80CNT,=H'0'          ANY SEGMENTS IN RECORD ?
+         BE    RETURN                  NOTHING TO LOOK FOR ...
+SKIP80   DS    0H                                               WS10013
+*
+****************************************************************
+*        OBTAIN WORKAREA
+****************************************************************
+*
+         SR    R0,R0                   CLEAR REG 0
+         LA    R0,WORKLEN              SET LENGTH FOR GETMAIN
+         STORAGE OBTAIN,ADDR=(R1),     GET CORE FOR REG SAVE AREA      *
+               LENGTH=(R0),COND=YES
+         LTR   R15,R15
+         BZ    CHAINSA
+         WTO   LINKAGE=BRANCH,MF=(E,GETMEMF) GET MEMORY FAIL MSG
+         B     RETURN
+CHAINSA  DS    0H
+         ST    R1,8(R13)               CHAIN
+         ST    R13,4(R1)               SAVE AREAS
+         LR    R13,R1                  ESTABLISH WORK AREA
+         USING WORKAREA,R13            ADDRESSABILITY
+*
+****************************************************************
+*        CREATE RECOVERY ENVIRONMENT
+****************************************************************
+*
+         XC    ABNDCODE,ABNDCODE       CLEAR ABEND CODE
+         LA    R9,ABNDEXIT
+         SETFRR A,               ESTABLISH AN FRR                      C
+               FRRAD=(9),        R11 POINT TO THE RECOVERY RTN         C
+               PARMAD=(8),       RETURN PARAMETER AREA PTR R8          C
+               WRKREGS=(6,7)     REGISTERS FOR EXPANSION R6 AND R7
+         ST    R13,0(R8)
+*
+*
+****************************************************************
+*        BUILD RQC DATA AND EVT                                *
+****************************************************************
+*                                                              *
+* 'RQC' IS THE 'REQUEST CONTROL BLOCK' WHICH IS USED BY THE PC *
+* ROUTINES TO PASS INFORMATION TO THE SA-AGENT ONLINE          *
+* INTERCEPTOR .                                                *
+*                                                              *
+* 'EVT' IS THE 'EVENT CONTROL BLOCK' WHICH IS IMBEDED IN THE   *
+* REQUEST BLOCK FOR 'NOTIFY REQUESTS' . IT DESCRIBES THE       *
+* EVENT THAT OCCURED INCLUDING THE ENTITY (USER, GROUP ETC...) *
+* AND THE EVENT ACTION TYPE (ADD, DELETED, MODIFY, PASSWORD    *
+* CHANGED, ETC...) .                                           *
+*                                                              *
+* THE FOLLOWING CODE FORMATS THESE CONTROL BLOCKS AND FILL THEM*
+* WITH THE RELEVANT INFO SO THEY CAN BE PASSED ON TO THE PC    *
+* ROUTINES AND BE TRANSFERED TO THE ONLINE INTERCEPTOR SERVER. *
+*                                                              *
+****************************************************************
+*
+*
+*        INITIALIZE RQC
+*
+         LA    R0,RQCAREA              CLEAR THE AREA
+         LA    R1,RQCLEN               SET LENGTH
+         XR    R15,R15                 PADD WITH X'00'
+         MVCL  R0,R14                  CLEAR
+         LA    R4,RQCAREA              R4 -> RQC
+         USING RQC,R4                  MAP LOCAL RQC
+         MVI   RQCTYPE,RQCTNOTX        REQUEST TYPE IS 'NOTIFY'
+         XC    TIMEDATE,TIMEDATE
+         MVC   GETTIME(GETTIMLN),GETTIMEL COPY LIST FORM        BS10096
+         TIME  DEC,TIMEDATE,LINKAGE=SYSTEM,MF=(E,GETTIME)
+         MVC   RQCTSTMP(4),TIMEDATE    TAKE ONLY TIME
+         L     R9,TIMEDATE+8           DATE IN WORD 3:0YYYYDDD
+         SLL   R9,4                    DATE IN FORMAT:YYYYDDD0
+         ST    R9,RQCTSTMP+4           STORE DATE
+* DATE FORMAT IS YYYYDDD0, NEED TO CONVERT TO 0CYYDDDF
+* WHERE C = 0 FORM 1900 TO 1999, C = 1 FORM 2000 TO 2099
+         OI    RQCTSTMP+7,X'0F'
+         CLI   RQCTSTMP+4,X'19'  FROM 1900 TO 1999 ?
+         BE    DATEFIX           YES, 1900 TO 1999
+         MVI   RQCTSTMP+4,X'01'  FROM 2000 TO 2099
+         B     INITEVT
+DATEFIX  DS    0H
+         MVI   RQCTSTMP+4,X'00'  FROM 1900 TO 1999
+*
+*        INITIALIZE EVT
+*
+INITEVT  DS    0H
+         LA    R5,RQCEVT               R5 -> EVT WITHIN THE RQC
+         USING EVT,R5                  MAP EVT
+         MVC   EVTEVT,=CL4'EVT '       SET EVT EYECATCHER
+         MVC   EVTFLAG,=A(EVTFULL)     MARK EVT AS CONTAINING DATA
+*                                                               WS10013
+         CLI   SMF80RTY,80             RECORD TYPE 80 ?         WS10013
+         BE    REC80A                  YES,CONTINUE WITH RTY=80 WS10013
+         USING SMFRCD30,R3             SMF REC   ADDRESSABILITY WS10013
+         MVI   EVTTYPE,EVTTUSER        USER EVENT               WS10013
+         MVC   EVTDATE,SMF30DTE        SET EVENT DATE           WS10013
+         MVC   EVTTIME,SMF30TME        SET EVENT TIME           WS10013
+         L     R6,SMF30IOF             OFFSET OF ID SECTION     WS10013
+         LA    R6,0(R6,R3)             -> ID SECTION            WS10013
+         MVC   EVTOUID,SMF30RUD-SMF30JBN(R6) SET USERID         WS10013
+         MVC   EVTUSER,SMF30RUD-SMF30JBN(R6) SET USERID         WS10013
+         MVC   EVTOJBN,SMF30JBN-SMF30JBN(R6) SET JOBNAME(USERID)WS10013
+         MVC   EVTOTERM,SMF30TID-SMF30JBN(R6) SET TERMINAL      WS10013
+         MVC   EVTGROUP,SMF30GRP-SMF30JBN(R6) SET TERMINAL      WS10013
+         MVI   EVTACT,EVTALGN          EVENT ACTION IS LOGIN    WS10013
+         MVC   ACTINFO,=CL8'LOGIN'     FAILED OPERATION FOR WTO WS10013
+         B     SENDEVT                                          WS10013
+REC80A   DS    0H                                               WS10013
+         USING SMFREC80,R3             SMF REC 80 ADDRESS.      WS10013
+         MVC   EVTDATE,SMF80DTE        SET EVENT DATE
+         MVC   EVTTIME,SMF80TME        SET EVENT TIME
+         MVC   EVTOUID,SMF80USR        SET ORIGINATOR USERID
+         MVC   EVTOJBN,SMF80JBN        SET ORIGINATOR JOBNAME
+         MVC   EVTOTERM,SMF80TRM       SET ORIGINATOR TERMINAL
+*
+*        PREPARE FOR RELOCATION SECTIONS SCAN
+*
+         LH    R9,SMF80CNT             REMAINING SECTION NUMBER
+         LH    R6,SMF80REL             OFFSET OF 1ST RELOCATE SECTION
+         LA    R6,SMF80FLG(R6)         R6 -> FIRST RELOCATE SECTION
+
+         USING RELOCSCT,R6             RELOCATION SECTION
+*
+*        PROCESS RECORD ACCORDING TO THE EVENT TYPE
+*
+         CLI   SMF80EVT,27
+         BE    GENERAL
+         CLI   SMF80EVT,88             AUTOPROF ?             IS10117
+         BE    AUTOPROF                                       IS10117
+*
+*        A RECORD PASSED EVENT TABLE FILTERING, BUT WAS NOT RECGNIZED
+*
+         WTO   LINKAGE=BRANCH,MF=(E,EVTIGNR)
+         B     CLEANUP
+*************************** IS10117 ********************************
+*                                                                  *
+* ADDED TO SUPPORT AUTOPROF (AUTO UID/GID SETTING WHEN FTP LOGIN)  *
+*                                                                  *
+********************************************************************
+AUTOPROF DS    0H
+         CLI   SMF80EVQ,0              GENERAL AUDIT IS 0 ?
+         BNE   CLEANUP                 NOT 0
+         XR    R2,R2                   CLEAR
+         ICM   R2,1,SMF80RTY+283       GET LENGTH OF USERID
+         LTR   R2,R2                   ZERO?
+         BZ    CLEANUP                 YES, DO NOTHING
+         C     R2,=F'8'                IS USERID FIELD LT OR EQ 8 ?
+         BH    CLEANUP                 NO, ABOVE 8
+         BCTR  R2,0
+         MVC   EVTUSER,=CL8' '         SET BLANKS BEFORE MVC
+         EX    R2,PRFMVUSR             MOVE USERID
+         MVC   EVTGROUP,=CL8' '        NO GROUP
+         MVI   EVTTYPE,EVTTUSER
+         MVI   EVTACT,EVTAUPD
+         MVC   ACTINFO,=CL8'AUTOPROF'
+         MVC   UIDINFO,EVTUSER
+         B     SENDEVT
+PRFMVUSR MVC   EVTUSER(*-*),SMF80RTY+284
+*********************** END OF IS10117 *****************************
+********************************************************************
+*                                                                  *
+* ADDED TO SUPPORT SMF80, RECORD TYPE GENERAL, OF CONSUL ZADMIN    *
+*                                                                  *
+********************************************************************
+*
+*        GENERAL
+*
+GENERAL  DS    0H
+         CLI   SMF80EVQ,0              GENERAL AUDIT IS 0 ?
+         BNE   CLEANUP                 NOT 0
+         TM    SMF80DES,X'80'          IS THE EVENT A VIOLATION? WS2561
+         BO    CLEANUP                 YES, IT IS A VIOLATION    WS2561
+         LA    R1,46                   REQUIERD SECTION IS 46
+         BAL   R14,LOCATES             REPOSITION (IF FOUND)
+         LTR   R15,R15                 FOUND ?
+         BNZ   CLEANUP                 NO, WE HAVE NOTHING
+         XR    R7,R7                   RESET R7 FOR IC
+         IC    R7,RELCTDLN             RELOCATION DATA LENGTH
+         ST    R7,GTFLDCNT             KEEP AS RESIDUAL CHARS CNT
+         LA    R7,GENTAB1              TABLE FOR COMMON CNGRACF
+         ST    R7,GTFLDTAB             KEEP AS CURRENT ADDR IN GENTAB
+         LA    R7,RELCTDTA             RELOCATION DATA
+         ST    R7,GTFLDADR             KEEP AS CRNT ADDR IN SMF REC
+         BAL   R14,SCNTBL              SCAN TABLE (CNGRACF)
+         C     R15,=F'4'               EXPECT USERID TO RETURN,IS FLD?
+         BNE   CLEANUP                 NO, TABLE PATTERN NOT FIT
+         C     R1,=F'8'                IS USERID FIELD LT OR EQ 8 ?
+         BH    CLEANUP                 NO, ABOVE 8
+         LTR   R1,R1                   R1 IS 0 ?
+         BNP   CLEANUP                 YES ZERO, NOT EXPECTED
+         BCTR  R1,0                    DECREASE R1 FOR EX
+         EX    R1,GENUSR               EXTRACT USERID
+         LA    R1,1(R1)                INCREASE R1 BACK
+         MVC   UIDINFO,EVTUSER         FAILED USER FOR WTO
+         B     GENAUSR
+GENUSR   MVC   EVTUSER(*-*),0(R7)      COPY USERID TO EVT
+GENAUSR  DS    0H
+         MVC   EVTGROUP,=CL8' '        NO GROUP
+         MVI   EVTTYPE,EVTTUSER        USER EVENT
+         MVC   GENGFA,GTFLDADR         KEEP SMF DATA ADDR
+         MVC   GENGFC,GTFLDCNT         KEEP SMF DATA RESIDUAL CNTR
+         LA    R7,GENTAB2              TABLE FOR RESUME
+         ST    R7,GTFLDTAB             KEEP AS CURRENT ADDR IN GENTAB
+         BAL   R14,SCNTBL              SCAN TABLE (SUBCOMMAND)
+         LTR   R15,R15                 IS RESUME SUBCOMMAND ?
+         BZ    GENRSUM                 YES, RESUME COMMAND
+         MVC   GTFLDADR,GENGFA         RESTORE SMF DATA ADDRESS
+         MVC   GTFLDCNT,GENGFC         RESTORE SMF DATA RESIDUAL
+         LA    R7,GENTAB3              TABLE FOR REVOKE
+         ST    R7,GTFLDTAB             KEEP AS CURRENT ADDR IN GENTAB
+         BAL   R14,SCNTBL              SCAN TBL (SCHED INTERNAL FIELD)
+         C     R15,=F'4'               EXPECT TO RETURN DUE SCHD FLD
+         BNE   CLEANUP                 TABLE PATTERN NOT FIT TO DATA
+         BAL   R14,SCNTBL              NEXT FIELDS (SCHEDULE ACTION)
+         LTR   R15,R15                 REVOKE PATTERN IDENIFIED ?
+         BNZ   CLEANUP                 NO
+         MVI   EVTACT,EVTAREV          EVENT ACTION IS REVOKE
+         MVC   ACTINFO,=CL8'REVOKE'    FAILED OPERATION FOR WTO
+         B     SENDEVT                 SEND EVENT
+GENRSUM  DS    0H
+         MVI   EVTACT,EVTAUPD          RESUME
+         MVC   ACTINFO,=CL8'RESUME'    FAILED OPERATION FOR WTO
+         B     SENDEVT                 SEND EVENT
+*
+********************************************************************
+*  ROUTINE TO COMPARE STRINGS BETWEEN TABLE STRING (TABLE IS AN    *
+*  INPUT TO ROUINTE) AND DATA SECTION OF SMF80 - TYPE GENERAL,     *
+*  RELOCATION 46.                                                  *
+*                                                                  *
+*  THE ROUTINE USES VARIABLES:                                     *
+*  GTFLDADR - CURRENT DATA ADDRESS IN SMF RECORD                   *
+*  GTFLDTAB - GENTAB TABLE CURRENT ADDRESS                         *
+*  GTFLDCNT - SMF RECORD RESIDUAL CHARACTERS COUNTER               *
+*                                                                  *
+*  THIS VARIABLES SHOULD BE INITIALIZED ONCE, IN CASE THE ROUTINE  *
+*  FAILS TO FIND THE STRING IN TABLE ORDER, THEN SERACH IN TABLE   *
+*  BY THE ROUTINE SHOULD BE STOPPED WITH THE INITIALIZED VARIABLES,*
+*  NEW SERACH MAY BE STARTED WITH INITIALIZED VARAIBLES AGAIN.     *
+*                                                                  *
+*------------------------------------------------------------------*
+*                                                                  *
+*  REGISTER USAGE :                                                *
+*  ----------------                                                *
+*      R1   = LENGTH OF FIELD THAT FOUND (OUTPUT)                  *
+*      R2   = POINT TO FIELD OR TO STRING TABLE  (INTERNAL USE)    *
+*      R7   = POSITION IN DATA  (OUTPUT:NEW POS)                   *
+*      R9   = REMAINING DATA PART, STR LENGTH IN TAB(INTERNAL USE) *
+*      R14  = RETURN ADDRESS                                       *
+*      R15  = RETURN CODE                                          *
+*                                                                  *
+*  RETURN CODES:                                                   *
+*  ------------                                                    *
+*  0 - END OF TABLE                                                *
+*  4 - TABLE SCAN STOP, ENCOUNTER 0 LENGTH IN TABLE,               *
+*      FOUND STRING ADDRESS IN R7,                                 *
+*      FOUND STRING LENGTH IN R1.                                  *
+*  8 - SCANNED DATA AND TABLE PATTERN NOT FIT                      *
+*                                                                  *
+********************************************************************
+*
+SCNTBL   DS    0H
+         L     R9,GTFLDTAB     R9->POINT TO STRING TABLE
+         CLC   0(4,R9),=F'256' END OF TABLE ?
+         BE    GETFOK          YES, END OF TABLE
+         L     R9,GTFLDCNT     R9->RESIDUAL SMF DATA
+         LTR   R9,R9           SMF80 DATA REACH THE END ?
+         BNP   GETFE           ERROR,OUT OF DATA RANGE
+         L     R7,GTFLDADR     R7->SMF DATA ADDRESS
+         LR    R2,R7           R2->LAST SMF DATA ADDRESS
+         B     GETFB1          LOOK FOR BLANKS
+GETFL1   DS    0H
+         LA    R2,1(R2)        GO NEXT CHAR
+         LTR   R9,R9           SMF DATA REACH TO END ?
+         BZ    GETFE           YES, REACHED TO END, ERROR
+         BCTR  R9,0            DECREASE R9 BY 1
+GETFB1   DS    0H
+         CLI   0(R2),C' '      THIS IS BLANK CHAR?
+         BE    GETFL1          YES BLANK, LOOK FOR NEXT BLANK
+         XR    R1,R1           SET FIELD LENGTH TO 0
+         LR    R7,R2           R7-> START OF NEW FIELD
+         B     GETFO1          LOOK FOR STRING
+GETFL2   DS    0H
+         LA    R2,1(R2)        GO NEXT CHAR
+         LA    R1,1(R1)        FIELD LENGTH INCREASED BY 1
+GETFO1   DS    0H
+         LTR   R9,R9           DATA PART LENGTH IS 0?
+         BZ    GETFSTR         YES, ITS OK
+         BCTR  R9,0            DECREASE R9 BY 1
+         CLI   0(R2),C' '      DATA IS BLANK?
+         BNE   GETFL2          NO BLANK, STILL IN  STRING
+GETFSTR  DS    0H
+         ST    R9,GTFLDCNT     STORE RESIDUAL SMF DATA
+         L     R2,GTFLDTAB     R2->POINT TO STRING TABLE
+         L     R9,0(R2)        GET STRING LENGTH FROM TABLE
+         LTR   R9,R9           IS FIELD LENGTH EQ 0 ?
+         BZ    GETF0           YES, LENGTH WILL NOT BE TESTED
+         CR    R1,R9           IS R1 EQ STR LENGTH FROM TABLE ?
+         BNE   GETFE           NO, STRING NOT FOUND
+         LA    R2,4(R2)        GO TO STRING IN TABLE
+         BCTR  R9,0            DECREASE R9 FOR EX
+         EX    R9,GETFCMP      FOUND FIELD IS EQ TO STRING IN TABLE?
+         BNE   GETFE           NO, FIELD AND STRING NOT EQUAL
+         LA    R9,1(R9)        INCREASE R9 BACK
+         B     GETFSK1         YES, FIELD AND TABLE STRING EQUAL
+GETFCMP  CLC   0(*-*,R7),0(R2) COMPARE SMF DATA AND STRING IN TBL
+GETFSK1  DS    0H
+         LA    R2,0(R2,R9)     SKIP STRING LENGTH IN TABLE
+         ST    R2,GTFLDTAB     STORE NEW TABLE ADDRESS
+         B     GETFUA
+GETF0    DS    0H
+         LA    R2,4(R2)        GO NEXT STRING DATA ON TABLE
+         ST    R2,GTFLDTAB     STORE NEW TABLE ADDRESS
+GETFUA   DS    0H              UPDATE ADDRESS OF NEW FIELD
+         LR    R2,R7           KEEP R7 TO POINT ON SMF DATA ADDRESS
+         LA    R2,0(R1,R2)     CLACULATE NEW SMF DATA ADDRESS
+         ST    R2,GTFLDADR     STORE NEW SMF DATA ADDRESS
+         LTR   R9,R9           COMPARE NEXT FIELD OR RETURN ?
+         BNZ   SCNTBL          YES, COMPARE NEXT FIELD
+         LA    R15,4           NO, RETURN
+         BR    R14             FINISH OK, MORE STRING IN TABLE
+GETFOK   DS    0H
+         LA    R15,0
+         BR    R14             FINISH OK, REACH END OF TABLE
+GETFE    DS    0H
+         LA    R15,8           FINISH NOT OK
+         BR    R14
+*
+*
+****************************************************************
+*        ROUTINE TO LOCATE SECTION                             *
+****************************************************************
+*                                                              *
+*  THE ROUTINE LOCATES A REQUESTED SECTION (PASSED IN REG 1)   *
+*  IN THE SMF RECORD                                           *
+*                                                              *
+*--------------------------------------------------------------*
+*                                                              *
+*  REGISTERS USAGE :                                           *
+*  -----------------                                           *
+*                                                              *
+*      R1   = REQUIRED SECTION                                 *
+*      R2   = CURRENT SECTION LENGTH                           *
+*      R6  -> CURRENT  SECTION                                 *
+*      R9   = REMAINING SECTION                                *
+*      R14 -> RETURN ADDRESS                                   *
+*      R15    RETURN CODE                                      *
+*                                                              *
+****************************************************************
+*
+LOCATES  DS    0H
+         XR    R15,R15                 ASSUME SUCCESS RC
+         XR    R2,R2                   CLEAR SECTION LENGTH
+LOCLOOP  DS    0H
+         IC    R2,RELCTDLN             LENGTH OF DATA THAT FOLOWS
+         EX    R1,EXCLI                REQUIRED SECTION ?
+         BER   R14                     YES, FOUND IT
+         LA    R6,2(R2,R6)             ADVNACE TO NEXT SECTION
+         BCT   R9,LOCLOOP              TRY AGAIN IF ANY SECTION LEFT
+         LA    R15,4                   SET NOT FOUND RC
+         BR    R14                     RETURN TO CALLER
+EXCLI    CLI   RELCTDTP,*-*            EXECUTE CODE TO COMPARE SECTION
+*
+         DROP  R5,R6
+*
+****************************************************************
+*        NOTIFY SA-AGENT INTERCEPTOR OF THE EVENT
+****************************************************************
+*
+SENDEVT  DS    0H
+*        WTO   LINKAGE=BRANCH,MF=(E,SENDEVTM)                   WS10013
+         CALL  CTSAP84,(FUJIFLAG,SSNAME,JOBNAME,(R4),PCCWORK),         X
+               MF=(E,CALLAREA)
+         LTR   R15,R15                 NOTIFY SUCCESSFULL ?
+         BZ    CLEANUP                 YES, CONTINUE
+*
+         CH    R15,=H'8'               FREE CHAIN EXISTS ?
+         BE    NOFRCHN                 NO MORE RQC IN FREE CHAIN
+*
+         CH    R15,=H'160'             WAS THE INTERCEPTOR UP ?
+         BNH   CLEANUP                 NO, THAN NO NEED FOR MESSAGE
+*
+****************************************************************
+*        NOTIFY ROUTINE INTERNAL ERROR
+****************************************************************
+*
+         CVD   R15,PACKD               CONVERT RC TO EBCDIC
+         UNPK  CHARRC,PACKD            CONVERT RC TO EBCDIC
+         OI    CHARRC+7,X'F0'          CONVERT RC TO EBCDIC
+         MVC   WTOAREA(WTONTFYL),WTONTFY
+         MVC   WTOAREA+WTONTFYL-4(4),CHARRC+4
+         WTO   LINKAGE=BRANCH,MF=(E,WTOAREA)
+         B     CLEANUP
+         DROP  R4
+*
+****************************************************************
+*        NOTIFY FREE CHAIN IS EMPTY  -
+****************************************************************
+*
+NOFRCHN  DS    0H
+         MVC   WTOAREA(WTOEVTL),WTOEVT
+         MVC   WTOAREA+13(L'ACTINFO),ACTINFO
+         MVC   WTOAREA+22(L'UIDINFO),UIDINFO
+         WTO   LINKAGE=BRANCH,MF=(E,WTOAREA)
+         B     CLEANUP
+*
+****************************************************************
+*        ISSUE ABEND MESSGAE                                   *
+****************************************************************
+*
+CLEANUP  DS    0H
+         ICM   R2,15,ABNDCODE          R2 = ABEND CODE WORD
+         BZ    NOABEND                 NO, NO ABEND
+         MVI   ABNDTYPE,C'U'           ASSUME USER ABEND
+         N     R2,=XL4'00000FFF'       TEST FOR USER ABEND CODE
+         BNZ   ABENDMSG                YES, HAVE USER ABEND CODE
+         L     R2,ABNDCODE             R2 = ABEND CODE WORD
+         SRL   R2,12                   ISOLATE SYSTEM ABEND CODE
+         MVI   ABNDTYPE,C'S'           SET SYSTEM ABEND CODE
+ABENDMSG DS    0H
+         ST    R2,ABNDBIN              SAVE BINARY ABEND CODE
+         UNPK  ABNDCHAR(9),ABNDBIN(5)  CONVERT TO ZONED
+         TR    ABNDCHAR(8),HEX2CHAR    MAKE IT CHARACTER
+         MVC   ABNDCHAR+4(1),ABNDTYPE  INSERT ABEND TYPE CHARACTER
+         MVC   WTOAREA(WTOABNDL),WTOABND
+         MVC   WTOAREA+WTOABNDL-4(4),ABNDCHAR+4
+         WTO   LINKAGE=BRANCH,MF=(E,WTOAREA)
+NOABEND  DS    0H
+*
+****************************************************************
+*        CLRER RECOVERY ENVIRONMENT                            *
+****************************************************************
+*
+         SETFRR D,WRKREGS=(6,7)  DELETE THE FRR
+*
+****************************************************************
+*        FREE WORKAREA
+****************************************************************
+*
+         LR    R1,R13                  ADDRESS FOR FREEMAIN
+         L     R13,4(R13)              RESTORE CALLERS SAVE AREA
+         SR    R0,R0                   CLEAR REG 0
+         LA    R0,WORKLEN              FREE WORK AREA
+         STORAGE RELEASE,ADDR=(R1),LENGTH=(R0),COND=YES
+         LTR   R15,R15
+         BZ    RETURN
+         WTO   LINKAGE=BRANCH,MF=(E,FREMEMF)
+*
+****************************************************************
+*        FINISH
+****************************************************************
+*
+RETURN   DS    0H
+         XR    R15,R15                 SET RETURN CODE
+         RETURN (14,12),T,RC=(15)      RESTORE REGISTERS AND RETURN
+         DROP  R11
+*
+****************************************************************
+*        CONSTANTS
+****************************************************************
+*
+         LTORG ,
+*
+SSNAME   DC    CL4'    '
+JOBNAME  DC    CL8'CTSAONI'
+FUJIFLAG DC    AL1(128)
+*
+*        'INTERESTING' EVENT CODES TABLE
+*
+EVENTCDS DC    256X'00'
+         ORG   EVENTCDS+27             GENERAL
+         DC    AL1(*-EVENTCDS)
+         ORG   EVENTCDS+88             AUTOPROF           IS10117
+         DC    AL1(*-EVENTCDS)                            IS10117
+         ORG
+*
+******************************************************************
+*
+* TABLE TO DEFINE ORDER OF STRING SERACH IN RELOACTION 46 IN SMF80
+* RECORD OF EVENT TYPE GENERAL, USED IN ROUTINE SCNTBL
+* IMPLEMENTED FOR CONSUL ZADMIN.
+*
+* TABLE CONSISTS OF FIELD LENGTH AND FIELD NAME.
+* NOTES: 1) FIELD LENGTH OF ZERO RETURNS STRING WITHOUT TESTING
+*           ITS LENGTH (WHEN STRING LENGTH IS UNKNOWN)
+*           SCNTBL RETURNS:
+*             R15 -> 4
+*             R7  -> ADDRESS OF FOUND STRING
+*             R1  -> LENGTH OF FOUND STRING
+*        2) TABLE ASSUMPTION IS MAX STRING LENGTH OF 255
+*           WHEN STRING LENGTH IS 256, SCNTBL RETURNS R15=0
+*
+* PAY ATTENTION TO DATA ALIGNMENT (USE XL)
+*
+******************************************************************
+*
+*
+* COMMON TABLE FOR CNGRACF USER
+*
+GENTAB1  DC    XL4'00000007',CL7'CNGRACF'
+         DC    XL4'00000004',CL4'USER'
+         DC    XL4'00000000'              SCNTBL RETURN 4
+         DC    XL4'00000100'              256 (X'100') IS END OF TABLE
+*
+* RESUME TABLE
+*
+GENTAB2  DC    XL4'00000006',CL6'RESUME'
+         DC    XL4'00000100'              256 (X'100') IS END OF TABLE
+*
+* REVOKE TABLE
+*
+GENTAB3  DC    XL4'00000008',CL8'SCHEDULE'
+         DC    XL4'00000000'              SCNTBL RETURN 4
+         DC    XL4'00000007',CL7'DISABLE'
+         DC    XL4'00000100'              256 (X'100') IS END OF TABLE
+*
+*BS10096*GETTIME  TIME  LINKAGE=SYSTEM,MF=L
+GETTIMEL TIME  LINKAGE=SYSTEM,MF=L                              BS10096
+GETTIMLN EQU   *-GETTIMEL                                       BS10096
+*
+SMF20    WTO   'CTSU84A: SMF TYPE = 20',LINKAGE=,MF=L
+SMF30    WTO   'CTSU84A: SMF TYPE = 30',LINKAGE=,MF=L
+SMF80    WTO   'CTSU84A: SMF TYPE = 80',LINKAGE=,MF=L
+SENDEVTM WTO   'CTSU84A: AT SENDEVT',LINKAGE=,MF=L
+EVTIGNR  WTO   'CTSU84A: SA-AGENT SMF EXIT IEFU84 RECORD FILTERING MISM*
+               ATCH - EVENT IGNORED',LINKAGE=,MF=L
+
+GETMEMF  WTO   'CTSU84A: GETMAIN FOR WORKAREA HAS FAILED',LINKAGE=,MF=L
+FREMEMF  WTO   'CTSU84A: FREEMAIN OF WORKAREA HAS FAILED',LINKAGE=,MF=L
+
+WTONTFY  WTO   'CTSU84A: SA-AGENT ONLINE INTERCEPTOR NOTIFY HAS FAILED *
+               RC=XXXX',LINKAGE=,MF=L
+WTONTFYL EQU   *-WTONTFY
+
+WTOEVT   WTO   'CTSU84A: <ACTION> <USERID> EVENT IS LOST. START AGENT A*
+               SAP TO EMPTY QUEUE AND MEMORY.',LINKAGE=,MF=L
+WTOEVTL  EQU   *-WTOEVT
+
+WTOABND  WTO   'CTSU84A: SA-AGENT SMF EXIT IEFU84 HAS ABENDED. ABEND CO*
+               DE=XXXX',LINKAGE=,MF=L
+WTOABNDL EQU   *-WTOABND
+
+HEX2CHAR DC    256AL1(*-HEX2CHAR)
+         ORG   HEX2CHAR+X'FA'
+         DC    CL6'ABCDEF'
+         ORG
+
+         DROP
+*
+****************************************************************
+*        ABEND RECOVERY ROUTINE                                *
+****************************************************************
+*
+ABNDEXIT DS    0H
+         USING ABNDEXIT,R15            ABEND EXIT ADDRESSABILITY
+         L     R12,=A(CTSU84A)         RESTORE LMOD BASE REG
+         DROP  R15                     USE LMOD ADDRESSABILITY
+         USING CTSU84A,R12             RESTORE ITS ADDRESSABILITY
+         USING SDWA,R1                 MAP SDWA
+         L     R13,SDWAPARM            RESTORE WORKAREA REGISTER
+         L     R13,0(R13)
+         USING WORKAREA,R13            MAP WORKAREA
+         MVC   ABNDCODE,SDWAABCC       SET ABEND CODE
+         TM    SDWAERRD,SDWACLUP       RETRY ALLOWED ?
+         BNZ   NORETRY                 NO, CAN NOT RETRY
+*
+RETRY    DS    0H
+         ST    R12,SDWASR12            SET BASE REGISTER FOR RETRY
+         ST    R13,SDWASR13            SET WORKAREA REGISTER FOR RETRY
+
+         ST    R14,RECVR14
+         SETRP RETREGS=YES,RC=4,RETADDR=CLEANUP,                       X
+               FRESDWA=YES,DUMP=YES    RETRAY TO CLEANUP
+         L     R14,RECVR14
+
+         BR    R14
+*
+NORETRY  DS    0H
+         XR    R15,R15                  INDICATE NO RETRY
+         BR    R14                      RETURN TO RTM
+         LTORG
+         DROP
+*
+****************************************************************
+*        WORK AREA
+****************************************************************
+*
+WORKAREA DSECT
+SAVEAREA DS    18F                     SAVE AREA TO CALL OTHERS
+CALLAREA CALL  ,(,,,,),MF=L            EXECUTE FORM CALL AREA
+PCCWORK  DS    XL512                   WORK AREA FOR CTSAP84 ROUTINE
+RQCAREA  DS    CL(RQCLEN)              AREA FOR RQC
+PACKD    DS    D                       RETURN CODE CONVERSION
+CHARRC   DS    CL8                     RETURN CODE CONVERSION
+WTOAREA  DS    XL384                   CTSMSGR WTO WORK AREA
+RECVR14  DS    F                       FOR ERROR RECOVERY ROUTINE
+ABNDCODE DS    XL4                     ABCODE SAVED BY ESTAE ROUTINE
+ABNDBIN  DS    XL5                     ISOLATED ABEND CODE + PAD BYTE
+ABNDTYPE DS    CL1                     ABEND TYPE (S/U)
+ABNDCHAR DS    CL9                     CHARCTER ABEND CODE FOR CTSMSG
+RESERVED DS    16X                     RESERVED AREA
+ACTINFO  DS    CL8                     EVENT ACTION INFO FOR WTO
+UIDINFO  DS    CL8                     USER\GROUP INFO FOR WTO
+GTFLDADR DS    A                       SMF RECORD DATA ADDRESS
+GTFLDTAB DS    A                       GENTAB TABLE CURRENT ADDR
+GTFLDCNT DS    F                       SMF REC RESIDUAL CHAR CNT
+GENGFA   DS    A                       AUX VAR. (LIKE GTFLDADR)
+GENGFC   DS    F                       AUX VAR. (LIKE GTFLDCNT)
+TIMEDATE DS    CL16                    TIME STAMP
+GETTIME  DS    XL(GETTIMLN)            TIME MACRO LIST FORM     BS10096
+WORKLEN  EQU   *-WORKAREA
+*
+****************************************************************
+*        SMF REC TYPE 80 HEADER
+****************************************************************
+*
+SMFREC80 DSECT
+         IFASMFR9 80
+****************************************************************
+*        SMF REC TYPE 30 HEADER                                WS10013
+****************************************************************
+         IFASMFR3 30                                           WS10013
+*
+****************************************************************
+*        GENERAL SMF80 RELOCATABLE SECTION MAPPING
+****************************************************************
+*
+RELOCSCT DSECT                         MAPPING FOR RELOCATION SECTION
+RELCTDTP DS    CL1                     DATATYPE
+RELCTDLN DS    CL1                     LENGTH OF DATA THAT FOLOWS
+RELCTDTA DS    CL255                   DATA
+*
+****************************************************************
+*        PARAMETER LIST
+****************************************************************
+*
+PARMLIST DSECT
+PARMSMF  DS    A
+*
+****************************************************************
+*        SA-AGENT CONTROL BLOCKS
+****************************************************************
+*
+RQC      DSECT
+         COPY  CTSRQC
+EVT      DSECT
+         COPY  CTSEVT
+*
+****************************************************************
+*        SYSTEM  CONTROL BLOCKS
+****************************************************************
+*
+         IHAFRRS
+         IHAPSA
+         IHASDWA
+         END

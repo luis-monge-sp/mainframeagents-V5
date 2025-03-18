@@ -1,0 +1,983 @@
+         START
+         TITLE 'SA-AGENT IEFU83 EXIT FOR ACF2 SYSTEMS'
+**
+***********************************************************************
+****                                                               ****
+****   SA-AGENT VERSION 4.0.XX                                     ****
+****                                                               ****
+****   (C) COPYRIGHT 1999-2004 BMC SOFTWARE, INC.                  ****
+****   ALL RIGHTS RESERVED.                                        ****
+****                                                               ****
+***********************************************************************
+*
+***********************************************************************
+*                                                                     *
+* MODULE NAME : ACFU83A                                               *
+*                                                                     *
+* DESCRIPTION : SA-AGENT IEFU83 EXIT FOR ACF2 SYSTEMS                 *
+*                                                                     *
+* FUNCTION:                                                           *
+*                                                                     *
+*    THIS MODULE EXAMINES ACF2 SMF RECORD AND WHEN IT RECOGNIZES      *
+*    A LID RECORD CHANGE, A GSO RECORD CHANGE, A RESET COMMAND,       *
+*    AN ACCESS OR RESOURCE RULE ADD OR UPDATE,                 WS10067*
+*    OR AN INVALID PASSWORD TYPING, IT NOTIFIES THE EVENT TO THE      *
+*    SA-AGENT ONLINE INTERCEPTOR SERVER VIA CROSS MEMORY SERVICES.    *
+*    WORKS WITH ONLINE INTERCEPTOR ONLY!                              *
+*                                                                     *
+* ATTRIBUTES  : THIS ROUTINE SHOULD BE LINK-EDITED WITH RMODE 24      *
+*               AND AMODE 31 .                                        *
+*                                                                     *
+* RESTRICTIONS : NONE                                                 *
+*                                                                     *
+* REGISTER USAGE :  R0  - TEMPORARY WORK REGISTER                     *
+*                   R1  - TEMPORARY WORK REGISTER                     *
+*                   R2  - TEMPORARY WORK REGISTER                     *
+*                   R3  - SMF RECORD                                  *
+*                   R4  - LOCAL RQC                                   *
+*                   R5  - RECORD TYPE FOR LOGONID RECORDS CHANGE      *
+*                   R6  - RECORD TYPE FOR INFOSTG RECORDS CHANGE      *
+*                   R7  - CURRENT SMF RECORD TYPE                     *
+*                   R8  - EVENT BLOCK IN RQC                          *
+*                   R9  - RECORD TYPE FOR COMMAND RECORDS             *
+*                   R10 - NOT USED                                    *
+*                   R11 - PARAMETERS LIST                             *
+*                   R12 - PROGRAM BASE REGISTER                       *
+*                   R13 - LOCAL SAVE AREA (GETMAINED)                 *
+*                   R14 - RETURN ADDRESS                              *
+*                   R15 - RETURN CODE (ALWAYS 0)                      *
+*                                                                     *
+* INPUT :                                                             *
+*                                                                     *
+*    REGISTER 1 POINTS TO A LIST OF 4 BYTE ADDRESSES FOR THE          *
+*    FOLLOWING TWO PARAMETERS:                                        *
+*                                                                     *
+*    1 - THE SMF RECORD TO BE PROCESSED BY THE EXIT                   *
+*    2 - THE SECOND ADDRESS IN THE LIST IS 0, NO 2ND PARAMETER        *
+*                                                                     *
+*                                                                     *
+* OUTPUT:                                                             *
+*                                                                     *
+*    0 - WRITE THE SMF RECORD (KEEP)                                  *
+*    4 - DON'T WRITE THE SMF RECORD (DELETE)                          *
+*                                                                     *
+*    REGISTER 15 ALWAYS CONTAINS ZERO                                 *
+*                                                                     *
+* CHANGE ACTIVITY :                                                   *
+*                                                                     *
+* 10/06/97 CREATED                                                    *
+* 20/10/97 BS2301 - ADDED SUPPORT FOR 'F ACF2,RESET(LID)' COMMAND     *
+* 26/10/97 BS2304 - EVTOUID=VALUE FROM ACSMFLID AND NOT ACSMFUID      *
+*                      EVTOTERM=VALUE FROM ACSMFSRC INSTEAD OF BLANKS *
+* 03/11/97 WS2302 - INTERCEPT PSWD-VIO CHANGES AT LOGON TIME          *
+*                     INTERCEPT USER SUSPEND AT LOGON TIME            *
+* 25/02/98 PS0244 - LONG RQC SUPPORT                                  *
+* 22/11/01 WS2431 - INTERCEPT CONNECTION CHANGES IN UID STRING        *
+* 15/01/02 WS2451 - INDICATE PSWD-VIO INTERCEPTION                    *
+* 12/10/02 WS2370 - SUPPORT USER PROFILE RECORDS INTERCEPTIONS        *
+* 06/10/02 AVNERL   BS2552                                            *
+*              -CPU LOOP BECAUSE OF WRONG CB TESTING                  *
+*              -SUPPORT PARTIAL FIELD  IN UID                         *
+*              -... AND MANY MORE BUGS                                *
+* 19/11/02 AVNERL   BS2564 DON'T PASS SUBTYPE=P SMF RECORDS.          *
+* 31/03/03 AVNERL   IS0057 DON'T TRUST ARE FIELD LENGTH (BS2567).     *
+* 03/12/03 AVNERL   BS2633 DON'T ADD/DELETE USERS WHEN USER PROFILE   *
+*                             IS BEING ADDED/DELETED. SEND UPDATE USER*
+* 02/10/03 MICHAEL  IS0121 RQCAREA MOVED TO END OF WORKAREA *         *
+* 30/09/05 AVNERL   IS0279 IMPLEMENT WS2538 FROM V3102.               *
+*              -DROP BS2564 & USE SEND_PASS_VIOLATION OF WS2451.      *
+* 05/08/07 AVNERL  WS10006 DROP SUBTYPE=A & PASSWORD USER PROFILE.    *
+* 16/09/07 AVNERL  IS10011 PREVENT RECONNECT CONNS.  (BS10002)        *
+* 23/09/07 AVNERL  IS10012 SEND MSG WHEN NO MORE EVENTS IN FREE CHAIN.*
+* 09/09/08 AVNERL  IS10025 USER PROFILES RECORDS ARE NOT INTERCEPTED. *
+* 17/01/17 NURITY  SAS2IBMN CHANGE RMODE 24 TO ANY.                   *
+* 09/01/18 SELIGT  WS10067 UPDATE GDB DYNAMICALLY WHEN ACCESS OR      *
+*                          RESOURCE RULES ARE ADDED/MODIFIED          *
+***********************************************************************
+*
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R11      EQU   11
+R10      EQU   10
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+*
+****************************************************************
+*        CONFIGURATIONS DEFINITION                             *
+****************************************************************
+*
+****************************************************************
+*        PROLOG CODE                                           *
+****************************************************************
+*
+CTSU83A  CSECT
+CTSU83A  AMODE 31
+*SAS29BMN CTSU83A  RMODE 24
+CTSU83A  RMODE ANY                                             SAS2IBMN
+*
+         SAVE  (14,12),,CTSU83A-&SYSDATE-&SYSTIME
+         LR    R12,R15
+         USING CTSU83A,R12
+         CTSLEVEL ,
+         LR    R11,R1                  SAVE PTR TO PARMS
+         USING PARMLIST,R11
+         L     R3,PARMSMF              R3 -> SMF RECORD
+         USING ACFSMF,R3               SMF RECORD ADDRESSABILITY
+*
+****************************************************************
+*        OBTAIN ACF2 SMF RECORD TYPES
+****************************************************************
+*
+         ACFINCVT R4,NONE=RETURN
+         USING  ACCVT,R4
+         XR     R5,R5                  LOGONID RECORD TYP
+         ICM    R5,B'0001',ACCSMFL     SMF RECORD FOR LID UPD ?
+         BNZ    GETSMFLE               YES, USE IT
+         IC     R5,ACCSMFAC            NO, USE 'ALL SMF' TYPE
+GETSMFLE DS     0H                     RSS PARAMS RECORD TYP
+         XR     R6,R6                  RSS PARAMETERS RECORD TYP
+         ICM    R6,B'0001',ACCSMFE     SMF RECORD FOR INFO STG UPD ?
+         BNZ    GETSMFEE               YES, USE IT
+         IC     R6,ACCSMFAC            NO, USE 'ALL SMF' TYPE
+GETSMFEE DS     0H
+         XR     R9,R9                  COMMAND RECORD TYP
+         ICM    R9,B'0001',ACCSMFC     SMF RECORD FOR COMMAND ?
+         BNZ    GETSMFCE               YES, USE IT
+         IC     R9,ACCSMFAC            NO, USE 'ALL SMF' TYPE
+GETSMFCE DS     0H
+         XR     R15,R15                PASSWORD RECORD TYP
+         ICM    R15,B'0001',ACCSMFP    SMF RECORD FOR PASSWORD?
+         BNZ    GETSMFPE               YES, USE IT
+         IC     R15,ACCSMFAC           NO, USE 'ALL SMF' TYPE
+GETSMFPE DS     0H
+         XR     R2,R2                  ACCESS RULE INS/UPD/DEL  WS10067
+         ICM    R2,B'0001',ACCSMFR     SMF RECORD FOR ACC RULE? WS10067
+         BNZ    GETSMFRE               YES, USE IT              WS10067
+         IC     R2,ACCSMFAC            NO, USE 'ALL SMF' TYPE   WS10067
+GETSMFRE DS     0H                                              WS10067
+         DROP   R4
+*
+****************************************************************
+*        FILTER NON-INTERSETING RECORDS
+****************************************************************
+*
+         XR    R7,R7
+         IC    R7,ACSMFTYP             GET CURRENT RECORD TYPE
+         CR    R7,R5                   LOGONID RECORD CHANGE ?
+         BE    FILTER0                 Y,CONTINUE
+         CR    R7,R6                   INFOSTG RECORD CHANGE ?
+         BE    FILTER0                 Y,CONTINUE
+         CR    R7,R9                   COMMAND RECORD ?
+         BE    FILTER0                 Y,CONTINUE
+         CR    R7,R15                  PASSWORD RECORD ?
+         BE    FILTER0                 Y,CONTINUE
+         CR    R7,R2                   ACCESS RULE RECORD?      WS10067
+         BE    FILTER0                 Y,CONTINUE               WS10067
+         B     RETURN                  NO, DONE
+*
+*        CHECK AGAINST ACF2 SMF RECORD SUB TYPES
+*
+FILTER0  DS    0H
+         CLC   =XL2'ACF2',ACSMFACF     ACF2 EYECATCHER ?
+         BNE   RETURN                  N,RETURN
+         CLI   ACSMFREC,ACRECL         LOGONID REC FUNCTION ?
+         BE    FILTER1                 Y, CONTINUE
+         CLI   ACSMFREC,ACRECE         INFOSTG REC FUNCTION ?
+         BE    FILTER2                 Y, CONTINUE
+*WS10006 CURRENTLY (BEFORE WS10006), THE ONLY CASE SUBTYPE=A RECORD
+*WS10006 IS PASSED AS EVENT, IS WHEN F ACF2,RESET COMMAND IS DONE.
+*WS10006 WHEN F ACF2,RESET COMMAND IS ISSUED, 3 OR 4 SUBTYPE=A
+*WS10006 RECORDS AND 1 SUBTYPE=L RECORD ARE WRITTEN TO SMF FILE.
+*WS10006 THEREFORE, THERE IS NO NEED TO HANDLE THE SUBTYPE=A RECORD.
+*WS10006 CLI   ACSMFREC,ACRECA         COMMAND REC ?
+*WS10006 BE    FILTER3                 Y, CONTINUE
+         CLI   ACSMFREC,ACRECP         PASSWORD REC FUNCTION ?
+         BE    FILTER4                 Y, CONTINUE              WS2538
+         CLI   ACSMFREC,ACRECR         ACCESS RULE FUNCTION?    WS10067
+         BE    FILTER5                 Y, CONTINUE              WS10067
+*BS2564  BE    FILTER4                 Y, CONTINUE
+*WS2538  BE    RETURN                  Y, DON'T PASS            BS2564
+         B     RETURN
+*
+*        CHECK AGAINST ACF2 SMF RECORD SUB TYPES
+*
+FILTER1  DS    0H
+         CLI   ACSMFFCN,ACFCNINS       INSERT  FUNCTION ?
+         BE    FILTERE                 Y, CONTINUE
+         CLI   ACSMFFCN,ACFCNREP       REPLACE FUNCTION ?
+         BE    FILTERE                 Y, CONTINUE
+         CLI   ACSMFFCN,ACFCNDEL       DELETE  FUNCTION ?
+         BE    FILTERE                 Y, CONTINUE
+         B     RETURN
+FILTER2  DS    0H
+         CLC   =CL4'CGSO',ACEMFKEY     GSO RECORD ?
+         BE    FILTERE                 Y, CONTINUE
+         CLC   =CL4'PUSR',ACEMFKEY     USER PROFILE RECORD ?  WS2370
+         BNE   FILTER3                 N, CHK NEXT FILTER     WS10006
+*WS10006 BE    FILTERE                 Y, CONTINUE            WS2370
+*WS10006 B     RETURN
+         CLC   =CL8'PASSWORD',ACEMFKEY+4 PASSWORD USER PROF?    WS10006
+         BE    RETURN                  Y, SKIP IT (SEE BELOW)   WS10006
+* PASSWORD USER PROFILE IS NOT UPDATED DIRECTLY.                WS10006
+* WHEN CHANGE <USER> PASS(<PASSWORD>) COMMAND IS USED, THE      WS10006
+* PASSWORD USER PROFILE IS UPDATED AS WELL. THEREFORE, THE      WS10006
+* CHANGE IS INTERCEPTED AND REPORTED TO ESS WITH THE LOGONID    WS10006
+* RECORD CHANGED. SO WE DO NOT NEED TO SEND A SECOND            WS10006
+* INTERCEPTION FOR SAME EVENT.                                  WS10006
+         BNE   FILTERE                 N, CONTINUE              IS10025
+*
+*WS10006 SUBTYPE=A SMF RECORDS ARE DROPPED
+FILTER3  DS    0H
+*WS10006 TM    ACFATYPE,ACFAMSG        MESSAGE LOGGING ?
+*WS10006 BZ    RETURN
+*WS10006 CLC   =HL2'0008',ACFAPMLN     PARM LENGTH >= 8 ?
+*WS10006 BH    RETURN
+*WS10006 CLC   =CL8'ACF79961',ACFAPARM MESSAGE ACF79961 ?
+*WS10006 BNE   RETURN
+*WS10006 B     FILTERE
+*                                                               WS10067
+*        CHECK RESOURCE RULE OPERATIONS                         WS10067
+*                                                               WS10067
+         CLI   ACEMFKEY,C'R'           RESOURCE RULE RECORD?    WS10067
+         BNE   FILTER4                 N, CHK NEXT FILTER       WS10067
+         CLI   ACSMFFCN,ACFCNINS       INSERT  FUNCTION?        WS10067
+         BE    FILTERE                 Y, CONTINUE              WS10067
+         CLI   ACSMFFCN,ACFCNREP       REPLACE FUNCTION?        WS10067
+         BE    FILTERE                 Y, CONTINUE              WS10067
+         B     RETURN                                           WS10067
+FILTER4  DS    0H
+         CLI   ACPMFWHY,12             MESSAGE ACF01012 ?
+         BE    FILTERE
+         CLI   ACPMFWHY,13             MESSAGE ACF01013 ?
+         BE    FILTERE                                          WS10067
+         BNE   RETURN
+*                                                               WS10067
+*        CHECK ACCESS RULE OPERATIONS                           WS10067
+*                                                               WS10067
+FILTER5  DS    0H                                               WS10067
+         CLI   ACSMFFCN,ACFCNINS       INSERT  FUNCTION?        WS10067
+         BE    FILTERE                 Y, CONTINUE              WS10067
+         CLI   ACSMFFCN,ACFCNREP       REPLACE FUNCTION?        WS10067
+         BNE   RETURN                  N, RETURN TO CALLER      WS10067
+******   BE    FILTERE                 Y, CONTINUE              WS10067
+*                                                               WS10067
+FILTERE  DS    0H
+*
+****************************************************************
+*        OBTAIN WORKAREA
+****************************************************************
+*
+         SR    R0,R0                   CLEAR REG 0
+*IS0121  LA    R0,WORKLEN              SET LENGTH FOR GETMAIN
+         L     R0,WALEN                SET LENGTH FOR GETMAIN - IS0121
+         GETMAIN RC,LV=(R0)            GET CORE FOR REG SAVE AREA
+         LTR   R15,R15
+         BZ    CHAINSA
+         WTO   'CTSU83A: GETMAIN FOR WORKAREA HAS FAILED'
+         B     RETURN
+CHAINSA  DS    0H
+         ST    R1,8(R13)               CHAIN
+         ST    R13,4(R1)               SAVE AREAS
+         LR    R13,R1                  ESTABLISH WORK AREA
+         USING WORKAREA,R13               ADDRESSABILITY
+*
+****************************************************************
+*        CREATE RECOVERY ENVIRONMENT
+****************************************************************
+*
+         XC    ABNDCODE,ABNDCODE       CLEAR ABEND CODE
+         MVC   WRKESTAE,LSTESTAE
+         ESTAE ABNDEXIT,PARAM=WORKAREA,TERM=YES,MF=(E,WRKESTAE)
+*
+****************************************************************
+*        BUILD RQC AND EVT                                     *
+****************************************************************
+*                                                              *
+* 'RQC' IS THE 'REQUEST CONTROL BLOCK' WHICH IS USED BY THE PC *
+* ROUTINES TO PASS INFORMATION TO THE SA-AGENT ONLINE          *
+* INTERCEPTOR.                                                 *
+*                                                              *
+* 'EVT' IS THE 'EVENT CONTROL BLOCK' WHICH IS IMBEDED IN THE   *
+* REQUEST BLOCK FOR 'NOTIFY REQUESTS' . IT DESCRIBES THE       *
+* EVENT THAT OCCURED INCLUDING THE ENTITY (USER, GROUP ETC...) *
+* AND THE EVENT ACTION TYPE (ADD, DELETED, MODIFY, PASSWORD    *
+* CHANGED, ETC...) .                                           *
+*                                                              *
+* THE FOLLOWING CODE FORMATS THESE CONTROL BLOCKS AND FILL THEM*
+* WITH THE RELEVANT INFO SO THEY CAN BE PASSED ON TO THE PC    *
+* ROUTINES AND BE TRANSFERED TO THE ONLINE INTERCEPTOR SERVER. *
+*                                                              *
+****************************************************************
+*
+BUILD    DS    0H
+*
+*        INITIALIZE RQC
+*
+*PS0244  XC    RQCAREA,RQCAREA        CLEAR LOCAL RQC AREA
+         LA    R0,RQCAREA             CLEAR THE AREA            PS0244
+         LA    R1,RQCLEN              SET LENGTH                PS0244
+         XR    R15,R15                PADD WITH X'00'           PS0244
+         MVCL  R0,R14                 CLEAR                     PS0244
+         LA    R4,RQCAREA             R4 -> LOCAL RQC AREA
+         USING RQC,R4                 MAP RQC
+         ST    R4,RQC#SV              SAVE RQC ADDRESS          WS2431
+*PS0244  MVI   RQCTYPE,RQCTNOT        RQC TYPE = NOTIFY
+         MVI   RQCTYPE,RQCTNOTX       RQC TYPE = NOTIFY         PS0244
+         TIME  DEC                    GET TIME
+         STM   R0,R1,RQCTSTMP         TIMESTAMP RQC
+*
+*        INITIALIZE EVT
+*
+         LA    R8,RQCEVT              R8 -> EVT
+         USING EVT,R8                 MAP IT
+         ST    R8,EVT#SV              SAVE EVT ADDRESS          WS2431
+         MVC   EVTEVT,=CL4'EVT '      SET EYE CATCHER
+         MVC   EVTFLAG,=A(EVTFULL)    MARK EVT AS LOADED WITH DATA
+         MVC   EVTDATE,ACSMFDAT       EVENT DATE
+         MVC   EVTTIME,ACSMFTIM       EVENT TIME
+         MVC   EVTOUID,ACSMFLID       EVENT USERID
+         MVC   EVTOJBN,ACSMFJOB       EVENT JOBNAME
+         MVC   EVTOTERM,ACSMFSRC      EVENT TERMINAL
+*
+*        INFOSTG GSO RECORD EVENT
+*
+         CLI   ACSMFREC,ACRECE         INFOSTG REC FUNCTION ?
+         BNE   SETLIDEV                N, CONTINUE CHECK
+         CLC   =CL4'PUSR',ACEMFKEY     USER PROFILE RECORD ?   WS2370
+         BE    SETPUSR                 Y, SET THE USER PROFILE WS2370
+         CLI   ACEMFKEY,C'R'           RESOURCE RULE EVENT?     WS10067
+         BNE   NTRSRCRL                NO, SKIP THESE STATEMENTSWS10067
+         MVI   EVTTYPE,EVTTRES         EVENT TYPE = RESOURCE    WS10067
+         MVI   EVTACT,EVTAADD          EVENT ACTION = ADD       WS10067
+         CLI   ACSMFFCN,ACFCNINS       INSERT FUNCTION?         WS10067
+         BE    SETRESTP                Y, CONTINUE              WS10067
+         MVI   EVTACT,EVTAUPD          EVENT ACTION = UPDATE    WS10067
+SETRESTP DS    0H                                               WS10067
+         XC    EVTRESTP,EVTRESTP       CLEAR RESOURCE TYPE FIELDWS10067
+         XC    EVTRESNM,EVTRESNM       CLEAR RESOURCE NAME FIELDWS10067
+*        ACEMFKEY IS SET TO RXXXYYYYYYYY... WHERE:              WS10067
+*              XXX IS 3-CHARACTER RESOURCE TYPE                 WS10067
+*              YYYYYYYY... IS (UP TO) 40-CHARACTER RESOURCE NAMEWS10067
+         MVC   EVTRESTP(3),ACEMFKEY+1  COPY XXX FROM ACEMFKEY   WS10067
+         MVC   EVTRESNM(40),ACEMFKEY+4 COPY RESOURCE NAME       WS10067
+         B     SENDEVT                                          WS10067
+NTRSRCRL DS    0H                                               WS10067
+         MVI   EVTTYPE,EVTTRSSP        RSS PARAMETERS
+         MVI   EVTACT,EVTAUPD            WERE UPDATED
+         B     SENDEVT
+*
+*        USER PROFILE RECORD EVENT
+*
+SETPUSR  DS    0H                                              WS2370
+         MVC   EVTUSER,ACLMFKEY+12                             WS2370
+         MVC   EVTGROUP,=CL8' '       GROUP_ID                 WS2370
+         MVI   EVTTYPE,EVTTUSER       EVENT TYPE               WS2370
+         MVI   EVTACT,EVTAUPD         ACTION UPDATE            WS2370
+         MVC   EVTUIDS,=24X'01'       NO OLD UID.             IS10011
+         CLI   ACSMFFCN,ACFCNREP      REPLACE FUNCTION ?       WS2370
+         BE    SENDEVT                                         WS2370
+*BS2633  MVI   EVTACT,EVTAADD         ACTION ADD               WS2370
+         CLI   ACSMFFCN,ACFCNINS      INSERT  FUNCTION ?       WS2370
+         BE    SENDEVT                                         WS2370
+*BS2633  MVI   EVTACT,EVTADEL         ACTION ADD               WS2370
+         CLI   ACSMFFCN,ACFCNDEL      DELETE  FUNCTION ?       WS2370
+         BE    SENDEVT                                         WS2370
+*                                                              WS2370
+*        INVALID RECORD DETECTED                               WS2370
+         WTO   'CTSU83A: SA-AGENT SMF EXIT IEFU83 RECORD MISMATCH - EVE*
+               NT IGNORED'
+         B     CLEANUP                                         WS2370
+*
+*        LIDREC EVENT
+*
+SETLIDEV DS    0H
+         CLI   ACSMFREC,ACRECL         LOGONID REC FUNCTION ?
+         BNE   SETCMDEV                N, CONTINUE CHECK
+         MVC   EVTUSER,ACLMFKEY       USER_ID
+         MVC   EVTGROUP,=CL8' '       GROUP_ID
+         MVI   EVTTYPE,EVTTUSER       EVENT TYPE
+         MVI   EVTACT,EVTAUPD         ACTION UPDATE
+         CLI   ACSMFFCN,ACFCNREP      REPLACE FUNCTION ?
+*WS2431  BE    SENDEVT
+         BE    FDRLOAD                LOAD FDR. FOR OLD-UID STR  WS2431
+         MVI   EVTACT,EVTAADD         ACTION ADD
+         CLI   ACSMFFCN,ACFCNINS      INSERT  FUNCTION ?
+         BE    SENDEVT
+         MVI   EVTACT,EVTADEL         ACTION ADD
+         CLI   ACSMFFCN,ACFCNDEL      DELETE  FUNCTION ?
+         BE    SENDEVT
+*
+*        INVALID RECORD DETECTED
+         WTO   'CTSU83A: SA-AGENT SMF EXIT IEFU83 RECORD MISMATCH - EVE*
+               NT IGNORED'
+         B     CLEANUP
+*
+*        COMMAND EVENT
+*
+SETCMDEV DS    0H
+*WS10006 CLI   ACSMFREC,ACRECA         COMMAND FUNCTION ?
+*WS10006 BNE   SETPASEV                N, MUST BE PASSWORD
+*WS10006 MVC   EVTUSER,=CL8' '        RESET USER_ID FIELD
+*WS10006 XR    R9,R9
+*WS10006 LH    R9,ACFAPMLN            R9 = MESSAGE TEXT LENGTH
+*WS10006 SH    R9,=AL2(L'ACF79961)    R9 = USERID LENGTH
+*WS10006 BNP   ERRLEN1
+*WS10006 CH    R9,=H'8'
+*WS10006 BH    ERRLEN2
+*WS10006 BCTR  R9,0
+*WS10006 EX    R9,COPYUSER            COPY USERID
+*WS10006 MVC   EVTGROUP,=CL8' '       GROUP_ID
+*WS10006 MVI   EVTTYPE,EVTTUSER       EVENT TYPE
+*WS10006 MVI   EVTACT,EVTAUPD         ACTION UPDATE
+*WS10006 MVI   EVTPVIO,C'Y'           INDICATE PASSWORD VIO EVT WS2451
+*WS10006 B     SENDEVT
+*                                                               WS10067
+*        ACCESS RULE ADD OR UPDATE                              WS10067
+*                                                               WS10067
+         CLI   ACSMFREC,ACRECR        ACCESS RULE FUNCTION?     WS10067
+         BNE   SETPASEV               N, SKIP THESE LINES       WS10067
+         MVI   EVTTYPE,EVTTRES        EVENT TYPE = RESOURCE     WS10067
+         MVI   EVTACT,EVTAADD         EVENT ACTION = ADD        WS10067
+         CLI   ACSMFFCN,ACFCNINS      INSERT FUNCTION?          WS10067
+         BE    SETRESNM               Y, CONTINUE               WS10067
+         MVI   EVTACT,EVTAUPD         EVENT ACTION = UPDATE     WS10067
+SETRESNM DS    0H                                               WS10067
+         XC    EVTRESTP,EVTRESTP      CLEAR RESOURCE TYPE FIELD WS10067
+         XC    EVTRESNM,EVTRESNM      CLEAR RESOURCE NAME FIELD WS10067
+*        ACRMFKEY IS SET TO THE 8-CHARACTER RULE KEY            WS10067
+         MVC   EVTRESNM(8),ACRMFKEY   COPY RESOURCE NAME        WS10067
+         B     SENDEVT                                          WS10067
+*
+*        PASSWORD EVENT
+*
+SETPASEV DS    0H
+         MVC   EVTUSER,ACSMFLID       USER_ID
+         MVC   EVTGROUP,=CL8' '       GROUP_ID
+         MVI   EVTTYPE,EVTTUSER       EVENT TYPE
+         CLI   ACPMFWHY,12            MESSAGE ACF01012 ?
+         BNE   ACFMSG2                N, MUST BE 2ND MESSAGE
+         MVI   EVTACT,EVTAUPD         ACTION UPDATE
+         MVI   EVTPVIO,C'Y'           INDICATE PASSWORD VIO EVT WS2451
+         MVC   EVTUIDS,=24X'01'       NO OLD UID.              IS10011
+         B     SENDEVT
+ACFMSG2  DS    0H                     MESSAGE ACF01013
+         MVI   EVTACT,EVTAREV         ACTION REVOKE
+*        ALTHOUGH PSWD_VIO IS NOT INCREMENTED WHEN ACF01013,    WS2538
+*        EVTPVIO IS SET WITH 'Y', TO ALLOW FILTERING WITH       WS2538
+*        SEND_PASS_VIOLATION.                                   WS2538
+         MVI   EVTPVIO,C'Y'           INDICATE PASSWORD VIO EVT WS2538
+         B     SENDEVT
+*
+COPYUSER MVC   EVTUSER(*-*),ACFAPARM+L'ACF79961
+*
+*        ERROR IN LENGTH OF MESSAGE
+ERRLEN1  WTO   'CTSU83A: SA-AGENT SMF EXIT IEFU83 ERROR IN MSGLEN - EVE*
+               NT IGNORED'
+         B     CLEANUP
+*
+*        ERROR IN LENGTH OF USERID
+ERRLEN2  WTO   'CTSU83A: SA-AGENT SMF EXIT IEFU83 USERID TOO LONG - EVE*
+               NT IGNORED'
+         B     CLEANUP
+****************************************************************
+*WS2431 START
+****************************************************************
+*        LOAD ACF FDR MODULE, SCAN THE FIELDS FROM THE COMMAND
+*        AND BUILD THE OLD-UID-STRING
+****************************************************************
+FDRLOAD  DS   0H
+         ACFINCVT R10,NONE=LOAD_ACFFDR
+         MVC    CGFDRPTR,ACCFDR-ACCVT(R10)
+         B      CONTINUE
+LOAD_ACFFDR DS  0H                         NO ACF2, USE LOAD MODULE
+         LOAD EP=ACFFDR
+         ST   R0,CGFDRPTR                * GET ACFFDR ADDRESS
+CONTINUE DS   0H
+         L    R10,CGFDRPTR
+*
+         MVC  CGUIDCNT,FDRUIDC-ACFDR(R10)  * GET UID FIELDS COUNT
+         XC   CGEOS2,CGEOS2   * SET /0 C END-OF-STRING
+*
+****************************************************************
+* BUILD FDR TABLE FROM FDR MODULE
+****************************************************************
+* MOVE OFFSET AND LENGTH
+UIDLOOP  DS   0H
+         USING CTSUID,R5
+         LA   R5,ACFDRTB
+         L    R8,CGUIDCNT               * UID FIELDS COUNT
+*BS2552  L    R7,FDRUID-ACFDR(R10)
+         ICM  R7,15,FDRUID-ACFDR(R10)   -> UID                  BS2552
+         BNZ  UIDOK                                             BS2552
+         WTO  'CTSU83A: NO UID IN ACFFDR.'                      BS2552
+         B    CLEANUP                   * EXIT                  BS2552
+UIDOK    DS    0H                                               BS2552
+         MVC  UIDOFST,=H'0'             * FIRST OFFSET IS 0
+NEXT_UIDF DS   0H
+         MVC  UIDLEN,2(R7)              * MOVE LENGTH TO OUR TABLE
+         LH   R6,UIDOFST                * OFFSET OF FIELD IN UID STR.
+         AH   R6,UIDLEN
+         STH  R6,UIDOFST+CTSUIDLN       * STORE OFFSET IN NEXT ENTRY
+         LA   R5,CTSUIDLN(R5)           * ADVANCE TO NEXT ENTRY
+         LA   R7,UIDENTRY(R7)
+         BCT  R8,NEXT_UIDF
+* GET UID STRING STRUCTURE
+         XC   CGCHRUID,CGCHRUID         * ZERO TARGET
+         XR   R6,R6
+         IC   R6,0(R7)                  * STRING LENGTH
+         BCTR R6,0                      * FOR EX
+         EX   R6,MVCCUID                * MOVE UID STRING STRUCTURE
+*MVCCUID MVC  CGCHRUID(*-*),1(R7)                                WS2431
+* MOVE FIELDS NAMES
+         L    R8,CGUIDCNT               * UID FIELDS COUNT (AGAIN)
+         LA   R7,CGCHRUID
+         LA   R9,L'CGCHRUID-1          LENGTH OF FIELD -1 4 EX  BS2552
+         LA   R5,ACFDRTB
+         MVI   UIDFLAG,0               CLR FLAGS BYTE           BS2552
+NEXT_UIDFL DS   0H
+         MVC  UIDFLD,BLANKS
+PRTUID   DS    0H                                               BS2552
+         EX   R9,TRTDLM1                * FIND "," OR X'00'OR ( BS2552
+*TRTDLM1 TRT  0(255,R7),TRTTAB1         * FIND "," OR X'00'OR ( BS2552
+         BZ    BADUID                  ILLEGAL UID STRUCTURE    BS2552
+         TM    UIDFLAG,PRTFLAG2        2ND PART OF PART FLD?    BS2552
+         BNZ   PRTFLD2                 YES, HANDLE IT           BS2552
+         TM    UIDFLAG,PRTFLAG1        1ST PART OF PART FLD?    BS2552
+         BNZ   PRTFLD1                 YES, HANDLE IT           BS2552
+         CLI   0(R1),C'('              PARTIAL FLD IN UID?      BS2552
+         BNE   SIMPUID                 NO, SIMPLE UID...        BS2552
+****     START OF PARTIAL UID FIELD **                          BS2552
+         OI    UIDFLAG,PRTFLAG1        YES, IND PART FLD IN UID BS2552
+NOUIDMV  DS    0H                                               BS2552
+         LA    R1,1(R1)                SKIP '('                 BS2552
+         LR    R6,R1                   UPDATE START FIELD ADDR  BS2552
+         SR    R6,R7                   LENGTH OF "FIELD"        BS2552
+         LR    R7,R1                   UPDATE START FIELD ADDR  BS2552
+         SR    R9,R6                   UPDATE RESIDUAL LENGTH   BS2552
+         B     PRTUID                  CONTINUE WITHOUT MOVING  BS2552
+PRTFLD2  DS    0H                                               BS2552
+         NI    UIDFLAG,X'FF'-PRTFLAG2  CLR 2ND FLAG             BS2552
+         B     NOUIDMV                 DON'T MOVE FLD           BS2552
+PRTFLD1  DS    0H                                               BS2552
+         NI    UIDFLAG,X'FF'-PRTFLAG1  CLR 1ST FLAG             BS2552
+         OI    UIDFLAG,PRTFLAG2        SET 2ND FLAG OF PRT FLD  BS2552
+         B     SIMPUID                 MOVE FLD AS USUAL        BS2552
+BADUID   DS    0H                                               BS2552
+         WTO   'UNEXPECTED UID FORMAT.'                         BS2552
+         B     CLEANUP                                          BS2552
+SIMPUID  DS    0H                                               BS2552
+         LR   R6,R1
+         SR   R6,R7                     * LENGTH
+         BCTR R6,0                      * FOR EX
+         EX   R6,MVCFLD
+*MVCFLD  MVC  UIDFLD(*-*),0(R7)                                  WS2431
+         LA   R7,1(,R1)                 * POINT TO NEXT FIELD
+         LA   R5,CTSUIDLN(R5)           * ADVANCE TO NEXT ENTRY
+         SR   R9,R6                                             BS2552
+         BCTR R9,0                     CALC RESIDUAL LENGTH     BS2552
+         BCT  R8,NEXT_UIDFL
+****************************************************************
+*        MVC OUIDSTR,=CL24'!!!!!!!!!!!!!!!!!!!!!!!!'
+         MVC OUIDSTR,=24X'01'
+********************************************************************
+* SCAN OLD ARE'S FOR KEYWORDS AND CHECK IF THEY ARE IN UID STRING  *
+********************************************************************
+         TM   ACLMFLGS,ACLMFBFR          ANY BEFORE ARES?       BS2552
+         BO   AF#ARE                     NO ARE.                BS2552
+         LH   R10,ACLBFARE               OFFSET OF OLD ARE.
+         LTR  R10,R10                    OFFSET ZERO MEANS
+         BZ   AF#ARE                      NO ARE.
+         AR   R10,R3                     POINT AT FIRST ARE.
+         USING ACARE,R10
+SCANFDR  DS   0H                                                BS2552
+         L    R8,CGUIDCNT               * UID FIELDS COUNT (AGAIN)
+         LA   R5,ACFDRTB
+         USING CTSUID,R5
+CMPFLD   DS   0H                                                BS2552
+         CLC  ARELNTH,=H'0'             EMPTY ENTRY ?           BS2552
+         BE   AF#ARE                    YES,NO MORE BEFORE ARES BS2552
+         TM   AREMFLG,AREMURCN          NO FIELD VALUE AVAIL?   BS2552
+         BO   NEXTFLD                   CHECK WITH NEXT FIELD   BS2552
+         CLC  AREANAME,UIDFLD           FIELD IN UID STRING?
+         BNE  NEXTFLD
+         TM   AREMFLG,AREMULTI          MULTI VALUE FIELD ?
+         BO   MULTFLD                   YES, NOT SUPPORTED
+         LA   R6,OUIDSTR                -> STRING PASSED 2 CALLE
+         LH   R4,UIDOFST
+         AR   R6,R4                     POINT TO FIELD IN UID STRING
+************************* IS0057 STARTS ****************************
+* WHEN ACF2 CHANGE CMD IS DONE, WITH FIELD CONTAINING TRAILING     *
+* BLANKS, ACF2 RETURNS ARE CTB WITH TRUNCATED BLANKS AND THE LENGTH*
+* BYTE DOES NOT INCLUDE THE BLANKS. THEREFORE, BLANKS ARE PADDED ON*
+* THE WHOLE FIELD AREA WITHIN THE OLD UID (OUIDSTR).               *
+* WHEN THE WHOLE FIELD CONTAINS BLANKS ONLY, THE FIELD IS NOT      *
+* PASSED AT ALL IN ARE (AND IF THIS IS THE ONLY FIELD, NO ARE IS   *
+* PASSED). FOR THIS AN ISSUE WAS OPENED IN CA #12595913 ON 30/3/03.*
+********************************************************************
+         LH   R4,UIDLEN                 FLD LEN IN UID           IS0057
+         LTR  R4,R4                     IS IT > 0 ?              IS0057
+         BZ   SKIP1                     NO, SKIP IT              IS0057
+         BCTR R4,0                      -1 FOR EX                IS0057
+         EX   R4,SETBLNK1               SET BLANKS IN OLD UID    IS0057
+*SETBLNK1MVC  0(*-*,R6),BLANKS          IN FIELD'S AREA IN UID   IS0057
+SKIP1    DS   0H                                                 IS0057
+************************** IS0057 ENDS *****************************
+         LH   R4,AREVLNTH               ACTUAL LENTH OF VALUE
+         CH   R4,UIDLEN                 CHECK IF LEN IS LEGAL
+         BNH  MVFLD                     R4 MUST BE LESS OR EQUAL
+         WTO  'CTSU83A: UID STRING FIELD LENGTH ERROR.'
+         B     CLEANUP
+MVFLD    LTR  R4,R4
+         BZ   NEXTFLD
+         BCTR R4,0
+         EX   R4,MVC2UID                MOVE OLD VALUE TO UID STRING
+*MVC2UID MVC  0(*-*,R6),AREVALUE                                 WS2431
+NEXTFLD  DS   0H
+         LA   R5,CTSUIDLN(R5)           NEXT ENTRY IN FDR TABLE
+         BCT  R8,CMPFLD
+*BS2552  CLI  AREFLGS,X'00'             CONTINUE WITH NEXT ARE?
+*BS2552  BNE  AF#ARE                    NO MORE BEFORE ARES (OLD)
+         TM   AREFLGS,AREFEND           END OF LIST ?           BS2552
+         BNZ  AF#ARE                    NO MORE BEFORE ARES     BS2552
+         AH   R10,ARELNTH               NEXT ARE
+         B    SCANFDR                   SCAN FDR TABLE FOR THIS ARE
+MULTFLD  DS   0H
+         L    R8,EVT#SV                 R8 -> EVT
+         WTO  'CTSU83A: MULTI VALUED FIELD WAS UPDATED.'
+         B    SENDEVT
+*
+********************************************************************
+* SCAN NEW ARE'S FOR KEYWORDS AND CHECK IF THEY ARE IN UID STRING  *
+********************************************************************
+AF#ARE   DS   0H
+         TM   ACLMFLGS,ACLMFAFT          ANY AFTER  ARES?       BS2552
+         BO   MOVUIDS                    NO ARE.                BS2552
+         LH   R10,ACLAFARE               OFFSET OF NEW ARE.
+         LTR  R10,R10                    OFFSET ZERO MEANS
+         BZ   MOVUIDS                     NO ARE.
+         AR   R10,R3                     POINT AT FIRST ARE.
+         USING ACARE,R10
+SCANFDR1 DS   0H                                                 BS2552
+         L    R8,CGUIDCNT               * UID FIELDS COUNT (AGAIN)
+         LA   R5,ACFDRTB
+         USING CTSUID,R5
+CMPFLD1  DS   0H                                                BS2552
+         CLC  ARELNTH,=H'0'             EMPTY ENTRY ?           BS2552
+         BE   MOVUIDS                   YES,NO MORE AFTER ARES  BS2552
+         TM   AREMFLG,AREMURCN          NO FIELD VALUE AVAIL?   BS2552
+         BO   NEXTFLD1                  CHECK WITH NEXT FIELD   BS2552
+         CLC  AREANAME,UIDFLD           FIELD IN UID STRING?
+         BNE  NEXTFLD1
+         TM   AREMFLG,AREMULTI
+         BO   MULTFLD
+         LA   R6,OUIDSTR
+         LH   R4,UIDOFST
+         AR   R6,R4                     POINT TO FIELD IN UID STRING
+*        CLI  0(R6),C'!'                CHECK OLD VALUE OF THE FIELD
+         CLI  0(R6),X'01'               CHECK OLD VALUE OF THE FIELD
+         BNE  NEXTFLD1                  OLD VALUE EXITS
+         LH   R4,AREVLNTH               ACTUAL LENTH OF VALUE
+         LTR   R4,R4                    CHECK FOR 0             BS2552
+         BZ    NEXTFLD1                 IF 0, NEXT FLD          BS2552
+         BCTR R4,0                      INDICATE OLD VALUE CHANGED BY
+         EX   R4,MVCSP                    MOVING SPACES OVER THE FIELD
+*MVCSP   MVC  0(*-*,R6),=CL24' '                                 WS2431
+NEXTFLD1 DS   0H                                                BS2552
+         LA   R5,CTSUIDLN(R5)           NEXT ENTRY IN FDR TABLE
+         BCT  R8,CMPFLD1
+*BS2552  CLI  AREFLGS,X'00'             CONTINUE WITH NEXT ARE?
+*BS2552  BNE  MOVUIDS                   NO MORE ARES
+         TM   AREFLGS,AREFEND           END OF LIST ?           BS2552
+         BNZ  MOVUIDS                   NO MORE BEFORE ARES     BS2552
+         AH   R10,ARELNTH               NEXT ARE
+         B    SCANFDR1                  SCAN FDR TABLE FOR THIS ARE
+*
+MOVUIDS  DS    0H
+         L     R8,EVT#SV                 R8 -> EVT
+         MVC   EVTUIDS,OUIDSTR           MOVE TO EVT
+*DEBUG
+*        MVC   WTOAREA(WTOUIDSL),WTOUIDS
+*        MVC   WTOAREA+WTOUIDSL-24(24),EVTUIDS
+*        WTO   MF=(E,WTOAREA)
+         B     SENDEVT
+*
+*WS2431 END
+*
+****************************************************************
+*        NOTIFY SA-AGENT INTERCEPTOR OF THE EVENT
+****************************************************************
+*
+SENDEVT  DS    0H
+         L     R4,RQC#SV               R4 -> RQC                 WS2431
+         CALL  CTSAPCC,(FUJIFLAG,SSNAME,JOBNAME,(R4),PCCWORK),         X
+               MF=(E,CALLAREA)
+         LTR   R15,R15                 NOTIFY SUCCESSFULL ?
+         BZ    CLEANUP                 YES, CONTINUE
+*
+         CH    R15,=H'8'               FREE CHAIN EXISTS ?      IS10012
+         BE    NOFRCHN                 NO MORE RQC IN FREE CHAINIS10012
+*
+         CH    R15,=H'160'             WAS THE INTERCEPTOR UP ?
+         BNH   CLEANUP                 NO, THAN NO NEED FOR MESSAGE
+*
+****************************************************************
+*        NOTIFY ROUTINE INTERNAL ERROR
+****************************************************************
+*
+         CVD   R15,PACKD               CONVERT RC TO EBCDIC
+         UNPK  CHARRC,PACKD            CONVERT RC TO EBCDIC
+         OI    CHARRC+7,X'F0'          CONVERT RC TO EBCDIC
+         MVC   WTOAREA(WTONTFYL),WTONTFY
+         MVC   WTOAREA+WTONTFYL-4(4),CHARRC+4
+         WTO   MF=(E,WTOAREA)
+         B     CLEANUP
+         DROP  R4
+*
+****************************************************************
+*        NOTIFY FREE CHAIN IS EMPTY  -                          IS10012
+****************************************************************
+*
+NOFRCHN  DS    0H                                               IS10012
+         MVC   WTOAREA(WTOEVTL),WTOEVT                          IS10012
+*        MVC   WTOAREA+13(L'ACTINFO),ACTINFO                    IS10012
+         MVC   WTOAREA+22(L'EVTUSER),EVTUSER                    IS10012
+         WTO   MF=(E,WTOAREA)                                   IS10012
+*        B     CLEANUP                                          IS10012
+*
+****************************************************************
+*        ISSUE ABEND MESSGAE                                   *
+****************************************************************
+*
+CLEANUP  DS    0H
+         ICM   R2,15,ABNDCODE          R2 = ABEND CODE WORD
+         BZ    NOABEND                 NO, NO ABEND
+         MVI   ABNDTYPE,C'U'           ASSUME USER ABEND
+         N     R2,=XL4'00000FFF'       TEST FOR USER ABEND CODE
+         BNZ   ABENDMSG                YES, HAVE USER ABEND CODE
+         L     R2,ABNDCODE             R2 = ABEND CODE WORD
+         SRL   R2,12                   ISOLATE SYSTEM ABEND CODE
+         MVI   ABNDTYPE,C'S'           SET SYSTEM ABEND CODE
+ABENDMSG DS    0H
+         ST    R2,ABNDBIN              SAVE BINARY ABEND CODE
+         UNPK  ABNDCHAR(9),ABNDBIN(5)  CONVERT TO ZONED
+         TR    ABNDCHAR(8),HEX2CHAR    MAKE IT CHARACTER
+         MVC   ABNDCHAR+4(1),ABNDTYPE  INSERT ABEND TYPE CHARACTER
+         MVC   WTOAREA(WTOABNDL),WTOABND
+         MVC   WTOAREA+WTOABNDL-4(4),ABNDCHAR+4
+         WTO   MF=(E,WTOAREA)
+NOABEND  DS    0H
+*
+****************************************************************
+*        CLRER RECOVERY ENVIRONMENT                            *
+****************************************************************
+*
+         ESTAE 0
+*
+****************************************************************
+*        FREE WORKAREA
+****************************************************************
+*
+         LR    R1,R13                  ADDRESS FOR FREEMAIN
+         L     R13,4(R13)              RESTORE CALLERS SAVE AREA
+         SR    R0,R0                   CLEAR REG 0
+*IS0121  LA    R0,WORKLEN              FREE WORK AREA
+         L     R0,WALEN                FREE WORK AREA - IS0121
+         FREEMAIN RC,LV=(R0),A=(R1)
+         LTR   R15,R15
+         BZ    RETURN
+         WTO   'CTSU83A: FREEMAIN OF WORKAREA HAS FAILED'
+*
+****************************************************************
+*        FINISH
+****************************************************************
+*
+RETURN   DS    0H
+         XR    R15,R15                 SET RETURN CODE
+         RETURN (14,12),T,RC=(15)      RESTORE REGISTERS AND RETURN
+         DROP  R11
+*
+*
+MVCCUID  MVC  CGCHRUID(*-*),1(R7)                                WS2431
+MVCFLD   MVC  UIDFLD(*-*),0(R7)                                  WS2431
+MVC2UID  MVC  0(*-*,R6),AREVALUE                                 WS2431
+SETBLNK1 MVC  0(*-*,R6),BLANKS                                   IS0057
+MVCSP    MVC  0(*-*,R6),=CL24' '                                 WS2431
+TRTDLM1  TRT  0(*-*,R7),TRTTAB1         * FIND "," OR X'00'OR ( BS2552
+*
+****************************************************************
+*        CONSTANTS
+****************************************************************
+*
+         LTORG ,
+*
+ACF79961 DC    C'ACF79961 INVALID PASSWORD COUNT REDUCED FOR '
+*
+SSNAME   DC    CL4'    '
+JOBNAME  DC    CL8'CTSAONI'
+FUJIFLAG DC    AL1(128)
+*
+LSTESTAE ESTAE MF=L
+LENESTAE EQU   *-LSTESTAE
+*
+WTONTFY  WTO   'CTSU83A: SA-AGENT ONLINE INTERCEPTOR NOTIFY HAS FAILED *
+               RC=XXXX',MF=L
+WTONTFYL EQU   *-WTONTFY
+WTOABND  WTO   'CTSU83A: SA-AGENT SMF EXIT IEFU83 HAS ABENDED. ABEND CO*
+               DE=XXXX',MF=L
+WTOABNDL EQU   *-WTOABND
+*
+WTOEVT   WTO   'CTSU83A: EVENT OF <USERID> IS LOST. START AGENT ASAP TO*
+                EMPTY QUEUE AND MEMORY.',MF=L                   IS10012
+WTOEVTL  EQU   *-WTOEVT                                         IS10012
+*
+*WS2431 NEXT 2 WTOS
+WTOUIDS  WTO   'CTSU83A: UID STRING:XXXXXXXXXXXXXXXXXXXXXXXX',MF=L
+WTOUIDSL EQU   *-WTOUIDS
+*
+HEX2CHAR DC    256AL1(*-HEX2CHAR)
+         ORG   HEX2CHAR+X'FA'
+         DC    CL6'ABCDEF'
+         ORG
+         DROP
+*
+****************************************************************
+*        ABEND RECOVERY ROUTINE                                *
+****************************************************************
+*
+ABNDEXIT DS    0H
+         USING ABNDEXIT,R15            ABEND EXIT ADDRESSABILITY
+         L     R12,=A(CTSU83A)         RESTORE LMOD BASE REG
+         DROP  R15                     USE LMOD ADDRESSABILITY
+         USING CTSU83A,R12             RESTORE ITS ADDRESSABILITY
+         C     R0,=F'12'               SDWA PROVIDED ?
+         BE    NOSDWA                  NO, CAN NOT RETRY
+         USING SDWA,R1                 MAP SDWA
+         L     R13,SDWAPARM            RESTORE WORKAREA REGISTER
+         USING WORKAREA,R13            MAP WORKAREA
+         MVC   ABNDCODE,SDWAABCC       SET ABEND CODE
+         TM    SDWAERRD,SDWACLUP       RETRY ALLOWED ?
+         BNZ   NORETRY                 NO, CAN NOT RETRY
+*
+RETRY    DS    0H
+         ST    R12,SDWASR12            SET BASE REGISTER FOR RETRY
+         ST    R13,SDWASR13            SET WORKAREA REGISTER FOR RETRY
+*
+         STM   R14,R1,SAVEREGS
+         SDUMP HDR='SA-AGENT IEFU83 SMF EXIT ABEND',                   X
+               SDATA=(ALLPSA,CSA,LSQA,RGN,SUMDUMP)
+         LM    R14,R1,SAVEREGS
+*
+         SETRP RETREGS=YES,RC=4,RETADDR=CLEANUP,                       X
+               FRESDWA=YES,DUMP=YES
+         BR    R14
+*
+NOSDWA   DS    0H
+         LR    R13,R2                   NO SDWA, PARM IN R2
+         ST    R1,ABNDCODE              SAVE ABEND CODE
+         XR    R1,R1                    CLEAR
+NORETRY  DS    0H
+         XR    R15,R15                  INDICATE NO RETRY
+         BR    R14                      RETURN TO RTM
+         LTORG
+*WS2431  DROP
+BLANKS   DC   CL8' '                                             WS2431
+TRTTAB1  DC    256X'00'                                          WS2431
+         ORG   TRTTAB1+X'00'                                     WS2431
+         DC    C'M'                                              WS2431
+         ORG   TRTTAB1+C','                                      WS2431
+         DC    C','                                              WS2431
+         ORG   TRTTAB1+C'('                                     BS2552
+         DC    C'('                                             BS2552
+         ORG   ,                                                BS2552
+*
+WALEN    DC    A(WORKLEN)             IS0121
+****************************************************************
+*        WORK AREA
+****************************************************************
+*
+WORKAREA DSECT
+SAVEAREA DS    18F                     SAVE AREA TO CALL OTHERS
+CALLAREA CALL  ,(,,,,),MF=L            EXECUTE FORM CALL AREA
+PCCWORK  DS    XL512                   WORK AREA FOR CTSAPCC ROUTINE
+*IS0121 RQCAREA  DS    CL(RQCLEN)              AREA FOR RQC
+PACKD    DS    D                       RETURN CODE CONVERSION
+CHARRC   DS    CL8                     RETURN CODE CONVERSION
+WTOAREA  DS    XL384                   CTSMSGR WTO WORK AREA
+ABNDCODE DS    XL4                     ABCODE SAVED BY ESTAE ROUTINE
+ABNDBIN  DS    XL5                     ISOLATED ABEND CODE + PAD BYTE
+ABNDTYPE DS    CL1                     ABEND TYPE (S/U)
+ABNDCHAR DS    CL9                     CHARCTER ABEND CODE FOR CTSMSG
+WRKESTAE DS    CL(LENESTAE)            EXECUTE FORM FOR ESTAE
+SAVEREGS DS    15F                     TEMPORARY SAVE REGISTERS AREA
+RESERVED DS    16X                     RESERVED AREA
+*WS2431 START
+RQC#SV   DS    A              SAVE RQC ADDRESS
+EVT#SV   DS    A              SAVE EVT ADDRESS
+ACFDRTB  DS    240C            SUPPORT UP TO 20 FIELDS.
+*
+CGFDRPTR DS  A                FDR MODULE ADDRESS
+CGUIDCNT DS  A                NUMBER OF FIELDS IN UID STRING
+CGCHRUID DS  CL255            UID STRING STRUCTURE (FIELDS LIST)
+CGEOS2   DS  XL4
+*
+OUIDSTR  DS  CL24             OLD UID STRING
+UIDFLAG  DS    X                                                BS2552
+PRTFLAG1 EQU   X'80'                   1ST PART FLD IND.        BS2552
+PRTFLAG2 EQU   X'40'                   2ND PART FLD IND.        BS2552
+*WS2431 END
+*IS0121 RQCAREA MOVED TO END OF WORKAREA
+RQCAREA  DS    CL(RQCLEN)              AREA FOR RQC
+WORKLEN  EQU   *-WORKAREA
+*WS2431 STRUCTURE OF FDR TABLE
+CTSUID     DSECT
+UIDFLD     DS  CL8
+UIDOFST    DS  XL2
+UIDLEN     DS  XL2
+UIDENTRY   EQU *-UIDOFST
+CTSUIDLN   EQU *-CTSUID
+*
+****************************************************************
+*        PARAMETER LIST
+****************************************************************
+*
+PARMLIST DSECT
+PARMSMF  DS    A
+*
+****************************************************************
+*        SA-AGENT CONTROL BLOCKS
+****************************************************************
+*
+RQC      DSECT
+         COPY  CTSRQC
+EVT      DSECT
+         COPY  CTSEVT
+*
+****************************************************************
+*        ACF2 MAPPING
+****************************************************************
+*
+         ACFLABE                       FOR ACFLABEL LENGTH
+         LIDREC                        FOR LIDREC LENGTH
+         ACFSMF TYPE=ALL
+         ACCVT
+*WS2431 - ADDED DSECTS
+         ACFDR
+         ACFDE
+         ACARE
+*
+****************************************************************
+*        SYSTEM  CONTROL BLOCKS
+****************************************************************
+*
+         IHASDWA
+         END

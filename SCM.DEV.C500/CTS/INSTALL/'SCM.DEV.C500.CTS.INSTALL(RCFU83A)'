@@ -1,0 +1,1003 @@
+         START
+         TITLE 'SA-AGENT IEFU83 EXIT FOR RACF SYSTEMS'
+*
+***********************************************************************
+****                                                               ****
+****   SA-AGENT VERSION 4.0.XX                                     ****
+****                                                               ****
+****   (C) COPYRIGHT 1999-2000 BMC SOFTWARE INC.                   ****
+****                                                               ****
+***********************************************************************
+*
+***********************************************************************
+*                                                                     *
+* MODULE NAME : CTSU83A                                               *
+*                                                                     *
+* DESCRIPTION : SA-AGENT IEFU83 EXIT FOR RACF SYSTEMS                 *
+*                                                                     *
+* FUNCTION:                                                           *
+*                                                                     *
+*    THIS MODULE EXAMINES TYPE 80 SMF RECORD WHEN AND WHEN RECOGNIZES *
+*    A USER PROFILE, USER GROUP PROFILE, CONNECT PROFILE OR GLOBAL    *
+*    PARAMETERS CHANGE, IT NOTIFYS OF THE EVENT TO THE SA-AGENT       *
+*    ONLINE INTERCEPTOR SERVER VIA  CROSS MEMORY SERVICES .           *
+*                                                                     *
+* ATTRIBUTES  : THIS ROUTINE SHOULD BE LINK-EDITED WITH RMODE 24      *
+*               AND AMODE 31 .                                        *
+*                                                                     *
+* RESTRICTIONS : NONE                                                 *
+*                                                                     *
+* REGISTER USAGE :  R0  - TEMPORARY WORK REGISTER                     *
+*                   R1  - TEMPORARY WORK REGISTER                     *
+*                   R2  - TEMPORARY WORK REGISTER                     *
+*                   R3  - SMF RECORD                                  *
+*                   R4  - LOCAL RQC                                   *
+*                   R5  - EVENT BLOCK IN RQC                          *
+*                   R6  - CURRENT RELOCATABLE SECTION                 *
+*                   R7  - CURRENT SECTION DATA                        *
+*                   R8  - NOT USED                                    *
+*                   R9  - REMAINING SECT IN RECORD                    *
+*                   R11 - PARAMETERS LIST                             *
+*                   R10 - NOT USED                                    *
+*                   R12 - PROGRAM BASE REGISTER                       *
+*                   R13 - LOCAL SAVE AREA (GETMAINED)                 *
+*                   R14 - RETURN ADDRESS                              *
+*                   R15 - RETURN CODE (ALWAYS 0)                      *
+*                                                                     *
+* INPUT :                                                             *
+*                                                                     *
+*    REGISTER 1 POINTS TO A LIST OF 4 BYTE ADDRESSES FOR THE          *
+*    FOLLOWING TWO PARAMETERS:                                        *
+*                                                                     *
+*    1 - THE SMF RECORD TO BE PROCESSED BY THE EXIT                   *
+*    2 - THE SECOND ADDRESS IN THE LIST IS 0, NO 2ND PARAMETER        *
+*                                                                     *
+*                                                                     *
+* OUTPUT:                                                             *
+*                                                                     *
+*    0 - WRITE THE SMF RECORD (KEEP)                                  *
+*    4 - DON'T WRITE THE SMF RECORD (DELETE)                          *
+*                                                                     *
+*    REGISTER 15 ALWAYS CONTAINS ZERO                                 *
+*                                                                     *
+* CHANGE ACTIVITY :                                                   *
+*                                                                     *
+*    24/10/94 CREATED                                                 *
+*    25/02/98 LONG RQC SUPPORT                                        *
+* IS0328 30NOV2005 AVNERL - SET NEW SUPGROUP IN EVT                   *
+* WS2555 16JAN2006 ELIMY  - ADD MSG WHEN NO MORE EVENTS IN FREE CHAIN.*
+* WS2556 07MAR2006 ELIMY  - SUPPORT RESUME\REVOKE FOR CONSUL ZADMIN   *
+* WS2558 09APR2006 ELIMY  - REMOVE CONSUL ZADMIN SUPPORT, SEE WS2558  *
+* IS10100 29/07/13 NURITY - SUPPORT REVOKE REASON.                    *
+*SAS2IBMN 17/01/17 NURITY - RMODE CHANEGD FROM 24 TO ANY             *
+***********************************************************************
+*
+R0       EQU   0
+R1       EQU   1
+R2       EQU   2
+R3       EQU   3
+R4       EQU   4
+R5       EQU   5
+R6       EQU   6
+R7       EQU   7
+R8       EQU   8
+R9       EQU   9
+R11      EQU   11
+R10      EQU   10
+R12      EQU   12
+R13      EQU   13
+R14      EQU   14
+R15      EQU   15
+*
+****************************************************************
+*        CONFIGURATIONS DEFINITION                             *
+****************************************************************
+*
+****************************************************************
+*        PROLOG CODE                                           *
+****************************************************************
+*
+CTSU83A  CSECT
+CTSU83A  AMODE 31
+*SAS2IBMN CTSU83A  RMODE 24
+CTSU83A  RMODE ANY                                             SAS2IBMN
+*
+         SAVE  (14,12),,CTSU83A-&SYSDATE-&SYSTIME
+         LR    R12,R15
+         USING CTSU83A,R12
+         CTSLEVEL ,
+         LR    R11,R1                   SAVE PTR TO PARMS
+         USING PARMLIST,R11
+*
+****************************************************************
+*        FILTER NON-INTERSETING RECORDS
+****************************************************************
+*
+         L     R3,PARMSMF              R3 -> SMF RECORD
+         USING SMFREC80,R3             SMF RECORD ADDRESSABILITY
+         CLI   SMF80RTY,80             RECORT TYPE 80 ?
+         BNE   RETURN                  N,RETURN
+         TRT   SMF80EVT,EVENTCDS       FILTER USING EVENTS TABLE
+         BZ    RETURN                  NON-INTERESTING EVENT
+         TM    SMF80ERR,X'40'          NO PROFILE UPDATES WERE MADE
+         BO    RETURN                  BECAUSE OF ERROR IN RACF
+         CLC   SMF80CNT,=H'0'          ANY SEGMENTS IN RECORD ?
+         BE    RETURN                  NOTHING TO LOOK FOR ...
+*
+****************************************************************
+*        OBTAIN WORKAREA
+****************************************************************
+*
+         SR    R0,R0                   CLEAR REG 0
+         LA    R0,WORKLEN              SET LENGTH FOR GETMAIN
+         GETMAIN RC,LV=(R0)            GET CORE FOR REG SAVE AREA
+         LTR   R15,R15
+         BZ    CHAINSA
+         WTO   'CTSU83A: GETMAIN FOR WORKAREA HAS FAILED'
+         B     RETURN
+CHAINSA  DS    0H
+         ST    R1,8(R13)               CHAIN
+         ST    R13,4(R1)               SAVE AREAS
+         LR    R13,R1                  ESTABLISH WORK AREA
+         USING WORKAREA,R13               ADDRESSABILITY
+*
+****************************************************************
+*        CREATE RECOVERY ENVIRONMENT
+****************************************************************
+*
+         XC    ABNDCODE,ABNDCODE       CLEAR ABEND CODE
+         MVC   WRKESTAE,LSTESTAE
+         ESTAE ABNDEXIT,PARAM=WORKAREA,TERM=YES,MF=(E,WRKESTAE)
+*
+****************************************************************
+*        BUILD RQC DATA AND EVT                                *
+****************************************************************
+*                                                              *
+* 'RQC' IS THE 'REQUEST CONTROL BLOCK' WHICH IS USED BY THE PC *
+* ROUTINES TO PASS INFORMATION TO THE SA-AGENT ONLINE          *
+* INTERCEPTOR .                                                *
+*                                                              *
+* 'EVT' IS THE 'EVENT CONTROL BLOCK' WHICH IS IMBEDED IN THE   *
+* REQUEST BLOCK FOR 'NOTIFY REQUESTS' . IT DESCRIBES THE       *
+* EVENT THAT OCCURED INCLUDING THE ENTITY (USER, GROUP ETC...) *
+* AND THE EVENT ACTION TYPE (ADD, DELETED, MODIFY, PASSWORD    *
+* CHANGED, ETC...) .                                           *
+*                                                              *
+* THE FOLLOWING CODE FORMATS THESE CONTROL BLOCKS AND FILL THEM*
+* WITH THE RELEVANT INFO SO THEY CAN BE PASSED ON TO THE PC    *
+* ROUTINES AND BE TRANSFERED TO THE ONLINE INTERCEPTOR SERVER. *
+*                                                              *
+****************************************************************
+*
+*
+*        INITIALIZE RQC
+*
+*PS0244  XC    RQCAREA,RQCAREA         CLEAR LOCAL RQC AREA
+         LA    R0,RQCAREA              CLEAR THE AREA            PS0244
+         LA    R1,RQCLEN               SET LENGTH                PS0244
+         XR    R15,R15                 PADD WITH X'00'           PS0244
+         MVCL  R0,R14                  CLEAR                     PS0244
+         LA    R4,RQCAREA              R4 -> RQC
+         USING RQC,R4                  MAP LOCAL RQC
+*PS0244  MVI   RQCTYPE,RQCTNOT         REQUEST TYPE IS 'NOTIFY'
+         MVI   RQCTYPE,RQCTNOTX        REQUEST TYPE IS 'NOTIFY'  PS0244
+         TIME  DEC                     TIMESTAMP
+         STM   R0,R1,RQCTSTMP             THE RQC
+*
+*        INITIALIZE EVT
+*
+         LA    R5,RQCEVT               R5 -> EVT WITHIN THE RQC
+         USING EVT,R5                  MAP EVT
+         MVC   EVTEVT,=CL4'EVT '       SET EVT EYECATCHER
+         MVC   EVTFLAG,=A(EVTFULL)     MARK EVT AS CONTAINING DATA
+         MVC   EVTDATE,SMF80DTE        SET EVENT DATE
+         MVC   EVTTIME,SMF80TME        SET EVENT TIME
+         MVC   EVTOUID,SMF80USR        SET ORIGINATOR USERID
+         MVC   EVTOJBN,SMF80JBN        SET ORIGINATOR JOBNAME
+         MVC   EVTOTERM,SMF80TRM       SET ORIGINATOR TERMINAL
+*
+*        PREPARE FOR RELOCATION SECTIONS SCAN
+*
+         LH    R9,SMF80CNT             REMAINING SECTION NUMBER
+         LH    R6,SMF80REL             OFFSET OF 1ST RELOCATE SECTION
+         LA    R6,SMF80FLG(R6)         R6 -> FIRST RELOCATE SECTION
+         USING RELOCSCT,R6             RELOCATION SECTION
+*
+*        PROCESS RECORD ACCORDING TO THE EVENT TYPE
+*
+         CLI   SMF80EVT,1
+         BE    LOGIN
+         CLI   SMF80EVT,9
+         BE    ADDGROUP
+         CLI   SMF80EVT,10
+         BE    ADDUSER
+         CLI   SMF80EVT,12
+         BE    ALTGROUP
+         CLI   SMF80EVT,13
+         BE    ALTUSER
+         CLI   SMF80EVT,14
+         BE    CONNECT
+         CLI   SMF80EVT,16
+         BE    DELGROUP
+         CLI   SMF80EVT,17
+         BE    DELUSER
+         CLI   SMF80EVT,18
+         BE    PASSWORD
+         CLI   SMF80EVT,23
+         BE    REMOVE
+         CLI   SMF80EVT,24
+         BE    SETROPTS
+*
+*        A RECORD PASSED EVENT TABLE FILTERING, BUT WAS NOT RECGNIZED
+*
+         WTO   'CTSU83A: SA-AGENT SMF EXIT IEFU83 RECORD FILTERING MISM*
+               ATCH - EVENT IGNORED'
+         B     CLEANUP
+*
+**  LOGIN
+**
+**  RECORDS FOR 'REVOKE' EVENTA RE PROCESSED:                  IS10100
+**  EVENT CODE QUALIFIER = 7 - REVOKED DUE TO PASSWORD         IS10100
+**                             ATTEMPTS.                       IS10100
+**  EVENT CODE QUALIFIER = 35 - REVOKED DUE TO INACTIVITY.     IS10100
+**  EVENT CODE QUALIFIER = 6 - REVOKED DUE TO REVOKE DATE, OR  IS10100
+**                             ALREADY REVOKED.                IS10100
+**                                                             IS10100
+**  FOR EVENT CODE QUALIFIER 6, TWO SMF RECORDS ARE WRITTEN.   IS10100
+**  - IN THE FIRST RECORD, TOKLT19 IS ON IN TOKFLG1 IN RUTKN,  IS10100
+**    AND TOKSTYP CONTAINS 0.                                  IS10100
+**  - IN THE SECOND RECORD, TOKLT19 IS OFF IN TOKFLG1 IN       IS10100
+**    RUTKN, AND TOKSTYP CONTAINS 6 (FOR TSO LOGON).           IS10100
+**  TO PREVENT MULTIPLE PROCESSING OF THE SAME EVENT, WE       IS10100
+**  IGNORE THE RECORDS WITH TOKSTYP CONTAINING 0.              IS10100
+**                                                             IS10100
+LOGIN    DS    0H
+         CLI   SMF80EVQ,7              REVOKED - PASSWORD ATTEMPTS ? ?
+*IS10100 BNE   CLEANUP                 NO, DO NOTHING
+*  IS10100 - START
+         BNE   LGINCRVI                ..NO - CHECK INACTIVITY.
+         LHI   R8,#EVRVRSP             ..YES - R8 = REVOKE REASON.
+         B     LGINPROC
+LGINCRVI DS    0H
+         CLI   SMF80EVQ,35             REVOKED - INACTIVITY ?
+         BNE   LGINCRV                 ..NO - CHECK REVOKED.
+         LHI   R8,#EVRVRSI             ..YES - R8 = REVOKE REASON.
+         B     LGINPROC
+LGINCRV  DS    0H
+         CLI   SMF80EVQ,6              REVOKED (REASON UNKNOWN) ?
+         BNE   CLEANUP                 ..NO - NOTHOING TO DO.
+         LHI   R8,#EVRVRS              ..YES - R8 = REVOKE REASON.
+LGINPROC DS    0H
+*  IS10100 - END
+         LA    R1,53                   REQUIRED SECTION IS 53
+         BAL   R14,LOCATES             REPOSITION (IF FOUND)
+         LTR   R15,R15                 FOUND ?
+         BNZ   CLEANUP                 NO, WE HAVE NOTHING
+         LA    R7,RELCTDTA             R7 -> SECTION DATA
+         USING E1S53,R7                 MAP SECTION DATA
+*
+         CLI   SMF80EVQ,6              REVOKED (REASON UNKNOWN) ? 0100
+         BNE   LGINCONT                ..NO - CONTINUE.        IS10100
+         CLI   E1S53TKN+3,X'00'        SESSION TYPE EXISTS ?   IS10100
+         BE    CLEANUP                 ..NO - IGNORE (SEE      IS10100
+*                                             COMMENTS ABOVE). IS10100
+LGINCONT DS    0H                                              IS10100
+         MVC   EVTUSER,E1S53TKN+64     COPY USERID FROM USER TOKEN
+         MVC   EVTGROUP,=CL8' '        NO GROUP
+         MVI   EVTTYPE,EVTTUSER        TYPE = USER
+         MVI   EVTACT,EVTAREV          ACTION = REVOKE
+         DROP  R7
+         MVI   EVTUPTYP,#EVTUPTV       UPDATE TYPE = REVOKED.   IS10100
+         STC   R8,EVTRVRSN             SET REVOKE REASON.       IS10100
+         MVC   ACTINFO,=CL8'REVOKE'    FAILED OPERATION FOR WTO  WS2555
+         MVC   UIDINFO,EVTUSER         FAILED USER FOR WTO       WS2555
+         B     SENDEVT
+*
+*        ADDGROUP
+*
+ADDGROUP DS    0H
+         CLI   SMF80EVQ,1              INSUFFICIENT AUTHORITY ?
+         BE    CLEANUP                 Y, NO UPDATE TO RACF DATA BASE
+         LA    R1,6                    REQUIRED SECTION IS 6
+         BAL   R14,LOCATES             REPOSITION (IF FOUND)
+         LTR   R15,R15                 FOUND ?
+         BNZ   CLEANUP                 NO, WE HAVE NOTHING
+         LA    R7,RELCTDTA             R7 -> SECTION DATA
+         USING E9S6,R7                 MAP SECTION DATA
+         MVC   EVTGROUP,E9S6GRP        GROUP NAME
+         MVC   EVTUSER,=CL8' '         NO USERID
+         MVI   EVTTYPE,EVTTGRP         TYPE = GROUP
+         MVI   EVTACT,EVTAADD          ACTION = ADD
+         TM    E9S6FKA,M9S6FKA         SUPGROUP IS SET?          IS0328
+         BZ    *+4+6                   NO, SKIP IT               IS0328
+         MVC   EVTSUPG,E9S6SUP         YES, SET NEW SUPGROUP     IS0328
+         DROP  R7
+         MVC   ACTINFO,=CL8'ADDGROUP'  FAILED OPERATION FOR WTO  WS2555
+         MVC   UIDINFO,EVTGROUP        FAILED USER FOR WTO       WS2555
+         B     SENDEVT
+*
+*        ADDUSER
+*
+ADDUSER  DS    0H
+         CLI   SMF80EVQ,1              INSUFFICIENT AUTHORITY ?
+         BE    CLEANUP                 Y, NO UPDATE TO RACF DATA BASE
+         LA    R1,6                    REQUIRED SECTION IS 6
+         BAL   R14,LOCATES             REPOSITION (IF FOUND)
+         LTR   R15,R15                 FOUND ?
+         BNZ   CLEANUP                 NO, WE HAVE NOTHING
+         LA    R7,RELCTDTA             R7 -> SECTION DATA
+         USING E10S6,R7                MAP SECTION DATA
+         MVC   EVTUSER,E10S6UID        USERID
+         MVC   EVTGROUP,E10S6DFG       DEFAULT GROUP
+         MVI   EVTTYPE,EVTTUSER
+         MVI   EVTACT,EVTAADD
+         DROP  R7
+         MVC   ACTINFO,=CL8'ADDUSER'   FAILED OPERATION FOR WTO  WS2555
+         MVC   UIDINFO,EVTUSER         FAILED USER FOR WTO       WS2555
+         B     SENDEVT
+*
+*        ALTGROUP
+*
+ALTGROUP DS    0H
+         CLI   SMF80EVQ,1              INSUFFICIENT AUTHORITY ?
+         BE    CLEANUP                 Y, NO UPDATE TO RACF DATA BASE
+         LA    R1,6                    REQUIRED SECTION IS 6
+         BAL   R14,LOCATES             REPOSITION (IF FOUND)
+         LTR   R15,R15                 FOUND ?
+         BNZ   CLEANUP                 NO, WE HAVE NOTHING
+         LA    R7,RELCTDTA             R7 -> SECTION DATA
+         USING E12S6,R7                MAP SECTION DATA
+         MVC   EVTGROUP,E12S6GID       GROUP NAME
+         MVC   EVTUSER,=CL8' '         NO USERID
+         MVI   EVTTYPE,EVTTGRP         TYPE = GROUP
+         MVI   EVTACT,EVTAUPD          ACTION = UPD
+         TM    E12S6FKA,M12S6FKA       SUPGROUP IS SET?          IS0328
+         BZ    *+4+6                   NO, SKIP IT               IS0328
+         MVC   EVTSUPG,E12S6SUP        YES, SET NEW SUPGROUP     IS0328
+         DROP  R7
+         MVC   ACTINFO,=CL8'ALTGROUP'  FAILED OPERATION FOR WTO  WS2555
+         MVC   UIDINFO,EVTGROUP        FAILED USER FOR WTO       WS2555
+         B     SENDEVT
+*
+*        ALTUSER
+*
+ALTUSER  DS    0H
+         CLI   SMF80EVQ,1              INSUFFICIENT AUTHORITY ?
+         BE    CLEANUP                 Y, NO UPDATE TO RACF DATA BASE
+         LA    R1,6                    REQUIRED SECTION IS 6
+         BAL   R14,LOCATES             REPOSITION (IF FOUND)
+         LTR   R15,R15                 FOUND ?
+         BNZ   CLEANUP                 NO, WE HAVE NOTHING
+         LA    R7,RELCTDTA             R7 -> SECTION DATA
+         USING E13S6,R7                MAP SECTION DATA
+         MVC   EVTUSER,E13S6UID        USERID
+         MVC   EVTGROUP,=CL8' '        NO GROUP
+         MVI   EVTTYPE,EVTTUSER
+         MVI   EVTACT,EVTAUPD
+         MVC   ACTINFO,=CL8'ALTUSER'   FAILED OPERATION FOR WTO  WS2555
+         MVC   UIDINFO,EVTUSER         FAILED USER FOR WTO       WS2555
+*
+*        IF A CONNECTION WAS MODIFIED, IN THE ALTUSER COMMAND
+*        SET THE GROUP FIELD
+*
+         TM    E13S6FLG,E13AUTH        AUTHORITY KEYWORD SPECIFIED ?
+         BZ    ALTUACC                 NO, CHECK UACC
+         TM    E13S6IGN,E13AUTH        WAS AUTHORITY KEYWORD IGNORED ?
+         BO    ALTUACC                 YES, CHECK UACC
+         TM    E13S6ERR,E13AUTH        WAS AUTHORITY KEYWORD IN ERROR?
+         BZ    ALTCONN                 NO, CONNECTION WAS UPDATED !
+ALTUACC  DS    0H
+*IS10100 TM    E13S6FLG+1,E13UACC      UACC KEYWORD SPECIFIED ?
+*IS10100 BZ    SENDEVT                 NO, NOTHING MORE TO CHECK
+*IS10100 TM    E13S6IGN+1,E13UACC      WAS UACC KEYWORD IGNORED ?
+*IS10100 BO    SENDEVT                 YES, NOTHING MORE TO CHECK
+*IS10100 TM    E13S6ERR+1,E13UACC      WAS UACC KEYWORD IN ERROR ?
+*IS10100 BO    SENDEVT                 YES, NOTHING MORE TO CHECK
+         TM    E13S6FL2,E13UACC        UACC KEYWORD SPECIFIED? IS10100
+         BZ    ALURVK                  ..NO - CHECK REVOKE.    IS10100
+         TM    E13S6IG2,E13UACC        UACC KEYWORD IGNORED ?  IS10100
+         BO    ALURVK                  ..YES - CHECK REVOKE.   IS10100
+         TM    E13S6ER2,E13UACC        UACC KEYWORD IN ERROR ? IS10100
+         BO    ALURVK                  ..YES - CHECK REVOKE.   IS10100
+ALTCONN  DS    0H
+         MVC   EVTGROUP,E13S6DFT       ASSUME DEFAULT CONN MODIFIED
+         TM    E13S6FLG,E13GROUP       WAS GROUP KEYWORD CHANGED ?
+*IS10100 BZ    SENDEVT                 NO, STAY WITH DEFAULT GROUP
+         BZ    ALURVK                  ..NO - STAY WITH DEFGRP IS10100
+         MVC   EVTGROUP,E13S6GRP       YES, THE GROUP CONN. MODIFED
+* IS10100 - START
+ALURVK   DS    0H                      HANDLE REVOKE REQUEST.
+         TM    E13S6FL3,E13REVOK       REVOKE KEYWORD SPECIFIED ?
+         BZ    ALURSUM                 ..NO - CHECK RESUME.
+         TM    E13S6IG3,E13REVOK       WAS REVOKE KEYWORD IGNORED ?
+         BO    ALURSUM                 ..YES - CHECK RESUME.
+         TM    E13S6ER3,E13REVOK       WAS REVOKE KEYWORD IN ERROR?
+         BO    ALURSUM                 ..YES - CHECK RESUME.
+         CLC   E13S6RVD,ZEROS          REVOKE DATE EMPTY ?
+         BNE   ALURSUM                 ..NO - NOT REVOKED.
+*                                      ..YES - SET REVOKE INFO IN EVT:
+         MVI   EVTUPTYP,#EVTUPTV       UPDATE TYPE = REVOKE.
+         MVI   EVTRVRSN,#EVRVRSC       REVOKE REASON = COMMAND.
+         B     ALUSNEVT
+ALURSUM  DS    0H                      HANDLE RESUME REQUEST.
+         TM    E13S6FL4,E13RESUM       RESUME KEYWORD SPECIFIED ?
+         BZ    ALUSNEVT                ..NO - SKIP RESUME PROCESS.
+         TM    E13S6IG4,E13RESUM       WAS RESUME KEYWORD IGNORED ?
+         BO    ALUSNEVT                ..YES - SKIP RESUME PROCESS.
+         TM    E13S6ER4,E13RESUM       WAS RESUME KEYWORD IN ERROR?
+         BO    ALUSNEVT                ..YES - SKIP RESUME PROCESS.
+         CLC   E13S6RSD,ZEROS          RESUME DATE EMPTY ?
+         BNE   ALUSNEVT                ..NO - NOT RESUMED.
+*                                      ..YES - SET RESUME INFO IN EVT:
+         MVI   EVTUPTYP,#EVTUPTV       UPDATE TYPE = REVOKE.
+         MVI   EVTRVRSN,#EVRVRS$       REVOKE REASON = ? (REVOKED ?)
+*                                      WE DO NOT SET THE 'RESUME' TYPE
+*                                      BECAUSE WE DO NOT KNOW IF THE
+*                                      IS ACTUALLY RESUMED. GETUSER
+*                                      WILL DETERMINE IF THE USER IS
+*                                      RESUMED OR NOT AND WILL UPDATE
+*                                      THE REVOKE REASON ACCOORDINGLY.
+         B     ALUSNEVT
+ALUSNEVT DS    0H
+* IS10100 - END
+         DROP  R7
+         B     SENDEVT
+*
+*        CONNECT
+*
+CONNECT  DS    0H
+         CLI   SMF80EVQ,1              INSUFFICIENT AUTHORITY ?
+         BE    CLEANUP                 Y, NO UPDATE TO RACF DATA BASE
+         LA    R1,6                    REQUIRED SECTION IS 6
+         BAL   R14,LOCATES             REPOSITION (IF FOUND)
+         LTR   R15,R15                 FOUND ?
+         BNZ   CLEANUP                 NO, WE HAVE NOTHING
+         LA    R7,RELCTDTA             R7 -> SECTION DATA
+         USING E14S6,R7                MAP SECTION DATA
+         MVC   EVTUSER,E14S6UID        USERID
+         MVC   EVTGROUP,E14S6GID       GROUP
+         MVI   EVTTYPE,EVTTCONN
+         MVI   EVTACT,EVTAUPD
+         DROP  R7
+         MVC   ACTINFO,=CL8'CONNECT'   FAILED OPERATION FOR WTO  WS2555
+         MVC   UIDINFO,EVTUSER         FAILED USER FOR WTO       WS2555
+         B     SENDEVT
+*
+*        DELGROUP
+*
+DELGROUP DS    0H
+         CLI   SMF80EVQ,1              INSUFFICIENT AUTHORITY ?
+         BE    CLEANUP                 Y, NO UPDATE TO RACF DATA BASE
+         LA    R1,6                    REQUIRED SECTION IS 6
+         BAL   R14,LOCATES             REPOSITION (IF FOUND)
+         LTR   R15,R15                 FOUND ?
+         BNZ   CLEANUP                 NO, WE HAVE NOTHING
+         LA    R7,RELCTDTA             R7 -> SECTION DATA
+         USING E16S6,R7                MAP SECTION DATA
+         MVC   EVTGROUP,E16S6GID       GROUP NAME
+         MVC   EVTUSER,=CL8' '         NO USERID
+         MVI   EVTTYPE,EVTTGRP         TYPE = GROUP
+         MVI   EVTACT,EVTADEL          ACTION = DEL
+         DROP  R7
+         MVC   ACTINFO,=CL8'DELGROUP'  FAILED OPERATION FOR WTO  WS2555
+         MVC   UIDINFO,EVTGROUP        FAILED USER FOR WTO       WS2555
+         B     SENDEVT
+*
+*        DELUSER
+*
+DELUSER  DS    0H
+         CLI   SMF80EVQ,1              INSUFFICIENT AUTHORITY ?
+         BE    CLEANUP                 Y, NO UPDATE TO RACF DATA BASE
+         LA    R1,6                    REQUIRED SECTION IS 6
+         BAL   R14,LOCATES             REPOSITION (IF FOUND)
+         LTR   R15,R15                 FOUND ?
+         BNZ   CLEANUP                 NO, WE HAVE NOTHING
+         LA    R7,RELCTDTA             R7 -> SECTION DATA
+         USING E17S6,R7                MAP SECTION DATA
+         MVC   EVTUSER,E17S6UID        USERID
+         MVC   EVTGROUP,=CL8' '        NO USERID
+         MVI   EVTTYPE,EVTTUSER        TYPE = USER
+         MVI   EVTACT,EVTADEL          ACTION = DEL
+         DROP  R7
+         MVC   ACTINFO,=CL8'DELUSER'   FAILED OPERATION FOR WTO  WS2555
+         MVC   UIDINFO,EVTUSER         FAILED USER FOR WTO       WS2555
+         B     SENDEVT
+*
+*        PASSWORD (NOTIFY OF USER UPDATE, IF INTERVAL WAS CHANGED)
+*
+PASSWORD DS    0H
+         CLI   SMF80EVQ,1              INSUFFICIENT AUTHORITY ?
+         BE    CLEANUP                 Y,NO UPDATE TO RACF DATA BASE
+         LA    R1,6                    REQUIRED SECTION IS 6
+         BAL   R14,LOCATES             REPOSITION (IF FOUND)
+         LTR   R15,R15                 FOUND ?
+         BNZ   CLEANUP                 NO, WE HAVE NOTHING
+         LA    R7,RELCTDTA             R7 -> SECTION DATA
+         USING E18S6,R7                MAP SECTION DATA
+         TM    E18S6FLG,E18FINTV       WAS INTERVAL SPECIFIED ?
+         BZ    CLEANUP                 NO, ONLY PASSWORD WAS CHANGED
+         TM    E18S6IGN,E18FINTV       WAS INTERVAL SPECIFIED ?
+         BO    CLEANUP                 INTERVAL WAS IGNORED
+         TM    E18S6ERR,E18FINTV       WAS INTERVAL SPECIFIED ?
+         BO    CLEANUP                 INTERVAL WAS IS ERROR
+*
+         MVC   EVTUSER,EVTOUID         DEFUALT USER IS THE ORIGNATING
+         TM    E18S6FLG,E18FUSER       WAS USER SPECIFIED ?
+         BZ    NOPUSER                 NO, STAY WITH ORIGINAL
+         TM    E18S6IGN,E18FUSER       WAS USER IGNORED  ?
+         BO    NOPUSER                 YES, STAY WITH ORIGINAL
+         TM    E18S6ERR,E18FUSER       WAS INTERVAL SPECIFIED ?
+         BO    NOPUSER                 NO, STAY WITH ORIGINAL
+         MVC   EVTUSER,E18S6UID        USERID
+NOPUSER  DS    0H
+         MVC   EVTGROUP,=CL8' '        NO USERID
+         MVI   EVTTYPE,EVTTUSER        TYPE = USER
+         MVI   EVTACT,EVTAUPD          ACTION = UPDATE
+         DROP  R7
+         MVC   ACTINFO,=CL8'CHNG PWD'  FAILED OPERATION FOR WTO  WS2555
+         MVC   UIDINFO,EVTUSER         FAILED USER FOR WTO       WS2555
+         B     SENDEVT
+*
+*        REMOVE
+*
+REMOVE   DS    0H
+         CLI   SMF80EVQ,1              INSUFFICIENT AUTHORITY ?
+         BE    CLEANUP                 Y, NO UPDATE TO RACF DATA BASE
+         LA    R1,6                    REQUIRED SECTION IS 6
+         BAL   R14,LOCATES             REPOSITION (IF FOUND)
+         LTR   R15,R15                 FOUND ?
+         BNZ   CLEANUP                 NO, WE HAVE NOTHING
+         LA    R7,RELCTDTA             R7 -> SECTION DATA
+         USING E23S6,R7                MAP SECTION DATA
+         MVC   EVTUSER,E23S6UID        USERID
+         MVC   EVTGROUP,E23S6GID       GROUP
+         MVI   EVTTYPE,EVTTCONN
+         MVI   EVTACT,EVTADEL
+         DROP  R7
+         MVC   ACTINFO,=CL8'REMOVE'    FAILED OPERATION FOR WTO  WS2555
+         MVC   UIDINFO,EVTUSER         FAILED USER FOR WTO       WS2555
+         B     SENDEVT
+*
+*        SETROPTS
+*
+SETROPTS DS    0H                      SETROPTS
+         CLI   SMF80EVQ,1              INSUFFICIENT AUTHORITY ?
+         BE    CLEANUP                 Y, NO UPDATE TO RACF DATA BASE
+         LA    R1,6                    REQUIRED SECTION IS 6
+         BAL   R14,LOCATES             REPOSITION (IF FOUND)
+         LTR   R15,R15                 FOUND ?
+         BNZ   CLEANUP                 NO, WE HAVE NOTHING
+         LA    R7,RELCTDTA             R7 -> SECTION DATA
+         USING E24S6,R7                MAP SECTION DATA
+         TM    E24S6FKA+1,E24FINTV     WAS INTERVAL SPECIFIED ?
+         BNZ   SETCHNGE                YES, GLOBAL PARAMETERS CHNG
+         TM    E24S6FKA+2,E24FREVK     WAS REVOKE SPECIFIED ?
+         BNZ   SETCHNGE                YES, GLOBAL PARAMETERS CHNG
+         TM    E24S6FKA+2,E24FRULE     WAS PASSWORD RULE SPECIFIED ?
+         BNZ   SETCHNGE                YES, GLOBAL PARAMETERS CHNG
+         B     CLEANUP
+SETCHNGE DS    0H
+         MVC   EVTUSER,=CL8' '         USERID
+         MVC   EVTGROUP,=CL8' '        GROUP
+         MVI   EVTTYPE,EVTTRSSP        RSS PARAMETERS
+         MVI   EVTACT,EVTAUPD             WERE UPDATED
+         MVC   ACTINFO,=CL8'SETROPTS'  FAILED OPERATION FOR WTO  WS2555
+         MVC   UIDINFO,=CL8' '         FAILED USER FOR WTO       WS2555
+         B     SENDEVT
+*
+*
+****************************************************************
+*        ROUTINE TO LOCATE SECTION                             *
+****************************************************************
+*                                                              *
+*  THE ROUTINE LOCATES A REQUESTED SECTION (PASSED IN REG 1)   *
+*  IN THE SMF RECORD                                           *
+*                                                              *
+*--------------------------------------------------------------*
+*                                                              *
+*  REGISTERS USAGE :                                           *
+*  -----------------                                           *
+*                                                              *
+*      R1   = REQUIRED SECTION                                 *
+*      R2   = CURRENT SECTION LENGTH                           *
+*      R6  -> CURRENT  SECTION                                 *
+*      R9   = REMAINING SECTION                                *
+*      R14 -> RETURN ADDRESS                                   *
+*      R15    RETURN CODE                                      *
+*                                                              *
+****************************************************************
+*
+LOCATES  DS    0H
+         XR    R15,R15                 ASSUME SUCCESS RC
+         XR    R2,R2                   CLEAR SECTION LENGTH
+LOCLOOP  DS    0H
+         IC    R2,RELCTDLN             LENGTH OF DATA THAT FOLOWS
+         EX    R1,EXCLI                REQUIRED SECTION ?
+         BER   R14                     YES, FOUND IT
+         LA    R6,2(R2,R6)             ADVNACE TO NEXT SECTION
+         BCT   R9,LOCLOOP              TRY AGAIN IF ANY SECTION LEFT
+         LA    R15,4                   SET NOT FOUND RC
+         BR    R14                     RETURN TO CALLER
+EXCLI    CLI   RELCTDTP,*-*            EXECUTE CODE TO COMPARE SECTION
+*
+         DROP  R5,R6
+*
+****************************************************************
+*        NOTIFY SA-AGENT INTERCEPTOR OF THE EVENT
+****************************************************************
+*
+SENDEVT  DS    0H
+         CALL  CTSAPCC,(FUJIFLAG,SSNAME,JOBNAME,(R4),PCCWORK),         X
+               MF=(E,CALLAREA)
+         LTR   R15,R15                 NOTIFY SUCCESSFULL ?
+         BZ    CLEANUP                 YES, CONTINUE
+*
+         CH    R15,=H'8'               FREE CHAIN EXISTS ?       WS2555
+         BE    NOFRCHN                 NO MORE RQC IN FREE CHAIN WS2555
+*
+         CH    R15,=H'160'             WAS THE INTERCEPTOR UP ?
+         BNH   CLEANUP                 NO, THAN NO NEED FOR MESSAGE
+*
+****************************************************************
+*        NOTIFY ROUTINE INTERNAL ERROR
+****************************************************************
+*
+         CVD   R15,PACKD               CONVERT RC TO EBCDIC
+         UNPK  CHARRC,PACKD            CONVERT RC TO EBCDIC
+         OI    CHARRC+7,X'F0'          CONVERT RC TO EBCDIC
+         MVC   WTOAREA(WTONTFYL),WTONTFY
+         MVC   WTOAREA+WTONTFYL-4(4),CHARRC+4
+         WTO   MF=(E,WTOAREA)
+         B     CLEANUP
+         DROP  R4
+*
+****************************************************************
+*        NOTIFY FREE CHAIN IS EMPTY  -                           WS2555
+****************************************************************
+*
+NOFRCHN  DS    0H                                                WS2555
+         MVC   WTOAREA(WTOEVTL),WTOEVT                           WS2555
+         MVC   WTOAREA+13(L'ACTINFO),ACTINFO                     WS2555
+         MVC   WTOAREA+22(L'UIDINFO),UIDINFO                     WS2555
+         WTO   MF=(E,WTOAREA)                                    WS2555
+         B     CLEANUP                                           WS2555
+*
+****************************************************************
+*        ISSUE ABEND MESSGAE                                   *
+****************************************************************
+*
+CLEANUP  DS    0H
+         ICM   R2,15,ABNDCODE          R2 = ABEND CODE WORD
+         BZ    NOABEND                 NO, NO ABEND
+         MVI   ABNDTYPE,C'U'           ASSUME USER ABEND
+         N     R2,=XL4'00000FFF'       TEST FOR USER ABEND CODE
+         BNZ   ABENDMSG                YES, HAVE USER ABEND CODE
+         L     R2,ABNDCODE             R2 = ABEND CODE WORD
+         SRL   R2,12                   ISOLATE SYSTEM ABEND CODE
+         MVI   ABNDTYPE,C'S'           SET SYSTEM ABEND CODE
+ABENDMSG DS    0H
+         ST    R2,ABNDBIN              SAVE BINARY ABEND CODE
+         UNPK  ABNDCHAR(9),ABNDBIN(5)  CONVERT TO ZONED
+         TR    ABNDCHAR(8),HEX2CHAR    MAKE IT CHARACTER
+         MVC   ABNDCHAR+4(1),ABNDTYPE  INSERT ABEND TYPE CHARACTER
+         MVC   WTOAREA(WTOABNDL),WTOABND
+         MVC   WTOAREA+WTOABNDL-4(4),ABNDCHAR+4
+         WTO   MF=(E,WTOAREA)
+NOABEND  DS    0H
+*
+****************************************************************
+*        CLRER RECOVERY ENVIRONMENT                            *
+****************************************************************
+*
+         ESTAE 0
+*
+****************************************************************
+*        FREE WORKAREA
+****************************************************************
+*
+         LR    R1,R13                  ADDRESS FOR FREEMAIN
+         L     R13,4(R13)              RESTORE CALLERS SAVE AREA
+         SR    R0,R0                   CLEAR REG 0
+         LA    R0,WORKLEN              FREE WORK AREA
+         FREEMAIN RC,LV=(R0),A=(R1)
+         LTR   R15,R15
+         BZ    RETURN
+         WTO   'CTSU83A: FREEMAIN OF WORKAREA HAS FAILED'
+*
+****************************************************************
+*        FINISH
+****************************************************************
+*
+RETURN   DS    0H
+         XR    R15,R15                 SET RETURN CODE
+         RETURN (14,12),T,RC=(15)      RESTORE REGISTERS AND RETURN
+         DROP  R11
+*
+****************************************************************
+*        CONSTANTS
+****************************************************************
+*
+         LTORG ,
+*
+SSNAME   DC    CL4'    '
+JOBNAME  DC    CL8'CTSAONI'
+FUJIFLAG DC    AL1(128)
+ZEROS    DC    XL4'00'                                         IS10100
+*
+*        'INTERESTING' EVENT CODES TABLE
+*
+EVENTCDS DC    256X'00'
+         ORG   EVENTCDS+1              LOGIN
+         DC    AL1(*-EVENTCDS)
+         ORG   EVENTCDS+9              ADDGROUP
+         DC    AL1(*-EVENTCDS)
+         ORG   EVENTCDS+10             ADDUSER
+         DC    AL1(*-EVENTCDS)
+         ORG   EVENTCDS+12             ALTGROUP
+         DC    AL1(*-EVENTCDS)
+         ORG   EVENTCDS+13             ALTUSER
+         DC    AL1(*-EVENTCDS)
+         ORG   EVENTCDS+14             CONNECT
+         DC    AL1(*-EVENTCDS)
+         ORG   EVENTCDS+16             DELGROUP
+         DC    AL1(*-EVENTCDS)
+         ORG   EVENTCDS+17             DELUSER
+         DC    AL1(*-EVENTCDS)
+         ORG   EVENTCDS+18             PASSWORD
+         DC    AL1(*-EVENTCDS)
+         ORG   EVENTCDS+23             REMOVE
+         DC    AL1(*-EVENTCDS)
+         ORG   EVENTCDS+24             SETROPTS
+         DC    AL1(*-EVENTCDS)
+         ORG
+*
+*
+LSTESTAE ESTAE MF=L
+LENESTAE EQU   *-LSTESTAE
+*
+WTONTFY  WTO   'CTSU83A: SA-AGENT ONLINE INTERCEPTOR NOTIFY HAS FAILED *
+               RC=XXXX',MF=L
+WTONTFYL EQU   *-WTONTFY
+WTOABND  WTO   'CTSU83A: SA-AGENT SMF EXIT IEFU83 HAS ABENDED. ABEND CO*
+               DE=XXXX',MF=L
+WTOABNDL EQU   *-WTOABND
+WTOEVT   WTO   'CTSU83A: <ACTION> <USERID> EVENT IS LOST. START AGENT A*
+               SAP TO EMPTY QUEUE AND MEMORY.',MF=L              WS2555
+WTOEVTL  EQU   *-WTOEVT                                          WS2555
+*
+HEX2CHAR DC    256AL1(*-HEX2CHAR)
+         ORG   HEX2CHAR+X'FA'
+         DC    CL6'ABCDEF'
+         ORG
+         DROP
+*
+****************************************************************
+*        ABEND RECOVERY ROUTINE                                *
+****************************************************************
+*
+ABNDEXIT DS    0H
+         USING ABNDEXIT,R15            ABEND EXIT ADDRESSABILITY
+         L     R12,=A(CTSU83A)         RESTORE LMOD BASE REG
+         DROP  R15                     USE LMOD ADDRESSABILITY
+         USING CTSU83A,R12             RESTORE ITS ADDRESSABILITY
+         C     R0,=F'12'               SDWA PROVIDED ?
+         BE    NOSDWA                  NO, CAN NOT RETRY
+         USING SDWA,R1                 MAP SDWA
+         L     R13,SDWAPARM            RESTORE WORKAREA REGISTER
+         USING WORKAREA,R13            MAP WORKAREA
+         MVC   ABNDCODE,SDWAABCC       SET ABEND CODE
+         TM    SDWAERRD,SDWACLUP       RETRY ALLOWED ?
+         BNZ   NORETRY                 NO, CAN NOT RETRY
+*
+RETRY    DS    0H
+         ST    R12,SDWASR12            SET BASE REGISTER FOR RETRY
+         ST    R13,SDWASR13            SET WORKAREA REGISTER FOR RETRY
+*
+         STM   R14,R1,SAVEREGS
+         SDUMP HDR='SA-AGENT IEFU83 SMF EXIT ABEND',                   X
+               SDATA=(ALLPSA,CSA,LSQA,RGN,SUMDUMP)
+         LM    R14,R1,SAVEREGS
+*
+         SETRP RETREGS=YES,RC=4,RETADDR=CLEANUP,                       X
+               FRESDWA=YES,DUMP=YES
+         BR    R14
+*
+NOSDWA   DS    0H
+         LR    R13,R2                   NO SDWA, PARM IN R2
+         ST    R1,ABNDCODE              SAVE ABEND CODE
+         XR    R1,R1                    CLEAR
+NORETRY  DS    0H
+         XR    R15,R15                  INDICATE NO RETRY
+         BR    R14                      RETURN TO RTM
+         LTORG
+         DROP
+*
+****************************************************************
+*        WORK AREA
+****************************************************************
+*
+WORKAREA DSECT
+SAVEAREA DS    18F                     SAVE AREA TO CALL OTHERS
+CALLAREA CALL  ,(,,,,),MF=L            EXECUTE FORM CALL AREA
+PCCWORK  DS    XL512                   WORK AREA FOR CTSAPCC ROUTINE
+RQCAREA  DS    CL(RQCLEN)              AREA FOR RQC
+PACKD    DS    D                       RETURN CODE CONVERSION
+CHARRC   DS    CL8                     RETURN CODE CONVERSION
+WTOAREA  DS    XL384                   CTSMSGR WTO WORK AREA
+ABNDCODE DS    XL4                     ABCODE SAVED BY ESTAE ROUTINE
+ABNDBIN  DS    XL5                     ISOLATED ABEND CODE + PAD BYTE
+ABNDTYPE DS    CL1                     ABEND TYPE (S/U)
+ABNDCHAR DS    CL9                     CHARCTER ABEND CODE FOR CTSMSG
+WRKESTAE DS    CL(LENESTAE)            EXECUTE FORM FOR ESTAE
+SAVEREGS DS    15F                     TEMPORARY SAVE REGISTERS AREA
+RESERVED DS    16X                     RESERVED AREA
+ACTINFO  DS    CL8                     EVENT ACTION INFO FOR WTO WS2555
+UIDINFO  DS    CL8                     USER\GROUP INFO FOR WTO   WS2555
+WORKLEN  EQU   *-WORKAREA
+*
+****************************************************************
+*        SMF REC TYPE 80 HEADER
+****************************************************************
+*
+SMFREC80 DSECT
+         IFASMFR9 80
+*
+****************************************************************
+*        GENERAL SMF80 RELOCATABLE SECTION MAPPING
+****************************************************************
+*
+RELOCSCT DSECT                         MAPPING FOR RELOCATION SECTION
+RELCTDTP DS    CL1                     DATATYPE
+RELCTDLN DS    CL1                     LENGTH OF DATA THAT FOLOWS
+RELCTDTA DS    CL255                   DATA
+*
+*        DESCRIPTION OF EVENT 1, FOR EVQ=7 , NEED UTOKEN ....
+*
+E1S53    DSECT
+E1S53TKN DS    XL80                    USER TOKEN
+         ORG   ,
+*
+*        DESCRIPTION OF EVENT 9/SECTION 6 (ADDGROUP)
+*
+E9S6     DSECT
+E9S6FKA  DS    CL1                     FLAG FOR KEYWORDS
+M9S6FKA  EQU   X'80'                   FLAG FOR SUPGROUP         IS0328
+E9S6FKI  DS    CL1                     FLAG FOR KEYWORDS
+E9S6GRP  DS    CL8                     GROUP NAME
+E9S6SUP  DS    CL8                     SUPERIOR GROUP
+E9S6OWN  DS    CL8                     USERID OR GROUP (OWNER )
+*
+*        DESCRIPTION OF EVENT 10/SECTION 6 (ADDUSER)
+*
+E10S6    DSECT
+E10S6FKA DS    CL4                     FLAG FOR KEYWORDS
+E10S6FKI DS    CL4                     FLAG FOR KEYWORDS
+E10S6FKE DS    CL4                     FLAG FOR KEYWORDS
+E10S6FKV DS    CL1                     FLAG FOR KEYWORDS
+E10S6UID DS    CL8                     USERID
+E10S6DFG DS    CL8                     DEFAULT GROUP
+*
+*        DESCRIPTION OF EVENT 12/SECTION 6 (ALTGROUP)
+*
+E12S6    DSECT
+E12S6FKA DS    CL1                     FLAG FOR KEYWORDS
+M12S6FKA EQU   X'80'                   FLAG FOR SUPGROUP         IS0328
+E12S6FKI DS    CL1                     FLAG FOR KEYWORDS
+E12S6FKV DS    CL1                     FLAG FOR KEYWORDS
+E12S6GID DS    CL8                     GROUP NAME
+E12S6SUP DS    CL8                     NEW SUPGROUP              IS0328
+*
+*        DESCRIPTION OF EVENT 13/SECTION 6 (ALTUSER)
+*
+E13S6    DSECT
+E13S6FLG DS    XL4                     FLAG FOR KEYWORDS SPECIFIED
+E13S6FL1 EQU   E13S6FLG                                        IS10100
+E13GROUP EQU   B'01000000'
+E13AUTH  EQU   B'00000100'
+E13S6FL2 EQU   E13S6FLG+1                                      IS10100
+E13UACC  EQU   B'01000000'
+E13S6FL3 EQU   E13S6FLG+2                                      IS10100
+E13REVOK EQU   B'00000001'                                     IS10100
+E13S6FL4 EQU   E13S6FLG+3                                      IS10100
+E13RESUM EQU   B'10000000'                                     IS10100
+E13S6IGN DS    XL4                     FLAG FOR KEYWORDS IGNORED
+E13S6IG1 EQU   E13S6IGN                                        IS10100
+E13S6IG2 EQU   E13S6IGN+1                                      IS10100
+E13S6IG3 EQU   E13S6IGN+2                                      IS10100
+E13S6IG4 EQU   E13S6IGN+3                                      IS10100
+E13S6ERR DS    XL4                     FLAG FOR KEYWORDS IN ERROR
+E13S6ER1 EQU   E13S6ERR                                        IS10100
+E13S6ER2 EQU   E13S6ERR+1                                      IS10100
+E13S6ER3 EQU   E13S6ERR+2                                      IS10100
+E13S6ER4 EQU   E13S6ERR+3                                      IS10100
+E13S6VIO DS    XL1                     FLAG FOR VIOLATIONS
+E13S6UID DS    CL8                     USERID
+E13S6DFT DS    CL8                     DEFAULT GROUP
+E13S6GRP DS    CL8                     GROUP KEYWORD
+E13S6UAF DS    X                       FLAGS FOR AUTHORITY     IS10100
+E13S6AUF DS    X                       FLAGS FOR UACC          IS10100
+E13S6OEN DS    CL8                     OWNER.                  IS10100
+E13S6CLF DS    XL2                     FLAGS FOR CLAUTH CLASSES. 10100
+E13S6CLI DS    XL2                     FLAGS FOR CLASSES IGNORED. 0100
+E13S6AKW DS    XL2                     FLAGS FOR ADDITIONAL KEYWORDS.0
+E13S6AK1 EQU   E13S6AKW                                        IS10100
+E13S6AK2 EQU   E13S6AKW+1                                      IS10100
+E13S6IAK DS    XL2                     FLAGS FOR ADDITIONAL KEYWORDS.0
+E13S6IA1 EQU   E13S6IAK                                        IS10100
+E13S6IA2 EQU   E13S6IAK+1                                      IS10100
+E13S6LNT DS    XL3                     LOGON TIME.             IS10100
+E13S6LFT DS    XL3                     LOGOFF TIME.            IS10100
+E13S6DYS DS    XL1                     DAYS THE USER CANNOT LOGON. 100
+E13S6RVD DS    XL4                     REVOKE DATE (00YYDDDC)  IS10100
+E13S6RSD DS    XL4                     RESUME DATE (00YYDDDC)  IS10100
+E13S6SLV DS    CL44                    SECLEVEL.               IS10100
+E13S6SLB DS    CL8                     SECLABEL.               IS10100
+*
+*        DESCRIPTION OF EVENT 14/SECTION 6 (CONNECT)
+*
+E14S6    DSECT
+E14S6FKA DS    CL2                     FLAG FOR KEYWORDS
+E14S6FKI DS    CL2                     FLAG FOR KEYWORDS
+E14S6UID DS    CL8                     USERID
+E14S6GID DS    CL8                     GROUP NAME
+*
+*        DESCRIPTION OF EVENT 16/SECTION 6 (DELGROUP)
+*
+E16S6    DSECT
+E16S6GID DS    CL8                     GROUP NAME
+*
+*        DESCRIPTION OF EVENT 17/SECTION 6 (DELUSER)
+*
+E17S6    DSECT
+E17S6UID DS    CL8                     USERID
+*
+*        DESCRIPTION OF EVENT 18/SECTION 6 (PASSWORD)
+*
+E18S6    DSECT
+E18S6FLG DS    XL1                     KEYWORDS FLAGS
+E18FINTV EQU   B'10000000'
+E18FUSER EQU   B'01000000'
+E18FPASS EQU   B'00100000'
+E18S6IGN DS    XL1                     IGNORED KEYWORDS FLAGS
+E18S6ERR DS    XL1                     ERROR KEYWORDS FLAGS
+E18S6INT DS    XL4                     CHANGE INTERVAL
+E18S6UID DS    CL8                     USERID (FOR USER KEYWORD)
+*
+*        DESCRIPTION OF EVENT 23/SECTION 6 (REMOVE)
+*
+E23S6    DSECT
+E23S6FKA DS    CL1                     FLAG FOR KEYWORDS
+E23S6FKI DS    CL1                     FLAG FOR KEYWORDS
+E23S6UID DS    CL8                     USERID
+E23S6GID DS    CL8                     GROUP NAME
+*
+*        DESCRIPTION OF EVENT 24/SECTION 6 (SETROPTS)
+*
+E24S6    DSECT
+E24S6FKA DS    CL3                     FLAG FOR KEYWORDS
+E24FINTV EQU   B'00001000'
+E24FREVK EQU   B'01000100'
+E24FRULE EQU   B'00100010'
+*
+****************************************************************
+*        PARAMETER LIST
+****************************************************************
+*
+PARMLIST DSECT
+PARMSMF  DS    A
+*
+****************************************************************
+*        SA-AGENT CONTROL BLOCKS
+****************************************************************
+*
+RQC      DSECT
+         COPY  CTSRQC
+EVT      DSECT
+         COPY  CTSEVT
+*
+****************************************************************
+*        SYSTEM  CONTROL BLOCKS
+****************************************************************
+*
+         IHASDWA
+         END
