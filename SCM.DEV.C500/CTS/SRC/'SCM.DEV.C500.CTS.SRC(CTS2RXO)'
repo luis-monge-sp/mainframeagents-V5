@@ -1,0 +1,2350 @@
+*
+         TITLE 'CTS2RXO - ACFRPTRX SYSPRINT INTERCEPTION.'
+*
+****************************************************************        00060000
+****                                                        ****        00070000
+****     MF CONNECTOR RELEASE 4.0.00                        ****        00080000
+****                                                        ****        00090000
+****     (C) COPYRIGHT 2015 SAILPOINT TECHNOLOGIES, INC.,   ****        00100000
+****     ALL RIGHTS RESERVED.                               ****        00110000
+****                                                        ****        00110000
+****************************************************************        00120000
+*
+****************************************************************
+*                                                              *
+* TITLE            : ACFRPTRX SYSPRINT INTERCEPTION            *
+*                                                              *
+* FILE NAME        : CTS2RXO                                   *
+*                                                              *
+* AUTHOR           : NURIT YAHALOM                             *
+*                                                              *
+* CREATION DATE    : 09/09/19                                  *
+*                                                              *
+* DESCRIPTION      : THIS PROGRAM CONTAINS 2 PARTS:            *
+*                    1. SVC SCREENING ROUTINE FOR OPEN TYPE=J. *
+*                       WHEN ACFRPTRX OPENS SYSPRINT, THIS     *
+*                       ROUTINE UPDATES THE ACB (ACBINRTN) TO  *
+*                       POINT TO OUR I/O ROUTINE, PREPARED THE *
+*                       WORK AREA FOR THE I/O ROUTINE "HSNGS"  *
+*                       IT ON THE RXOB.                        *
+*                    2. I/O ROUTINE CALLED FOR EVERY LINE      *
+*                       WRITTEN BY ACFRPTRX TO SYSPRINT.  THE  *
+*                       I/O ROUTINE SAVES THE LINES IN STORAGE *
+*                       BLOCKS.                                *
+*                                                              *
+*                    THESE 2 PARTS ARE IN THE SAME PROGRAM     *
+*                    BECAUSE THEY SHARE DSECTS.                *
+*                                                              *
+*                    AT THE BEGINNING OF THE MODULE (THE       *
+*                    BEGINNING OF THE SVC ROUTINE) THERE IS    *
+*                    A BLOCK (RXOB) IN WHICH CTS2RXS SETS THE  *
+*                    PARAMETERS FOR THE SVC ROUTINE. THIS IS   *
+*                    NEEDED BECAUSE THE SVC ROUTINE IS CALLED  *
+*                    BY THE SYSTEM DURING OPEN, SO WE DO NOT   *
+*                    HAVE A WAY TO PASS PARAMETERS TO IT.      *
+*                                                              *
+*                    PLEASE SEE MORE EXPLANATIONS BELOW.       *
+*                                                              *
+* PARAMETERS       :  SVC 22 (OPEN TYPE=J)                     *
+*                     --------------------                     *
+*                     (FROM Z/OS DIAGNOSIS - REFERENCE)        *
+*                     GTF DATA IS:                             *
+*                     R15 AND R0 NO APPLICABLE DATA.           *
+*                     R1  ADDRESS OF THE PARAMETER LIST.       *
+*                         PLIST FOUR TO 40 BYTES OF THE OPEN   *
+*                         PARAMETER LIST, WHICH HAS A          *
+*                         MAXIMUM LENGTH OF 1020 BYTES.        *
+*                         THE LIST IS A SERIES OF 4-BYTE       *
+*                         ENTRIES IN THE FOLLOWING FORMAT:     *
+*                         BYTES                                *
+*                         0  OPTION BYTE; BIT SETTINGS ARE:    *
+*                            BITS                              *
+*                            1... .... LAST ENTRY INDICATOR.   *
+*                            .000 .... DISP.                   *
+*                            .011 .... LEAVE.                  *
+*                            .001 .... REREAD.                 *
+*                            .... 0000 INPUT.                  *
+*                            .... 1111 OUTPUT.                 *
+*                            .... 0100 UPDAT.                  *
+*                            .... 0111 OUTIN.                  *
+*                            .... 0011 INOUT.                  *
+*                            .... 0001 RDBACK.                 *
+*                            .... 1110 EXTEND.                 *
+*                            .... 0110 OUTINX.                 *
+*                         1-3 DCB/ACB ADDRESS.                 *
+*                                                              *
+*                     IN ADDITION, CTS2RXS PASSES PARAMETERS   *
+*                     TO THE SVC ROUTINE INTHE                 *
+*                                                              *
+*                     I/O                                      *
+*                     ---                                      *
+*                     R0  = RPL REQUEST CODE.                  *
+*                     R1  -> RPL                               *
+*                                                              *
+*                     BOTH                                     *
+*                     ----                                     *
+*                     IN ADDITION, CTS2RXS SETS SOME VALUES IN *
+*                     THE RXOB AT THE BEGINNING OF THIS        *
+*                     ROUTINE TO BE USED BY THE SVC AND I/O    *
+*                     ROUTINES:                                *
+*                     SCRT -> SCREENING TABLE (BOTH)           *
+*                     STCK -> TIME SCREENING WAS SET (BOTH)    *
+*                     IGNL -> LIST OF LINES TO IGNORE (I/O)    *
+*                     OUTA -> AREA FOR OUTPUT BUFFER ADDR (I/O)*
+*                     1M   -> 1 OR MANE (I/O)                  *
+*                     DBGL -> DEBUG LEVEL (BOTH)               *
+*                     FAIL -> FAILURE INDICATION (BOTH)        *
+*                                                              *
+*                                                              *
+*                                                              *
+* RETURN CODES     :  OPEN:                                    *
+*                                                              *
+*                     I/O:                                     *
+*                     0 - OK                                   *
+*                     ABEND U2088 WITH A REASON CODE FOR THE   *
+*                                 TYPE OF THE ERROR.           *
+*                                                              *
+*                                                              *
+* LINKAGE ATTRIBUTES:  RENT                                    *
+*                                                              *
+*                                                              *
+* ENVIRONMENT:                                                 *
+*               SVC SCREENING ROUTINE                          *
+*               ---------------------                          *
+*               THE SVC SCREENING ROUTINE RECEIVES CONTROL     *
+*               AS AN SVC.                                     *
+*                                                              *
+*               REGISTERS AT ENTRY:                            *
+*               R3  -> CVT                                     *
+*               R4  -> TCB                                     *
+*               R5  -> SVRB                                    *
+*               R6  -> ENTRY                                   *
+*               R7  -> ASCB                                    *
+*               R14 -> RETURN ADDRESS.                         *
+*                                                              *
+*               THERE IS NO NEED TO SAVE REGISTERS AT ENTRY.   *
+*               THE REGISTERS ARE SAVED BY THE SYSTEM IN THE   *
+*               SVRB CREATED FOR THE SVC.                      *
+*               THE SVC SCREENING SHOULD ALLOCATE A SAVE AREA  *
+*               AND SET R13 TO POINT TO IT, TO BE USED BY ANY  *
+*               PROGRAM WHICH T CALLS (STANDARD LINKAGE).      *
+*                                                              *
+*               AMODE AT ENTRY: 31 (SET BY OUR ROUTINE)        *
+*                                                              *
+*                                                              *
+*               I/O ROUTINE                                    *
+*               -----------                                    *
+*               THE I/O ROUTINE IS CALLED BY Z/OS SAM-SI       *
+*               ROUTINE WHEN I/O IS DONE TO THE FILE.          *
+*                                                              *
+*               REGISTERS AT ENTRY:                            *
+*               R13 -> SAVE AREA                               *
+*               R14 -> RETURN ADDRESS.                         *
+*                                                              *
+*               THE I/O ROUTINE HAS TO SAVE THE CALLER         *
+*               REGISTERS AT ENTRY, AND RESTORE THEM AT EXIT.  *
+*                                                              *
+*               AMODE AT ENTRY: CALLER.                        *
+*                                                              *
+****************************************************************
+*
+****************************************************************
+* MOD.ID   WHO      WHEN     DESCRIPTION                       *
+* -------- -------- -------- --------------------------------- *
+* WS10075  NURITY   03/09/19 NEW VERSION.                      *
+* WS10076  SELIGT   05/12/19 CHANGE ALL LRA... FIELD NAMES TO  *
+*                            RUO... AND MOVE THE IGNORE LIST   *
+*                            TO A NEW MACRO, CTSARUOI          *
+* WS10076N NURITY   06/02/20 ADDSSABILITY IN IORTN             *
+* BS10111  NURITY   08/12/20 SUPPORT RUOB ABOVE THE BAR.       *
+* BS10114  NURITY   31/01/21 ABEND S0C4 IN OPEN TYPE=J MODULE. *
+* BS10117  NURITY   19/09/21 ABEND SDC2-0049 -  RUOB UTOKEN    *
+*                            COLLIDED WITH ATB CELLPOOL.       *
+* WS10084  THOMAS   13/07/23 REPLACE ACFRPTRX                  *
+* IS10188  AVNERL   14/10/24 ABOVE 16M. ONLY 4 LINKCARD #SOM   *
+****************************************************************
+****************************************************************
+*
+* OVERVIEW:
+* =========
+* ACFRPTRX IS AN ACF2 UTILITY USED TO GET PERMISSIONS FOR USERS.
+* WE USE THIS UTILITY DURING ACCOUNT AGGREGATION OR SYNC USER
+* PROCESSING.
+* ACFRPTRX WRITES ITS OUTPUT TO SYSPRINT. WE NEED A WAY TO READ
+* AND ANALYZE THIS OUTPUT IN ORDER TO GET ALL THE PERMISSIONS OF
+* A SPECIFIC USER. THE WAYS TO DO IT ARE:
+* 1. READING SYSPRINT FROM SPOOL.
+*    CONS:
+*    1.C1. I/O
+*    1.C2. THE DATA REMAINS IN SPOOL...  MIGHT BE LARGE.
+*    1.C3. WE HAVE TO FIND A WAY TO CLEAR THE SYSOUT FILE BEFORE
+*          THE NEXT INVOCATION OF ACFRPTRX.
+* 2. DIRECTING SYSPRINT TO A SEQUENTIAL FILE
+*    CONS:
+*    2.C1. I/O
+*    2.C2. WE MAY GET FILE FULL CONDITIONS.
+* 3. INTERCEPTING THE I/O TO SYSPRINT AND SAVING THE DATA IN
+*    STORAGE.
+*    PROS:
+*    3.P1. NO I/O
+*    3.P2. NO FILE HANDLING.
+*    CONS
+*    3.C1. NOT EASY TO DEVELOP.
+*
+* WE CHOSE NUMBER 3.
+*
+* HOW IS IT DONE ?
+* ----------------
+* SYSPRINT IS A SYSOUT -> JES2 FILE -> SUBSYSTEM FILE.  WHEN A
+* DCB FOR A SUBSYSTEM FILE IS OPENED, THE SYSTEM CREATES AN ACB
+* AND RPL FOR THIS FILE AND ISSUES OPEN TYPE=J FOR THIS ACB.
+* AT THE END OF THE OPEN PROCESS, THE ACB CONTAINS THE ADDRESS OF
+* THE SUBSYSTEM I/O ROUTINE, AND THE DCB CONTAINS THE ADDRESS OF
+* Z/OS SAM-SI (SEQUENAIL ACCESS METHID - SUBSYSTEM INTERFACE)
+* ROUTINE.
+* WHEN I/O IS DONE TO THIS DCB, THE SAM-SI ROUTINE "TRANSLATES"
+* IT TO I/O ON THE ACB AND RPL AND CALLS THE SUBSYSTEM I/O
+* ROUTINE TO HANDLE IT.
+*
+* WE ARE GOING TO TAKE ADVANTAGE OF THIS PROCESS AND:
+* - SET SVC SCREENING FOR OPEN TYPE=J, WHICH WILL BE 'INHERITED"
+*   TO SUBTASKS, WHEN CREATED.
+* - ATTACH ACFRPTRX.
+* - WHEN ACFRPTRX OPENS SYSPRINT OUR SVC SCREENING ROUTINE (CTS2RXO)
+*   WILL RECEIVE CONTROL.
+* - CTS2RXO CALLS THE STANDARD OPEN PROCESS, AND CHANGES THE
+*   RETURN ADDRESS SO OPEN RETURNS TO IT INSTEAD OF TO THE CALLER.
+* - WHEN OPEN RETURNS, CTS2RXO SET OUR I/O ROUTINE ADDRESS IN THE
+*   ACB, PREPARES THE WORK AREA FOR IT, CONTAINING ALL THE DATA
+*   IT NEEDS, AND PUTS THE ADDRESS OF THIS WORK AREA IN THE ACB.
+* - WHEN ACFRPTRX PUTS A RECORD TO SYSPRINT, THE SAM-SI ROUTINE
+*   SET BY OPEN IN THE DCB "TRANSLATES" THE PUT TO ACB/RPL AND
+*   CALLS THE I/O ROUTINE SET IN THE ACB TO PERFORM THE PUT -> IT
+*   CALLS OUR I/O ROUTINE.
+* - OUR I/O ROUTINE ALLOCATES AREA AND SAVES THERE THE LINE PUT
+*   BY ACFRPTRX.
+* - AFTER ACFRPTRX TERMINATION THE SVC SCREENING IS REMOVED.
+*
+*
+* PASSING DATA TO THE SVC SCREENING ROUTINE:
+* ---------------------------------------------------------
+* THERE IS NO "STANDARD" WAY TO PASS INFORMATION BETWEEN OUR
+* PROGRAMS AND THE SVC SCREENING ROUTINE AND THE I/O ROUTINE
+* BECAUSE WE ARE NOT CALLING THEM. MOREOVER, WE ARE NOT EVEN
+* DOING THE PUT.
+* TO OVERCOME THIS, WE PUT THE DATA NEEDED BY THE SCREENING
+* ROUTINE AND THE I/O ROUTINE INSIDE THE SVC SCREENING MODULE
+* (CTS2RXO) AFTER LOADING IT TO STORAGE.
+*
+* CTS2RXO STARTS WITH A CALL TO CTS2RXOB WHICH IS A MACRO
+* CREATING A CONTROL BLOCK CALLED RXOB. THIS BLOCK CONTIANS
+* AL THE FIELDS USED TO PASS DATA TO/FROM THE SVCD AND I/O
+* ROUTINES.
+* CTS2RXS, CALLED BY THE C CODE TO SET THE SVC SCREENING, GETS
+* THE PARAMETERS NEEDED BY CTS2RXO (THIS MODULE). AFTER LOADING
+* CTS2RXO TO STORAGE, IT SETS THE FIELDS IN THE RXOB THE
+* BEGINNING OF THE MODULE WITH THE DATA NEEDED.
+*
+* THIS WAY WHEN THE SVC ROUTINE RECEIVES CONTROL FOR OPEN, IT
+* HAS ALL THE INFORMATION IT NEEDS.
+*
+*
+* PASSING DATA TO THE I/O ROUTINE
+* -------------------------------
+* THE I/O ROUTINE IS PART OF CTS2RXO AND THEREFORE CAN ACCESS ALL
+* THE DATA PREPARED IN THE THE RXOB (DESCRIBED EARLIER). THIS
+* MEANS THAT THE I/O ROUTINE CAN ACCESS ALL THE PARAMETERS PASSED
+* FROM THE C CALLER.
+* IN ADDITION, THE SVC ROUTINE PREPARES THE WORK FOR THE I/O
+* ROUTINE AND PUTS ITS ADDRESS IN THE RXOB. WHEN THE I/O ROUTINE
+* GETS CONTROL, IT LOCATES THE RXOB AT THE BEGINNING OF THE
+* MODULE AND TAKES ITS WORK AREA ADDRESS.
+* PLEASE NOTE THAT THE I/O ROUTINE CANNOT CHANGE THE RXOB SINCE
+* IT RESIDES IN A PROTECTED STORAGE (CTS2RXO IS RENT SO IT IS
+* LOADED BY THE SYSTEM TO A PROTECTED STORAGE) WHILE THE I/O RUNS
+* IN KEY 8.
+*
+*
+* LOGIC - SVC
+* ===========
+* THE SCREENING ROUTINE RECEIVES CONTROL FROM THE SYSTEM WHEN
+* OPEN TYPE=J IS DONE.
+* IT FIRST CHECKS IF SYSPRINT ACB IS OPENED BY ACFRPTRX.
+* IF NOT, BRANCH TO THE OPEN TYPE=J SYSTEM SVC MODULE.
+* WHEN SYSPRINT ACB IS OPENED BY ACFRPTRX, THE ROUTINE HAS TO VERIFY
+* THE RXOB:
+* 1. IF THIS IS THE FIRST OPEN (NO TCB TOKEN IN THE RXOB), WE CAN
+*    CONTINUE OUR PROCESS.
+* 2. IF THIS IS NOT THE FIRST OPEN (WE HAVE TCB TOKEN IN THE EXOB),
+*    WE HAVE TO VERIFY THAT ALL OPENS WERE DONE UNDER THE SAME TASK.
+*    IF THEY ARE, THIS IS 'RE-OPEN' (ACFRPTRX OPENED AND CLOSED
+*    SYSPRINT MORE THAN ONCE) AND WE CAN USE THE CONTENT OF THE
+*    RXOB. OTHEREWISE, WE WILL NOT HANDLE THIS FILE.
+*
+*
+* LOGIC - I/O
+* ===========
+* AFTER VELIDATING THE ENVIRONMENT, THE I/O ROUTINE HANDLES THE
+* RECORD POINTED BY THE RPL.
+* ANY RECORD THAT DOES NOT MATCH AN ENTRY IN THE IGNORE LIST IS
+* SAVED IN STORGE BLOCKS. THE STORAGE BLOCKS ARE MAPPED BY CTSARUOB.
+* STORAGE BLOCK SIZE IS CONTROLLED BY:
+* 1. THE 1/M PARAMETER - IF 1, IT MEANS THAT WE BRING DATA FOR 1
+*    ENTITY ONLY, SO THE STORAGE BLOCK CAN BE SMALLER.
+*    IF M, WE BRING DATA FOR MANY ENTITIES AND THEREFORE NEED A
+*    LARGE BLOCK.
+* 2. DEFAULT AND MINIMUM SIZES DEFINED IN THE PROGRAM (EQU) FOR
+*    EACH TYPE
+* 3. IF ALLOCATEION FOR THE DFEFAULT SIZE FAILS, WE WILL DEVIDE
+*    THE SIZE BY 2 AND RETRY, UNTIL THE MINIMUM S REACHED.
+*
+*
+* EVIRONMENT VALIDATION
+* =====================
+* WHAT HAS TO BE VALIDATED:
+* - SVC SCREENING IS ACTIVE FOR THE TASK.
+* - THE SCREENING TABLE IS THE SAME.
+* - SCREENING ACTIVATION TIMESTAMP.
+* - TCBTOKEN, WHEN EXISTS IN RXOB
+*
+* SCENARIOS TO BE SUPPORTED:
+* 1. OPEN ->  I/O
+*    THERE CANNOT BE I/O WITHOUT OPEN SO IF THE SCREENING TABLE
+*    TIMESTAMP IS OK, WE CAN USE THE ADDRESSES IN THE RXOB
+*    BECAUSE NOTHING WAS * CHANGED SINCE THE LAST OPEN.
+* 2. OPEN -> OPEN -> I/O
+*    WE PROBABLY DO NOT SEE THE SECOND OPEN.  IF WE DO, WE WILL
+*    HANDLE AS IN 3.
+* 3. OPEN -> CLOSE -> OPEN -> I/O
+*    THE SECOND OPEN CAN USE THE ADDRESSES IN RXOB IF, IN
+*    ADDITION TO SCREENING TABLE TIMESTAMP VALIDATION, THE
+*    TCBTOKEN IN RXOB IS THE ACTIVE ONE.
+* 4. OPEN -> I/O -> CLOSE -> OPEN -> I/O
+*    SAME AS 3
+*
+*
+* ERROR HANDLING
+* ==============
+* 1. THE SVC AND I/O ROUTINE ISSUE THEIR ERROR MESSAGES AS WTO,
+*    AND PASS THEM BACK TO THE CALLER USING THE ERROR BLOCK
+*    POINTED BY THE RXOB. IF THE CONTROL BLOCKS VALIDATION
+*    FAILS, WE WILLNOT RETURN THE ERRIR MESSAGE TO THE CALLER
+*    BECAUSE WE ARE NOT SURE ITS ADDRESS IS OK.
+* 2. WHEN THERE IS AN ERROR IN THE SVC IT WILL SET AN INDICATION
+*    IN THE RXOB IN ORDER TO INFORM SUBSEQUENT OPEN OR I/O
+*    OPERATIONS ABOUT IT, AND WILL RETURN A RETURN CODE WHICH
+*    SHOULD FIAL THE OPEN.
+* 3. WHEN THERE IS AN ERROR IN THE I/O PROCESS, IT WILL SET AN
+*    ERROR INDICATION IN THE IOWA, IN ORDER TO INFORM SUBSEQUENT
+*    OPEN OR I/O OPERATIONS ABOUT IT AND WILL ABEND. THIS WILL
+*    CAUSE ACFRPTRX TO FAIL. THIS WILL BE SEEN BY THE C CALLER.
+*
+*
+* NOTES:
+* ======
+* 1. WHEN THE SVC SCREENING IS ACTIVE, OUR SVC SCREENING ROUTINE
+*    RECEIVES CONTROL FOR EVERY OPEN TYPE=J.
+*    BUT, WE ARE ONLY INTERESTED IN OPEN FOR SYSPRINT DONE BY
+*    ACFRPTRX. SO, FOR ANY OTHER OPEN WE GET, WE JUST PASS CONTROL
+*    TO THE STANDARD OPEN PROCESS, WHICH, WHEN ENDS, RETURNS
+*    DIRECTLY TO OUR CALLER.
+* 2. WE ASSUME THAT:
+*    2.1 THE ATTACH DONE FOR ACFRPTRX IS SYNCHRONOUS - AFTER
+*        ATTACH WE WAIT FOR THE ATTACHED TASK TO COMPLETE BEFORE
+*        PROCESS OF THE ATTACHING TASK CONTINUES.
+*    2.2 NO MULTIPLE CONCURRENT SETTING OF THE SVC SCREENING.
+*    2.3 ACFRPTRX DOES NOT ISSUE MULTIPLE I/O REQUESTS TO
+*        SYSPRINT CONCURRENTLY.
+*    IF ANY OF THE ABOVE IS NOT CORRECT, THE LOGIC WILL HAVE
+*    TO BE CHANGED TO SUPPORT IT.
+*
+*
+****************************************************************
+*
+*--------------------------------------------------------------*
+**
+**              RESETRXE MACRO
+**
+*--------------------------------------------------------------*
+*
+         MACRO
+         RESETRXE
+.*
+.**   RESET THE ERROR BLOCK.
+.**
+.**   THE CHARACTER-TYPE FIELDS ARE C-STRING SO RESETTING THEM
+.**   MEANS PUTTING X'00' AT THE BEGINNING (EMPY STRING).
+.**
+.**   THIS MACRO USES R15 AND R1.
+.*
+         PUSH  USING
+         L     R15,RXOBERRB
+         USING RXE,R15
+         CHI   R15,0
+         BE    RSEND&SYSNDX
+         XC    RXEERROR,RXEERROR       NO ERROR.
+         MVI   RXEPGM,X'00'
+         MVI   RXEFUNC,X'00'
+         MVI   RXEMSG,X'00'
+         MVI   RXEDLINE,X'00'
+         XC    RXELINE#,RXELINE#
+RSEND&SYSNDX DS 0H
+         POP   USING
+         MEND
+*
+*--------------------------------------------------------------*
+**
+**              FILLRXE MACRO
+**
+*--------------------------------------------------------------*
+         MACRO
+         FILLRXE &FUNC=,&MSG=,&LINE=,&LINELEN=,&RXOB=
+.*
+.**   FILL THE ERROR BLOCK POINTED BY RXOB
+.**
+.**   FUNC = MANDATORY. VARIABLE NAME CONTAINNG THE FUNCTION
+.** NAME FOLLOWED BY X'00'.
+.**   MSG  = MANDATORY. VARIABLE NAME CONTAINIG THE MESSAGE TEXT
+.**          CREATED BY CTSMSG1 (THE PARAMETER POINTER BY RAREA
+.**          IN THE CALL TO CTSMSG1)
+.**   LINE = OPTIONAL. VARIABLE NAME CONTAINING LINE IN ERROR.
+.**   LINELEN = MANDATORY WHEN LINE IS SPECIFIED. A REGISTER CONTAINING
+.**             LINE LENGTH.
+.**   RXOB = OPTIONAL. A REGISTER TO USE FOR RXOB BASE, IF NO
+.**          USING FOR RXOB IS IN EFFECT.
+.**
+.**   FORMAT OF MSG :
+.**   - 2 BYETES CONTAINING MESSAGE/DATA LENGTH.
+.**   - MESSAGE/DATA TEXT
+.**
+.**   THIS MACRO USES R15 AND R1.
+.*
+         PUSH  USING
+         AIF   (T'&RXOB EQ 'O').FLDO
+         L     &RXOB,=A(CTS2RXO)
+         USING (RXOB,RXOBEND),&RXOB
+.FLDO    ANOP
+         L     R15,RXOBERRB
+         CHI   R15,0
+         BE    FLEND&SYSNDX
+         USING RXE,R15
+         MVC   RXEERROR,ERRORFLG    ERROR.
+         MVC   RXEPGM(#ERRPGML),ERRPGMNM
+         MVI   RXEPGM+#ERRPGML,X'00'
+         MVC   RXEFUNC(#&FUNC.L),&FUNC
+         MVI   RXEFUNC+#&FUNC.L,X'00'
+.*  MOVE MESSAGE
+         LH    R1,&MSG                 R1 = MESSAGE LENGTH.
+         CHI   R1,L'RXEMSG-1           ENOUGH SPACE FOR MESSAGE ?
+         BNH   FLMSG&SYSNDX
+         LHI   R1,L'RXEMSG-1
+FLMSG&SYSNDX DS 0H
+         AHI   R1,-1
+         EX    R1,FLMVM&SYSNDX        MOVE MESSAGE.
+         B     *+L'*+L'FLMVM&SYSNDX
+FLMVM&SYSNDX MVC RXEMSG(0),&MSG+2
+         LA    R1,RXEMSG+1(R1)
+         MVI   0(R1),X'00'             PUT TERMINATOR.
+.*  MOVE DATA LINE, IF PASSED.
+         AIF   (T'&LINE EQ 'O').NOLINE
+         LR    R1,&LINELEN
+         CHI   R1,L'RXEDLINE-1           ENOUGH SPACE FOR MESSAGE ?
+         BNH   FLLINE&SYSNDX
+         LHI   R1,L'RXEDLINE-1
+FLLINE&SYSNDX DS 0H
+         AHI   R1,-1
+         EX    R1,FLMVD&SYSNDX        MOVE DATA LINE
+         B     *+L'*+L'FLMVD&SYSNDX
+         AIF   ('&LINE'(1,1) EQ '(').LINEREG
+FLMVD&SYSNDX MVC RXEDLINE(0),&LINE
+         AGO   .LTERM
+.LINEREG ANOP
+FLMVD&SYSNDX MVC RXEDLINE(0),0&LINE
+.LTERM   ANOP
+         LA    R1,RXEDLINE+1(R1)
+         MVI   0(R1),X'00'             PUT TERMINATOR.
+         MVC   RXELINE#,IOWLINE#       SET LINE NUMBER.
+         AGO   .FLEND
+.NOLINE  ANOP
+         MVI   RXEDLINE,X'00'
+.FLEND   ANOP
+FLEND&SYSNDX DS 0H
+         POP   USING
+         MEND
+*
+*--------------------------------------------------------------*
+**
+**                     SVC ROUTINE
+**
+*--------------------------------------------------------------*
+*
+CTS2RXO  CSECT
+CTS2RXO  AMODE 24                      THIS IS NOT REAL...  WE SET THE
+*                                      AMODE OF THE SVC SAME AS THE
+*                                      ORIGINAL.
+CTS2RXO  RMODE 24                      DO NOT CHANGE BECASUE OF THE
+*                                      I/O ROUTINE.
+         LHI   15,0                    NULLIFY THE...          WS10084
+         BR    14                      ...ROUTINE.             WS10084
+         DC    C'CTS2RXO - THIS MODULE IS OBSOLETE'            WS10084
+*
+         AGO   .END                    SKIP THE WHOLE ROUTINE  WS10084
+
+*                                      REGISTERS AT ENTRY:
+*                                      R3 -> CVT
+*                                      R4 -> TCB
+*                                      R5 -> SVRB
+*                                      R6 -> ENTRY
+*                                      R7 -> ASCB
+         USING CVT,R3
+         USING TCB,R4
+         USING RBBASIC,R5
+*--------------------------------------------------------------*
+**   SET THE ENTRY CONTROL BLOCK.
+*--------------------------------------------------------------*
+         CTS2RXOB TYPE=B               THIS SHOULD BE THE FIRST CMD.
+*
+**
+**   INITIALIZATION
+**
+**   NO NEED TO SAVE REGUSTERS... WE ARE SVC SO REGISTERS WERE
+**   SAVED BY THE SYSTEM IN THE SVRB.
+**
+**   NOTE: THE WORK AREA IS ALLOCATED HERE ONLY IF WE WILL NEED
+**         TO PRODUCE DIAGNOSTIC MESSAGES. OTHERWISE, IT WILL
+**         BE ALLOCATED LATER, AND ONLY FOR OPEN OF SYSPRINT
+**         DONE BY ACFRPTRX. FOR ALL OTHER OPEN REQUESTS, THE
+**         WORK AREA WILL NOT BE ALLOCATED.
+**
+*
+         CTSLEVEL
+*
+         LR    R12,R6                  R12 = BASE.
+         USING (CTS2RXO,CTS2RXOE),R12
+         LARL  R11,CONST
+         USING CONST,R11
+         LR    R7,R14                  R7 = R14 AT ENTRY.      BS10114
+*
+         LHI   R13,0                   NO WORK AREA YET.
+         CLI   RXOBDBGL,0              DEBUG LEVEL IS 0 ?
+         BE    LOOK4RB                 ..YES - NO NEED FOR WA YET
+*                                      ..NO --->
+         BRAS  R14,GETWA               ALLOCATE WORK AREA.
+         CHI   R15,0
+         BNE   ERRGETWA
+         USING WA,R13
+*
+*BS10111 SAM31
+*
+*
+**
+**   VERIFY WE ARE UNDER ACFRPTRX.
+**
+**   LOCATE THE FRIST RB IN TASK AND CHECK IF THE CDE POINTED
+**   BY IT IS FOR ACFRPTRX.
+**
+*
+LOOK4RB  DS    0H
+*
+         SAM31                                                 BS10111
+*
+         LHI   R9,0                    SET 'NO ACB' INDICATION.
+         L     R15,TCBRBP              R15 -> RB CHAIN (LAST RB).
+         CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,1,77),                       >
+               'TCB = ~   RB = ~',(?R4,?R15),                          >
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+RBLOOP   DS    0H                      LOOP ON RBS TO LOCATE THE FIRST
+         LHI   R8,0
+         ICM   R8,B'0111',RBCDE1-RBBASIC(R15) R8 -> CDE
+         CHI   R8,0
+         BE    CHKNXTRB                ..NO CDE, SKIP.
+         CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,1,77),                       >
+               'RBSTAB2=$  RBLINK=$   PGMNAME = _',                    >
+               (RBSTAB2-RBBASIC(R15),1,                                >
+               RBLINKB-RBBASIC(R15),3,                                 >
+               CDNAME-CDENTRY(R8),8),                                  >
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+CHKNXTRB DS    0H
+         TM    RBSTAB2-RBBASIC(R15),RBTCBNXT PREV ONE IS THE TCB?
+         BO    RBFOUND                 ..YES - FIRST RB IN TASK.
+         ICM   R15,B'0111',RBLINKB-RBBASIC(R15) R15 -> PREVIOUS RB
+         NILH  R15,X'00FF'             ZERO LEFTMOST BYTE.
+         B     RBLOOP                  CHECK IF FIRST RB ON TASK.
+RBFOUND  DS    0H
+         LHI   R8,0
+         ICM   R8,B'0111',RBCDE1-RBBASIC(R15) R8 -> CDE
+         CLC   CDNAME-CDENTRY(8,R8),=CL8'ACFRPTRX'
+         BNE   JUSTOPEN               ..NO - NOTHING TO DO, GO TO OPEN.
+*
+**   SEARCH THE OPEN ACB/DCB LIST FOR AN ACB FOR SYSPRINT.
+*
+         L     R10,RBGRS1              R10 -> OPEN INPUT R1
+         USING IFGACB,R9
+LOOK4ACB DS    0H
+         ICM   R9,B'0111',1(R10)       R9 -> ACB/DCB
+         CHI   R9,0
+         BE    NEXTACB
+         CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,1,77),                       >
+               'DDNAME:  ACB = _     DCB = _',                         >
+               (ACBDDNM,8,DCBDDNAM-IHADCB(R9),8),                      >
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+         CLI   ACBID,ACBIDVAL          ACB ?
+         BNE   NEXTACB                 NO... CHECK NEXT.
+         CLC   ACBDDNM,=CL8'SYSPRINT'  OUR ACB ?
+         BE    OURS                    YES... PROCESS.
+NEXTACB  DS    0H
+         TM    0(R10),X'80'            LAST ENTRY ?
+         BO    NOTOURS                 YES... BRANCH TO OPEN.
+         LA    R10,4(,R10)             R10 -> NEXT ENTRY IN PARM LIST.
+         B     LOOK4ACB
+NOTOURS  DS    0H
+         CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,1,77),                       >
+               'NO SYSPRINT IN OPEN PARM LIST',                        >00037400
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+*
+**   PREPARE TO GO TO OPEN WHEN WE DO NOT NEED TO SET OUR
+**   INTERCEPTION FOR THIS CALL.
+*
+JUSTOPEN DS    0H
+         LHI   R9,0
+*
+         L     R1,CVTABEND            R1 -> SECONDARY SVC      BS10114
+         L     R1,SCVTSVCT-SCVTSECT(,R1) R1 -> SVC TABLE.      BS10114
+         USING SVCENTRY,R1                                     BS10114
+         LA    R0,22                  R0 = OPEN SVC NUMBER.    BS10114
+         MH    R0,=H'8'               R0 = OPEN SVC OFFSET IN  BS10114
+*                                          SVCTABLE.           BS10114
+         AR    R1,R0                  R1 -> OPEN SVC ENTRY.    BS10114
+         L     R6,SVCEP               R6 = OPEN TYPE=J SVC ADR BS10114
+         DROP  R1                                              BS10114
+*
+         CHI   R13,0                   WORK AREA WAS ALLOCATED ?
+*BS10114 BE    OPEN                    ..NO - NO NEED TO FREE.
+         BE    JOPREPAD                ..NO - NO NEED TO FREE. BS10114
+         CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,1,77),               BS10114 >
+               'SVC ADDR = ~',(?R6),                           BS10114 >
+               RAREA=RAREA,DBGAREA=DBGAREA                     BS10114
+         BRAS  R14,FREEOPWA
+JOPREPAD DS    0H                                              BS10114
+         B     OPEN                    ALWAYS DO OPEN.
+*
+**   THE OPEN IS DONE BY ACFRPTRX AND ONE OF THE DCBS/ACBS IS
+**   FOR SYSPRINT.
+**
+*
+OURS     DS    0H                      R9-> ACB
+         CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,1,77),                       >
+               'SYSPRINT ACB = ~',(?R9),                               >00037400
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+*
+         CHI   R13,0                   WORK AREA WAS ALLOCATED ?
+         BNE   CHECKENV                ..YES - USE IT.
+*                                      ..NO - --->  ALLOCATE IT.
+         BRAS  R14,GETWA               ALLOCATE WORK AREA
+         CHI   R15,0
+         BNE   ERRGETWA
+*                                      R13 -> WORK AREA
+CHECKENV DS    0H
+         MVC   DBGLEVEL,RXOBDBGL       TAKE DEBUG LEVEL.
+         ST    R9,ACBADDR              SAVE THE ACB ADDRESS.
+*
+**   VERIFY OUR ENVIRONMENT:
+**   - IF ANY PREVIOUS ERROR, FAIL THE OPEN.
+**   - IF THE SCREENING TABLE OR ITS TIME STAMP DOES NOT MATCH OURS,
+**     FAIL THE OPEN.
+**   - IF THIS IS RE-OPEN (WE HAVE A TCB TOKEN IN RXOB), VERIFY
+**     THIS IS FOR THE SAME TCB, AND THAT THERE WAS NO PREVIOUS ERROR.
+*
+         CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,1,77),                       >
+               'RXOB (~): ~ / $ ...     SCRT = ~',                     >00037400
+               (?R12,RXOBSCRT,RXOBSTCK,8,TCBSVCA2),                    >
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+         CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,1,77),                       >
+               'RXOB: ... / $ / $ /~ ...',                     BS10111 >
+               (RXOBTCBT,16,RXOBFAIL,1,RXOBIOWA),                      >
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+         CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,1,77),               BS10111 >
+               'RXOB: ... / ~ / ~ / ~',                        BS10111 >
+               (RXOBDMGR,RXOBRUTK,RXOBOUTA),                   BS10111 >
+               RAREA=RAREA,DBGAREA=DBGAREA                     BS10111  00037500
+         CLI   RXOBFAIL,#RXOBFOK       ANY PREVIOUS FAILURE ?
+         BNE   ERRFAILF                ..YES - FAIL THE OPEN.
+         L     R8,TCBSVCA2             R8 -> SCRENEING TABLE.
+         C     R8,RXOBSCRT             SAME SCREENING TABLE ?
+         BNE   ERRSCRT                 ...NO - FAIL THE OPEN.
+         LA    R8,#SCETLEN(,R8)        R8 -> SCREENING TABLE EXTENSION.
+         USING SCE,R8
+         CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,1,77),                       >
+               'SCE (~): _ / $',(?R8,SCEEYE,4,SCESTCK,8),              >00037400
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+         CLC   SCEEYE,SCEICAT          EXTENSION IS OK ?
+         BNE   ERREYEC                 ..INCORRECT - ERROR.
+         CLC   SCESTCK,RXOBSTCK        SAME TIME STAMP ?
+         BNE   ERRSTCK                 ..INCORRECT - ERROR.
+         DROP  R8                                              BS10111
+*
+         L     R15,RXOBDMGR            R15 -> DATA MGT, RTN.   BS10111
+         CHI   R15,0                   ADDRESS EXISTS ?        BS10111
+         BE    ERRNODMR                ..NO - ERROR.           BS10111
+*
+         L     R15,RXOBRUTK            R15 -> USER TOKEN .     BS10111
+         CHI   R15,0                   ADDRESS EXISTS ?        BS10111
+         BE    ERRNOUTK                ..NO - ERROR.           BS10111
+*
+         CLC   RXOBTCBT,=XL(L'RXOBTCBT)'00'  FIRST OPEN ?
+         BE    PREPIOWA                ..YES - PREPARE TO OPEN.
+*                                      ..NO - VERIFY SAME TASK.
+         L     R15,TCBSTCB             R15 => SECONDARY TCB.
+         LA    R15,0(,R15)             PURIFY RIGHTMOST BIT.
+         CHI   R15,0                   EXISTS ?
+         BE    ERRSTCB
+         USING STCB,R15
+         CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,1,77),                       >
+               'TCB = $',(STCBTTKN,16),                                >
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+         CLC   RXOBTCBT,STCBTTKN       SAME TCB TOKEN ?
+         BNE   ERRTOKEN                ..NO - TCBS ARE MIXED...
+         DROP  R15
+         L     R15,RXOBIOWA            R15 -> IOWA
+         CHI   R15,0                   IOWA EXISTS ?
+*BS10111 BNE   ERRNOIOW                ..NO - PREVIOS OPEN WAS NOT OK.
+         BE    ERRNOIOW                ..NO - PREVIOS OPEN...  BS10111
+*                                             WAS NOT OK.      BS10111
+         USING IOWA,R15
+         CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,1,77),                       >
+               'IOWA (~): _ / ~ / $',                                  >
+               (?R15,IOWEYE,4,IOWSCRT,IOWSTCK,8),                      >
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+         CLC   IOWEYE,IOAWICAT         IS IT IOWA ?
+         BNE   ERRIOWIC                ..NO - ERROR.
+         CLI   IOWFAIL,#IOWFOK         ANY ERROR?
+         BNE   ERRIOF                  ..YES - OUT.
+         CLC   IOWSCRT,RXOBSCRT        VALIDATE...
+         BNE   ERRIOWSC
+         CLC   IOWSTCK,RXOBSTCK           ...THE IOWA...
+         BNE   ERRIOWTS
+*
+**  ALL IS OK
+*
+         RESETRXE                      RESET THE ERROR BLOCK.
+         B     PREPOPEN                PREPARE FOR 'OUR'OPEN
+         DROP  R15
+*
+**   PREPARE THE ENVIRONMENT FOR OUR I/O ROUTINE
+*
+PREPIOWA DS    0H
+         RESETRXE                      RESET THE ERROR BLOCK.
+         L     R15,TCBSTCB             R15 -> STCB
+         USING STCB,R15
+         MVC   RXOBTCBT-RXOB(,R12),STCBTTKN  PUT TCB TOKEN IN RXOB
+*                                      THIS WAY OF WRITING IS USED TO   PASS
+*                                      BYPASS REENTRANCY CHECK. SAME
+*                                      IS DONE BELOW.
+         DROP  R15
+*
+**   GET THE I/O WORK AREA + I/O ROUTINE HANDLE.
+*
+         LHI   R1,0                    GETLEN REQUEST.         BS10111
+         L     R15,RXOBDMGR            R15 -> I/O ROUTINE.     BS10111
+         BASR  R14,R15                 CALL THE I/O ROUTINE    BS10111
+*                                      WITHOUT PARAMETERS TO   BS10111
+*                                      GET ITS HANDLE LENGTH.  BS10111
+*                                      THE LENGTH IS RETURNED  BS10111
+*                                      IN R15.                 BS10111
+         LA    R8,#IOWALEN(R15)        R8 = AREA LENGTH.       BS10111
+         LHI   R2,0
+*BS10111 STORAGE OBTAIN,LENGTH=#IOWALEN,ADDR=(R1),SP=#IOWASP,COND=YES, >
+               KEY=8,LINKAGE=SYSTEM,LOC=BELOW   ALLOCATE I/O WORK AREA.
+         STORAGE OBTAIN,LENGTH=(R8),ADDR=(R1),SP=#IOWASP,      BS10111 >
+               COND=YES,KEY=8,LINKAGE=SYSTEM,LOC=BELOW         BS10111
+         CHI   R15,0
+         BNE   OPERRGIW
+*
+         LR    R2,R1                   R2 -> IOWA
+*
+         LR    R0,R1
+         LA    R1,#IOWALEN
+         LHI   R15,0
+         MVCL  R0,R14                  ZERO AREA.
+*
+         USING IOWA,R2
+         MVC   IOWEYE,IOAWICAT         ...INITIALIZE...
+         ST    R8,IOWLEN                                       BS10111
+         MVC   IOWSCRT,RXOBSCRT            ...THE ...
+         MVC   IOWSTCK,RXOBSTCK                ...I/O...
+         MVC   IOWDBGLV,DBGLEVEL                  ...WORK AREA.
+         LA    R0,#IOWALEN(R2)         R0 -> HANDLE AREA.      BS10111
+         ST    R0,IOWDMHND             SET HANDLE ADDRESS.     BS10111
+         LHI   R0,0                                            BS01111
+         IC    R0,IOWDBGLV                                     BS01111
+         ST    R0,IOWDMDBG             SET DEBUG LEVEL FOR     BS01111
+*                                      DATA MGT. ROUTINE.
+*BS10111 CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,1,77),                       >
+               'NEW IOWA (~): _ / ~ / $',                              >
+               (?R2,IOWEYE,4,IOWSCRT,IOWSTCK,8),                       >
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+         L     R15,RXOBRUTK                                    BS10111
+*BS10117 CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,1,77),               BS10111 >
+               'NEW IOWA (~): _ / ~ / $ / ~ / ~ (#)',          BS10111 >
+               (?R2,IOWEYE,4,IOWSCRT,IOWSTCK,8,                BS10111 >
+               IOWDMHND,?R15,0(R15)),                          BS10111 >
+               RAREA=RAREA,DBGAREA=DBGAREA                     BS10111  00037500
+         CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,1,77),               BS10117 >
+               'NEW IOWA (~): _ / ~ / $ ',                     BS10117 >
+               (?R2,IOWEYE,4,IOWSCRT,IOWSTCK,8),               BS10117 >
+               RAREA=RAREA,DBGAREA=DBGAREA                     BS10117  00037500
+         CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,1,77),               BS10117 >
+               'NEW IOWA    : ~ / ~ (~)',                      BS10117 >
+               (IOWDMHND,?R15,0(R15)),                         BS10117 >
+               RAREA=RAREA,DBGAREA=DBGAREA                     BS10117  00037500
+         ST    R2,RXOBIOWA-RXOB(R12)   RXOB -> IOWA.
+*                                                              BS10111
+**  CALL THE DATA MANAGEMENT ROUTINE TO INITIALIZE             BS10111
+**  ITS HANDLE.                                                BS10111
+**                                                             BS10111
+**   CALL  DMGTRTN,(STARTIO,IOWDMHND,0,0,0,0,0,                BS10111
+**               RXOBDBGL,DBGTYPE,                             BS10111
+**               DMMSGA,DMERMGAL,DMMSGL),VL                    BS10111
+*                                                              BS10111
+         XC    IOWDRMSL,IOWDRMSL       CLEAR ERROR MSG LENGTH. BS10111
+         LA    R0,STARTIO                                      BS10111
+         ST    R0,IOWDMP01              1 -> REQUEST TYPE.     BS10111
+         LA    R0,IOWDMHND                                     BS10111
+         ST    R0,IOWDMP02              2 -> HANDLE ADDRESS.   BS10111
+         LHI   R0,0                                            BS10111
+         ST    R0,IOWDMP03              3 -> RUOB ADDRESS.     BS10111
+         ST    R0,IOWDMP04              4 -> LINE TO PUT.      BS10111
+         ST    R0,IOWDMP05              5 -> LINE LENGTH       BS10111
+         ST    R0,IOWDMP06              6 -> SEGMENTS NUMBER.  BS10111
+         ST    R0,IOWDMP07              7 -> UTOKEN.           BS10111
+         LA    R0,IOWDMDBG                                     BS10111
+         ST    R0,IOWDMP08              8 -> DEBUG LEVEL.      BS10111
+         LA    R0,DBGTYPE                                      BS10111
+         ST    R0,IOWDMP09              9 -> DEBUG TYPE.       BS10111
+         LA    R0,IOWDRMSA                                     BS10111
+         ST    R0,IOWDMP10             10 -> MESSAGE AREA.     BS10111
+         LA    R0,DMERMGAL                                     BS10111
+         ST    R0,IOWDMP11             11 -> MAX MSG LENGTH.   BS10111
+         LA    R0,IOWDRMSL                                     BS10111
+         ST    R0,IOWDMP12             12 - MSG LENGTH.        BS10111
+         OI    IOWDMP12,X'80'          SET 'VL'                BS10111
+         LA    R1,IOWDMRPL             R1 -> DM RTN PARMS.     BD10111
+         L     R15,RXOBDMGR            R15 -> DATA MGT. RTN    BS10111
+         BASR  R14,R15                 CALL THE ROUTINE.       BS10111
+*                                                              BS10111
+         CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,1,77),               BS10111 >
+               'DMGT - STARTIO: RC = #     MSG = # / _',       BS10111 >
+               (?R15,DMMSGL,DMMSGA,20),                        BS10111 >
+               RAREA=RAREA,DBGAREA=DBGAREA                     BS10111  00037500
+         CHI   R15,0                   OK ?                    BS10111
+         BNE   OPERRSTI                ..NO FAIL THE OPEN.     BS10111
+         DROP  R2
+*
+**   WHEN THE ENVIRONMENT IS OK, WE HAVE TO CALL THE STANDARD OPEN
+**   PROCESS AFTER SETTING ITS RETURN ADDRESS TO OUR OPENRET ROUTINE.
+**   OUR OPENRET ROUTINE WILL DO THE REQUIRED SETTINGS AND WILL
+**   RETURN TO THE CALLER.
+**
+**   WE ASVAE THE CALLER REGISTERS IN OUR WORK AREA, AND REPLACE
+**   THE CALLER SAVE AREA AND THE CALLER RETURN ADDRESS WITH OUR
+**   ADDRESS.  WHEN THE SVC TERMINATES, CONTORL WILL BE RETURNED
+**   TO US TO SET OUR I/O ROUTINE IN THE ACB. THEN WE WILL RETURN
+**   TO THE CALLER USING ITS REGISTERS AS WE SAVED IN OUR WORK AREA.
+*
+PREPOPEN DS    0H
+         ST    R9,ACBADDR              SAVE OUR ACB ADDRESS.
+*
+         MVC   SACALLER(16*4),RBGRSAVE SAVE CALLER REGISTER IN OUR WA.
+*                                      TO BE USED WHEN WE RETURN TO
+*                                      CALLER.
+         LARL  R14,OPENRET             R14 = OPEN RETURN ADDRESS.
+         LHI   R15,0
+         ICM   R15,B'1000',RBGRS14     R15 - LEFTMOST BYTE OF RET ADDR.
+         NILH  R15,X'8000'             LEAVE ONLY AMODE BIT.
+         OR    R14,R15                 SET OPENRET AMODE AS CALLER.
+         STM   R13,R14,RBGRS13         PUT R13 (WA) AND R14 (OPENRET)
+*                                      IN SVRB  SO THAT:
+*                                      - OPEN RETURNS TO US (R14)
+*                                      - WHEN OPEN "RETURNS" TO US
+*                                        WE WILL HAVE THE ADDRESS OF
+*                                        THE WORK AREA.
+**                                                             BS10114
+**                                                             BS10114
+**   LOOK FOR THE IBM OPEN TYPE=J MODULE AND CALL IT.          BS10114
+**                                                             BS10114
+**   ACTUALLY WE DO NOT NEED THE FILE TO BE OPENED BECAUSE     BS10114
+**   WE REPLACE THE I/O ROUTINE ADDRESS AND SAVE THE DATA      BS10114
+**   INSTORAGE. BUT, THE OPEN PROCESS IS NEEDED FOR CORRECT    BS10114
+**   PROCESSING OF THE I/O ROUTINES EXECUTED BEFORE WE ARE     BS10114
+**   CALLED, AND BY THE CLOSE PROCESS.                         BS10114
+**                                                             BS10114
+**   THE STRAIGHT-FORWARD WAY TO CALL THE OPEN PROCESS IS TO   BS10114
+**   TAKE ITS ADDRESS FROM THE SVCTABLE (AS WE DO FOR FILES    BS10114
+**   THAT WE DO NOT PROCESS). BUT, IN CASE ANY PRODUCT SET ITS BS10114
+**   FRONT-END THERE, WE WILL CALL THIS FRONT-END.  THIS       BS10114
+**   FRONT-END MAY DO THE SAME 'TRICK' AS WE DO IN ORDER TO    BS10114
+**   GET CONTORL AFTER OPEN IS DONE AND/OR GET THE DATA WRITTEN S10114
+**   TO THE FILE, AND BY DOING THIS, IT MAY THROW US AWAY FROM BS10114
+**   THE PROCESS.                                              BS10114
+**                                                             BS10114
+**   TO PREVENT THIS FROM HAPENNING, AND STILL HAVE THE FILE   BS10114
+**   OPEN PROCESS, WE LOOK FOR THE SYSTEM OPEN TYPE=J SVC MODULE 10114
+**   IGC0002B AND CALL IT.                                     BS10114
+*                                                              BS10114
+         CSVQUERY INEPNAME=SVC22NM,                            BS10114 >
+               SEARCH=LPA,                                     BS10114 >
+               OUTEPA=SVC22EPA,                                BS10114 >
+               OUTATTR2=SVC22ATR,                              BS10114 >
+               MF=(E,CSQ)                                      BS10114
+         CHI   R15,0                   OK ?                    BS10114
+         BNE   OPERRCSQ                ..NO - ERROR.           BS10114
+         L     R6,SVC22EPA             R6 -> SVC 22 EP.        BS10114
+         TM    SVC22ATR,B'00110000'    AMODE 31 OR ANY ?       BS10114
+         BZ    PREPOEND                                        BS10114
+         OILH  R6,X'8000'              SET AMODE 31.           BS10114
+PREPOEND DS    0H                                              BS10114
+         CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,1,77),               BS10114 >
+               'S22: EPA = ~    ATTR = $   R6 = ~',            BS10114 >
+               (SVC22EPA,SVC22ATR,1,?R6),                      BS10114 >
+               RAREA=RAREA,DBGAREA=DBGAREA                     BS10114
+         B     OPEN                    GO OPEN THE FILE.       BS10114
+*
+**   GO DO OPEN TYPE=J.
+*
+*BS10114
+*BS10114 FOR OPEN FOR OUR ACB, WE WILL HAVE A WORK AREA, WHILE FOR
+*BS10114 OPEN OR ANOTHER ACB/DCB, WE WON'T (EVEN IF WE HAD, WE JUST
+*BS10114 RELEASED IT BEFORE GETTING HERE). THIS IS WHY WE CHECK R13
+*BS10114 BEFORE PRODUCING THE DIAGNOSTIC MESSAGE.
+*BS10114
+*BS10114 OPEN     DS    0H
+*BS10114 CHI   R13,0                   SAVE AREA EXISTS ?
+*BS10114 BE    OPENDO                  ..NO - SKIP DIAG.
+*BS10114 CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,1,77),                      >
+*BS10114       'CALL OPEN',                                           >
+*BS10114       RAREA=RAREA,DBGAREA=DBGAREA
+*BS10114
+*BS10114 OPENDO   DS    0H
+*BS10114 L     R1,CVTABEND            R1 -> SECONDARY SVC
+*BS10114 L     R1,SCVTSVCT-SCVTSECT(,R1) R1 -> SVC TABLE.
+*BS10114 USING SVCENTRY,R1
+*BS10114 LA    R0,22                  R0 = OPEN SVC NUMBER.
+*BS10114 MH    R0,=H'8'               R0 = OPEN SVC OFFSET IN SVCTABLE.
+*BS10114 AR    R1,R0                  R1 -> OPEN SVC ENTRY.
+*BS10114 L     R6,SVCEP               R6 = OPEN TYPE=J SVC ADDRESS.
+*BS10114 DROP  R1
+*                                                              BS10114
+**   RESOTRE REGISTERS AND CALL OPEN                           BS10114
+**                                                             BS10114
+**   - R0-R1 ARE RESTORED FROM THE SVRB BECAUSE THEY SHOULD    BS10114
+**     HAVE THE VALUE FROM WHEN THE SVC INSTRCUTION WAS        BS10114
+**     ISSUED.                                                 BS10114
+**   - R2 IS NOT RESOTORED BECAUSE IT IS USED AS A WORK        BS10114
+**     REGISTER BY SYSTEM.                                     BS10114
+**   - R3-R5 ARE NOT CHNAGED BY THE PROGRAM AND THEREFORE      BS10114
+**     ARE NOT RESTORED.                                       BS10114
+**   - R6 IS LOADED WITH THE OPEN SVC EP.                      BS10114
+**   - R7 WHICH WE USED TO SAVE THE RETURN ADDRESS, IS         BS10114
+**     RESTORED TO ITS VALUE AT ENTRY (-> ASCB).               BS10114
+**   - R8-R12 ARE NOT RESOTORED BECAUSE THEY ARE USED AS       BS10114
+**     WORK REGISTERS BY SYSTEM.                               BS10114
+**   - R13 IS RESTORED FROM THE SVRB BECAUSE IT SHOULD         BS10114
+**     HAVE THE VALUE FROM WHEN THE SVC INSTRCUTION            BS10114
+**   - R14 IS RESTORED FROM R7, WHERE WE KEPT THE RETURN       BS10114
+**     RETURN ADDRESS.                                         BS10114
+**     HAVE THE VALUE FROM WHEN THE SVC INSTRCUTION            BS10114
+**   - R15 IS RESTORED FROM THE SVRB BECAUSE IT SHOULD         BS10114
+**     HAVE THE VALUE FROM WHEN THE SVC INSTRCUTION            BS10114
+**                                                             BS10114
+**
+**   AFTER CALLING OPEN TYPE=J SVC, CONTROL WILL RETURNED
+**   TO OUR OPENRET ROUTINE BELOW (WHEN SYSPRINT IS OPENED BY
+**   ACFRPTRX) OR DIRECTLY TO THE CALLER (FOR ALL OTHER OPEN'S)
+**
+*                                                              BS10114
+OPEN     DS    0H                                              BS10114
+*BS10114 LM    R0,R5,RBGRS0            RESTORE R0 AND R1 AT ENTRY.
+*BS10114 LM    R7,R15,RBGRS7            RESTORE R0 AND R1 AT ENTRY.
+         LM    R0,R1,RBGRS0            RESTORE R0-R1           BS10114
+         LR    R14,R7                  RESTORE RETURN ADDRESS. BS10114
+         L     R7,PSAAOLD-PSA          RESTORE R7.             BS10114
+         L     R13,RBGRS13             RESTORE R13             BS10114
+         L     R15,RBGRS15             RESTORE R15.            BS10114
+         BSM   0,R6                    CALL OPEN TYPE=J SVC.
+*                                      - WHEN "OUR" ACB, OPEN WILL      TO
+*                                        RETURH TO OPENRET ROUTINE.
+*                                      - WHEN NOT "OUR" ACB, OPEN WILL
+*                                        RETURN TO THE CALLER.
+* * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * * *
+*
+**   ISSUE ERROR MESSAGES AND RETURN
+**
+**   WE WILL REACH THIS CODE ONLY WHEN AN ERROR OCCURS BEFORE
+**   CALLING THE OPEN TYPE=J SVC.
+**
+**   WHEN WE CALL OPEN, IT WILL RETURN EITHER TO THE CALLER
+**   OR TO OUT OPEN-RETURN CODE.
+*
+ERRGETWA DS    0H
+         WTO   'CTS2RXO:SVCRTN - OBTAIN FOR OPEN WORK AREA FAILED'      00037400
+         LR    R10,R12
+         MVI   RXOBFAIL-RXOB(R12),#RXOBFFL  SET 'FAILED'
+         B     RC8
+*
+**   ENVIRONMENT ERRORS
+**
+**   WHEN THE ENIRONMENT IS NOT VALID, WE CANNOT RETURN THE ERROR
+**   MESSGAE TO THE CALLER.
+*
+ERRFAILF DS    0H                      FAIL FLAG IS ON
+         LA    R1,MRFAILF-MSGRTN
+         B     ERRHANDL
+ERRSCRT  DS    0H                      DIFFERENT SCREENING TABLE
+         LA    R1,MRSCRT-MSGRTN
+         B     ERRHANDL
+ERREYEC  DS    0H                      INVALID SCREENING TABLE EXT.
+         LA    R1,MREYEC-MSGRTN
+         B     ERRHANDL
+ERRSTCK  DS    0H                      TIME STMAPS DO NOT MATCH
+         LA    R1,MRSTCK-MSGRTN
+         B     ERRHANDL
+ERRSTCB  DS    0H                      STCB ADDRESS IS 0
+         LA    R1,MRSTCB-MSGRTN
+         B     ERRHANDL
+ERRTOKEN DS    0H                      TCB TOKEN DOES NOT MATCH RXOB.
+         LR    R0,R15                  R0 -> STCB
+         LA    R1,MRTOKEN-MSGRTN
+         B     ERRHANDL
+ERRNODMR DS    0H                      NO DATA MGT. RTN ADDR.  BS10111
+         LA    R1,MRNODMRT-MSGRTN                              BS10111
+         B     ERRHANDL                                        BS10111
+ERRNOUTK DS    0H                      NO RUOB UTOKEN ADDR.    BS10111
+         LA    R1,MRNOUTK-MSGRTN                               BS10111
+         B     ERRHANDL                                        BS10111
+ERRNOIOW DS    0H                      REOPEN BUT NO IOWA
+         LA    R1,MRNOIOW-MSGRTN
+         B     ERRHANDL
+ERRIOF   DS    0H                      I/O ERROR FLAG IS ON.
+         LR    R0,R15                  R0 -> IOWA
+         LA    R1,MRIOF-MSGRTN
+         B     ERRHANDL
+ERRIOWIC DS    0H                      IOWA EYE-CATCHER INVALID.
+         LR    R0,R15                  R0 -> IOWA
+         LA    R1,MRIOWIC-MSGRTN
+         B     ERRHANDL
+ERRIOWSC DS    0H                      SCRT POINTER IS NOT CORRECT.
+         LR    R0,R15                  R0 -> IOWA
+         LA    R1,MRIOWSC-MSGRTN
+         B     ERRHANDL
+ERRIOWTS DS    0H                      TIMESTAMP IS NOT CORRECT
+         LR    R0,R15                  R0 -> IOWA
+         LA    R1,MRIOWTS-MSGRTN
+         B     ERRHANDL
+OPERRGIW DS    0H                      GETMAIN FOR IOWA FAILED.
+         LR    R0,R8                   R0 - AREA LEN FOR MSG   BS10111
+         LA    R1,MRERRGIW-MSGRTN
+         B     ERRHANDL
+OPERRSTI DS    0H                                              BS10111
+         LR    R0,R15                  R0 = RC                 BS10114
+         LA    R1,MRERRSIO-MSGRTN                              BS10111
+         B     ERRHANDL                                        BS10111
+OPERRCSQ DS    0H                                              BS10111
+         LR    R0,R15                  R0 = RC                 BS10114
+         LA    R1,MRERRCSQ-MSGRTN                              BS10114
+         B     ERRHANDL                                        BS10114
+ERRHANDL DS    0H
+         LARL  R15,MSGRTN
+         BALR  R14,R15
+*
+**  RETURN TO CALLER AFTER ERROR.
+**
+**  IF ALL OK, WE DO NOT RETURN FROM HERE...  EITHER OPEN RETURNS TO
+**  THE CALLER, OR TO OUR OPEN-RETURN ROUTINE.
+*
+RC8      DS    0H
+         LHI   R15,8                   SET RETURN CODE.
+         B     OUT
+OUT      DS    0H
+         LR    R5,R15                  SAVE RC.
+         BRAS  R14,FREEOPWA            FREE THE WORK AREA.
+         LR    R15,R5                  RESTORE RC.
+         L     R14,RBGRS14             RESTORE R14.
+         BSM   0,R14                   RETURN TO CALLER.
+         DROP  ,
+CTS2RXOE DS    0H
+*----------------------------------------------------------------
+*
+**  GET OPEN WORK AREA.
+**
+**  OUTPUT:  R13 -> WORK AREA.
+**
+**  THIS ROUTINE DESTROYS R0, R1, R2, R14 AND R15
+**
+*
+*----------------------------------------------------------------
+GETWA    DS    0H
+         LR    R2,R14                  SAVE RETURN ADDRESS.
+*
+         BASR  R13,0
+         USING (*,GETWAE),R13          WE NEED IT FOR STORAGE
+         STORAGE OBTAIN,LENGTH=#WALEN,ADDR=(R1),SP=#WASP,COND=YES,     X
+               LINKAGE=SYSTEM,LOC=BELOW,KEY=8
+*                                      ALLOCATE IN TASK-RELATED SP
+         DROP  R13
+         LHI   R13,0                   RESTORE R13.
+*
+         CHI   R15,0
+         JNE   GETWARET
+*
+         LR    R13,R1
+*
+         LR    R0,R1
+         LA    R1,#WALEN
+         LHI   R15,0
+         MVCL  R0,R14                  ZERO AREA.
+*
+         LHI   R15,0                   SET RETURN CODE
+GETWARET DS    0H
+         LR    R14,R2                  RESTORE RETURN ADDRESS.
+         BR    R14                     RETURN
+         DROP  ,
+GETWAE   DS    0H
+*
+*----------------------------------------------------------------
+*
+**  FREE OPEN WORK AREA.
+**
+**  INPUT:  R13 -> WORK AREA / = 0
+**
+**  THIS ROUTINE DESTROYS R0, R1, R2, R14 AND R15
+**
+*
+*----------------------------------------------------------------
+FREEOPWA DS    0H
+         LTR   R1,R13                  WORK AREA WAS ALLOCATED ?
+         JZ    FREWAEND                ..NO - NO NEED TO FREE.
+*
+         LR    R2,R14                  SAVE RETURN ADDRESS.
+         BASR  R13,0
+         USING (*,FREEOPAE),R13
+*
+         STORAGE RELEASE,LENGTH=#WALEN,ADDR=(R1),SP=#WASP,COND=YES,    X
+               LINKAGE=SYSTEM,KEY=8
+         DROP  R13
+         LHI   R13,0                   NO WORK AREA
+         CHI   R15,0
+         JE    FREWARET                GO TO OPEN THE FILES.
+*                                      OPEN WILL RETURN TO OUR CALLER.
+         WTO   'CTSXXXX: CTS2RXO - RELEASE OF OPEN WORK AREA FAILED'    00037400
+FREWARET DS    0H
+         LR    R14,R2                  RESTORE RETURN ADDRESS.
+FREWAEND DS    0H
+         BR    R14                     RETURN
+         DROP  ,
+FREEOPAE DS    0H
+*----------------------------------------------------------------
+*
+**  HANDLE ERRORS.
+**
+**  R0 - MESSGAE DEPENDENT DATA.
+**  R1 -> SECTION TO EXECUTE.
+**
+*
+*  BS10111
+*  DIAG LEVEL WAS CHANGED FROM 0 TO 255.
+*----------------------------------------------------------------
+MSGRTN   DS    0H
+         USING CONST,R11
+         USING WA,R13
+         STM   R0,R14,SAMSGRTN          SAVE REGISTERS.
+         LR    R9,R15                  R9 - BASE.
+         USING (MSGRTN,MSGRTNE),R9
+*
+         LARL  R12,RXOB
+         USING (RXOB,RXOBEND),R12
+*
+         B     MSGRTN(R1)
+*
+**   ENVIRONMENT ERRORS
+**
+**   WHEN THE ENIRONMENT IS NOT VALID, WE CANNOT RETURN THE ERROR
+**   MESSGAE TO THE CALLER.
+*
+MRFAILF  DS     0H                      FAIL FLAG IS ON
+         MVC   M254RSN,=CL15'(O) PREV OPENF'
+         B     MRM254
+MRSCRT   DS    0H                      DIFFERENT SCREENING TABLE
+         USING TCB,R4
+         MVC   M254RSN,=CL15'(O) SCRT NMATCH'
+         CTSADBG TYPE=WTO,LEVEL=(DBGLV255,255),                        >
+               'SCREENING TABLE ADDRESS MISMATCH: ~ / ~',              >00037400
+               (TCBSVCA2,RXOBSCRT),                                    >
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+         DROP  R4
+         B     MRM254
+MREYEC   DS    0H                      INVALID SCREENING TABLE EXT.
+         USING SCE,R8
+         MVC   M254RSN,=CL15'(O) SCE EYEC'
+         CTSADBG TYPE=WTO,LEVEL=(DBGLV255,255),                        >
+               'SCE EYE CATCHER IS INVALID: ~ - _',                    >00037400
+               (?R8,SCEEYE,4),                                         >
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+         DROP  R8
+         B     MRM254
+MRSTCK   DS    0H                      TIME STMAPS DO NOT MATCH
+         USING SCE,R8
+         MVC   M254RSN,=CL15'(O) SCE NOMTCH'
+         CTSADBG TYPE=WTO,LEVEL=(DBGLV255,255),                        >
+               'TIME STAMPS DO NOT MATCH: ~/$   ~/$',                  >00037400
+               (?R12,16,RXOBSTCK,?R8,16,SCESTCK),                      >
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+         DROP  R8
+         B     MRM254
+MRSTCB   DS    0H                      STCB ADDRESS IS 0
+         USING TCB,R4
+         MVC   M254RSN,=CL15'(O) NO STCB'
+         CTSADBG TYPE=WTO,LEVEL=(DBGLV255,255),                        >
+               'TCB = ~    TCBSTCB = ~',                               >00037400
+               (?R4,TCBSTCB),                                          >
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+         DROP  R4
+         B     MRM254
+MRTOKEN DS     0H                      TCB TOKEN DOES NOT MATCH RXOB.
+         LR    R15,R0
+         MVC   M254RSN,=CL15'(O) TKN NOMTCH'
+         CTSADBG TYPE=WTO,LEVEL=(DBGLV255,255),                        >
+               'TOKENS: $ (STCB) / $ (RXOB)',                          >00037400
+               (STCBTTKN-STCB(,R15),16,RXOBTCBT,16),                   >
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+         B     MRM254
+MRNOIOW  DS     0H                     REOPEN BUT NO IOWA
+         MVC   M254RSN,=CL15'(O) ROPN NOIOWA'
+         B     MRM254
+MRIOF    DS    0H                      I/O FLAG IS ON.
+         MVC   M254RSN,=CL15'(O) ROPN IOERR'
+         B     MRM254
+MRIOWIC DS     0H                      IOWA EYE-CATCHER INVALID.
+         MVC   M254RSN,=CL15'(O) ROPN IOWIC'
+         LR    R15,R0                  R15 -> IOWA
+         USING IOWA,R15
+         CTSADBG TYPE=WTO,LEVEL=(DBGLV255,255),                        >
+               'IOWA EYE-CATHER = _',(IOWEYE,4),                       >00037400
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+         DROP  R15
+         B     MRM254
+MRNODMRT DS    0H                      NO DATA MGT. RTN ADDR.  BS10111
+         MVC   M254RSN,=CL15'(O) NO DM RTN'                    BS10111
+         B     MRM254                                          BS10111
+MRNOUTK  DS    0H                      NO UTOKEN ADDRESS.      BS10111
+         MVC   M254RSN,=CL15'(O) NO UTOKEN'                    BS10111
+         B     MRM254                                          BS10111
+MRIOWSC DS     0H                      SCRT POINTER IS NOT CORRECT.
+         MVC   M254RSN,=CL15'(O) ROPN IOWSC'
+         LR    R15,R0                  R15 -> IOWA
+         USING IOWA,R15
+         CTSADBG TYPE=WTO,LEVEL=(DBGLV255,255),                        >
+               'SCRT:  RXOB = ~    IOWA = ~',                          >00037400
+               (RXOBSCRT,IOWSCRT),                                     >
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+         DROP  R15
+         B     MRM254
+MRIOWTS DS     0H                      TIMESTAMP IS NOT CORRECT
+         MVC   M254RSN,=CL15'(O) ROPN IOWTS'
+         LR    R15,R0                  R15 -> IOWA
+         USING IOWA,R15
+         CTSADBG TYPE=WTO,LEVEL=(DBGLV255,255),                        >
+               'TIMESTAMP:  RXOB = $    IOWWA = $',                    >00037400
+               (RXOBSTCK,8,IOWSTCK,8),                                 >
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+         DROP  R15
+         B     MRM254
+MRM254   DS    0H
+         LR    R10,R12
+         MVI   RXOBFAIL-RXOB(R12),#RXOBFFL  SET 'FAILED'
+         CTSMSG1 CODE=CTS254E,ROUT=WTO,RAREA=RAREA,                    >
+               PLANT=(15,M254RSN)
+         B     MROUT
+*
+**  IOWA GETMAIN FAILED - MESSAGE CAN BE RETURNED.
+*
+MRERRGIW DS    0H                      GETMAIN FOR IOWA FAILED.
+         MVI   RXOBFAIL-RXOB(R12),#RXOBFFL  SET 'FAILED'
+         CTSAN2C CHARRC                TRANSLATE RC
+*BS10111 LHI   R15,#IOWALEN
+         LR    R15,R0                  R15 = LENGTH.           BS10111
+         CTSAN2C NUMCHAR,LEN=7         TRANLATAE LENGTH,
+         LHI   R15,#IOWASP
+         CTSAN2C SPNUM,LEN=3           TRANSLATE SP NUM.
+         LR    R15,R10                 IOWA TABLE ADDRESS.
+         CTSAN2C M251ADDR,MODE=HEX TRANSALTE ADDRESS.
+         MVC   M251ACT,=CL7'OBTAIN'
+         MVC   M251CBNM,=CL8'IOWA'
+         CTSMSG1 CODE=CTS251E,ROUT=(WTO,NO),RAREA=RAREA,               >
+               PLANT=(7,M251ACT,8,M251CBNM,8,M251ADDR,7,NUMCHAR,3,     >
+               SPNUM,,2,CHARRC)
+         B     MRFILRXE                                        BS10111
+*                                                              BS10111
+**  DATA MANAGEMENT ROUTINE - STARTIO REQUEST FAILED.          BS10111
+*                                                              BS10111
+MRERRSIO DS    0H                      STARTIO REQUEST FAILED..BS10111
+         OC    DMMSGL,DMMSGL           MESSAGE RETURNED ?      BS10111
+         BNZ   MRMSGSIO                ..YES - USE IT.         BS10111
+         LR    R15,R0                  GET RC,                 BS10114
+         CTSAN2C CHARRC                TRANSLATE RC            BS10111
+*BS10114 CTSMSG1 CODE=CTS253E,ROUT=(WTO,NO),RAREA=RAREA,       BS10111>
+         CTSMSG1 CODE=CTS261E,ROUT=(WTO,NO),RAREA=RAREA,       BS10111 >
+               PLANT=(8,=CL8'CTSARUH',8,=CL8'STARTIO',         BS10111 >
+               2,CHARRC)                                       BS10111
+         B     MRFILRXE                                        BS10111
+MRMSGSIO DS    0H                      HANDLE MSG FROM IORTN   BS10111
+         MVC   RAREA(#DMRMSAL),DMMSG+2  MOVE MESSAGE TO RAREA  BS10111
+         MVC   WTOL(WTOML),WTOM                                BS10111
+         WTO   TEXT=RAREA,MF=(E,WTOL) WTO THE MESSAGE.         BS10111
+         B     MRFILRXE                                        BS10114
+*                                                              BS10114
+**  CSVQUERY FOR IGC0002B FAILED.                              BS10114
+*                                                              BS10114
+MRERRCSQ DS    0H                      STARTIO REQUEST FAILED..BS10114
+         LR    R15,R0                  GET RC,                 BS10114
+         CTSAN2C CHARRC                TRANSLATE RC            BS10114
+         CTSMSG1 CODEMSG=CTS261E,ROUT=(WTO,NO),RAREA=RAREA,    BS10114 >
+               PLANT=(8,=CL8'CTSARXO',8,=CL8'CSVQUERY',        BS10114 >
+               2,CHARRC)                                       BS10114
+         B     MRFILRXE                                        BS10114
+*
+MRFILRXE DS    0H                                              BS10111
+         FILLRXE FUNC=ERRSVC,MSG=RAREA FILL THE ERROR BLOCK.
+MROUT    DS    0H
+         LM    R0,R14,SAMSGRTN
+         BR    R14
+MSGRTNE  DS    0H
+*
+*----------------------------------------------------------------
+**
+**   OPENRET ROUTINE
+**
+**   WHEN OPEN RETURNS TO US, WE HAVE TO PUT OUR I/O ROUTINE ADDRESS
+**   IN THE ACB IN ORDER TO INTERCEPT THE DATA WRITTAN TO IT.
+**
+**   R13 -> WORK AREA.
+**
+**   *** ATTENTION ***
+**   THIS CODE RECEIVES CONTROL UNDER OPEN CALLER ENVIRONMENT WHICH
+**   MIGHT BE NOT-AUTHORIZED. THEREFORE, IT SHOULD *NOT* UPDATE THE
+**   RXOB.
+**
+**   NOTE:
+**   WE DO NOT RELEASE THE IOWA IN CASE OD ERROR BECAUSE IT IS
+**   ALLOCATED IN SUBPOOL 230 WHICH IS TASK RELATES SO IT WILL
+**   BE RELEASED AUTOMATICALLY WHEN THE TAK ENDS.
+**
+*----------------------------------------------------------------
+OPENRET  DS    0H
+         USING WA,R13
+         STM   R0,R15,SAOPRETE         SAVE REGISTERS AT ENTRY TO
+*                                      OPENRET:
+*                                      R13 -> WA
+*                                      R15  - OPEN RETURN CODE.
+         LR    R15,R13                 SAVE WORK AREA ADDRESS.
+         LM    R0,R14,SACALLER         RESTORE CALLER REGISTERS.
+         BAKR  R14,0                   SAVE CALLER REGISTERS IN LE.
+         LR    R13,R15                 RESTORE WORK AREA ADDRESS.
+*
+         BASR  R10,0                   R10 = BASE REGISTER.
+         USING (*,OPENRETE),R10
+         LARL  R12,RXOB                R12 -> RXOB
+         USING (RXOB,RXOBEND),R12
+         LARL  R11,CONST               R11 -> CONSTANTS AREA
+         USING CONST,R11
+*
+         L     R15,SAOPRETE+(15*4)     R15 = OPEN TYPE=J RETURN CODE.
+         CTSADBG TYPE=WTO,LEVEL=(DBGLEVEL,1,77),                       >
+               'OPEN RC = #',(?R15),                                   >00037400
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+*
+         CHI   R15,0                   OPEN OK ?
+         BNE   ORRET                   ..NO - RETURN TO CALLER.
+         L     R9,ACBADDR              R9 -> OUR ACB
+         USING IFGACB,R9
+         CTSADBG TYPE=WTO,LEVEL=(DBGLEVEL,1,77),                       >
+               'OPENRET: ACB (~) -> $ / $ / $ / ~  (~ / ~)',           >
+               (?R9,ACBID,1,ACBOFLGS,1,ACBINRTN+1,3,ACBAPID,           >
+               =A(IORTN),RXOBIOWA),                                    >
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+         CLI   ACBID,ACBIDVAL          ACB ?
+         BNE   ORERRACB                NO... ERROR.
+         TM    ACBOFLGS,ACBOPEN        OPEN OK ?
+         BZ    ORRET                   NO... OUT.
+*
+**   CHECK IF WE ARE ALREADY IN THE ACB (RE-OPEN ?)
+**   I DON'T KNOW IF THIS CAN HAPPEN AT ALL.....
+**
+**   IF WE ARE, VERIFY THAT OUR ENVIRONMENT IS SET OK.
+*
+         CLC   ACBINRTN+1(3),=AL3(IORTN) ARE WE ALREADY THERE ?
+         BNE   ORSET                   ..NO - SET.
+         L     R3,ACBAPID
+         CHI   R3,0                    IOWA IS THERE ?
+         BE    ORERRNIW                ..NO - ERROR.
+         C     R3,RXOBIOWA             IOWA ADDRESS OK ?
+         BNE   ORERRNIW                ..NO - ERROR.
+         USING IOWA,R3
+         CLC   IOWEYE,IOAWICAT
+         BNE   ORERRIOW
+         BE    ORRET                   ..YES - ALL IS IN PLACE.
+         DROP  R3
+*
+**   SET OUR I/O ROUTINE AND WORK AREA ADDRESS IN THE ACB.
+*
+ORSET    DS    0H
+         L     R3,RXOBIOWA             R3 -> IOWA
+         CHI   R3,0                    IOWA EXISTS ?
+         BE    ORERRNIW                NO IOWA - ERROR.
+         USING IOWA,R3
+*
+         XC    IOWJESAD,IOWJESAD
+         MVC   IOWJESAD+1(3),ACBINRTN+1 SAVE ORIGINAL I/O ROUTINE.
+         MVC   ACBINRTN+1(3),=AL3(IORTN) SET OUR I/O RTN IN ACB.
+         ST    R3,ACBAPID              PASS I/O WORK AREA TO I/O RTN
+         CTSADBG TYPE=WTO,LEVEL=(DBGLEVEL,1,77),                       >
+               'ACBINTRN = ~    ACBAPID = ~ -> _,~',                   >00037400
+               (ACBINRTN,ACBAPID,IOWEYE,4,IOWSCRT),                    >
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+         B     ORRET
+*
+**   ISSUE ERROR MESSAGES AND RETURN TO CALLER.
+**
+**   IF ENVIRONMENT IS INVALID, WE CANNOT RETURN THE ERORR MESSAGE,
+*
+ORERRNIW DS    0H                      ENVIRONMENT ERROR = IOWA
+         MVC   M254RSN,=CL15'(R) IOWA PTRS'
+         CTSADBG TYPE=WTO,LEVEL=(DBGLV255,255),                        >
+               'OPENRET - IOWA PTRS = ~ / ~',                          >
+               (RXOBIOWA,ACBAPID),                                     >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         B     ORERRMSG
+ORERRIOW DS    0H                      ENVIRONMENT ERROR = IOWA
+         MVC   M254RSN,=CL15'(R) IOWA EYEC'
+         CTSADBG TYPE=WTO,LEVEL=(DBGLV255,255),                        >
+               'OPENRET - IOWA = _ / ~',                               >
+               (IOWEYE,4,IOWSCRT),                                     >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         B     ORERRMSG
+ORERRACB DS    0H                      ENVIRONMENT ERROR - ACB PTRS.
+         MVC   M254RSN,=CL15'(R) ACB PTRS'
+ORERRMSG DS    0H                      ENVIRONMENT ERROR.
+         CTSADBG TYPE=WTO,LEVEL=(DBGLV255,255),                        >
+               'OPENRET - ACB = ~ / $ / $ / ~   IORTN = ~',            >
+               (?R9,ACBIDVAL,1,ACBINRTN+1,3,ACBAPID,=A(IORTN)),        >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         CTSMSG1 CODEMSG=CTS254E,ROUT=WTO,RAREA=RAREA,                 >
+               PLANT=(15,M254RSN)
+         LHI   R15,8
+         B     ORFRWA
+*
+**  RETURN TO CALLER.
+*
+ORRET    DS    0H
+         L     R15,SAOPRETE+(R15*4)     R15 = OPEN TYPE=J RC.
+ORFRWA   DS    0H
+         CTSADBG TYPE=WTO,LEVEL=(DBGLEVEL,1,77),                       >
+               'RETURN: RC = #',(?R15),                                >00037400
+               RAREA=RAREA,DBGAREA=DBGAREA                              00037500
+         LR    R5,R15                  SAVE RC
+         BRAS  R14,FREEOPWA
+         LR    R15,R5                  RESTORE RC.
+*
+         PR                            RETURN TO CALLER.
+         DROP  ,
+*
+OPENRETE DS    0H
+*
+*----------------------------------------------------------------
+*
+**  I/O ROUTINE
+*
+*----------------------------------------------------------------
+CTS2RXO  CSECT
+IORTN    DS    0H
+         BSM   R14,0                   SET CURRENT AMODE IN R14.
+         STM   R14,R12,12(R13)         SAVE REGISTERS.
+         LR    R10,R15
+         USING (IORTN,IORTNE),R10
+         LARL  R11,CONST
+         USING CONST,R11
+         LARL  R12,RXOB                R10 -> RXOB
+         USING (RXOB,RXOBEND),R12
+*
+         LHI   R15,0                   SET DEFAULT RC.
+         LR    R6,R0                   R6 = RPL REQUEST.
+*
+         LA    R7,0(,R1)               R7 -> RPL  (PURIFIED)
+         USING IFGRPL,R7
+         CL    R6,=A(RPLPUT)           PUT ?
+         BNE   IOOUT                   ..NO - NOTHING TO DO.
+*
+**  TAKE INPUT PARAMETERS AND PURIFY
+**
+**  WE DO NOT USE RPLCCHAR BECAUSE WE IGNORE THE ASA/MACHINE CODE
+**  POINTED BY IT.
+*
+         L     R5,RPLDACB              R5 -> ACB.
+         LA    R5,0(,R5)               PURIFY ADDRESS...
+         USING IFGACB,R5
+         L     R4,RPLRLEN              R4 = RECORD LENGTH.
+         L     R3,RPLAREA              R3 -> DATA OF RECORD.
+         LA    R3,0(,R3)               PURIFY ADDRESS.
+*
+**  VALIDATE THE IOWA
+*
+         L     R1,ACBAPID
+         CLC   IOWEYE-IOWA(4,R1),IOAWICAT
+         BNE   IOINVWA
+*
+**   INITIALIZE THE ENVIRONMENT
+*
+         ST    R1,8(,R13)
+         ST    R13,4(,R1)              CHAIN SAVE AREAS.
+         LR    R13,R1
+         USING IOWA,R13
+*
+*BS10111 TAM   ,                       TEST ADDRESSING MODE             04070000
+*BS10111 IPM   R1                      RETRIEVE CC AND PROGRAM MASK     04080000
+*BS10111 NILH  R1,X'3000'              LEAVE ONLY CC.                   04090000
+*BS10111 SRL   R1,28                   MOVE CC TO THE RIGHT.            04100000
+*BS10111 ST    R1,IOWAMODE             SAVE TAM TEST RESULTS.           04110000
+*BS10111 SAM31
+         CTSAAMD 31,AMODSAV=IOWAMODE   SAVE AMODE AND...       BS10111
+*                                      SWITCH TO 31.           BS10111
+*
+**  VALIDATE OUR ENVIRONMENT
+*
+         L     R15,PSATOLD-PSA
+         USING TCB,R15
+         CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,77),                         >
+               'RXOB (~): ~ / $ ...     SCRT = ~',                     >00037400
+               (?R12,RXOBSCRT,RXOBSTCK,8,TCBSVCA2),                    >
+               RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+         CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,77),                         >
+               'RXOB: ... / $ / $ /~',                                 >
+               (RXOBTCBT,16,RXOBFAIL,1,RXOBIOWA),                      >
+               RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+         CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,77),                 BS10111 >
+               'RXOB - DMGTR DATA: ~ / ~ / ~',                 BS10111 >00037400
+               (RXOBDMGR,RXOBRUTK,RXOBOUTA),                   BS10111 >
+               RAREA=IOWRAREA,DBGAREA=IOWDBGAR                 BS10111  00037500
+         DROP  R15
+         CTSADBG TYPE=WTO,LEVEL=(IOWDBGLV,77),                         >
+               'IORTN: IOWA (~): _ / ~ / $ / $',                       >
+               (?R13,IOWEYE,4,IOWSCRT,IOWSTCK,8,IOWFAIL,1),            >
+               RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+*
+         CLI   RXOBFAIL,X'00'          ANY PREVIOUS FAILURE ?
+         BNE   IOFAIL
+         CLI   IOWFAIL,X'00'           ANY PREVIOUS FAILURE ?
+         BNE   IOFAIL
+*
+         L     R15,PSATOLD-PSA
+         USING TCB,R15
+         L     R8,TCBSVCA2             R8-> SCRENEING TABLE.
+         C     R8,IOWSCRT              SAME SCREENING TABLE ?
+         BNE   IOERRSCT                 ...NO - FAIL THE OPEN.
+         LA    R8,#SCETLEN(,R8)        R8 -> SCE
+         USING SCE,R8
+         CLC   SCEEYE,SCEICAT          EXTENSION IS OK ?
+         BNE   IOERRSCE                ..INCORRECT - ERROR.
+         CLC   SCESTCK,IOWSTCK         SAME TIME STAMP ?
+         BNE   IOERRSCE                ..INCORRECT - ERROR.
+         DROP  R8
+*
+         L     R15,TCBSTCB             R15 => SECONDARY TCB.
+         DROP  R15
+         USING STCB,R15
+         CTSADBG TYPE=WTO,LEVEL=(RXOBDBGL,77),                         >
+               'IORTN: TCB = $',(STCBTTKN,16),                         >
+               RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+         CLC   RXOBTCBT,STCBTTKN       SAME TCB TOKEN ?
+         BNE   IOERRTKN                ..NO - TCBS ARE MIXED...
+         DROP  R15
+*
+**   PUT
+*
+         RESETRXE
+         CTSADBG TYPE=WTO,LEVEL=(IOWDBGLV,77),                         >
+               'IORTN: ACB = ~    RAREA = ~   RLEN = #',               >00037400
+               (?R5,?R3,?R4),                                          >
+               RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+         LR    R15,R4
+         CHI   R2,50
+         BNH   IODBGREC
+         LHI   R15,50
+IODBGREC DS    0H
+         CTSADBG TYPE=WTO,LEVEL=(IOWDBGLV,77),                         >
+               '-->RCV: _ (#)',(0(R3),?R15,?R4),                       >    CTSA
+               RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+         L     R1,IOWLINE#             COUNT THE LINES.
+         AHI   R1,1
+         ST    R1,IOWLINE#
+         CHI   R4,0                    LINE LENGTH = 0 ?       BS10111
+         BE    IOENDREC                ..YES - IGNORE.         BS10111
+*
+**   CHECK IF RECORD HAS TO BE IGNORED
+*
+         L     R8,RXOBIGNL             R8 -> IGNORE LIST
+         USING IGNLIST,R8
+IOIGNLOP DS    0H
+         CTSADBG TYPE=WTO,LEVEL=(IOWDBGLV,77),                         >
+               'IGNLST: $ / $ / _',(IGNLEN,1,IGNFULL,1,IGNTEXT,20),    >    CTSA
+               RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+         CLI   IGNLEN,0                END OF LIST ?
+         BE    IOSAVREC                ..YES - SAVE THE RECORD.
+         CLI   IGNFULL,X'FF'           REPEATED CHARACTER MATCH ?
+         BE    IORPTCHK                ..YES - GO CHECK.
+         LHI   R15,0
+         IC    R15,IGNLEN
+         CR    R15,R4                  IGNORE TEXT LONGER THAN RECORD ?
+         BH    IOIGNNXT                ...YES - CHECK NEXT ENTRY.
+         AHI   R15,-1
+         EX    R15,IOCLCIGN
+         B     *+L'*+L'IOCLCIGN        RECORD MATCHS IGNORE TEXT ?
+IOCLCIGN CLC   0(0,R3),IGNTEXT
+         BE    IOIGNREC                ..YES - IGNORE LINE.
+         B     IOIGNNXT                ..NO - CHECK NEXT ENTRY.
+IORPTCHK DS    0H                      CHECK REPEATED CHARACTER:
+         LR    R15,R3
+         LR    R0,R4
+         LHI   R1,0
+         IC    R1,IGNTEXT              R1 = CHARACTER TO IGNORE.
+IOMCHLOP DS    0H                      CHECK ALL CHARS OF LINE.
+         CLM   R1,B'0001',0(R15)       IS IT THE IGNORE CHARACTER ?
+         BNE   IOIGNNXT                ..NO - SAVE RECORD.
+         LA    R15,1(,R15)             R15 -> NEXT CHARACTER IN RECORD.
+         BCT   R0,IOMCHLOP             CHECK NEXT CHARACTER IN RECORD.
+         B     IOIGNREC
+IOIGNNXT DS    0H
+         LA    R8,#IGNLEN(,R8)         R8 0> NEXT ENTRY.
+         B     IOIGNLOP
+IOIGNREC DS    0H
+         CTSADBG TYPE=WTO,LEVEL=(IOWDBGLV,77),                         >
+               'IORTN: RECORD IS IGNORED (IGNLST = $ / $ / _)',        >    CTSA
+               (IGNLEN,1,IGNFULL,1,IGNTEXT,25),                        >
+               RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+         B     IOENDREC                ALL MATCH - IGNORE LINE.
+         DROP  R8
+*
+**   SAVE RECORD.
+*
+IOSAVREC DS    0H
+*BS10111 CTSADBG TYPE=WTO,LEVEL=(IOWDBGLV,77),                         >
+               'IORTN: IOWBUFA = ~  RECLEN = #',(IOWBUFA,?R4),         >00037400
+               RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+         CTSADBG TYPE=WTO,LEVEL=(IOWDBGLV,77),                 BS10111 >
+               'IORTN: RXOBOUTA = ~  RECLEN = #',              BS10111 >
+               (RXOBOUTA,?R4),                                 BS10111 >
+               RAREA=IOWRAREA,DBGAREA=IOWDBGAR                 BS10111  00037500
+*BS10111
+*BS10111
+*BS10111 CHECK IF ENOUGH PLACE FOR RECORD.
+*BS10111
+*BS10111 LHI   R0,0                    BUFFER LENGTH UNKNOWN.
+*BS10111 L     R9,IOWBUFA
+*BS10111 CHI   R9,0
+*BS10111 BE    IOGETBLK
+*BS10111                               ALL FIELDS IN THE NEXT   WS10076
+*BS10111                               ~15 LINES WHICH BEGAN    WS10076
+*BS10111                               WITH LRA WERE CHANGED    WS10076
+*BS10111                               TO RUO.                  WS10076
+*BS10111 CURRBUF  USING RUO,R9
+*BS10111 CTSADBG TYPE=WTO,LEVEL=(IOWDBGLV,77),                        >
+*BS10111       'IORTN: BLOCK DATA LENGTH = #    USED LENGTH = #',     > 00037400
+*BS10111       (IOWBUFDL,CURRBUF.RUOHDLEN),                           >
+*BS10111       RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+*BS10111 LA    R1,1(,R4)               R1 = LENGTH REQ'D FOR RECORD.
+*BS10111 L     R0,IOWBUFDL             R0 = MAX DATA LENGTH,
+*BS10111 S     R0,CURRBUF.RUOHDLEN     R0 = FREE AREA LENGTH.
+*BS10111 CR    R1,R0                   ENOUGH SPACE FOR RECORD ?
+*BS10111 BNH   IOMOVREC
+*BS10111 L     R0,CURRBUF.RUOHLEN      R0 = BUFFER LENGTH.
+*BS10111
+*BS10111 GET A NEW BLOCK
+*BS10111
+*BS10111 IOGETBLK DS    0H
+*BS10111 CLI   RXOB1OM,C'M'            MANY ?
+*BS10111 BE    IOBUFLM                 ..YES - SET LENGTH.
+*BS10111                               ..NO - DEFAULT IS '1'.
+*BS10111 L     R6,=A(#BUF1MIN)         SET MINIMUM LENGTH ALLOWED.
+*BS10111 CHI   R0,0                    BUFFER LENGTH SET ?
+*BS10111 BNE   IOOBTN                  ..YES - USE IT.
+*BS10111 L     R0,=A(#BUF1L)           ..NO - DEFAULT IS '1'.
+*BS10111 B     IOOBTN
+*BS10111 IOBUFLM  DS    0H
+*BS10111 L     R6,=A(#BUFMMIN)         SET MINIMUM LENGTH ALLOWED.
+*BS10111 CHI   R0,0                    BUFFER LENGTH SET ?
+*BS10111 BNE   IOOBTN                  ..YES - USE IT.
+*BS10111 L     R0,=A(#BUFML)           SET LENGTH FOR 'M'
+*BS10111 IOOBTN   DS    0H
+*BS10111 LR    R2,R0                   R2 = REQUESTED LENGTH.
+*BS10111 LHI   R8,#RUOKEY              R8 - KEY.
+*BS10111 SLL   R8,4                    MOVE KEY TO ITS PLACE.
+*WS10076N STORAGE OBTAIN,LENGTH=(R0),ADDR=(R1),SP=#RUOSP,COND=YES,    >
+*BS10111       LINKAGE=SYSTEM,KEY=8
+*WS10076N
+*BS10111 STORAGE OBTAIN,LENGTH=(R0),ADDR=(R1),SP=#RUOSP,COND=YES,     >
+*BS10111       LINKAGE=SYSTEM,KEY=(R8),LOC=31
+*BS10111 LR    R8,R1                   R8 -> NEW BLOCK.
+*BS10111 CTSADBG TYPE=WTO,LEVEL=(IOWDBGLV,1,77),                      >
+*BS10111       'IORTN: NEW BLK: LEN = # (MIN = #)  ADDR = ~  RC = #', > 00037400
+*BS10111       (?R2,?R6,?R8,?R15),                                    >
+*BS10111       RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+*BS10111 CHI   R15,0
+*BS10111 BE    IOINITBF
+*BS10111 LR    R0,R2
+*BS10111 CR    R0,R6                   LENGTH REQ. > MINIMUM ?
+*BS10111 BNH   IOERRGTM                ...NO - ERROR.
+*BS10111 SRL   R0,1                    TAKE HALF LENGTH.
+*BS10111 CR    R0,R6                   NEW LENGTH >= MINIMUM ?
+*BS10111 BNL   IOOBTN                  ..YES - USE NEW LENGTH.
+*BS10111 LR    R0,R6                   ..NO - TAKE MINIMUM.
+*BS10111 B     IOOBTN                  RETRY ALLCATION.
+*BS10111
+*BS10111 INITIALIZE THE HEADER OF THE NEW BUFFER.
+*BS10111
+*BS10111                               ALL FIELDS IN THE NEXT   WS10076
+*BS10111                               ~15 LINES WHICH BEGAN    WS10076
+*BS10111                               WITH LRA WERE CHANGED    WS10076
+*BS10111                               TO RUO.                  WS10076
+*BS10111 IOINITBF DS    0H
+*BS10111 LR    R0,R2
+*BS10111 AHI   R0,-#RUOHLEN            R0 = DATA PART LENGTH IN BUFFER.
+*BS10111 ST    R0,IOWBUFDL             SAVE IT.
+*BS10111
+*BS10111 NEWBUF   USING RUO,R8
+*BS10111 MVC   NEWBUF.RUOHEYEC,=CL4'RUOB' SET EYE CATCHER       WS10076
+*BS10111 LHI   R0,0
+*BS10111 ST    R0,NEWBUF.RUOHNEXT
+*BS10111 ST    R0,NEWBUF.RUOHDLEN      DATA LENGTH = 0.
+*BS10111 ST    R2,NEWBUF.RUOHLEN       SAVE BUFFER LENGTH,
+*BS10111 MVI   NEWBUF.RUOHSP,#RUOSP                            WS10076
+*BS10111 MVI   NEWBUF.RUOHKEY,8                                WS10076
+*BS10111 MVI   NEWBUF.RUOHLOC,31                               WS10076
+*BS10111
+*BS10111 ST    R8,IOWBUFA              SET AS CURRENT BUFFER.
+*BS10111 CTSADBG TYPE=WTO,LEVEL=(IOWDBGLV,1,77),                      >
+*BS10111       'IORTN: BUFFER AFTER INIT:  ~ -> ~, #, #',             > 00037400
+*BS10111       (?R8,NEWBUF.RUOHNEXT,NEWBUF.RUOHLEN,NEWBUF.RUOHDLEN),  >
+*BS10111       RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+*BS10111
+*BS10111 CHI   R9,0                    FIRST TIME ?
+*BS10111 BNE   IOCHAIN
+*BS10111
+*BS10111 FIRST RECORD - RETURN ADDRESS TO CALLER
+*BS10111
+*BS10111 L     R1,RXOBOUTA
+*BS10111 ST    R8,0(,R1)               RETURN BUFFER ADDRESS.
+*BS10111 B     IOSETCBF                SET CURRENT BUFFER.
+*BS10111
+*BS10111 NOT FIRST BUFFER - CHAIN BUFFERS.
+*BS10111
+*BS10111                               ALL FIELDS IN THE NEXT   WS10076
+*BS10111                               ~40 LINES WHICH BEGAN    WS10076
+*BS10111                               WITH LRA WERE CHANGED    WS10076
+*BS10111                               TO RUO.                  WS10076
+*BS10111 IOCHAIN  DS    0H
+*BS10111 ST    R8,CURRBUF.RUOHNEXT     CHAIN BUFFERS.
+*BS10111 CTSADBG TYPE=WTO,LEVEL=(IOWDBGLV,1,77),                      >
+*BS10111       'IORTN: PREV BUFFER AFTER CHAIN:  ~ -> ~, #, #',       > 00037400
+*BS10111      (?R9,CURRBUF.RUOHNEXT,CURRBUF.RUOHLEN,CURRBUF.RUOHDLEN),> X
+*BS10111       RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+*BS10111 IOSETCBF DS    0H
+*BS10111 LR    R9,R8                   NEW IS NOW CORRENT.
+*BS10111 DROP  NEWBUF
+*BS10111
+*BS10111 MOVE RECORD TO BUFFER.
+*BS10111
+*BS10111 IOMOVREC DS    0H
+*BS10111 CTSADBG TYPE=WTO,LEVEL=(IOWDBGLV,77),                        >
+*BS10111       'IORTN: BUFFER BEFORE MOVE:  ~ -> #, #',               > 00037400
+*BS10111       (?R9,CURRBUF.RUOHLEN,CURRBUF.RUOHDLEN),                >
+*BS10111       RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+*BS10111 LA    R15,CURRBUF.RUODATA
+*BS10111 A     R15,CURRBUF.RUOHDLEN
+*BS10111 REC      USING RUOL,R15
+*BS10111 STC   R4,REC.RUOLLEN
+*BS10111 AHI   R4,-1
+*BS10111 EX    R4,IOMVCREC
+*BS10111 B     *+L'*+L'IOMVCREC
+*BS10111 IOMVCREC MVC   REC.RUOLDATA,0(R3)
+*BS10111 DROP  REC
+*BS10111 AHI   R4,1+1                  RESTORE (-1 ABOVE) + 1 FOR
+*BS10111                               LENGTH BYTE.
+*BS10111 A     R4,CURRBUF.RUOHDLEN
+*BS10111 ST    R4,CURRBUF.RUOHDLEN     UPDATE DATA LENGTH.
+*BS10111 CTSADBG TYPE=WTO,LEVEL=(IOWDBGLV,77),                        >
+*BS10111       'IORTN: BUFFER AFTER MOVE:  ~ -> #, #',                > 00037400
+*BS10111       (?R9,CURRBUF.RUOHLEN,CURRBUF.RUOHDLEN),                >
+*BS10111       RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+*BS10111 DROP  CURRBUF
+         L     R0,IOWDEFBL             R0 = DEFAULT BLOCK LEN. BS10111
+         CHI   R0,0                    ALRADY SET ?            BS10111
+         BNE   IOPUT                   ..UES - PUT RECORD.     BS10111
+         CLI   RXOB1OM,C'M'            MANY ?                  BS10111
+         BE    IOBUFLM                 ..YES - TAKE LEN FOR M  BS10111
+         L     R0,=A(#BUF1L)           ..NO - TAKE LEN FOR 1.  BS10111
+         B     IOSETBLL                                        BS10111
+IOBUFLM  DS    0H                                              BS10111
+         L     R0,=A(#BUFML)           TAKE LEN FOR M.         BS10111
+IOSETBLL DS    0H                                              BS10111
+         ST    R0,IOWDEFBL             SET BLOCK LENGTH.       BS10111
+IOPUT    DS    0H                                              BS10111
+*                                                              BS10111
+**    CALL  DMGTRTN,(PUT,IOWDMHND,(R14),(R3),                  BS10111
+**             IOWLNELN,IOWDEFBL,RXOBRUTK,                     BS10111
+**             IOWDMDBG,DBGTYPE,                               BS10111
+**             IOWDRMSA,DMERMGAL,IOWDRMSL),VL                  BS10111
+*                                                              BS10111
+         ST    R4,IOWLNELN             SERT LINE LENGTH        BS10111
+         XC    IOWDRMSL,IOWDRMSL       CLEAR ERROR MSG LENGTH. BS10111
+*                                                              BS10111
+         LA    R0,PUT                                          BS10111
+         ST    R0,IOWDMP01              1 -> REQUEST TYPE.     BS10111
+         LA    R0,IOWDMHND                                     BS10111
+         ST    R0,IOWDMP02              2 -> HANDLE ADDRESS.   BS10111
+         L     R0,RXOBOUTA                                     BS10111
+         ST    R0,IOWDMP03              3 -> RUOB ADDRESS.     BS10111
+         ST    R3,IOWDMP04              4 -> LINE TO PUT.      BS10111
+         LA    R0,IOWLNELN                                     BS10111
+         ST    R0,IOWDMP05              5 -> LINE LENGTH       BS10111
+         LA    R0,IOWDEFBL                                     BS10111
+         ST    R0,IOWDMP06              6 -> SEGMENTS NUMBER.  BS10111
+         L     R0,RXOBRUTK                                     BS10111
+         ST    R0,IOWDMP07              7 -> UTOKEN.           BS10111
+         LA    R0,IOWDMDBG                                     BS10111
+         ST    R0,IOWDMP08              8 -> DEBUG LEVEL.      BS10111
+         LA    R0,DBGTYPE                                      BS10111
+         ST    R0,IOWDMP09              9 -> DEBUG TYPE.       BS10111
+         LA    R0,IOWDRMSA                                     BS10111
+         ST    R0,IOWDMP10             10 -> MESSAGE AREA.     BS10111
+         LA    R0,DMERMGAL                                     BS10111
+         ST    R0,IOWDMP11             11 -> MAX MSG LENGTH.   BS10111
+         LA    R0,IOWDRMSL                                     BS10111
+         ST    R0,IOWDMP12             12 - MSG LENGTH.        BS10111
+         OI    IOWDMP12,X'80'          SET 'VL'                BS10111
+         LA    R1,IOWDMRPL             R1 -> DM RTN PARMS.     BD10111
+         L     R15,RXOBDMGR            R15 -> DATA MGT. RTN    BS10111
+         BASR  R14,R15                 CALL THE ROUTINE.       BS10111
+*                                                              BS10111
+*BS10117 CTSADBG TYPE=WTO,LEVEL=(IOWDBGLV,77),                 BS10111 >
+               'IORTN-PUT: RC=#  LINE=_  H=~  BLK=$  UTOKEN=#', S10111 >
+               (?R15,0(R3),20,IOWDMHND,RXOBOUTA,8,RXOBRUTK),   BS10111 >
+               RAREA=IOWRAREA,DBGAREA=IOWDBGAR                 BS10111  04730000
+         CTSADBG TYPE=WTO,LEVEL=(IOWDBGLV,77),                 BS10117 >
+               'IORTN-PUT: RC=#  LINE=_  H=~ ',                BS10117 >
+               (?R15,0(R3),20,IOWDMHND),                       BS10117 >
+               RAREA=IOWRAREA,DBGAREA=IOWDBGAR                 BS10117  04730000
+         L     R14,RXOBRUTK                                    BS10117
+         L     R0,0(,R14)              R0 = UPDATED UTOKEN.    BS10117
+         L     R14,RXOBOUTA                                    BS10117
+         CTSADBG TYPE=WTO,LEVEL=(IOWDBGLV,77),                 BS10117 >
+               'IORTN-PUT: BLK=~->$   UTKN=~->~',              BS10117 >
+               (RXOBOUTA,0(R14),8,RXOBRUTK,?R0),               BS10117 >
+               RAREA=IOWRAREA,DBGAREA=IOWDBGAR                 BS10117  04730000
+         CHI   R15,0                   OK ?                    BS10111
+         BNE   IOERRDMR                ..NO - ERROR.           BS10111
+*
+IOENDREC DS    0H
+         LHI   R15,0                   SET RC.
+*
+**   SWITCH AMODE, RESTORE REGISTERS AND RETURN
+*
+         CTSADBG TYPE=WTO,LEVEL=(IOWDBGLV,77),                         >
+               'IORTN: RC - #',(?R15),                                 >00037400
+               RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+*BS10111
+*BS10111 L     R2,IOWAMODE             R2 = CALLER AMODE (TAM RC        11900000
+*BS10111                                    SAVED AT ENTRY.             11910000
+*BS10111 LHI   R1,0                                                     11920000
+*BS10111 MHI   R2,L'AMODE24            USE THE RC (0/1/3) AS INDEX      11930000
+*BS10111                               TO THE SET AMODE COMMANDS TABLE. 11940000
+*BS10111 EX    R1,AMDCMDTB(R2)         RESTORE AMODE BY PERFORMING      11950000
+*
+*
+         CTSAAMD RESTORE,AMODSAV=IOWAMODE,  RESTORE AMODE      BS10111 >
+               CMDTAB=AMDCMDTB,R=R1                            BS10111
+         L     R13,4(,R13)             R13 -> PREV SAVE AREA.           00037700
+IOOUT    DS    0H
+         STCM  R15,B'0111',RPLFDBK     SET RETURN CODE IN RPL.
+         L     R14,12(,R13)            RESTORE...                       00037900
+         LM    R0,R12,20(R13)           ...REGISTERS.                   00037900
+         BSM   0,R14                   RETURN TO CALLER.
+*
+**   ISSUE ERROR MESSAGES AND ABEND
+**
+**   FOR ENVIRONMENT ERROR, WE CANNOT RETURN THE ERROR MESSAGE.
+*
+IOFAIL   DS    0H
+*WS10076N MVC   IOWM254R,=CL15'(I) PREV IOF'
+*WS10076N CTSADBG TYPE=WTO,LEVEL=(DBGLV255,255),                      >
+*WS10076N      'IORTN: FAIL = $ / $',                                 >
+*WS10076N      (RXOBFAIL,1,IOWFAIL,1),                                >
+*WS10076N      RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+         LA    R1,IMFAIL-IOMSGRTN                              WS10076N
+         LARL  R15,IOMSGRTN                                    WS10076N
+         BALR  R14,R15                                         WS10076N
+         LHI   R2,0
+         IILL  R2,C'FL'
+*WS10076N B     IOMSG254
+         B     IOSETFL                 SET 'FAIL' AND ABEND    WS10076N
+IOERRSCE DS    0H
+*WS10076N MVC   IOWM254R,=CL15'(I) SCE NOMCH'
+*WS10076N USING SCE,R8
+*WS10076N CTSADBG TYPE=WTO,LEVEL=(DBGLV255,255),                      >
+*WS10076N      'IORTN: SCE = _, $   IOWA: $',                         >
+*WS10076N      (SCEEYE,4,SCESTCK,16,IOWSTCK,16),                      >
+*WS10076N      RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+         LR    R0,R8                   R0 -> SCE               WS10076N
+         LA    R1,IMERRSCE-IOMSGRTN                            WS10076N
+         LARL  R15,IOMSGRTN                                    WS10076N
+         BALR  R14,R15                                         WS10076N
+         LHI   R2,0
+         IILL  R2,C'CE'
+*WS10076N DROP  R8
+*WS10076N B     IOMSG254
+         B     IOSETFL                 SET 'FAIL' AND ABEND    WS10076
+IOERRSCT DS    0H
+*WS10076N MVC   IOWM254R,=CL15'(I) SCRT NMATCH'
+*WS10076N USING TCB,R15
+*WS10076N CTSADBG TYPE=WTO,LEVEL=(DBGLV255,255),                      >
+*WS10076N      'IORTN: SCRT = ~ / ~',(TCBSVCA2,?R8),                  >
+*WS10076N      RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+         LR    R0,R15                  R0 -> TCB               WS10076N
+         LA    R1,IMERRSCT-IOMSGRTN                            WS10076N
+         LARL  R15,IOMSGRTN                                    WS10076N
+         BALR  R14,R15                                         WS10076N
+         LHI   R2,0
+         IILL  R2,C'CT'
+*WS10076N DROP  R15
+*WS10076N B     IOMSG254
+         B     IOSETFL                 SET 'FAIL' AND ABEND    WS10076N
+IOERRTKN DS    0H
+*WS10076N MVC   IOWM254R,=CL15'(I) TKN ERR'
+*WS10076N USING STCB,R15
+*WS10076N CTSADBG TYPE=WTO,LEVEL=(DBGLV255,255),                      >
+*WS10076N      'IORTN: TKN = $ / $',(RXOBTCBT,16,STCBTTKN,16),        >
+*WS10076N      RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+         LR    R0,R15                  R0 -> STCB              WS10076N
+         LA    R1,IMERRTKN-IOMSGRTN                            WS10076N
+         LARL  R15,IOMSGRTN                                    WS10076N
+         BALR  R14,R15                                         WS10076N
+         LHI   R2,0
+         IILL  R2,C'TK'
+*WS10076N DROP  R15
+*WS10076N B     IOMSG254
+         B     IOSETFL                 SET 'FAIL' AND ABEND    WS10076N
+*WS10076N IOMSG254 DS    0H
+*WS10076N CTSMSG1 CODEMSG=CTS254E,ROUT=WTO,RAREA=IOWRAREA,            >
+*WS10076N      PLANT=(15,IOWM254R)
+*WS10076N B     IOSETFL                 SET 'FAIL' AND ABEND
+*
+*                                      ALL FIELDS IN THE NEXT   WS10076
+*                                      ~15 LINES WHICH BEGAN    WS10076
+*                                      WITH LRA WERE CHANGED    WS10076
+*                                      TO RUO.                  WS10076
+*BS10111 IOERRGTM DS    0H
+*WS10076N LR    R8,R15                  SAVE RC.
+*WS10076N CTSAN2C IOWCHRRC,WRKPFX=IOW TRANSLATE RC
+*WS10076N LR    R15,R2
+*WS10076N CTSAN2C IOW#CHAR,LEN=7,WRKPFX=IOW TRANSLATE LENGTH
+*WS10076N LHI   R15,#RUOSP
+*WS10076N CTSAN2C IOWSPNUM,LEN=3,WRKPFX=IOW TRANSLATE SP
+*WS10076N MVC   IOWMADDR,BLANKS8
+*WS10076N MVC   IOWMACT,=CL7'OBTAIN'
+*WS10076N MVC   IOWMCBNM,=CL8'RUO'
+*WS10076N CTSMSG1 CODEMSG=CTS251E,ROUT=(WTO,NO),RAREA=IOWRAREA,       >
+*WS10076N      PLANT=(7,IOWMACT,8,IOWMCBNM,8,IOWMADDR,7,IOW#CHAR,     >
+*WS10076N      3,IOWSPNUM,2,IOWCHRRC)
+*WS10076N FILLRXE FUNC=ERRIO,MSG=IOWRAREA,LINELEN=R4,LINE=(R3)
+*WS10076N LHI   R15,#RUOSP
+*WS10076N CTSADBG TYPE=WTO,LEVEL=(DBGLV255,255),                      >
+*WS10076N      'IORTN: BUFFER OBTAIN FAILED: # / #   RC = #',         > 00037400
+*WS10076N      (?R2,?R15,?R8),                                        >
+*WS10076N      RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+*BS10111 LR    R0,R15                  R0 -> RC.               WS10076N
+*BS10111 LA    R1,IMERRGTM-IOMSGRTN                            WS10076N
+*BS10111 LARL  R15,IOMSGRTN                                    WS10076N
+*BS10111 BALR  R14,R15                                         WS10076N
+*BS10111 LHI   R2,0
+*BS10111 IILL  R2,C'GM'
+*BS10111 B     IOSETFL                 SET 'FAIL' AND ABEND
+*
+IOERRDMR DS    0H                      DATA MGT. RTN FAILED.  .BS10111
+         LA    R1,IMERRDM-IOMSGRTN                             BS10111
+         LARL  R15,IOMSGRTN                                    BS10111
+         BALR  R14,R15                                         BS10111
+         LHI   R2,0                                            BS10111
+         IILL  R2,C'DM'                                        BS10111
+         B     IOSETFL                 SET 'FAIL' AND ABEND    BS10111
+*
+IOINVWA  DS    0H
+         WTO   'CTS2RXO:IORTN - WORK AREA ERROR'
+         LHI   R2,0
+         IILL  R2,C'WA'                SET REASON CODE.
+         B     IOABEND
+*
+**   SET RETURN CODE AND RETURN
+*
+IOSETFL  DS    0H
+         MVI   IOWFAIL,X'FF'          SET 'FAIL' INDICATION.
+IOABEND  DS    0H
+         CLM   R2,B'0011',RXOBABDL     SAME AS LAST ABEND ?
+         BE    IOABNDND                ..YES - ABEND, NO DUMP
+*                                      TO PREVENT REPEATED DUMPS FOR
+*                                      THE SAME ERROR.
+         TESTAUTH FCTN=1
+         CHI   R15,0                   APF AUTH ?
+         BNE   IOABENDD                NO - CAN'T SAVE ABEND CODE.
+         MODESET KEY=ZERO
+         STCM  R2,B'0011',RXOBFAIL-RXOB(R12) SAVE LAST ABEND.
+         MODESET KEY=NZERO
+IOABENDD DS    0H
+         ABEND 2088,DUMP,REASON=(R2)   ABEND WITH DUMP.
+*WS10076N B     IORTNE
+*
+IOABNDND DS    0H
+         ABEND 2088,,REASON=(R2)       ABEND WITHOUT DUMP
+*WS10076N B     IORTNE
+*
+         DROP  ,
+IORTNE   DS    0H
+*
+***  WS10076N - START
+*----------------------------------------------------------------
+*
+**  HANDLE ERRORS.
+**
+**  R0 - MESSGAE DEPENDENT DATA.
+**  R1 -> SECTION TO EXECUTE.
+**  R2 -> MORE DATA FOR THE ERROR.
+**
+*
+*----------------------------------------------------------------
+IOMSGRTN DS    0H
+         USING CONST,R11
+         USING IOWA,R13
+         STM   R0,R14,IOWSAMRT          SAVE REGISTERS.
+         LR    R9,R15                   R9 - BASE.
+         USING (IOMSGRTN,IOMSGRTE),R9
+*
+         LARL  R12,RXOB
+         USING (RXOB,RXOBEND),R12
+*
+         B     IOMSGRTN(R1)
+*
+IMFAIL   DS    0H
+         MVC   IOWM254R,=CL15'(I) PREV IOF'
+         CTSADBG TYPE=WTO,LEVEL=(DBGLV255,255),                        >
+               'IORTN: FAIL = $ / $',                                  >
+               (RXOBFAIL,1,IOWFAIL,1),                                 >
+               RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+         B     IMMSG254
+*
+IMERRSCE DS    0H
+         LR    R8,R0
+         MVC   IOWM254R,=CL15'(I) SCE NOMCH'
+         USING SCE,R8
+         CTSADBG TYPE=WTO,LEVEL=(DBGLV255,255),                        >
+               'IORTN: SCE = _, $   IOWA: $',                          >
+               (SCEEYE,4,SCESTCK,16,IOWSTCK,16),                       >
+               RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+         DROP  R8
+         B     IMMSG254
+*
+IMERRSCT DS    0H
+         LR    R15,R0
+         MVC   IOWM254R,=CL15'(I) SCRT NMATCH'
+         USING TCB,R15
+         CTSADBG TYPE=WTO,LEVEL=(DBGLV255,255),                        >
+               'IORTN: SCRT = ~ / ~',(TCBSVCA2,?R8),                   >
+               RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+         DROP  R15
+         B     IMMSG254
+*
+IMERRTKN DS    0H
+         LR    R15,R0
+         MVC   IOWM254R,=CL15'(I) TKN ERR'
+         USING STCB,R15
+         CTSADBG TYPE=WTO,LEVEL=(DBGLV255,255),                        >
+               'IORTN: TKN = $ / $',(RXOBTCBT,16,STCBTTKN,16),         >
+               RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+         DROP  R15
+         B     IMMSG254
+*
+IMMSG254 DS    0H
+         CTSMSG1 CODEMSG=CTS254E,ROUT=WTO,RAREA=IOWRAREA,              >
+               PLANT=(15,IOWM254R)
+         B     IOMROUT                 SET 'FAIL' AND ABEND
+*
+*                                      ALL FIELDS IN THE NEXT   WS10076
+*                                      ~15 LINES WHICH BEGAN    WS10076
+*                                      WITH LRA WERE CHANGED    WS10076
+*                                      TO RUO.                  WS10076
+*BS10111 IMERRGTM DS    0H
+*BS10111 LR    R8,R0                   SAVE RC.
+*BS10111 CTSAN2C IOWCHRRC,WRKPFX=IOW TRANSLATE RC
+*BS10111 LR    R15,R2
+*BS10111 CTSAN2C IOW#CHAR,LEN=7,WRKPFX=IOW TRANSLATE LENGTH
+*BS10111 LHI   R15,#RUOSP
+*BS10111 CTSAN2C IOWSPNUM,LEN=3,WRKPFX=IOW TRANSLATE SP
+*BS10111 MVC   IOWMADDR,BLANKS8
+*BS10111 MVC   IOWMACT,=CL7'OBTAIN'
+*BS10111 MVC   IOWMCBNM,=CL8'RUO'
+*BS10111 CTSMSG1 CODEMSG=CTS251E,ROUT=(WTO,NO),RAREA=IOWRAREA,        >
+*BS10111       PLANT=(7,IOWMACT,8,IOWMCBNM,8,IOWMADDR,7,IOW#CHAR,     >
+*BS10111       3,IOWSPNUM,2,IOWCHRRC)
+*BS10111 FILLRXE FUNC=ERRIO,MSG=IOWRAREA,LINELEN=R4,LINE=(R3)
+*BS10111 LHI   R15,#RUOSP
+*BS10111 CTSADBG TYPE=WTO,LEVEL=(DBGLV255,255),                       >
+*BS10111       'IORTN: BUFFER OBTAIN FAILED: # / #   RC = #',         > 00037400
+*BS10111       (?R2,?R15,?R8),                                        >
+*BS10111       RAREA=IOWRAREA,DBGAREA=IOWDBGAR                          00037500
+*
+*                                                              BS10111
+**  DATA MANAGEMENT ROUTINE REQUEST FAILED                     BS10111
+*                                                              BS10111
+IMERRDM  DS    0H                                              BS10111
+         OC    IOWDRMSL,IOWDRMSL       MESSAGE RETURNED ?      BS10111
+         BNZ   IMERRDMM                ..YES - USE IT.         BS10111
+         CTSAN2C IOWCHRRC,WRKPFX=IOW   TRANSLATE RC            BS10111
+*BS10114 CTSMSG1 CODE=CTS261E,ROUT=(WTO,NO),RAREA=IOWRAREA,    BS10111>
+         CTSMSG1 CODEMSG=CTS261E,ROUT=(WTO,NO),RAREA=IOWRAREA, BS10114 >
+               PLANT=(8,=CL8'CTSARUH',8,=CL8'PUT',             BS10111 >
+               2,IOWCHRRC)                                     BS10111
+         B     IMERRDMR                                        BS10111
+IMERRDMM DS    0H                      HANDLE MSG FROM IORTN   BS10111
+         MVC   IOWRAREA(#DMRMSAL),IOWDMMSG+2                   BS10111
+         MVC   IOWWTOL(WTOML),WTOM                             BS10111
+         WTO   TEXT=IOWRAREA,MF=(E,IOWWTOL) WTO RETURNED MSG.  BS10111
+IMERRDMR DS    0H                                              BS10111
+         FILLRXE FUNC=ERRIO,MSG=IOWRAREA,LINELEN=R4,LINE=(R3)  BS10111
+*
+IOMROUT  DS    0H
+         LM    R0,R14,IOWSAMRT
+         BR    R14
+IOMSGRTE DS    0H
+         DROP  ,
+***  WS10076N - END
+*
+*----------------------------------------------------------------
+**  SVC SCREENING WORK AREA
+*----------------------------------------------------------------
+*
+WA       DSECT
+         DS    18F                     TO BE USED BY CALLED ROUTINES.
+SAMSGRTN DS    18F                     MSGRTN SAVE AREA.
+SACALLER DS    16F                     REGS FROM SVRB AT ENTRY TO SVC
+SAOPRETE DS    16F                     REGS AT ENTRY TO OPEN-RETURN.
+*BS10111 SAHIGH   DS    16F                     HIGH-HALF SAVE AREA.
+ACBADDR  DS    A                       -> SYSPRINT ACB.
+DBGLEVEL DS    X                       DEBUG LEVEL.
+CHARRC   DS    CL2
+NUMCHAR  DS    CL8                     FOR CTSAN2C OUTPUT.
+SPNUM    DS    CL3                     SUBPOOL NUMBER IN CHAR (FOR MSG)
+M251ACT  DS    CL7                     OBTAIN/RELEASE FOR CTS251E
+M251ADDR DS    CL8                     ADDRESS FOR CTS252E
+M251CBNM DS    CL8                     CONTROL BLOCK NAME.
+M254RSN  DS    CL15                    REASON CODE FOR CTS254
+SVC22EPA DS    A                       -> IGC0002B             BS10114
+SVC22ATR DS    X                       IGC0002B ATTRIBUTES.    BS10114
+*   THE FOLLOWING 3 LINES SHOULD BE NOT BE DISJOINTED.         BS10111
+DMMSG    DS    0F                                              BS10111
+DMMSGL   DS    F                       MESSAGE AREA LENGTH.    BS10111
+DMMSGA   DS    CL(#DMRMSAL)            DATA MGT.MSG AREA.      BS10111
+*
+**   I/O ROUTINE PARAMETERS BLOCK
+*
+DMRCALL  CALL  ,(,,,,,,,,,,,),VL,MF=L  DATA MGT. RTN CALL LIST BS10111
+*
+WTOL     WTO   TEXT=(),MF=L                                    BS10111
+*
+         CSVQUERY MF=(L,CSQ)                                   BS10114
+*
+         CTSAN2C WORK=YES,RENT=VAR
+         DS    0D
+RAREA    DS    XL512                   USED BY CTSADBG.
+DBGAREA  DS    XL2048
+#WALEN   EQU   *-WA
+#WASP    EQU   230
+*
+*----------------------------------------------------------------
+**  I/O ROUTINE EQUATES
+*----------------------------------------------------------------
+*BS10111 #BUF1L   EQU   1024*10  10K  DEFAULT BUFFER LENGTH (WHEN 1)
+*BS10111 #BUF1MIN EQU   1024          MINIMUM BUFFER LENGTH (WHEN 1)
+*BS10111 #BUFML   EQU   1024*1024*50 50M DEFAULT BUFFER LENGTH (WHEN M)
+*BS10111 #BUFMMIN EQU   1024*1024 1M   MINIMUM BUFFER LENGTH (WHEN M)
+#BUF1L   EQU   10       10M            BLOCK LENGTH  WHEN 1    BS10111
+#BUFML   EQU   1000     1G             BLOCK LENGTH WHEN M     BS10111
+*--------------------------------------------------------------------
+**
+**  I/O ROUTINE WORK AREA.
+**
+**  - CREATED BY THE SVC SCREENING ROUTINE.
+**  - POINTED BY ACBAPID.
+**
+*----------------------------------------------------------------
+IOWA     DSECT
+IOWSA    DS    18F
+IOWEYE   DS    CL4
+IOWLEN   DS    A                       IOWA + IORTN HANDLE LEN BS10111
+IOWSAMRT DS    18F                     MSGRTN SAVE AREA.       WS10076N
+IOWSCRT  DS    A                       -> SCREENING TABLE.
+IOWSTCK  DS    XL8                     -> STCK SCREENING WAS SET.
+IOWJESAD DS    A                       -> ORIGINAL I/O ROUTINE.
+IOWDMHND DS    A                       -> I/O ROUTINE HANDLE.  BS10111
+*BS10111 IOWBUFA  DS    A                       CURRENT BUFFER START.
+IOWDEFBL DS    A                       DEFAULT BLOCK LENGTH.   BS10111
+IOWAMODE DS    A                       AMODE CC.
+*BS10111 IOWBUFDL DS    A              LENGTH OF DATA PORTION IN BUFFR.
+IOWRUHHA DS    A                       CTSARUH HANDLE ADDRESS. BS10111
+IOWLINE# DS    F                       LINE COUNTER.
+IOWLNELN DS    A                       LINE LENGTH             BS10111
+IOWDBGLV DS    X                       DEBUG LEVEL
+IOWDMDBG DS    A                       DEBUG LEVEL FOR DMGTR   BS10111
+IOWFAIL  DS    X                       FAIL INDICATION.
+#IOWFOK  EQU   X'00'                   ..OK
+#IOWFFL  EQU   X'FF'                   ..FAIL.
+IOWCHRRC DS    CL2
+*BS10111 IOW#CHAR DS    CL8            FOR CTSAN2C OUTPUT.
+*BS10111 IOWSPNUM DS    CL3            SUBPOOL NUMBER IN CHAR (FOR MSG)
+*BS10111 IOWMACT  DS    CL7            OBTAIN/RELEASE FOR CTS251E
+*BS10111 IOWMCBNM DS    CL8                     ADDRESS FOR CTS252E
+*BS10111 IOWMADDR DS    CL8                     CONTROL BLOCK NAME.
+IOWM254R DS    CL15                    REASON CODE FOR CTS254
+*   THE FOLLOWING 3 LINES SHOULD BE NOT BE DISJOINTED.         BS10111
+IOWDMMSG DS    0F                                              BS10111
+IOWDRMSL DS    F                       MESSAGE AREA LENGTH.    BS10111
+IOWDRMSA DS    CL(#DMRMSAL)            DATA MGT. MESSGAE AREA  BS10111
+*
+**   I/O ROUTINE PARAMETERS BLOCK
+*
+IOWDMRPL DS    0F                      DATA MGT. RTN PARM LIST BS10111
+IOWDMP01 DS    A                       PARM # 01               BS10111
+IOWDMP02 DS    A                       PARM # 02               BS10111
+IOWDMP03 DS    A                       PARM # 03               BS10111
+IOWDMP04 DS    A                       PARM # 04               BS10111
+IOWDMP05 DS    A                       PARM # 05               BS10111
+IOWDMP06 DS    A                       PARM # 06               BS10111
+IOWDMP07 DS    A                       PARM # 07               BS10111
+IOWDMP08 DS    A                       PARM # 08               BS10111
+IOWDMP09 DS    A                       PARM # 09               BS10111
+IOWDMP10 DS    A                       PARM # 10               BS10111
+IOWDMP11 DS    A                       PARM # 11               BS10111
+IOWDMP12 DS    A                       PARM # 12               BS10111
+*
+IOWWTOL  WTO   TEXT=(),MF=L                                    BS10111
+*
+         CTSAN2C WORK=YES,RENT=VAR,WRKPFX=IOW
+         DS    0D
+IOWRAREA DS    XL512                   USED BY CTSADBG.
+IOWDBGAR DS    XL2048
+#IOWALEN EQU   *-IOWA
+#IOWASP  EQU   230
+*
+*BS10111---------------------------------------------------------
+*BS10111  MEMORY BLOCK HEADRE STRUCTURE
+*BS10111
+*BS10111  ANY CHNAGE SHOULD BE COORDINATED WITH THE CALLING C PROGRAM.
+*BS10111---------------------------------------------------------
+*BS10111 BLKHDR   DSECT
+*BS10111 BHNEXT   DS    A             -> NEXT BLOCK.
+*BS10111 BHBLKL   DS    A             BLOCK LENGTH (INCLUDING HEADER)
+*BS10111 BHSP     DS    A             BLOCK SUBPOOL.EXT.
+*BS10111 BHDATAL  DS    A             DATA LENGTHWHOLE LINE SHOULD
+*BS10111 BHDATA   EQU   *             START OF DATATAIN THE CHARACTER
+*BS10111 #BHLEN   EQU   *-BLKHDR      BLKHDR LENGTH
+*
+*----------------------------------------------------------------
+**  SHARED CONSTANTS
+*----------------------------------------------------------------
+CTS2RXO  CSECT
+CONST    EQU   *
+         LTORG ,
+BLANKS8  DC    CL8' '
+DBGLV255 DC    AL1(255)                DEBUG = ALWAYS.
+         CTS2SCE TYPE=DC
+IOAWICAT DC    C'IOWA'
+         CTSAN2C WORK=YES,RENT=CONST
+STARTIO  DC    CL8'STARTIO'                                    BS10111
+PUT      DC    CL8'PUT'                                        BS10111
+DBGTYPE  DC    CL8'WTO'                                        BS10111
+#DMRMSAL EQU   200                     IORTN MSG AREA LENGTH.  BS10111
+DMERMGAL DC    A(#DMRMSAL)                                     BS10111
+*
+**  SET AMODE COMMANDS TABLE.
+**                                     THE SAM COMMAND CORRESPONDING    11960000
+**                                     TO THE TAM RC:                   11970000
+*
+*BS10111 AMDCMDTB DS    0H                    FORCE COMMAND ALIGNMENT.
+*BS10111 AMODE24  SAM24                       TAM RC = 0
+*BS10111 AMODECEL EQU   L'AMODE24
+*BS10111 AMODE31  SAM31                       TAM RC = 1
+*BS10111          DS    XL(AMODECEL)'00'      NO TAM RC.
+*BS10111 AMODE64  SAM64                       TAM RC = 3
+*BS10111 AMODECME EQU   *
+         CTSAAMD DEFCMDT,CMDTAB=AMDCMDTB                       BS10111
+*
+SVC22NM  DC    CL8'IGC0002B'                                   BS10114
+*
+ERRORFLG DC    F'1'
+ERRPGMNM DC    C'CTS2RXO',X'00'
+#ERRPGML EQU   *-ERRPGMNM
+ERRSVC   DC    C'SVCRTN',X'00'
+#ERRSVCL EQU   *-ERRSVC
+ERRIO    DC    C'IORTN',X'00'
+#ERRIOL  EQU   *-ERRIO
+WTOM     WTO   TEXT=(),MF=L                                    BS10111
+WTOML    EQU   *-WTOM                                          BS10111
+*
+*----------------------------------------------------------------
+**  PROCUT CONTORL BLOCS.
+*----------------------------------------------------------------
+*
+         CTS2SCE                       SCREENING TABLE EXTENSION.
+*
+         COPY  CTSARUOB                PERMISSIONS MEMORY BLK  WS10076
+*
+         COPY  CTSARUOI                IGNORE LIST FOR REXX    WS10076
+*                                      OR UTILITY OUTPUT       WS10076
+*
+         COPY  CTS2RXE                 ACFRPTRX INTERCEPTION - ERROR
+*                                      BLOCK.
+*----------------------------------------------------------------
+**  SYSTEM CONTROL BLOCKS.
+*----------------------------------------------------------------
+         CTSEQUR
+*
+*        IHASDWA ,                     SDWA
+*
+         IHAPSA LIST=YES               PSA
+*
+         CVT   DSECT=YES,LIST=YES      CVT
+*
+         IHASCVT DSECT=YES,LIST=YES    SCVT
+*
+         IHASVC LIST=YES               SVC TABLE.
+*
+         IKJTCB LIST=YES               TCB
+*
+         IHASTCB LIST=YES              STCB
+*
+         IHACDE ,                      CDE
+*
+         IHARB LIST=YES                RB
+*
+         DCBD  DSORG=PS                DCB
+*
+         IFGACB ,                      ACB
+*
+         IFGRPL ,                      RPL
+*
+.END     ANOP                                                 WS10084
+         END

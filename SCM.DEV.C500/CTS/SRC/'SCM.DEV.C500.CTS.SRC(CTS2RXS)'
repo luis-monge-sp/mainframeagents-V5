@@ -1,0 +1,1737 @@
+*
+         TITLE 'CTS2RXS - SET SVC SCREENING FOR ACFRPTRX SYSPRINT'
+*
+****************************************************************
+****                                                        ****
+****     MF CONNECTOR RELEASE 4.0.00                        ****
+****                                                        ****
+****     (C) COPYRIGHT 2015 SAILPOINT TECHNOLOGIES, INC.,   ****
+****     ALL RIGHTS RESERVED.                               ****
+****                                                        ****
+****************************************************************
+*
+****************************************************************
+*                                                              *
+* TITLE            : SET SVC SREENING FOR ACFRPTRX SYSPRINT    *
+*                                                              *
+* FILE NAME        : CTS2RXS                                   *
+*                                                              *
+* AUTHOR           : NURIT YAHALOM                             *
+*                                                              *
+* CREATION DATE    : 03/09/19                                  *
+*                                                              *
+* DESCRIPTION      : HANDLE SVC SCREENING FOR OPEN TYPE=J      *
+*                    (SVC 22).                                 *
+*                    THE SCREENING TABLE IS ALLOCATED WITH AN  *
+*                    EXTENSION, IN WHICH THE ROUTINE PASSES    *
+*                    PARAMETERS TO THE SVC SCREENING ROUTINE.  *
+*                                                              *
+* PARAMETERS       : 1. FUNCTION - (CL8) - (I)                 *
+*                       ACT   - INITIALIZE THE SVC SCREENING   *
+*                               IF NEEDED.                     *
+*                               SAVE ACTIVE SVC SCREENING      *
+*                               SETTING AND ACTIVATE OUR.      *
+*                       DEACT - DEACTIVATE OUR SVC SCREENING   *
+*                               WHILE RESTORING THE PREVIOUS   *
+*                               SVC SCREENING ENVIRONMENT.     *
+*                       TERM  - DELETE THE SVC SCREENING       *
+*                               MODULE AND FREE THE TABLE.     *
+*                    2. DEBUG LEVEL - (I)                      *
+*                    3. ERROR BLOCK (MAPPED BY CTS2RXE) - (O)  *
+*                                                              *
+*                    FUNCTION RELATED PARAMETERS:              *
+*                    ACT:                                      *
+*                    4. DATA MANAGEMENT ROUTINE ADDR (I)       *
+*                    5. RULE BLOCK ADDRESS (O)                 *
+*                    6. LIST OF LINES TO IGNORE. (I)           *
+*                       LIST STRUCTURE:                        *
+*                         1 BYTE STRING LENGTH FOLLOWED BY THE *
+*                         STRING TO IGNORE. STRING LENGTH OF   *
+*                    7. 1/MANY INDICATION - (I) - C            *
+*                       1 - RULES FOR 1 UID ARE REQUESTED.     *
+*                       M - RULES FOR MANY UIDS ARE REQUESTED. *
+*                                                              *
+*                    THIS ROUTINE DOES NOT PROCESS THESE       *
+*                    PARAMETERS. IT JUST SETS THEM TO BE USED  *
+*                    BY THE SCREENING ROUTINE, WHEN NEEDED.    *
+*                                                              *
+* RETURN CODES     :  0 - OK.                                  *
+*                     4 - REQUEST FAILED.                      *
+*                                                              *
+*                                                              *
+* LINKAGE ATTRIBUTES:  RENT                                    *
+*                                                              *
+*                                                              *
+****************************************************************
+*
+****************************************************************
+* MOD.ID   WHO  WHEN     DESCRIPTION                           *
+* -------- ---- -------- ------------------------------------- *
+* WS10075  NY   03.09.19 NEW VERSION.                          *
+* BS10111  NY   08.12.20 SUPPORT RUOB ABOVE THE BAR.           *
+* WS10084  TS   13.07.23 REPLACE ACFRPTRX                      *
+* IS10188  AL   14.10.24 ABOVE 16M. ONLY 4 LINKCARD #SOM.      *
+*                                                              *
+****************************************************************
+****************************************************************
+*
+* OVERVIEW
+* --------
+* AS PART OF THE SUPPORT FOR RETURNING PERMISSIONS AS
+* USER ATTRIBUTES, WE NEED TO RETRIEVE THE PERMISSIONS FOR EACH
+* USER.  ACFRPTRX IS A UTILITY THAT DOES EXACTLY THIS - RETURNS
+* THE PERMISSIONS FOR ALL OR SOME USERS. THE PERMISSIONS ARE
+* WRITTEN TO SYSPRINT.
+*
+* DURING GETUSER, WE ATTACH ACFRPTRX AND PROVIDE IT WITH THE
+* REQUIRED PARAMETERS. BUT, INSTEAD OF DIRECTING SYSPRINT TO A
+* SEQUENTIAL FILE (WHICH MIGHT BECOME FULL), OR TO A SYSOUT
+* (WHICH MIGHT BE LARGE, AND IS COMPLICATED TO READ) WE ARE
+* INTERCEPTING THE OUTPUT WHEN WRITTEN, AND KEEPING IT IN
+* STORAGE WHICH IS EASY TO SCAN.
+* THIS IS DONE BY USING SVC SCREENING TO INTERCEPT THE OPEN DONE TO
+* SYSPRINT AND SETTING OUR ROUTINE AS THE I/O ROUTINE THAT WILL
+* BE CALLED WHEN DATA IS WRITTEN TO SYSPRINT. OUR ROUTINE WILL
+* GET ALL THE RECORDS WRITTEN TO THIS FILE AND KEEP THEM IN STORAGE
+* TO BE USED BY THE GETUSER PROCESS. PLEASE SEE CTS2RXO FOR
+* DETAILED EXPLANATIONS.
+*
+* SVC SCEENING IS DESCRIBED IN "MVS AUTHORIZED ASSEMBLER SERVICES
+* GUIDE" CHAPTER 23 "USER-WRITTEN SVC ROUTINES" UNDER THE TITLE
+* "SUBSYSTEM SVC SCREENING".
+*
+* THE WAY WE ARE USING SVC SCREENING IS NOT THE OFFICIAL WAY IT
+* IS MEANT TO BE USED, BUT IT IS AN OFFICIAL SERVICE AND LETS US
+* ACHIEVE WHAT WE WANT...
+*
+*
+* LOGIC
+* =====
+* THIS ROUTINE HANDLES ALL ACTIONS REQUIRED TO SET AND REMOVE THE
+* SVC SCREENING ENVIRONMENT FOR OPEN DONE FOR SYSPRINT BY ACFRPTRX.
+*
+* THE MF CONNECTOR USES SVC SCREENING FOR SETTNG AUTHORIZATION.
+* SO, BEFORE ACTIVATING ACFRPTRX WE NEED TO REPLACE THE EXISTING
+* SVC SCREENING  WITH THE NEW ONE FOR INTERCEPTING THE OPEN FOR
+* SYSPRINT.  WHEN ACFRPTRX ENDS, WE REMOVE THE SCREENING FOR OPEN
+* AND RE-ACTIVATE THE ORIGINAL SCREENING (SEE "LIMITATIONS AND
+* CONSIDERATINS" BELOW).
+*
+* FOR SVC SCREENING TO BE ACTIVE, AN SVC SCREENING TABLE HAS TO
+* BE ALLOCATED, SET AND POINTED BY THE TCB.  WE ALLOCATE THIS
+* TABLE ONCE, AND USE IT WHEN NEEDED. THE ADDRESS OF THIS TABLE
+* IS KEPT IN A TASK LEVEL NAME/TOKEN PAIR.  THE TABLE IS ALLOCATED
+* IN SUBPOOL 253, WHICH IS A TASK-RELATED SUBPOOL.
+*
+* THE SCREENING ROUTINE RECEIVES CONTROL FROM THE SYSTEM WHEN THE
+* SPECIFIC SVC (AS SET IN THE SVC SCREENING TABLE) IS ACTIVATED.
+* THERE IS NO WAY TO PASS INFORMATION FROM THE PROGRAM THAT SET
+* THE SCRENEING TO THE SCREENING ROUTINE.
+* WE OVERCOME THIS LIMITATION BY ALLOCATING A LARGER SCREENING
+* TABLE, AND SETTING THE PARAMETERS THAT NEED TO BE PASSED TO THE
+* SVC ROUTINE IN THIS EXTENSION.
+*
+*
+* LIMITATIONS AND CONSIDERATIONS:
+* ===============================
+* 1. THE SVC SCREENING IS ACTIVATED FOR THE TASK THAT ATTACHES
+*    ACFRPTRX, AND IS PROPAGATED TO THE TASK ATTACHED FOR
+*    ACTIVATING ACFRPTRX.  THEREFORE, WE NEED TO BE CAREFUL TO
+*    REMOVE IT AFTER THE TASK FOR ACFRPTRX TERMINATES.
+*
+* 2. WHEN THE NEW SCREENING IS ACTIVE, WE SHOULD NOT ACTIVATE
+*    TSO, BECAUSE WE HAVE NO WAY TO RESET AUTHORIZATION. IF NEEDED.
+*    WE WILL HAVE TO CHECK IF/HOW WE CAN ACTIVATE SCREENING FOR
+*    BOTH SVCS.  (THE ISSUE IS THAT THE CONDITIONS REQUIRED FOR EACH
+*    ARE DIFFERENT, BUT THERE IS ONLY 1 SET OF CONDITIONS WHICH
+*    CAN BE SPECIFIED IN TE SCREENING ROUTINE.)
+*
+* 3. WE SHOULD BE CAREFUL NOT TO USE THE OPEN SCREENING ROUTINE
+*    CONCURRENTLY FOR DIFFERENT FILES. THIS LIMITAITON IS DUE TO
+*    WAY WE PASS INFORMATION TO THE SVC ROUTINE (SEE ABOVE).
+*
+*
+* STRUCTURE
+* =========
+* THIS PROGRAM IS SPLIT INTO SEPARATE ROUTINES (BECAUSE OF
+* ADDRESSABILITY ISSUES. EACH ROUTINE ENDS WITH A LABEL WHICH
+* IS USUALLY THE ROUTINE NAME APPENDED WITH E (FOR EXMAPLE, THE
+* DOACT ROUTINE ENDS WITH LABEL DOACTE). THE USING SET IN EACH
+* ROUTINE HAS START AND END LABELS SO THAT WE WON'T HAVE OVERLAPPING
+* USING FROM ONE ROUTINE TO THE NEXT.
+*
+*
+* ERROR HANDLING
+* ==============
+* ERROR MESSGAES ISSUED BY THIS ROUTINE, AND BY THE SVC AND I/O
+* ROUTINES, ARE WRITTEN TO THE JOBLOG. WE WANT THEE MESSAGES TO
+* APPEAR IN STDMSG ALONG WITH ALL THE OTHER PRODUCT MESSAGES.
+* ANOTHER ISSUE IS THAT ANY ERROR IN THE SVC OR I/O ROUTINE ARE
+* NOT SEEN BY THE PROGRAM THAT ACTIVATED THE SCREENING.
+* TO SOLVE BOTH ISSUES, WE USE AN ERROR BLOCK, MAPPED BY CTS2RXE,
+* IN WHICH WE WILL PASS TO THE CALLER TAN INDICATION THAT THERE
+* WAS AN ERROR, AND ALL DETAILS ABOUT THE ERROR, INCLUDING THE
+* MESSAGE.
+* THE CALLER SHOULD ISSUE THIS ERROR MESSAGE AS THE DESCRIPTION
+* ON THE STANDARD "INTERNAL ERROR' MESSAGE.
+*
+*
+****************************************************************
+*
+*--------------------------------------------------------------------
+**                       MACROS
+*--------------------------------------------------------------------
+*
+         MACRO
+.***************************************************************
+.*
+.*  SETKEY
+.*
+.*  SET PSW KEY.
+.*
+.*  &KEY - 0 / TCB
+.*
+.*  THE MACRO DESTROIES R0, R1, R2, R14 AND R15
+.*
+.*
+.***************************************************************
+         SETKEY &KEY
+         AIF   ('&KEY' EQ '0').KEY0
+         AIF   ('&KEY' EQ 'TCB').KEYTCB
+         AGO   .ERRKEY
+.KEY0    ANOP
+         MODESET EXTKEY=ZERO
+         AGO   .SKEND
+.KEYTCB  ANOP
+         LHI   R2,0
+         IPK                           R2 = CURRENT KEY.
+         CHI   R2,0                    IF WE ARE IN KEY 0...
+         BNE   SK&SYSNDX
+         L     R14,PSATOLD-PSA
+         USING TCB,R14
+         MODESET EXTKEY=TCB,WORKREG=2  ..SWITCH BACK TO TCB KEY.
+         DROP  R14
+SK&SYSNDX DS   0H
+         AGO   .SKEND
+.ERRKEY  ANOP
+         MNOTE '8,KEY &KEY IS INVALID.  CAN BE 0 OR TCB'
+.SKEND   ANOP
+         MEND
+*
+*--------------------------------------------------------------------
+**                       PROGRAM
+*--------------------------------------------------------------------
+*
+CTS2RXS  CSECT
+CTS2RXS  AMODE ANY
+CTS2RXS  RMODE ANY
+*
+         LHI   15,0                    NULLIFY THE...          WS10084
+         BR    14                      ...ROUTINE.             WS10084
+         DC    C'CTS2RXS - THIS MODULE IS OBSOLETE'            WS10084
+*
+         AGO   .END                    SKIP THE WHOLE ROUTINE  WS10084
+         USING CTS2RXS,R15
+         BSM   R14,0                   SAVE CURRENT AMODE IN R14
+         STM   R14,R12,12(R13)         SAVE REGISTERS.
+         CTSLEVEL
+*
+         LR    R12,R15                 SET BASE REGISTER.
+         DROP  R15
+         USING (CTS2RXS,CTS2RXSE),R12
+         LR    R10,R1                  R10 -> PARMS LIST.
+         USING PRM,R10                 R10 POINTS TO INPUT PARMS
+         LARL  R11,CONST
+         USING CONST,R11
+*
+*
+**   ALLOCATE WORK AREA AND CHAIN SAVE AREAS.
+**
+**   NOTE:
+**   WE NEED TO ALLOCATE IT BELOW THE LINE BECAUSE OF CTSADBG
+*
+         STORAGE OBTAIN,LENGTH=#WALEN,ADDR=(R1),COND=YES,LOC=24,       >
+               LINKAGE=SYSTEM
+         CHI   R15,0
+         BNE   GETMERR                 GETMAIN FAILED.
+*
+         LR    R3,R1                   SAVE AREA LENGTH
+*
+         LR    R0,R1
+         LHI   R1,#WACLNLN
+         SLR   R15,R15
+         MVCL  R0,R14                  ZERO AREA.
+*
+         LR    R1,R3
+         ST    R13,4(,R1)              CHAIN
+         ST    R1,8(,R13)                ...SAVE...
+         LR    R13,R1                       ...AREAS
+         USING WA,R13
+*
+**   TAKE DEBUG LEVEL.
+*
+         MVI   DBGLEVEL,0              ZERO DEBUG LEVEL.
+         L     R1,PRMDBG               R1 -> DEBUG LEVEL (4 BYTES)
+         LA    R1,0(,R1)               CLEAR AMODE BIT.
+         CHI   R1,0                    DEBUG LEVEL PROVIDED ?
+         BE    NODEBUG
+         L     R1,0(,R1)               R1 = DEBUG LEVEL
+         CHI   R1,0                    VALID DEBUG LEVEL ?
+         BNH   NODEBUG                 ..NO - NO DEBUG.
+         STC   R1,ORIGDBGL             STORE DEBUG LEVEL (1 BYTE)
+         STC   R1,DBGLEVEL             STORE DEBUG LEVEL (1 BYTE)
+         CHI   R1,77                   I/O DIAG IS ALSO REQUESTED ?
+         BNE   NODEBUG
+         MVI   DBGLEVEL,1              SET APPROPRIATE LEVEL FOR US.
+NODEBUG  DS    0H
+*
+**   CLEAR ERROR BLOCK
+*
+         MVC   PARMVAL,BLANKS8
+         MVC   PARMNAME,=CL8'ERRORBLK'
+         L     R1,PRMERBLK             R1 -> ERROR BLOCK.
+         LA    R1,0(,R1)
+         CHI   R1,0
+         BE    PRMERR
+         ST    R1,ERRBLKA              SAVE ERROR BLOCK ADDRESS.
+*
+         USING RXE,R1
+         LHI   R15,0
+         ST    R15,RXEERROR
+         MVI   RXEPGM,X'00'
+         MVI   RXEFUNC,X'00'
+         MVI   RXEMSG,X'00'
+         MVI   RXEDLINE,X'00'
+         DROP  R1
+*
+**   BRANCH ACCORDING TO FUNCTION.
+*
+         LA    R5,FENTRY
+         ST    R5,CURFUNC
+         MVC   CURREQ,12(R5)           SAVE REQUEST NAME, FOR MSGS.
+         MVC   PARMNAME,=CL8'REQTYPE'
+         L     R4,PRMFUNC              R4 -> FUNCTION.
+         LA    R4,0(,R4)               CLEAR HIGH-ORDER BYTE.
+         CHI   R4,0                    PASSED ?
+         BE    PRMERR                  ..NO - ERROR.
+         MVC   PARMVAL,0(R4)
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'FUNCTION = _',(0(R4),8),                               >
+               RAREA=RAREA,DBGAREA=DBGAREA
+*
+         LA    R5,FUNCTAB
+         LA    R0,#FUNCTE#
+FUNCLOOP DS    0H
+         CLC   0(8,R5),0(R4)           CHECK FUNCTION.
+         BE    DOFUNC
+         LA    R5,#FUNCTEL(,R5)
+         BCT   R0,FUNCLOOP
+         B     PRMERR
+DOFUNC   DS    0H
+         ST    R5,CURFUNC
+         MVC   CURREQ,12(R5)           SAVE REQUEST NAME, FOR MSGS.
+         MVC   MDSETL(#MDSSPML),MDSETSM
+         MODESET MF=(E,MDSETL)         SET 'SUPERVISOR STATE' SO THAT
+*                                      WE CAN CHANGE KEY WHEN NEEDED.
+         L     R15,8(,R5)              R15 -> FUNCTION ROUTINE
+         BASR  R14,R15                 GO PROCESS IT.
+*
+*                                      INTERNAL ROUTINES RC:
+*                                       0 - OK
+*                                       4 - PARAMETER ERROR.
+*                                       8 - FUNCTION FAILED.
+*                                      12 - INTERCEPTION FAILED (DEACT)
+         B     *+L'*(R15)
+         B     RETURN
+         B     PRMERR
+         B     RC4
+*
+**  ISSUE ERROR MESSAGES, SET RETURN CODE AND RETURN
+*
+GETMERR  DS    0H
+         WTO   'CTSXXXX - CTS2RXS - ALLOCATION OF WORK AREA FAILED'
+         B     RC4                     SET RC (WITHOUT MESSAGE...)
+PRMERR   DS    0H
+         LHI   R1,MSG250-MSGRTN        ISSUE CTS250E
+         LARL  R15,MSGRTN
+         BASR  R14,R15
+*
+         B     RC4
+*
+RC4      DS    0H
+         LHI   R15,4                   REQUEST FAILED.
+         B     RETURN
+*
+RETURN   DS    0H
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'RETURN: RC = #',(?R15),                                >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         LR    R5,R15                  SAVE RC
+         MVC   MDSETL(#MDSPRML),MDSETPM
+         MODESET MF=(E,MDSETL)
+         LR    R1,R13                  R1 -> ALLOCTED AREA.
+         L     R13,4(,R13)
+         FREEMAIN RC,LV=#WALEN,A=(R1)
+         LR    R15,R5                  RESTORE RC.
+*
+OUT      DS    0H
+         L     R14,12(,R13)
+         LM    R0,R12,20(R13)
+         BSM   0,R14
+         DROP  ,
+         LTORG ,
+CTS2RXSE DS    0H
+*
+*--------------------------------------------------------------------
+**
+**   ACT
+**
+**   - PURIFY AND VERIFY PARAMETERS.
+**   - RETRIEVE THE NAME/TOKEN PAIR.
+**     IF NOT FOUND, CALL INITSCE TO INITIALIZE THE SVC SCREENING
+**     ENVIRONMENT.
+**   - VALIDATE THE SCREENING TABLE AND MODULE.
+**   - SET TIME=X'FF' IN SCE TO INDICATE TABLE IS BEING UPDATED.
+**   - SET THE SCE (SCREENING TABLE EXTENSION) AND RXOB (CTS2RXO
+**     ENTRY BLOCK):
+**     * PUT THE PARMAETERS IN THE RXOB
+**     * PUT STCK TIME IN BOTH
+**   - IF SVC SCREEING IS ALREADY ACTIVE, SAVE THE CURENT SETTING
+**     (SCREENING TABLE ADDRESS AND FLAGS) IN THE SCE.
+**   - ACTIVATE OUR SVC SCREENING.
+**
+**   RETURN CODES:
+**    0 - OK
+**    4 - PARAMETERS ERROR.
+**    8 - ERROR.
+**
+*--------------------------------------------------------------------
+DOACT    DS    0H
+         USING WA,R13
+         BSM   R14,0
+         STM   R14,R12,SADO+12           SAVE REGISTERS
+         LR    R9,R15
+         USING (DOACT,DOACTE),R9
+         USING CONST,R11
+         USING PRM,R10
+*
+**   VERIFY AND SAVE PARAMETERS
+*
+         L     R15,PRMA1OM
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'ACT: RULEADDR = ~    IGNORE LIST = ~  1/M = ~/_',      >
+               (PRMARULA,PRMAIGN,?R15,0(R15),1),                       >
+               RAREA=RAREA,DBGAREA=DBGAREA
+*
+         MVC   PARMVAL,BLANKS8                                 BS10111
+         MVC   PARMNAME,=CL8'IORTADDR'                         BS10111
+         L     R1,PRMDMGRA             R1 -> DATA MGT. ROUTINE BS10111
+         LA    R1,0(,R1)                                       BS10111
+         CHI   R1,0                                            BS10111
+         BE    DARC4                                           BS10111
+         ST    R1,@DMGRA                                       BS10111
+*
+         MVC   PARMVAL,BLANKS8
+         MVC   PARMNAME,=CL8'RULEADDR'
+         L     R1,PRMARULA             R1 -> RULE AREA POINTER.
+         LA    R1,0(,R1)
+         CHI   R1,0
+         BE    DARC4
+         ST    R1,@RULEAPA
+*
+         MVC   PARMNAME,=CL8'IGNRLIST'
+         MVC   PARMVAL,BLANKS8
+         L     R1,PRMAIGN              R1 -> IGNORE LIST (OPTIONAL)
+         LA    R1,0(,R1)
+         ST    R1,@IGNLSTA
+*
+         MVC   PARMNAME,=CL8'1/M'
+         MVC   PARMVAL,BLANKS8
+         L     R1,PRMA1OM              R1 -> 1/M
+         LA    R1,0(,R1)
+         CHI   R1,0
+         BE    DARC4
+         ST    R1,@1OMA
+         MVC   PARMVAL(1),0(R1)
+         CLI   0(R1),C'1'
+         BE    DA1OMEND
+         CLI   0(R1),C'M'
+         BNE   DARC4
+DA1OMEND DS    0H
+*
+         MVC   PARMVAL,BLANKS8                                 BS10111
+         MVC   PARMNAME,=CL8'RUOBUTKA'                         BS10111
+         L     R1,PRMRUTKA             R1 -> RUOB UTOKEN.      BS10111
+         LA    R1,0(,R1)                                       BS10111
+         CHI   R1,0                                            BS10111
+         BE    DARC4                                           BS10111
+         ST    R1,@RUTKNA                                      BS10111
+         SAM31
+*
+**   RETRIEVE THE NAME/TOKEN.
+**   IF EXISTS, VALIDATE THE ENVIRONMENT.
+*
+         LARL  R15,VALENV
+         BASR  R14,R15                 RETRIEVE AND VALIDATE THE ENV.
+         B     *+L'*(R15)
+         B     DAUSESCE                0 - ENVIRONMENT OK.
+         B     DAINIT                  4 - NO NAME TOKEN - INIT.
+         B     DARC8                   8 - ENVIRONMENT ERROR.
+*
+**   NOT FOUND - CREATE THE SCREENING ENVIRONMENT AND NAME/TOKEN
+*
+DAINIT   DS    0H
+         MVI   VEISACT,#VEISACN        ACTIVE = 'INACTIVE'
+         LARL  R15,INITENV
+         BASR  R14,R15                 GO INIT THE ENVIRONMENT.
+         CHI   R15,0                   SUCCESSFUL ?
+         BNE   DARC8                   ..NO - OUT.
+*
+**  PREPARE THE SCREENING TABLE AND RXOB
+*
+DAUSESCE DS    0H
+         CLI   VEISACT,#VEISACY        ACTIVE ?
+         BE    DAERRACT                ..YES - ERROR.
+         L     R7,NTTKSCEA             R7 -> SVC SCREENING TABLE.
+         L     R6,0(,R7)               R6 -> SVC ROUTINE (CTS2RXO)
+         USING RXOB,R6
+         LA    R8,#SCETLEN(,R7)        R8 -> SCREENING TABLE EXTENSION.
+         USING SCE,R8
+*
+         TIME  STCK,STCKTIME           GET CURRENT TIME.
+         SETKEY 0
+*
+         MVC   SCESTCK,NOTIME          SET X'FF' IN TIME.
+         XC    SCEACT(#SCEACTL),SCEACT
+*
+         XC    RXOBCALL(#RXOBCLN),RXOBCALL
+         L     R1,@RULEAPA
+         ST    R1,RXOBOUTA             SET RULE AREA ADDRESS POINTER.
+         L     R1,@IGNLSTA
+         ST    R1,RXOBIGNL             SET IGNORE LIST ADDRESS.
+         L     R1,@1OMA
+         MVC   RXOB1OM,0(R1)           SET 1/M
+         MVC   RXOBDBGL,ORIGDBGL       SET DEBUG LEVEL.
+         MVC   RXOBERRB,ERRBLKA        SET ERROR BLOCK ADDRESS.
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'ACT: RXOB (~) = ~, $, ~, ~, _, $',                     >
+               (?R6,RXOBSCRT,RXOBSTCK,8,RXOBIGNL,RXOBOUTA,RXOB1OM,1,   >
+               RXOBFAIL,1),                                            >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),               BS10111 >
+               'ACT: RXOB... = ~, ~',                          BS10111 >
+               (RXOBDMGR,RXOBRUTK),                            BS10111 >
+               RAREA=RAREA,DBGAREA=DBGAREA                     BS10111
+         MVC   SCESTCK,STCKTIME        SET X'FF' IN TIME.
+         MVC   RXOBSTCK,SCESTCK        SET ACT TIME IN RXOB
+         MVC   RXOBDMGR,@DMGRA         PUT DATA MGT. RTN ADDR.  BS10111
+         MVC   RXOBRUTK,@RUTKNA        PUT RUOB UTOKEN ADDRESS. BS10111
+*
+**  ACTIVATE SVC SCREENING.
+*
+         L     R5,PSATOLD-PSA          R5 -> ACTIVE TCB
+         USING TCB,R5
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'ACT: TCB (BEFORE) - FLAGS = $  SCRN = ~',              >
+               (TCBFLGS7,1,TCBSVCA2),                                  >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         L     R1,TCBSVCA2             R1 -> ACTIVE SCREEING TABLE.
+         CHI   R1,0                    SVC SCREENING IS ACTIVE ?
+         BE    DASETSCR                ..NO - SET OURES.
+*                                      ..YES - SAVE IN EXTENSION.
+         ST    R1,SCEPREV
+         MVC   SCETCBF,TCBFLGS7
+         NI    SCETCBF,TCBSVCS+TCBSVCSP LEAVE ONLY SCRN FLAGS.
+DASETSCR DS    0H
+         ST    R7,TCBSVCA2             SET SVC SCREENING TABLE ADDR.
+         OI    TCBFLGS7,TCBSVCS+TCBSVCSP ACTIVATE FOR TASK AND SUBTASKS
+*
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'ACT: TCB (AFTER) - FLAGS = $  SCRN = ~',               >
+               (TCBFLGS7,1,TCBSVCA2),                                  >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'ACT: SCE =  $, ~, $',                                  >
+               (SCESTCK,8,SCEPREV,SCETCBF,1),                          >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         DROP  R5,R6,R8
+         SETKEY TCB
+         B     DARC0
+*
+**  ISSUE ERROR MESSAGES, SET RETURN CODE AND RETURN
+*
+DAERRACT DS    0H                      AREADY ACTIVE
+         MVC   STATUS,=CL8'ACTIVE'
+         LHI   R1,MSG256-MSGRTN        ISSUE CTS256E
+         LARL  R15,MSGRTN
+         BASR  R14,R15
+         B     DARC8
+DARC0    DS    0H
+         LHI   R15,0                   OK.
+         B     DARET
+*
+DARC4    DS    0H                      PARAMETERS ERROR.
+         LHI   R15,4
+         B     DARET
+*
+DARC8    DS    0H                      FUNCTION FAILED.
+         LHI   R15,8
+         B     DARET
+*
+DARET    DS    0H
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'DOACT: RC = #',(?R15),                                 >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         LR    R5,R15
+         SETKEY TCB
+         LR    R15,R5
+DAEND    DS    0H
+         L     R14,SADO+12             RESTORE...
+         LM    R0,R12,SADO+20          ...REGISTERS.
+         BSM   0,R14
+         DROP  ,
+         LTORG ,
+DOACTE   DS    0H
+*--------------------------------------------------------------------
+**
+**   DEACT
+**
+**   - VALIDATE THE SCREENING TABLE AND MODULE.
+**   - VERIFY THAT OUR SCREENING TABLE IS ACTIVE.
+**   - IF A PREVIOUS SCREENING WAS ACTIVE, RE-ACTIVATE IT.
+**     OTHERWISE, REMOVE OUR SCREENING TABLE AND FLAGS.
+**
+**   RETURN CODES:
+**    0 - OK
+**    4 - PARAMETERS ERROR (N/A)
+**    8 - ERROR.
+**
+*--------------------------------------------------------------------
+DODEACT  DS    0H
+         USING WA,R13
+         BSM   R14,0
+         STM   R14,R12,SADO+12           SAVE REGISTERS
+         LR    R9,R15
+         USING (DODEACT,DODEACTE),R9
+         USING CONST,R11
+         USING PRM,R10
+*
+         SAM31
+*
+**   RETRIEVE THE NAME/TOKEN.
+**   IF EXISTS, VALIDATE THE ENVIRONMENT.
+*
+         LARL  R15,VALENV
+         BASR  R14,R15                 RETRIEVE AND VALIDATE THE ENV.
+         B     *+L'*(R15)
+         B     DDDEACT                  0 - ENVIRONMENT IS OK.
+         B     DDERRNTK                 4 - NO NAME/TOKEN - ERROR.
+         B     DDRC8                    8 - ERROR.
+*
+**   DEACTIVATE
+*
+DDDEACT  DS    0H
+         CLI   VEISACT,#VEISACY        ACTIVE ?
+         BNE   DDERRINA                ..NO - ERROR.
+         L     R7,NTTKSCEA             R7 -> SVC SCREENING TABLE.
+         L     R6,0(,R7)               R6 -> SVC ROUTINE (CTS2RXO)
+         USING RXOB,R6
+         LA    R8,#SCETLEN(,R7)        R8 -> SCREENING TABLE EXTENSION.
+         USING SCE,R8
+*
+**  VERIFY WE ARE NOT ACTIVE IN ANY SUBTASK, IF EXISTS.
+*
+         LR    R1,R7                   R1 -> OUR SCREENING TABLE.
+         LARL  R15,CHKDTR              CHECK DAUGHTER TASKS.
+         BASR  R14,R15
+         CHI   R15,0                   ACTIVE ?
+         BE    DDERRTSK                ..YES - CANNOT TERMINATE.
+*
+**  REMOVE OUR SCREENING.
+*
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'DEACT:  SCEPREV = ~   SCETCBF = $',                    >
+               (SCEPREV,SCETCBF,1),                                    >
+               RAREA=RAREA,DBGAREA=DBGAREA
+*
+         SETKEY 0
+         L     R5,PSATOLD-PSA          R5 -> ACTIVE TCB
+         USING TCB,R5
+         MVC   SCESTCK,NOTIME          SET X'FF' IN TIME - INVALIDATE.
+         NI    TCBFLGS7,X'FF'-(TCBSVCS+TCBSVCSP) REMOVE OUR SCREENING.
+         OC    TCBFLGS7,SCETCBF         RESTORE...
+         MVC   TCBSVCA2,SCEPREV            ...PREVIOUS SCREENING.
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'DEACT: TCB (AFTER) - FLAGS = $  SCRN = ~',             >
+               (TCBFLGS7,1,TCBSVCA2),                                  >
+               RAREA=RAREA,DBGAREA=DBGAREA
+*
+**  CLEAR THE SCE AND RXOB
+*
+         XC    RXOBCALL(#RXOBCLN),RXOBCALL
+         XC    SCEACT(#SCEACTL),SCEACT
+         MVC   SCESTCK,TIME0           CLEAR STCK.
+         DROP  R6,R8
+*
+         DROP  R5
+         SETKEY TCB
+         B     DDRC0
+*
+**  SET RETURN CODE AND RETURN
+*
+DDERRINA DS    0H                      ALREADY INACTIVE.
+         MVC   STATUS,=CL8'INACTIVE'
+         LHI   R1,MSG256-MSGRTN        ISSUE CTS256E
+         LARL  R15,MSGRTN
+         BASR  R14,R15
+         B     DDRC8
+DDERRNTK DS    0H                      NAME/TOKEN DOES NOT EXIST.
+         LHI   R1,MSG258-MSGRTN        ISSUE CTS258E
+         LARL  R15,MSGRTN
+         BASR  R14,R15
+         B     DDRC8
+DDERRTSK DS    0H                      ACTIVE IN SUBTASK.
+         LR    R5,R1                   -> DAUGHTER TCB.
+         LHI   R1,MSG259-MSGRTN        ISSUE CTS259E
+         LARL  R15,MSGRTN
+         BASR  R14,R15
+         USING TCB,R5
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGL255,255),                      >
+               'CHKDTR:  TCB = ~   FLAGS = $  SCRN = ~   (OURS = ~)',  >
+               (?R5,TCBFLGS7,1,TCBSVCA2,?R7),                          >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         DROP  R5
+         B     DDRC8
+DDRC0    DS    0H
+         LHI   R15,0                   OK.
+         B     DDRET
+*
+DDRC8    DS    0H                      INVALID ENVIRONMENT.
+         LHI   R15,8
+         B     DDRET
+*
+DDRET    DS    0H
+         LR    R5,R15
+         SETKEY TCB
+         LR    R15,R5
+DDEND    DS    0H
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'DODEACT: RC = #',(?R15),                               >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         L     R14,SADO+12             RESTORE...
+         LM    R0,R12,SADO+20          ...REGISTERS.
+         BSM   0,R14
+         DROP  ,
+         LTORG ,
+DODEACTE DS    0H
+*--------------------------------------------------------------------
+**
+**   TERM
+**
+**   - VALIDATE THE SCREENING TABLE AND MODULE.
+**   - VERIFY THAT OUR SCREENING TABLE IS NOT ACTIVE (IN CURRENT OR
+**     DAUGHTER TASKS).
+**   - VERIFY CTS2RXO IS LOADED, AND ITS ADDESS MATCH "OURS".
+**   - IF ALL IS VALID, FREE THE SCREENING TABLE AND DELETE CTS2RXO.
+**
+**   RETURN CODES:
+**    0 - OK
+**    4 - PARAMETERS ERROR (N/A)
+**    8 - ERROR.
+**
+*--------------------------------------------------------------------
+DOTERM   DS    0H
+         USING WA,R13
+         BSM   R14,0
+         STM   R14,R12,SADO+12           SAVE REGISTERS
+         LR    R9,R15
+         USING (DOTERM,DOTERME),R9
+         USING CONST,R11
+         USING PRM,R10
+*
+         SAM31
+*
+*
+**   RETRIEVE THE NAME/TOKEN.
+**   IF EXISTS, VALIDATE THE ENVIRONMENT.
+*
+         LARL  R15,VALENV
+         BASR  R14,R15                 RETRIEVE AND VALIDATE THE ENV.
+         B     *+L'*(R15)
+         B     DTTERM                  0 - ENVIRONMENT OK.
+         B     DTRC0                   4 - NO NAME/TOKEN - OK
+         B     DTRC8                   8 - ERROR.
+*
+**  ENVIRONMENT IS OK AND INACTIVE - TERMINATE.
+*
+DTTERM   DS    0H
+         CLI   VEISACT,#VEISACY        ACTIVE ?
+         BE    DTERRACT                ..YES - ERROR.
+         L     R7,NTTKSCEA             R7 -> SVC SCREENING TABLE.
+         L     R6,0(,R7)               R6 -> SVC ROUTINE (CTS2RXO)
+         LA    R6,0(,R6)               PURUFY ADDRESS.
+         USING RXOB,R6
+         LA    R8,#SCETLEN(,R7)        R8 -> SCREENING TABLE EXTENSION.
+         USING SCE,R8
+*
+**  VERIFY WE ARE NOT ACTIVE IN ANY SUBTASK, IF EXISTS.
+*
+         LR    R1,R7                   R1 -> OUR SCREENING TABLE.
+         LARL  R15,CHKDTR              CHECK DAUGHTER TASKS.
+         BASR  R14,R15
+         CHI   R15,0                   ACTIVE ?
+         BE    DTERRTSK                ..YES - CANNOT TERMINATE.
+*
+**  VERIFY WE ARE GOING TO DELETE THE CORRECT MODULE.
+*
+         MVC   CSVQL(CSVQML),CSVQM
+         LA    R3,RXOEPA
+         CSVQUERY INEPNAME=CTS2RXO,SEARCH=JPA,OUTEPA=(R3),MF=(E,CSVQL)
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'TERM: CSVQUERY - RC = #   CTS2RXO EPA = ~',            >
+               (?R15,RXOEPA),                                          >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         CHI   R15,0
+         BNE   DTERRNLD                CTS2RXO NOT LOADED
+         C     R6,RXOEPA
+         BNE   DTERRMOD                CTS2RXO NOT OURS.
+*
+**  TABLES AND MODULE ARE VALID - TERMINATE
+*
+         SETKEY 0
+         MVC   SCESTCK,NOTIME          TABLE IN WORK
+         SETKEY TCB
+*
+**   DELETE THE NAME/TOKEN PAIR
+*
+         MVC   RTN,=CL8'IEANTDL'
+         LA    R1,NTLEVEL
+         ST    R1,RAREA
+         LA    R1,NTNAME
+         ST    R1,RAREA+4
+         LA    R1,NTRC
+         ST    R1,RAREA+8
+         OI    RAREA+8,X'80'
+         LA    R1,RAREA                R1 -> PARMS TABLE.
+*
+         L     R15,X'10'
+         L     R15,X'220'(R15,0)
+         L     R15,X'14'(R15,0)
+         L     R15,X'0C'(R15,0)        R15 -> IEANTDL
+*
+         CALL  (15)
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'IEANTDL - NAME/TOKEN = _, $    RC = #',                >
+               (NTNAME,16,NTTOKEN,16,?R15),                            >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         CHI   R15,0
+         BNE   DTERRNDL                NAME/TOKEN DELETE FAILED.
+*
+**   DELETE THE MODULE (CTS2RXO)
+*
+         DELETE EPLOC=CTS2RXO
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'TERM: DELETE FOR CTS2RXO.  RC = #',(?R15),             >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         CHI   R15,0                   SUCESSFUL DELETE ?
+         BE    DTRLS                   ..YES - GO FREE THE SCRN TABLE.  LE.
+         MVC   CHARARS,BLANKS8
+         MVC   CHARABND,BLANKS8
+         CTSAN2C CHARRC                TRANSLATE RETURN CODE.
+         MVC   MSGACT,=CL7'DELETE'
+         LHI   R1,MSG253-MSGRTN        ISSUE CTS253E
+         LARL  R15,MSGRTN
+         BASR  R14,R15
+*
+DTRLS    DS    0H
+         SETKEY 0
+         L     R0,SCELGTH
+         AHI   R0,#SCETLEN             R0 = SCREENING TABLE LENGTH
+         LR    R3,R0                   SAVE LENGTH (FOR DIAG).
+         LR    R1,R7                   R1 -> SCREENING TABLE.
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'TERM: SCREENING TABLE RELEASE: ~ / #',(?R7,?R3),       >
+               RAREA=RAREA,DBGAREA=DBGAREA
+*
+         STORAGE RELEASE,LENGTH=(R0),SP=#SCETSP,ADDR=(R1),             >
+               COND=YES,LINKAGE=SYSTEM
+*
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'TERM: SCREENING TABLE RELEASE: ~ / #   RC = #',        >
+               (?R7,?R3,?R15),                                         >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         DROP  R6,R8
+         LR    R5,R15
+         SETKEY TCB
+         LR    R15,R5
+         CHI   R15,0                   SUCCESSFUL RELEASE ?
+         BE    DTRC0                   ..YES - RETURN.
+*                                      ..NO - ISSUE MESSGAE.
+         CTSAN2C CHARRC                TRANSLATE RC
+         LR    R15,R3
+         CTSAN2C NUMCHAR,LEN=7         TRANLATAE LEBGTH,
+         LHI   R15,#SCETSP
+         CTSAN2C SPNUM,LEN=3           TRANSLATE SP NUM.
+         LR    R15,R7                  SCE TABLE ADDRESS
+         CTSAN2C M251ADDR,MODE=HEX TRANSALTE ADDRESS.
+         MVC   MSGACT,=CL7'RELEASE'
+         MVC   M251CBNM,=CL8'SCRNT'
+         LHI   R1,MSG251-MSGRTN        ISSUE CTS251E
+         LARL  R15,MSGRTN
+         BASR  R14,R15
+         B     DTRC0                   DO OT FAIL THE TERMINATION.
+*
+**  SET RETURN CODE AND RETURN
+*
+DTERRACT DS    0H
+         MVC   M257RSN,=CL20'ACTIVE'
+         B     DTERR258
+DTERRNLD DS    0H
+         MVC   M257RSN,=CL20'MODULE NOT LOADED'
+         B     DTERR258
+DTERRMOD DS    0H
+         MVC   M257RSN,=CL20'MODULE ERROR'
+         B     DTERR258
+DTERR258 DS    0H
+         LHI   R1,MSG257-MSGRTN        ISSUE CTS257E
+         LARL  R15,MSGRTN
+         BASR  R14,R15
+         B     DTRC8
+DTERRNDL DS    0H
+         CTSAN2C CHARRC
+         LHI   R1,MSG252-MSGRTN        ISSUE CTS252E
+         LARL  R15,MSGRTN
+         BASR  R14,R15
+         B     DTRC8
+DTERRTSK DS    0H                      ACTIVE IN SUBTASK.
+         LR    R5,R1                   -> DAUGHTER TCB.
+         LHI   R1,MSG259-MSGRTN        ISSUE CTS259E
+         LARL  R15,MSGRTN
+         BASR  R14,R15
+         USING TCB,R5
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGL255,255),                      >
+               'CHKDTR:  TCB = ~   FLAGS = $  SCRN = ~   (OURS = ~)',  >
+               (?R5,TCBFLGS7,1,TCBSVCA2,?R7),                          >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         DROP  R5
+         B     DTRC8
+*
+DTRC0    DS    0H
+         LHI   R15,0                   OK.
+         B     DTRET
+*
+DTRC8    DS    0H                      CONTROL BLOCKS ERROR.
+         LHI   R15,8
+         B     DTRET
+*
+DTRET    DS    0H
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'DOTERM: RC = #',(?R15),                                >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         LR    R5,R15
+         SETKEY TCB
+         LR    R15,R5
+DTEND    DS    0H
+         L     R14,SADO+12             RESTORE...
+         LM    R0,R12,SADO+20          ...REGISTERS.
+         BSM   0,R14
+         DROP  ,
+         LTORG ,
+DOTERME  DS    0H
+*--------------------------------------------------------------------
+**
+**   RETRIEVE AND VALIDATE THE SVC SCREENING TABLE AND MODULE
+**
+**   - RETRIEVE THE NAME/TOKEN PAIR.
+**   - VALIDATE THE EYE-CATCHER IN THE SCREENING TABLE.
+**   - VALIDATE THE SCREENING ROUTINE.
+**   - CHECK IF TCB FLAGS AND POINTER ARE OK:
+**    . FLAG IS ON AND TCB POINTS TO US - ACTIVE
+**    . FLAG IS ON AND TCB DOES NOT POINT TO US - INACTIVE
+**    . FLAG IS OFF AND TCB POINTS TO US - ERROR.
+**    . FLAG IS OFF AND TCB DOES NOT POINT TO US - INACTIVE
+**      (TCB POINTER MAY BE 0 OR MAY POINT TO ANOHER TABLE).
+**
+**
+**   OUTPUT:
+**   VEISACT - STATUS INDICATION: ACTIVE/INACTIVE/UNKNOWN.
+**
+**   RETURN CODES:
+**    0 - ACTIVE AND CONTROL BLOCKS ARE OK.
+**    4 - NAME/TOKEN NOT FOUND.
+**    8 - ENVIRONMENT ERROR.
+**
+*--------------------------------------------------------------------
+VALENV   DS    0H
+         USING WA,R13
+         BSM   R14,0
+         STM   R14,R12,SAVAL+12          SAVE REGISTERS
+         LR    R9,R15
+         USING (VALENV,VALENVE),R9
+         USING CONST,R11
+         USING PRM,R10
+         MVI   VEISACT,#VEISACU         ACTIVE = UNKNOWN.
+*
+**   RETRIEVE THE NAME/TOKEN TO GET THE SCREENING TABLE ADDRESS.
+*
+         MVC   RTN,=CL8'IEANTRT'
+         LA    R1,NTLEVEL
+         ST    R1,RAREA
+         LA    R1,NTNAME
+         ST    R1,RAREA+4
+         LA    R1,NTTOKEN
+         ST    R1,RAREA+8
+         LA    R1,NTRC
+         ST    R1,RAREA+12
+         OI    RAREA+12,X'80'
+         LA    R1,RAREA                R1 -> PARMS TABLE.
+*
+         L     R15,X'10'
+         L     R15,X'220'(R15,0)
+         L     R15,X'14'(R15,0)
+         L     R15,X'08'(R15,0)        R15 -> IEANTRT
+*
+         CALL  (15)
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               '_ - VALENV: IEANTRT - NAME/TOKEN = _, $    RC = #',    >
+               (CURREQ,13,NTNAME,16,NTTOKEN,16,?R15),                  >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         CHI   R15,0
+         BE    VEVALIDT                NAME/TOKEN FOUND - VALIDATE.
+         CHI   R15,4                   NOT FOUND ?
+         BE    VERC4                   ..YES - RETURN APPRORIATE RC.
+         B     VEERRNT                 ..NO - ERROR.
+*
+**   VALIDATE THE SCE AND RXOB
+*
+VEVALIDT DS    0H
+         L     R7,NTTKSCEA             R7 -> SVC SCREENING TABLE.
+         L     R6,0(,R7)               R6 -> SVC ROUTINE (CTS2RXO)
+         USING RXOB,R6
+         LA    R8,#SCETLEN(,R7)       R8 -> SCREENING TABLE EXTENSION.
+         USING SCE,R8
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               '_ - VALENV: SCRNTAB: ~ -> ~  SCE: ~ -> _  RXOB: ~ -> _,>
+               ~',                                                     >
+               (CURREQ,13,?R7,0(R7),?R8,SCEEYE,8,?R6,RXOBEYEC,8,RXOBSCR>
+               T),                                                     >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         CLC   SCEEYE,SCEICAT          EXTENSION IS OK ?
+         BNE   VEERRSCI                ..INCORRECT - ERROR.
+         CLC   RXOBEYEC,RXOBICAT       SCREENING ROUTINE IS OK?
+         BNE   VEERRRXI
+         C     R7,RXOBSCRT             ...AND POINTS TO SCRN TABLE ?
+         BNE   VEERRRXP
+*
+**   CHECK THE TCB FLAGS.
+*
+         L     R5,PSATOLD-PSA          R5 -> ACTIVE TCB
+         USING TCB,R5
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               '_ - VALENV: TCB - FLAGS = $  SCRN = ~',                >
+               (CURREQ,13,TCBFLGS7,1,TCBSVCA2),                        >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         C     R7,TCBSVCA2             ARE WE POINTED BY TCB?
+         BNE   VEVALINA                ..NO - INACTIVE - VALIDATE,
+*                                      ..YES --->
+         TM    TCBFLGS7,TCBSVCS+TCBSVCSP ARE FLAGS ON ?
+         BO    VEVALACT                ..YES - VALIDATE WHEN ACTIVE.
+         B     VEERRTCB                ..NO - ERROR.
+*
+**   VALIDATE WHEN ACTIVE
+*
+VEVALACT DS    0H
+         MVI   VEISACT,#VEISACY        ACTIVE = 'ACTIVE'
+         CLC   SCESTCK,TIME0           SCE WAS RESET ?
+         BE    VEERRT0
+         CLC   SCESTCK,NOTIME          SCE NOT COMPLETE ?
+         BE    VEERRTF
+         CLC   RXOBSTCK,TIME0          RXOB WAS RESET ?
+         BE    VEERRR0
+         B     VERC0                   INAACTIVE AND OK.
+*
+**   VALIDATE WHEN INACTIVE
+*
+VEVALINA DS    0H
+         MVI   VEISACT,#VEISACN        ACTIVE = 'INACTIVE'
+         CLC   SCESTCK,TIME0           SCE WAS RESET ?
+         BNE   VEERRNT0
+         CLC   RXOBSTCK,TIME0          RXOB WAS RESET ?
+         BNE   VEERRNR0
+         B     VERC0                   INAACTIVE AND OK.
+*--------------------------------------------------------------------
+**  ISSUE ERROR MESSAGES AND SET RETURN CODES.
+*--------------------------------------------------------------------
+VEERRNT  DS    0H                      NAME/TOKEN RETRIEVE FAILED.
+         CTSAN2C CHARRC
+         LHI   R1,MSG252-MSGRTN        ISSUE CTS252E
+         LARL  R15,MSGRTN
+         BASR  R14,R15
+         B     VERC8
+*
+VEERRSCI DS    0H
+         MVC   M254RSN,=CL15'SCE EYEC'
+         B     VEERRENV
+VEERRRXI DS    0H
+         MVC   M254RSN,=CL15'RXOB EYEC'
+         B     VEERRENV
+VEERRRXP DS    0H
+         MVC   M254RSN,=CL15'RXOB SCEPTR'
+         B     VEERRENV
+VEERRTCB DS    0H
+         MVC   M254RSN,=CL15'TCB FLAGS'
+         B     VEERRENV
+VEERRT0  DS    0H
+         MVC   M254RSN,=CL15'SCE RESET'
+         B     VEERRENV
+VEERRTF  DS    0H
+         MVC   M254RSN,=CL15'SCE TIMEF'
+         B     VEERRENV
+VEERRR0  DS    0H
+         MVC   M254RSN,=CL15'RXOB RESET'
+         B     VEERRENV
+VEERRNT0 DS    0H
+         MVC   M254RSN,=CL15'SCE NORESET'
+         B     VEERRENV
+VEERRNR0 DS    0H 3
+         MVC   M254RSN,=CL15'RXOB NORESET'
+         B     VEERRENV
+VEERRENV DS    0H
+         LHI   R1,MSG254-MSGRTN        ISSUE CTS254E
+         LARL  R15,MSGRTN
+         BASR  R14,R15
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGL255,255),                      >
+               '_ - VALENV:NAME/TOKEN = _, $',                         >
+               (CURREQ,13,NTNAME,16,NTTOKEN,16),                       >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGL255,255),                      >
+               '_ - VALENV: TCB - FLAGS = $  SCRN = ~',                >
+               (CURREQ,13,TCBFLGS7,1,TCBSVCA2),                        >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         CTSADBG TYPE=SNAP,LEVEL=(DBGL255,255),                        >
+               HDR='VALENV: SCR TABLE + SCE',                          >
+               ADDR=(0(,R7),#SCELEN+#SCETLEN-1(,R7)),                  >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         CTSADBG TYPE=SNAP,LEVEL=(DBGL255,255),                        >
+               HDR='VALENV: RXOB',                                     >
+               ADDR=(RXOB,RXOB+#RXOBLEN-1),                            >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         B     VERC8
+*
+VERC0    DS    0H                      WE ARE ACTIVE.
+         LHI   R15,0
+         B     VERET
+VERC4    DS    0H                      NAME/TOKEN DOES NOT EXIST.
+         LHI   R15,4
+         B     VERET
+VERC8    DS    0H                      ENVIRONMENT ERROR.
+         LHI   R15,8
+         B     VERET
+*--------------------------------------------------------------------
+**  RETURN
+*--------------------------------------------------------------------
+VERET    DS    0H                      RESTORE REGISTERS
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'VALENV:  RC = #',(?R15),                               >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         L     R14,SAVAL+12            RESTORE...
+         LM    R0,R12,SAVAL+20          ...REGISTERS.
+         BSM   0,R14
+         DROP  ,
+         LTORG ,
+VALENVE  DS    0H
+*--------------------------------------------------------------------
+**
+**   CHECK IF WE ARE ACTIVE IN A DAUGHTER TASK.
+**
+**   INPUT:
+**   R1 -> SCREENING TABLE.
+**
+**   OUTPUT:
+**   R1 -> TCB ADDRESS OF THE TASK WE ARE ACTIVE IN, WHEN RC=0
+**
+**   RETURN CODES:
+**    0 - YES.
+**    4 - NO.
+**
+*--------------------------------------------------------------------
+CHKDTR   DS    0H
+         USING WA,R13
+         BSM   R14,0
+         STM   R14,R12,SAVAL+12          SAVE REGISTERS
+         LR    R9,R15
+         USING (CHKDTR,CHKDTRE),R9
+         USING CONST,R11
+         USING PRM,R10
+         LR    R7,R1                   R7 -> OUR SCREENING TABLE.
+*
+**   CHECK THE TCB FLAGS.
+*
+         L     R5,PSATOLD-PSA          R5 -> ACTIVE TCB
+         USING TCB,R5
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'CHKDTR:  SCRT = ~    TCB = ~',(?R7,?R5),               >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         L     R5,TCBLTC               R5 -> LAST DAUGHTER TASK.
+CDLOOP   DS    0H
+         CHI   R5,0                    ANY DAUGHTER TASK ?
+         BE    CDRC4                   ..NO - RETURN.
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'CHKDTR:  TCB = ~   FLAGS = $  SCRN = ~',               >
+               (?R5,TCBFLGS7,1,TCBSVCA2),                              >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         TM    TCBFLGS7,TCBSVCS+TCBSVCSP SCREENING IS ACTIVE ?
+         BZ    CDNEXT                  ..NO - CHECK NEXT.
+         C     R7,TCBSVCA2             ARE WE POINTED BY TCB?
+         BE    CDRC0                   ..YES - WE ARE ACTIVE.
+CDNEXT   DS    0H
+         L     R5,TCBNTC               R5 -> OLDER DAUGHTER.
+         B     CDLOOP                  GO CHECK IT..
+*
+CDRC0    DS    0H                      WE ARE ACTIVE.
+         LR    R1,R5                   R1 -> DAUGHTER TCB.
+         LHI   R15,0
+         B     CDRET
+CDRC4    DS    0H                      WE ARE NOT ACTIVE.
+         LHI   R1,0                    NO TCB ADDRESS.
+         LHI   R15,4
+         B     CDRET
+*--------------------------------------------------------------------
+**  RETURN, WHILE RETURNING R1.
+*--------------------------------------------------------------------
+CDRET    DS    0H                      RESTORE REGISTERS
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'CHKRDT:  RC = #',(?R15),                               >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         L     R14,SAVAL+12            RESTORE...
+         L     R0,SAVAL+20
+         LM    R2,R12,SAVAL+28          ...REGISTERS.
+         BSM   0,R14
+         DROP  ,
+         LTORG ,
+CHKDTRE  DS    0H
+*--------------------------------------------------------------------
+**
+**   INIT THE SVC SCREENING ENVIRONMENT
+**
+**   - ALLOCATE STORAGE FOR THE SVC SCREEING TABLE + EXTENSION.
+**   - INITIALIZE THE SCREENING TABLE.
+**   - INITIALIZE THE EXTENSION.
+**   - LOAD THE SCREENING ROUTINE
+**   - INITIALIZE THE ENTRY CONTROL BLOCK OF THE SCREENING
+**     ROUTINE.
+**   - CREATE A NAME/TOKEN PAIR WITH THE SCREENING TABLE ADDRESS
+**     AS TOKEN.
+**   - RETURN THE SCEEENING TABLE ADDRESS.
+**
+**   RETURN CODES:
+**   0 - OK
+**   4 - ERROR.
+**
+**
+*--------------------------------------------------------------------
+INITENV  DS    0H
+         USING WA,R13
+         BSM   R14,0
+         STM   R14,R12,SAINIT+12         SAVE REGISTERS
+         LR    R9,R15
+         USING (INITENV,INITENVE),R9
+         USING CONST,R11
+         USING PRM,R10
+*
+**   LOAD THE SVC SCREENING ROUTINE
+*
+         LOAD  EPLOC=CTS2RXO,ERRET=IEERRLOD
+         ST    R0,CTS2RXOA
+         NILH  R0,X'7FFF'              ZERO THE AMODE BIT.
+         LR    R6,R0                   R6 -> CTS2RXO
+         USING RXOB,R6
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'ACT: SVC SCREENING ROUTINE: ~ -> ~ _',                 >
+               (?R6,RXOB,RXOBEYEC,8),                                  >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         CLC   RXOBEYEC,RXOBICAT       VERIFY LOAD MODULE.
+         BNE   IEERRMOD
+*
+**   ALLOCATE THE SVC SCREENING TABLE + EXTENSION
+**
+**   THE SVC SCREENING TABLE IS ALLOCATED IN SUBPOOL 253 WHICH
+**   IS WONED BY THE CURRENT TASK, SO IF THE TASK FAILS, THE
+**   BLOCK WILL BE AUTOMATICALY FREED.
+*
+         SETKEY 0
+         LA    R0,#SCETLEN+#SCELEN
+         LR    R3,R0                   SAVE LENGTH.
+         LHI   R7,0
+         STORAGE OBTAIN,LENGTH=(R0),SP=#SCETSP,LOC=31,                 >
+               ADDR=(R1),COND=YES,LINKAGE=SYSTEM
+         LR    R7,R1                   R7 -> SCREEING TABLE.
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'ACT: OBTAIN SVC SCREENING TABLE - ~ (#).   RC = #',    >
+               (?R7,?R3,?R15),                                         >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         CHI   R15,0                   GETMAIN OK ?
+         BNE   IEERRGTM
+         ST    R7,SCRTADDR             SAVE SCREENING TABLE ADDRESS.
+         LR    R0,R7
+         LR    R1,R3
+         SLR   R15,R15
+         MVCL  R0,R14                  ZERO AREA.
+*
+**  SET SVC SCREENING TABLE FOR OPEN TYPE=J
+*
+         L     R5,CVTPTR               R5 -> CVT
+         L     R5,CVTABEND-CVT(,R5)    R5 -> SECONDARY SVC
+         L     R5,SCVTSVCT-SCVTSECT(,R5) R5 -> SVC TABLE.
+         USING SVCENTRY,R5
+         LA    R5,22*8(,R5)            R5 -> OPEN TYPE=J SVC ENTRY.
+*
+*                                      COPY ITS ATTRIBUTES TO THE
+*                                      SCREENING TABLE:
+         LHI   R0,0
+         ICM   R0,B'1000',SVCEP        GET ORIGINAL AMODE.
+         NILH  R0,X'8000'              LEAVE AMODE.
+         OR    R6,R0                   SET ORIGINAL AS OURS.
+         ST    R6,0(,R7)               SCREEN ROUTINE ADDRESS.
+         MVC   4(1,R7),SVCTP           - SET SVC TYPE.
+         MVC   5(1,R7),SVCATTR3        - SET ASC MODE.
+         MVC   6(2,R7),SVCLOCKS        - SET LOCKS REQUIRED.
+         MVC   8(256,R7),=256X'80'     - NO SCREENING FOR ALL SVCS.
+         MVI   8+22(R7),X'00'          - SCREEN SVC 22 (OPEN TYPE=J)
+         DROP  R5
+*
+**  INITIALIZE THE EXTENSION
+*
+         LA    R8,#SCETLEN(,R7)        R8 -> EXTENSION.
+         USING SCE,R8
+         MVC   SCEEYE,SCEICAT          SET EYE-CATCHER.
+         LHI   R0,#SCELEN
+         ST    R0,SCELGTH              SET LENGTH.
+         MVC   SCESTCK,NOTIME
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'ACT: SCREENING TABLE EXTENSION = _, #',                >
+               (SCEEYE,4,SCELGTH),                                     >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         DROP  R8
+*
+**  INITIALIZE THE SCREENING ROUTINE ENTRY CONTOL BLOCK.
+**
+**  WE HAVE TO DO IT WHILE IN KEY 0 BECAUSE CTS2RXO IS REENTRANT
+**  SO IT IS LOADED INTO SP 252 KEY 0.
+*
+         ST    R7,RXOBSCRT             PUT SCREENING TABLE ADDRESS.
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'ACT: CTS2RXOB =  ~, ~',                                >
+               (RXOB,RXOBSCRT),                                        >
+               RAREA=RAREA,DBGAREA=DBGAREA
+*
+         DROP  R6
+*
+         SETKEY TCB
+*
+**  CREATE A NAME/TOKEN PAIR WITH THE SCREENING TABLE ADDRESS
+**  AS TOKEN.
+*
+         ST    R7,NTTKSCEA             SET TOKEN.
+*
+         MVC   RTN,=CL8'IEANTCR'
+         LA    R1,NTLEVEL              NAME/TOKEN LEVEL
+         ST    R1,RAREA
+         LA    R1,NTNAME               NAME
+         ST    R1,RAREA+4
+         LA    R1,NTTOKEN              TOKEN
+         ST    R1,RAREA+8
+         LA    R1,NTPRSIST             PERSIST
+         ST    R1,RAREA+12
+         LA    R1,NTRC                 RETURN CODE.
+         ST    R1,RAREA+16
+         OI    RAREA+16,X'80'
+         LA    R1,RAREA                R1 -> IEANTCR PARMS TABLE.
+*
+         L     R15,X'10'
+         L     R15,X'220'(R15,0)
+         L     R15,X'14'(R15,0)
+         L     R15,X'04'(R15,0)        R15 -> IEANTCR
+         CALL  (15)
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'ACT: IEANTCT - NAME/TOKEN = _, $    RC = #',           >
+               (NTNAME,16,NTTOKEN,16,?R15),                            >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         CHI   R15,0
+         BNE   IEERRNT
+         B     IERC0
+*--------------------------------------------------------------------
+**  LOAD - ERROR ROUTINE
+*--------------------------------------------------------------------
+IEERRLOD DS    0H
+         LR    R2,R1
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'ACT: CTS2RXO LOAD FAILED WITH ABEND ~-~',              >
+               (?R2,?R15),                                             >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         CTSAN2C CHARARS               TRANSLATE REASON CODE.
+         LR    R15,R2
+         CTSAN2C CHARABND              TRANSLATE ABEND CODE.
+         MVC   CHARRC,BLANKS8          NO RC.
+         MVC   MSGACT,=CL7'LOAD'
+         LHI   R1,MSG253-MSGRTN        ISSUE CTS253E
+         LARL  R15,MSGRTN
+         BASR  R14,R15
+         B     IERC4
+*--------------------------------------------------------------------
+**  ISSUE ERROR MESSAGES AND SET RETURN CODES
+*--------------------------------------------------------------------
+IEERRGTM DS    0H
+         CTSAN2C CHARRC
+         LR    R15,R3                  15 = LENGTH.
+         CTSAN2C NUMCHAR,LEN=7         TRANSLATE LENGTH
+         LHI   R15,#SCETSP
+         CTSAN2C SPNUM,LEN=3           TRANSLATE SP NUMBER
+         MVC   M251ADDR,BLANKS8
+         MVC   MSGACT,=CL7'OBTAIN'
+         MVC   M251CBNM,=CL8'SCRNT'
+         LHI   R1,MSG251-MSGRTN        ISSUE CTS251E
+         LARL  R15,MSGRTN
+         BASR  R14,R15
+         B     IERC4
+*
+IEERRNT  DS    0H                      NAME/TOKEN RETRIEVE FAILED.
+         CTSAN2C CHARRC
+         LHI   R1,MSG252-MSGRTN        ISSUE CTS252E
+         LARL  R15,MSGRTN
+         BASR  R14,R15
+         B     IERC4
+*
+IEERRMOD DS    0H
+         LHI   R1,MSG255-MSGRTN        ISSUE CTS255E
+         LARL  R15,MSGRTN
+         BASR  R14,R15
+         B     IERC4
+*
+IERC0    DS    0H
+         LHI   R15,0                   OK.
+         B     IERET
+*
+IERC4    DS    0H                      INITIALIZATION FAILED - CLEANUP
+         L     R7,SCRTADDR             R7 -> SCREENING TABLE.
+         CHI   R7,0                    ALLOCTED ?
+         BE    IERC4DMD                ..NO - DELETE MODULE.
+*
+         LHI   R3,#SCETLEN+#SCELEN
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'ACT: RELEASE SCREENING TABLE:  ~ / #',(?R7,?R3),       >
+               RAREA=RAREA,DBGAREA=DBGAREA
+*
+         SETKEY 0
+         STORAGE RELEASE,LENGTH=(R3),SP=#SCETSP,ADDR=(R7),             >
+               COND=YES,LINKAGE=SYSTEM
+*
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGL255,255),                      >
+               'ACT: SCREENING TABLE RELEASE: ~ / #   RC = #',         >
+               (?R7,?R3,?R15),                                         >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         XC    SCRTADDR,SCRTADDR       RESET SCRT ADDRESS.
+         LR    R5,R15
+         SETKEY TCB
+         LR    R15,R5
+         CHI   R15,0                   RELEASE OK ?
+         BE    IERC4DMD                ..YES - DELETE MODULE.
+*                                      ..NO - ISSUE MESSAGE
+         CTSAN2C CHARRC                TRANSLATE RC
+         LR    R15,R3
+         CTSAN2C NUMCHAR,LEN=7         TRANLATAE LEBGTH,
+         LHI   R15,#SCETSP
+         CTSAN2C SPNUM,LEN=3           TRANSLATE SP NUM.
+         LR    R15,R7                  SCE TABLE ADDRESS
+         CTSAN2C M251ADDR,MODE=HEX TRANSALTE ADDRESS.
+         MVC   MSGACT,=CL7'RELEASE'
+         MVC   M251CBNM,=CL8'SCRNT'
+         LHI   R1,MSG251-MSGRTN        ISSUE CTS251E
+         LARL  R15,MSGRTN
+         BASR  R14,R15
+*
+IERC4DMD DS    0H                      DELETE THE MODULE, IF LOADED.
+         L     R15,CTS2RXOA
+         CHI   R15,0                   MODULE LOADED?
+         BE    IERC4RET
+         XC    CTS2RXOA,CTS2RXOA       RESET SCRT ADDRESS.
+         DELETE EPLOC=CTS2RXO
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'ACT: DELETE FOR CTS2RXO.  RC = #',(?R15),              >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         CHI   R15,0                   SUCCESSFUL DELETE ?
+         BE    IERC4RET                ..YES - RETURN.
+*                                      ..NO - ISSUE MESSAGE.
+         MVC   CHARARS,BLANKS8
+         MVC   CHARABND,BLANKS8
+         CTSAN2C CHARRC                TRANSLATE RETURN CODE.
+         MVC   MSGACT,=CL7'DELETE'
+         LHI   R1,MSG253-MSGRTN        ISSUE CTS253E
+         LARL  R15,MSGRTN
+         BASR  R14,R15
+*
+IERC4RET DS    0H
+         LHI   R15,4
+         B     IERET
+*--------------------------------------------------------------------
+**   RETURN
+**   - RESET KEY, IF NEEDED,
+**   - RETURN
+*--------------------------------------------------------------------
+IERET    DS    0H
+         LR    R5,R15
+         SETKEY TCB
+         LR    R15,R5
+         CTSADBG TYPE=PRTDBG,LEVEL=(DBGLEVEL,1),                       >
+               'INITENV: RC = #',(?R15),                               >
+               RAREA=RAREA,DBGAREA=DBGAREA
+         L     R14,SAINIT+12           RESTORE...
+         LM    R0,R12,SAINIT+20          ...REGISTERS.
+         BSM   0,R14
+         DROP  ,
+         LTORG ,
+INITENVE DS    0H
+*--------------------------------------------------------------------
+**
+**   ISSUE ERROR MESSAGES
+**
+**   ISSUE THE REQUESTED ERROR MESSAGE.
+**
+**   INPUT:
+**   R1 - OFFSET OF REQUIRED MESSAGE "BLOCK" IN THIS THIS ROUTINE.
+**
+**
+*--------------------------------------------------------------------
+MSGRTN   DS    0H
+         USING WA,R13
+         BSM   R14,0
+         STM   R14,R12,SAMSG+12        SAVE REGISTERS
+         LR    R9,R15
+         USING (MSGRTN,MSGRTNE),R9
+         USING CONST,R11
+         L     R5,CURFUNC              R5 -> CURRENT FUNC IN FUNCTAB    .
+         B     MSGRTN(R1)
+*
+MSG250   DS    0H
+         CTSMSG1 CODE=CTS250E,ROUT=(WTO,NO),RAREA=RAREA,               >
+               PLANT=(8,=CL8'CTS2RXS',13,CURREQ,8,PARMNAME,8,PARMVAL)
+         CLC   PARMNAME,=CL8'ERRORBLK' IF ERROR BLOCK IS MISSIND
+         BE    MREND                   SKIP RETURNING MESSAGE.
+         B     MRRET
+MSG251   DS    0H
+         CTSMSG1 CODE=CTS251E,ROUT=(WTO,NO),RAREA=RAREA,               >
+               PLANT=(7,MSGACT,8,M251CBNM,8,M251ADDR,7,NUMCHAR,3,SPNUM,>
+               ,2,CHARRC)
+         B     MRRET
+MSG252   DS    0H
+         CTSMSG1 CODE=CTS252E,ROUT=(WTO,NO),RAREA=RAREA,               >
+               PLANT=(8,RTN,16,NTNAME,2,CHARRC)
+         B     MRRET
+MSG253   DS    0H
+         CTSMSG1 CODE=CTS253E,ROUT=(WTO,NO),RAREA=RAREA,               >
+               PLANT=(6,MSGACT,8,=CL8'CTS2RXO',3,CHARRC,3,CHARABND,3,CH>
+               ARARS)
+         B     MRRET
+MSG254   DS    0H
+         CTSMSG1 CODE=CTS254E,ROUT=(WTO,NO),RAREA=RAREA,               >
+               PLANT=(15,M254RSN)
+         B     MRRET
+MSG255   DS    0H
+         CTSMSG1 CODE=CTS255E,ROUT=(WTO,NO),RAREA=RAREA
+         B     MRRET
+MSG256   DS    0H
+         CTSMSG1 CODE=CTS256E,ROUT=(WTO,NO),RAREA=RAREA,               >
+               PLANT=(8,STATUS)
+         B     MRRET
+MSG257   DS    0H
+         CTSMSG1 CODE=CTS257E,ROUT=(WTO,NO),RAREA=RAREA,               >
+               PLANT=(20,M257RSN)
+         B     MRRET
+MSG258   DS    0H
+         CTSMSG1 CODE=CTS258E,ROUT=(WTO,NO),RAREA=RAREA
+         B     MRRET
+MSG259   DS    0H
+         CTSMSG1 CODE=CTS259E,ROUT=(WTO,NO),RAREA=RAREA
+         B     MRRET
+*
+**   RETURN THE MESSGAE TO THE CALLER IN THE ERROR BLOCK.
+**
+**   THE MESSAGE WAS CREATED BY CTSMSG1 IN RAREA:
+**   2 BYTES = MESSAHE LENGTH
+**   MESSAGE TEXT
+*
+MRRET    DS    0H
+         L     R1,ERRBLKA              R1 -> ERROR BLOCK.
+         CHI   R1,0
+         BE    MREND
+*
+         USING RXE,R1
+         LHI   R15,1
+         ST    R15,RXEERROR
+*
+         MVC   RXEPGM(8),=CL8'CTS2RXS'
+         MVI   RXEPGM+8,X'00'
+         MVC   RXEFUNC(8),0(R5)
+         MVI   RXEFUNC+8,X'00'
+*
+         LH    R15,RAREA               R15 = MESSAGE LENGTH.
+         CHI   R15,L'RXEMSG-1          ENOUGH SPACE FOR MESSAGE ?
+         BNH   MRRETMSG                ..YES - MOVE.
+         LHI   R15,L'RXEMSG-1          ..NO - TRUNCATE
+MRRETMSG DS    0H
+         AHI   R15,-1
+         EX    R15,MRMVMSG
+         B     *+L'*+L'MRMVMSG
+MRMVMSG  MVC   RXEMSG(0),RAREA+2
+         LA    R15,RXEMSG+1(R15)       R15 -> CHAR AFTER MSG TEXT.
+         MVI   0(R15),X'00'            PUT C-TYPE PERMINATOR.
+         DROP  R1
+*
+**  RETURN
+*
+MREND    DS    0H
+         LM    R14,R12,SAMSG+12        RESTORE REGISTERS.
+         BSM   0,R14
+         DROP  ,
+         LTORG ,
+MSGRTNE  DS    0H
+*--------------------------------------------------------------------
+**   CONSTANTS
+*--------------------------------------------------------------------
+CONST    DS    0D
+AMSGRTN  DC    A(MSGRTN)
+BLANKS8  DC    CL8' '
+CTS2RXO  DC    CL8'CTS2RXO'
+NOTIME   DC    XL(L'SCESTCK)'FFFFFFFFFFFFFFFF'
+TIME0    DC    XL(L'SCESTCK)'00'
+SCE      CTS2SCE TYPE=DC
+RXOB     CTS2RXOB TYPE=DC
+NTNAME   DC    CL16'SP-SCRN-IO-RPTRX'
+NTLEVEL  DC    A(IEANT_TASK_LEVEL)
+NTPRSIST DC    A(IEANT_NOPERSIST)
+DBGL255  DC    AL1(255)                DEBUG = ALWAYS
+*
+#RUOBUTX EQU   C'X'                    ACFRPTRX RUOB UTOKEN ID.BS10111
+*
+         CSVQUERY MF=(L,CSVQM)
+MDSETSM  MODESET MODE=SUP,MF=L M
+#MDSSPML EQU   *-MDSETSM
+MDSETPM  MODESET MODE=PROB,MF=L
+#MDSPRML EQU   *-MDSETPM
+*
+**   FUNCTIONS TABLE.
+*
+FUNCTAB  DS    0X
+FACT     DC    CL8'ACT',AL4(DOACT),CL13'ACTIVATION'
+#FUNCTEL EQU   *-FUNCTAB
+FDEACT   DC    CL8'DEACT',AL4(DODEACT),CL13'DEACTIVATION'
+FTERM    DC    CL8'TERM',AL4(DOTERM),CL13'TERMINATION'
+#FUNCTE# EQU   (*-FUNCTAB)/#FUNCTEL
+*
+FENTRY   DC    CL8'ENTRY',AL4(0),CL13'ENTRY'  DUMMY ENTRY FOR MESSAGE.
+*
+         CTSAN2C WORK=YES,RENT=CONST
+*
+         LTORG ,
+*
+*--------------------------------------------------------------------
+**   WORK AREA
+*--------------------------------------------------------------------
+*
+WA       DSECT
+SA       DS    18F                     SAVE AREA.
+SADO     DS    18F                     1ST LEVEL ROUTINES SAVE AREA.
+SAINIT   DS    18F                     INITENV SAVE AREA.
+SAVAL    DS    18F                     VALSCE SAVE AREA.
+SAMSG    DS    18F                     VALSCE SAVE AREA.
+*
+SCRNTABA DS    A                       -> SCREENING TABLE.
+SVCADDR  DS    A                       -> SCREENING ROUTINE.
+STCKTIME DS    2A
+RXOEPA   DS    A
+CTS2RXOA DS    A                       -> CTS2RXO.
+SCRTADDR DS    A                       -> SCRENEING TABLE.
+PARMNAME DS    CL8                     PARAMETER NAME (FOR MSG)
+PARMVAL  DS    CL8                     PARAMETER VALUE (FOR MSG)
+CURFUNC  DS    A                       -> CURRENT ENTRY IN FUNCTAB.
+CURREQ   DS    CL13                    CURRENT REQUEST NAME (FULL)
+DBGLEVEL DS    XL1                     DEBUG LEVEL FOR THIS ROUTINE.
+ORIGDBGL DS    XL1                     ORIGINAL (INPUT) DEBUG LEVEL
+ERRBLKA  DS    A                       -> ERROR BLOCK.
+CHARRC   DS    CL2                     RC IN CHAR (FOR CTSMSG1)
+CHARABND DS    CL3                     LOAD ABEND CODE (CTS CTSMSG1)
+CHARARS  DS    CL3                     LOAD ABEND REASON CODE (FOR MSG)
+RTN      DS    CL8                     ROUTINE NAME FOR CTS252E
+NUMCHAR  DS    CL8                     FOR CTSAN2C OUTPUT.
+SPNUM    DS    CL3                     SUBPOOL NUMBER IN CHAR (FOR MSG)
+STATUS   DS    CL8                     ACTIVE/INACTIVE (FOR MSG)
+MSGACT   DS    CL7                     OBTAIN/RELEASE FOR CTS251E
+M251ADDR DS    CL8                     ADDRESS FOR CTS251E
+M251CBNM DS    CL8                     CONTROL BLOCK NAME.
+M257RSN  DS    CL20                    REASON FOR MSG CTS257E
+M254RSN  DS    CL15                    REASON FOR MSG CTS254E
+VEISACT  DS    X                       ACTIVE/INACTIVE (BY VALENV):     .
+#VEISACU EQU   0                       ..UNKNOWN.
+#VEISACN EQU   1                       ..INACTIVE.
+#VEISACY EQU   2                       ..ACTIVE.
+*
+NTTOKEN  DS    0A,XL16                    TOKEN.
+         ORG   NTTOKEN
+NTTKSCEA DS    AL4                     -> SCE.
+         ORG   ,
+NTRC     DS    A
+*
+*   SAVED PARAMETER (AFTER ADDRESS WAS PURIFIED)
+@RULEAPA DS    A
+@DMGRA   DS    A                                               BS10111
+@IGNLSTA DS    A
+@1OMA    DS    A
+@RUTKNA  DS    A                                               BS10111
+*
+         CTSAN2C WORK=YES,RENT=VAR
+*
+         CSVQUERY MF=(L,CSVQL)
+MDSETL   MODESET MODE=SUP,MF=L
+#WACLNLN EQU   *-WA                    LENGTH OF AREA TO RESET.
+         DS    0D
+RAREA    DS    XL512                   USED BY CTSADBG.
+DBGAREA  DS    XL2048
+#WALEN   EQU   *-WA
+*
+*--------------------------------------------------------------------
+**   DSECTS
+*--------------------------------------------------------------------
+*
+**   PARAMETERS BLOCK.
+*
+PRM      DSECT                         PARAMETERS:
+PRMFUNC  DS    A   1. (I)              -> FUNCTION.
+PRMDBG   DS    A   2  (I)              -> DEBUG LEVEL.
+PRMERBLK DS    A   3  (I)              -> ERROR BLOCK.
+PRMVAR   DS    0A
+PRMACT   ORG   PRMVAR
+PRMDMGRA DS    A   4. (I)              -> DATA MGT. RTN.       BS10111
+PRMARULA DS    A   5. (I)              -> AREA FOR RULE BLOCK ADDR.
+PRMAIGN  DS    A   6. (I)              -> IGNORE LIST.
+PRMA1OM  DS    A   7. (I)              -> 1/MANY INDICATION.
+PRMRUTKA DS    A   8. (I)              -> RUOB USER TOKEN.     BS10111
+         ORG   ,
+*
+SCE      CTS2SCE TYPE=DSECT            SCREENING TABLE EXTENSION.
+*
+RXOB     CTS2RXOB TYPE=DSECT           CTS2RXO ENTRY BLOCK.
+*
+         COPY  CTS2RXE                 ERROR BLOCK.
+*
+         CTSEQUR
+*--------------------------------------------------------------------
+**   SYSTEM CONTROL BLOCKS
+*--------------------------------------------------------------------
+         IHAPSA LIST=YES
+         IKJTCB LIST=YES               LIST=YES
+         CVT   DSECT=YES,LIST=YES
+         IHASCVT DSECT=YES
+         IHASVC LIST=YES
+         IEANTASM ,                    NAME/TOKEN EQUATES.
+.END     ANOP                                                   WS10084
+         END
