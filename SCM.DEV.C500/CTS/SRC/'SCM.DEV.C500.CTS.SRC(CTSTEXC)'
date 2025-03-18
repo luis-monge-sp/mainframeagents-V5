@@ -1,0 +1,458 @@
+          START
+*
+****************************************************************
+****                                                        ****
+****     CONTROL-SA  RELEASE 3.0.0                          ****
+****                                                        ****
+****     LICENCED MATERIAL - NEW DIMENSION SOFTWARE LTD.    ****
+****                                                        ****
+****************************************************************
+*
+****************************************************************
+*                                                              *
+* TITLE            : CTSTEXC                                   *
+*                                                              *
+* FILE NAME        : CTSTEXC                                   *
+*                                                              *
+* AUTHOR           : ALEXANDER SHVARTSMAN / YONI DORMAN        *
+*                                                              *
+* CREATION DATE    : 15/08/00                                  *
+*                                                              *
+* DESCRIPTION      : COMMAND PROCESSOR TO EXECUTE TSS COMMAND  *
+*                                                              *
+* ASSUMPTIONS AND                                              *
+*   CONSIDERATIONS :                                           *
+*                                                              *
+****************************************************************
+*
+****************************************************************
+* MOD.ID   WHO      WHEN     DESCRIPTION                       *
+* -------- -------- -------- --------------------------------- *
+* BS2428   YONI     14/08/00 CREATED.                          *
+* IS10007  AVNERL   03/11/06 SET RC IF TSS CMD FAILS.          *
+* IS10184  NURITY   31/08/21 IMPROVE SCRIPTS PERFORMANCE       *
+*                            (CHANGE TO BE RENT.)              *
+* IS10188  AVNERL   06/10/24 MOVE OUR MODULES ABOVE 16M LINE   *
+****************************************************************
+*
+PARM     DSECT
+PARMDBG  DS    A
+PARMCMD  DS    A
+PARMLEN  DS    A
+PARMCPPL DS    A
+*
+*IS10184 CTSTEXC  CSECT ,
+CTSTEXC  AMODE ANY
+*IS10188 CTSTEXC  RMODE 24
+CTSTEXC  RMODE ANY                                             IS10188
+*
+***************************************************************
+*        INITIALIZE                                           *
+***************************************************************
+*
+*IS10184 BEGIN *
+*IS10188 CTSTEXC CTSBGNR R12,LV=#WALEN,CLEAR=NO,EQUR=YES       IS10184
+CTSTEXC  CTSBGNR R12,LV=#WALEN,CLEAR=NO,EQUR=YES,     IS10184  IS10188 *
+               GMTYPE=RC,LOC=24                                IS10188
+         CTSLEVEL
+         USING WA,R13                                          IS10184
+         LR    R8,R1
+         USING PARM,R8
+*
+         XC    WASTART(#WACLNLN),WASTART                       IS10184
+*
+*IS10184 LA    R12,4095(R13)       R12 2ND BASE REGISTER        IS10007
+*IS10184 LA    R12,1(R12)          --------""-----------        IS10007
+*IS10184 USING CTSTEXC+4096,R12    --------""-----------        IS10007
+         L     R5,PARMDBG          DEBUG LEVEL
+         L     R5,0(R5)
+         ST    R5,DEBUG
+         L     R6,PARMCMD          CMD ADDR
+         L     R6,0(R6)
+         L     R7,PARMLEN          LEN ADDR
+         L     R9,PARMCPPL         ADDRESS OF CPPL
+         USING CPPL,R9
+*
+         USING TXPL,R2            TSS EXTENDED PARAMETER LIST
+         USING TXPLRETH,R3        RETURN BUFFER HEADER
+         USING TXPLLINE,R4        RETURNED DATA LINE
+*
+* LOCATE MVS SECURITY CONTROL BLOCK (ACEE) FOR ACTIVE USER.
+* MUST BE PASSED TO TSSAUTH
+*
+*        GET ACEE
+*
+*IS10184 LA    R1,PGETACEE
+*IS10184 CTSCALL CTSALGN
+         XC    ACEE1,ACEE1                                     IS10184
+         LA    R10,ACEE1
+         CALL  CTSAWHO,(0,0,0,0,(R10)),VL,LINKINST=BASR,       IS10184 >
+               MF=(E,CALL10)                                   IS10184
+*
+         L     R10,ACEE1
+         LR    R11,R10
+         USING ACEE,R11
+*
+         SR    R7,R7
+         ICM   R7,B'0111',ACEELEN
+         DROP  R11
+         AR    R7,R10
+         CTSADBG TYPE=SNAP,ID=5,LEVEL=(DBGLVL,1),                      X
+               HDR='** ACEE **',                                       X
+               ADDR=(0(R10),0(R7)),                                    X
+               RAREA=RAREA,DBGAREA=DBGAREA                     IS10184
+*IS10184       RAREA=RAREA1
+*
+*IS10184 CTSADBG 'ACEE1=_',(0(R10),4),RAREA=RAREA1,LEVEL=(DBGLVL,1),  >
+         CTSADBG 'ACEE1=_',(0(R10),4),LEVEL=(DBGLVL,1),        IS10184 >
+               RAREA=RAREA,DBGAREA=DBGAREA                     IS10184
+*
+         SLR   R7,R7                   NO MESSAGE
+*IS10184 XC    WORKAREA(LWORK),WORKAREA   CLEAN WORKAREA
+*
+* LOCATE MVS SECURITY CONTROL BLOCK (ACEE) FOR ACTIVE USER.
+* MUST BE PASSED TO TSSAUTH
+* THIS ENSURES THAT THE USER HAS SIGNED ON TO TOP SECRET
+*
+         L     R6,ACEE1           LOCATE ACEE1
+         LTR   R6,R6
+         BZ    RET8               OR ELSE EXIT
+         CLC   =C'ACEE',0(R6)     VALIDATE ACEE1
+         BNE   RET8               OR ELSE EXIT
+*
+* PARSE THE INPUT BUFFER LOOKING FOR THE FUNCTION.
+*
+         L     R3,PARMCMD         LOCATE BUFFER
+         L     R3,0(R3)           OBTAIN BUFFER
+         ST    R3,@BUFFER         SAVE FOR LATER
+         L     R2,PARMLEN         LOCATE LENGTH
+         L     R2,0(R2)           OBTAIN LENGTH
+         STH   R2,BUFLENTH        SAVE FOR LATER
+         CTSADBG 'PARMLEN=#,CMD=_',LEVEL=(DBGLVL,1),                   X
+               (?R2,0(R3),?R2),                                        >
+               RAREA=RAREA,DBGAREA=DBGAREA                     IS10184
+*
+* LOCATE THE TSS KEYWORD AND STRIP IT
+*
+TSS00100 DS    0H
+         CLI   0(R3),C' '         IS THIS A BLANK?
+         BNE   TSS00150           N, CONTINUE
+         LA    R3,1(,R3)          Y, R3 @ NEXT CHARACTER
+         BCT   R2,TSS00100        LOOP - LOOKING FOR FUNCTION
+         B     TSS09200           ERROR - INVALID FUNCTION
+TSS00150 DS    0H
+         CLC   0(3,R3),=CL3'TSS'  IS IT A TSS COMMAND?
+         BNE   TSS09200
+         SH    R2,=F'3'
+*
+* RAW INPUT COMMAND BUFFER IS ASSUMED TO BE UPPERCASE
+*
+TSS00200 DS    0H
+         CLI   0(R3),C' '         IS THIS A BLANK?
+         BNE   TSS01000           N, CONTINUE
+         LA    R3,1(,R3)          Y, R3 @ NEXT CHARACTER
+         BCT   R2,TSS00200        LOOP - LOOKING FOR FUNCTION
+         B     TSS09200           ERROR - INVALID FUNCTION
+*
+* INVOKE THE ACTUAL TSS COMMAND.
+*
+TSS01000 DS    0H
+         STH   R2,BUFLENTH
+         ST    R3,@BUFFER
+         LA    R2,TSSTXPL         R2 @ TSS EXTENDED PARAMETER LIST
+         MVC   TXPLID,=C'TXPL'    MOVE IN ID
+         ST    R6,TXPLACEE        MOVE IN @ ACEE
+         MVC   TXPLCLEN,BUFLENTH  NEED BUFFER LENGTH
+         MVC   TXPLCBUF,@BUFFER   AND ADDRESS
+*
+         L     R1,TXPLCBUF
+         CTSADBG 'TXPLCLEN=~,TXPLCBUF=~,CBUF=_',LEVEL=(DBGLVL,1),      X
+               (TXPLCLEN,TXPLCBUF,0(R1),200),                          >
+               RAREA=RAREA,DBGAREA=DBGAREA                     IS10184
+*
+* ATTACH THE TSS COMMAND.
+*
+         LR    R1,R2              R1 @ TXPL
+         MVC   ATTACH(ATTACHL),ATTACHX MF=L
+         LA    R0,TSSECB          R0 @ ECB
+         ATTACH EP=TSS,ECB=(0),SHSPV=1,SF=(E,ATTACH)
+         ST    R1,TSSTCB          SAVE @ TCB
+*
+* WAIT FOR COMMAND TO COMPLETE.
+*
+         WAIT  ECB=TSSECB
+*
+* GET RID OF TSS TCB.
+*
+         DETACH TSSTCB            GET RID OF TCB
+*
+* MUST NOW SEND OUTPUT FROM TSS COMMAND TO THE TERMINAL.
+* ONE MESSAGE AT A TIME
+*
+         ICM   R3,15,TXPLRET      -> RETURN BUFFER
+         BZ    TSS99999           OR ELSE
+TSS02000 DS    0H
+         LA    R4,TXPLHLEN(R0,R3) R4 @ FIRST MSG IN NEW BUFFER
+         LH    R15,TXPLDLEN       R15 HAS DATA LENGTH
+         LTR   R15,R15            END OF THIS TSS COMMAND BUFFER?
+         BNZ   TSS05000           N, CONTINUE
+*
+* CURRENT TSS COMMAND BUFFER HAS BEEN EXHAUSTED, DETERMINE IF
+* ANOTHER BUFFER EXISTS.
+*
+TSS03000 DS    0H
+         ICM   R3,15,TXPLNXTR     ANY MORE BUFFERS?
+         BZ    TSS06000           N, CONTINUE
+         B     TSS02000           G, PROCESS NEXT MESSAGE
+*
+* PLACE MESSAGE INTO TERMINAL BUFFER.
+*
+TSS05000 DS    0H
+         LH    R5,TXPLDLEN        R2 HAS DATA LENGTH
+         LTR   R5,R5              END OF THIS TSS COMMAND BUFFER?
+         BZ    TSS03000           Y, GO GET NEXT BUFFER
+         LA    R7,TXPLDATA-1      N, R1 @ MESSAGE
+********************** IS10007 STARTS ****************************
+* R7 -> 1 BYTE OF LENGTH (MAX 255) AND AFTER IT THE DATA ITSELF.
+* FOR EXAMPLE:
+* - TSS0300I  REPLACE  FUNCTION SUCCESSFUL
+* - TSS0352E  ACID NOT OWNED WITHIN SCOPE
+* - TSS0301I  REPLACE  FUNCTION FAILED, RETURN CODE =  8
+*          ^
+*          |
+* CHECK AT R7 -> + 1 + 7 WHETHER IT'S : I / S / E / W.
+* I ==> RC=0, W ==> RC=4, E ==> RC=08, S ==> RC=16.
+         XR    R15,R15            CLEAR REG
+         IC    R15,0(R7)          R15 = TSS OUTPUT LENGTH
+         CTSADBG 'TSS LINE OUTPUT=_',LEVEL=(DBGLVL,1),(1(R7),?R15),    >
+               RAREA=RAREA,DBGAREA=DBGAREA                     IS10184
+         MVI   TRC,0              ASSUME IT'S INFO
+         CLC   1(3,R7),=C'TSS'    TSS HEADER OF MESSAGE ?
+         BNE   RCSET              NO, SKIP RC SET
+         CLI   8(R7),C'I'         INFO MSG
+         BE    RCSET
+         MVI   TRC,4              ASSUME IT'S WARNING
+         CLI   8(R7),C'W'         INFO MSG
+         BE    RCSET
+         MVI   TRC,08             ASSUME IT'S ERROR
+         CLI   8(R7),C'E'         INFO MSG
+         BE    RCSET
+         MVI   TRC,16             ASSUME IT'S SEVERE
+         CLI   8(R7),C'S'         SEVERE MSG ?
+         BE    RCSET
+         MVI   TRC,20             NONE OF THE ABOVE
+RCSET    DS    0H                 SET HIGHEST RC
+         CLC   TRC,RC             -------""-----
+         BNH   SKIPRC             -------""-----
+         MVC   RC,TRC             -------""-----
+SKIPRC   DS    0H
+         CTSADBG 'RC(HEX)=$ TEMP RC(HEX)=$',LEVEL=(DBGLVL,1),          X
+               (RC,1,TRC,1),                                           >
+               RAREA=RAREA,DBGAREA=DBGAREA                     IS10184
+         DROP  R8                 NO NEED IN USING FOR PARM.
+********************** IS10007  ENDS ****************************
+         BAL   R14,WRITE          SEND MESSAGE TO SCREEN
+         LA    R4,2(R5,R4)        R4 @ NEXT MESSAGE
+         B     TSS05000           GO FOR MORE
+TSS06000 DS    0H
+*
+* SUBROUTINE TO PERFORM CLEANUP FROM THE TSS COMMAND. SPECIFICALLY,
+* TO FREEMAIN ANY EXTRA BUFFERS GETMAINED BY THE TSS COMMAND.
+*
+         L     R3,TXPLRET         R3 @ FIRST BUFFER
+TSS07100 L     R0,TXPLRLEN        R0 HAS LENGTH OF BUFFER
+         LR    R1,R3              R1 @ CURRENT BUFFER
+         L     R3,TXPLNXTR        R3 @ NEXT BUFFER
+         FREEMAIN RU,LV=(R0),SP=TXPLSP,A=(R1) FREE THIS BUFFER
+         LTR   R3,R3              ANY MORE BUFFER'S?
+         BZ    TSS99999           N, EXIT
+         B     TSS07100           Y, LOOP FREEING BUFFERS
+         SPACE 3
+*
+* ISSUE MESSAGE AND RETURN.
+*
+WRITE    DS    0H   R7 -> MESSAGE: +0(1)=LENGTH  +1(?)=TEXT
+         ST    R14,@RETURN
+****************************************************************
+* ISSUE THE EXECUTE FORM OF THE PUTLINE MACRO INSTRUCTION.
+* USE IT TO WRITE A SINGLE LINE OF DATA TO THE TERMINAL AND BUILD
+* THE IOPL
+****************************************************************
+         XC    ECBADS,ECBADS
+         XC    TEXTADS(4),TEXTADS
+         MVC   TEXT,BLANKS
+         XC    IOPLADS,IOPLADS
+*IS10007 L     R12,CPPLUPT           POINT TO CPPL AREAS
+         L     R8,CPPLUPT            POINT TO CPPL AREAS        IS10007
+         L     R11,CPPLECT
+*
+         LA    R0,TEXT               ADDRESS OF TARGET
+         LA    R14,1(,R7)            ADDRESS OF SOURCE
+         XR    R1,R1
+         IC    R1,0(R7)              LENGTH OF SOURCE
+         LR    R15,R1                LENGTH OF TARGET
+         MVCL  R0,R14                MOVE IT
+         XR    R1,R1
+         IC    R1,0(R7)              LENGTH OF SOURCE
+         LA    R1,5(R1)              CALC REAL LENGTH OF MESSAGE +
+*                                    LENGTH + PREFIX LENGTH
+         STH   R1,TEXTADS            LENGTH OF THE OUTPUT LINE
+*
+*IS10184 PUTLINE PARM=PUTBLOCK,UPT=(12),ECT=(11),ECB=ECBADS,          1
+         PUTLINE PARM=PUTBLOCK,UPT=(8),ECT=(11),ECB=ECBADS,    IS10184 1
+               OUTPUT=(TEXTADS,TERM,SINGLE,DATA),MF=(E,IOPLADS)
+         L     R14,@RETURN
+         BR    R14
+*
+* EXITS.
+*
+TSS09000 LA    R7,MSG0201         R1 @ MESSAGE
+         BAL   R14,WRITE          G, ISSUE MESSAGE
+         B     TSS99999           EXIT
+TSS09200 LA    R7,MSG0204         R1 @ MESSAGE
+         BAL   R14,WRITE          G, ISSUE MESSAGE
+         B     TSS99999           EXIT
+TSS09300 LA    R7,MSG0224         R1 @ MESSAGE
+         BAL   R14,WRITE          G, ISSUE MESSAGE
+         B     TSS09600           G, ISSUE FUNCTION FAILED MESSAGE
+TSS09400 LA    R7,MSG7101         R1 @ MESSAGE
+         BAL   R14,WRITE          G, ISSUE MESSAGE
+         B     TSS09600           G, ISSUE FUNCTION FAILED MESSAGE
+TSS09500 LA    R7,MSG0300         R1 @ MESSAGE
+         BAL   R14,WRITE          G, ISSUE MESSAGE
+         B     TSS99999           EXIT
+TSS09600 LA    R7,MSG0301         R1 @ MESSAGE
+         BAL   R14,WRITE          G, ISSUE MESSAGE
+         B     TSS99999           EXIT
+TSS99999 DS    0H
+         SLR   R7,R7              NO MESSAGE
+         B     RETURN
+RET8     DS    0H        TSS0201E TOP SECRET SECURITY IS NOT ACTIVE
+*IS10007 LA    R15,8              SET RC IN RC FIELD
+         MVI   RC,8               SET RC IN RC FIELD          IS10007
+*IS10007 B     RETURN
+*
+RETURN   DS    0H
+         XR    R15,R15                                        IS10007
+         IC    R15,RC             SET RC IN R15               IS10007
+*IS10184 BRTRN (15)
+*
+         CTSBRTR (R15),LV=WALEN                                IS10184
+         DROP  ,
+         LTORG ,                                               IS10184
+*
+* CONSTANTS ETC.
+*
+*IS10184 CLLOCK   DC    X'08',CL8'LOCK'
+*IS10184 CLULOCK  DC    X'08',CL8'UNLOCK'
+*IS10184 RACHECKX RACHECK MF=L
+*IS10184 RACHECKL EQU   *-RACHECKX
+ATTACHX  ATTACH SF=L
+ATTACHL  EQU   *-ATTACHX
+*IS10184 TSSBLANK DC    CL256' '
+MSG0201  DC    AL1(50),CL50'TSS0201E TOP SECRET SECURITY IS NOT ACTIVE'
+MSG0204  DC    AL1(40),CL40'TSS0204E FUNCTION KEYWORD MISSING'
+MSG0224  DC    AL1(30),CL30'TSS0224E PASSWORD REQUIRED'
+MSG0300  DC    AL1(40),CL40'TSS0300I TSS FUNCTION SUCCESSFUL'
+MSG0301  DC    AL1(50),CL50'TSS0301I TSS FUNCTION FAILED'
+MSG7101  DC    AL1(30),CL30'TSS7101E PASSWORD IS INCORRECT'
+*IS10184 LTORG
+*IS10184 XFERCMND MVC   TSSATBUF+4(*-*),1(R5)
+BLANKS   DC    CL256' '
+*
+* WORKAREA.
+*
+*IS10007 WRKSV1  DS    18F        UNUSED FIELDS
+*IS10007 WRKSV2  DS    18F        UNUSED FIELDS
+*IS10184 TSSWORK  DS    D
+*IS10184 WORKAREA DS    0D
+WA       DSECT                                                 IS10184
+         DS    18F                     SAVE AREA               IS10184
+WASTART  DS    0X                                              IS10184
+@RETURN  DS    A
+@BUFFER  DS    A                  ADDRESS OF COMMAND BUFFER
+BUFLENTH DS    H                  LENGTH OF BUFFER
+TSSTXPL  DS    5F                 TSS EXTENDED PARAMETER LIST
+TSSTCB   DS    A                  TSS COMMAND'S TCB
+TSSECB   DS    A                  ECB FROM ATTACH
+TSSFUNC  DS    CL8
+TSSPSWD  DS    CL8
+ECBADS   DS    F
+RC       DS    X       IS10184     RETURN CODE OF PROGRAM    IS10007
+TRC      DS    X       IS10184     TEMPORARY RC              IS10007
+*IS10184 LWORK    EQU   *-WORKAREA
+#WACLNLN EQU   *-WASTART                                       IS10184
+ATTACH   ATTACH SF=L
+PUTBLOCK PUTLINE MF=L
+TEXTADS  DS    H                  LENGTH OF THE OUTPUT LINE
+         DS    H                  RESERVED
+TEXT     DS    CL256              MESSAGE BUFFER
+IOPLADS  DS    4F
+PARMADDR DS    A
+DEBUG    DC    F'0'
+         ORG   DEBUG+3
+DBGLVL   DS    X
+*IS10184 RC       DC    X'00'     RETURN CODE OF PROGRAM    IS10007
+*IS10184 TRC      DC    X'00'     TEMPORARY RC              IS10007
+*IS10184 RACHECK  RACHECK MF=L
+*IS10184 TSSATBUF DS    CL256
+ACEE1    DS    A                   ADDR ACEE
+CALL10   DS    10A                     CALL PARMLIST (10 PARMS)IS10184
+CALL10L  EQU   *-CALL10                                        IS10184
+*IS10184 DBGLEVEL DS    X                   DEBUG LEVEL
+*IS10184 RAREA1   DS    32D
+*IS10184 MODE     DC    CL8'CHECK'          LOGIN MODE
+*IS10184 RCROUT   DS    F                   ROUTER RC
+*IS10184 RCRACF   DS    F                   RACF RC
+*IS10184 RSNRACF  DS    F                   RACF RESON
+*IS10184 DBGLVF   DS    F                   DEBUF LEVEL
+*IS10184
+*IS10184  PGETACEE DS    0D        GET ACEE PARAMETER LIST
+*IS10184 DC    A(MODE)             MODE - "CHECK"
+*IS10184 DC    A(DBGLVF)           DEBUG LEVEL
+*IS10184 DC    A(RCROUT)           ROUTER RC
+*IS10184 DC    A(RCRACF)           RACF RC
+*IS10184 DC    A(RSNRACF)          RACF RESON
+*IS10184 DC    A(ACEE1)            ACEE
+         DS    0D                                              IS10184
+RAREA    DS    XL512                   USED BY CTSADBG         IS10184
+DBGAREA  DS    XL2048                  USED BY CTSADBG         IS10184
+#WALEN   EQU   *-WA                                            IS10184
+*
+         CTSEQUR
+*
+* DSECTS.
+*
+TXPL     DSECT
+*
+* TSS COMMAND EXTENDED PARAMETER LIST.
+*
+TXPLID   DC    C'TXPL'            CONTROL BLOCK IDENTIFIER
+TXPLCBUF DS    A                  @ COMMAND INPUT BUFFER
+TXPLCLEN DS    H                  LENGTH OF COMMAND BUFFER
+TXPLRSV1 DS    H                  RESERVED
+TXPLRET  DS    A                  @ FIRST RETURN AREA
+TXPLACEE DS    A                  @ CALLER'S ACEE
+TXPLLEN  EQU   *-TXPL             LENGTH OF PARAMETER LIST
+*
+* RETURN DATA AREA HEADER.
+*
+TXPLRETH DSECT ;                  RETURN DATA AREA HEADER
+TXPLNXTR DS    A                  @ NEXT RETURN AREA, OR ZERO
+TXPLRLEN DS    A                  LENGTH OF THIS RETURN AREA
+TXPLNXTL DS    A                  @ NEXT LINE IN THIS AREA
+TXPLRSV2 DS    A                  RESERVED
+TXPLSP   EQU   1                  SUBPOOL FOR GETMAIN/FREEMAIN
+TXPLHLEN EQU   *-TXPLRETH         LENGTH OF HEADER
+*
+* RETURN DATA LINE FORMAT.
+*
+TXPLLINE DSECT ;                  RETURN DATA LINE FORMAT
+TXPLDLEN DS    H                  LENGTH OF THIS LINE
+TXPLDATA DS    C                  DATA LINE
+*
+**   SYSTEM CONTROL BLOCKS
+*
+         IKJCPPL
+         IHAACEE
+         END

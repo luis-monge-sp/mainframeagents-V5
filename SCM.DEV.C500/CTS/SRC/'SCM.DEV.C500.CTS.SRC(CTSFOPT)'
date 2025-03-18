@@ -1,0 +1,2527 @@
+****************************************************************        00000201
+****                                                        ****        00000301
+****     CONTROL-SA  RELEASE 1.3.0                          ****        00000401
+****                                                        ****        00000501
+****     LICENCED MATERIAL - NEW DIMENSION SOFTWARE LTD.    ****        00000601
+****                                                        ****        00000701
+****************************************************************        00000801
+*                                                                       00000901
+****************************************************************        00001001
+*                                                              *        00001101
+* TITLE            : GET RACF OPTIONS                          *        00001201
+*                                                              *        00001301
+* FILE NAME        : CTSFOPT                                   *        00001401
+*                                                              *        00001501
+* AUTHOR           : ALEXANDER SHVARTSMAN                      *        00001601
+*                                                              *        00001701
+* CREATION DATE    : 29/04/96                                  *        00001801
+*                                                              *        00001901
+* DESCRIPTION      :                                           *        00002001
+*                                                              *        00002101
+*                                                              *        00002101
+* INPUT            : DEBUG       -  DEBUG LEVEL                *
+*                                                              *
+* OUTPUT           : RETAREA     -  OPTION PARAMETER STRUCTURE *
+*                                                              *
+* RETURN VALUE     :  0 - O.K.                                 *
+*                     4 - GET OF REQUESTED FIELD IS NOT SUPP   *
+*                     8 - RETURN AREA OVERFLOW( FROM PUTPARM ) *
+*                    16 - RACF IS NOT ACTIVE                   *
+*                    24 - FREEMAIN FAILED                      *
+*                    30 - INVALID RULE INDEX                   *
+*                    32 - INVALID INDEX OF FIELD               *
+*                    34 - ADDINFO KEYWORD NOT FOUND (PUTCDT)   *
+*                    38 - INVALID MASK LENGTH       (PUTCDT)   *
+*                                                              *
+* ASSUMPTIONS AND                                              *        00002201
+*   CONSIDERATIONS : CALLER MUST BE AUTHORIZED                 *        00002301
+*                                                              *        00002401
+*------------------------- V 2.1.0 ----------------------------*        00190000
+* PS0163 AS 28.07.97 RACF SECURITY SERVER SUPPORT              *        00492000
+* WS2557 AS 22.05.06 RACF MIXEDCASE PASSWORD SUPPORT FOR ZOS17 *        00492000
+* WS10074 NY 04.11.10 RACF EXTENDED PASWORD SUPPORT.           *        00492000
+* BS10130 NY 11.01.24 SUPPORT DYNAMIC CDT.                     *
+* IS10188 AL 06.10.24 MOVE OUR MODULES ABOVE 16M LINE          *
+****************************************************************        00210000
+****************************************************************        00002501
+*                                                              *
+*    CALCULATE REAL LENGTH OF FIELD                            *
+*    PARAMETERS :                                              *
+*    TXTFLD    =  FIELD ADDR                                   *
+*    MAXEXPL   =  MAX EXPECTED LENGTH                          *
+*    PTFLDPL   =  ADDR FOR SAVING LENGTH                       *
+*                                                              *
+****************************************************************        00002501
+         MACRO
+         SETLEN &TXTFLD,&MAXEXPL,&PTFLDPL
+         LA    R1,&TXTFLD+&MAXEXPL     MAX FIELD ADDR
+         L     R11,=A(BLANKTAB)        TRANSLATE TABLE ADDR
+         TRT   &TXTFLD.(&MAXEXPL.),0(R11)
+         LA    R11,&TXTFLD             START FIELD NAME ADDR
+         SR    R1,R11                  CALCULATE THE LENGTH
+         ST    R1,&PTFLDPL             SAVE REAL LENGTH OF FIELD
+         MEND                                                           00000940
+****************************************************************        00002501
+*                                                              *
+*   CDTMAP MACRO - CREATE CDT TABLE PRCOESSING TABLE           *
+****************************************************************
+         MACRO
+         CDTMAP   &KWD,&LBL,&FLD                                        00000070
+         GBLC     &BASE
+         AIF   ('&KWD' EQ 'START').CDTMAP0                              00000120
+         AIF   ('&KWD' EQ 'END').CDTMAP1                                00000120
+         DC    CL8'&KWD',A(&LBL),A(&FLD-&BASE),A(L'&FLD)
+         AGO   .CDTMAP2
+.CDTMAP0 ANOP                                                           00000120
+&BASE    SETC  '&LBL'
+         AGO   .CDTMAP2
+.CDTMAP1 ANOP                                                           00000120
+         DC    CL8'********'
+         AGO   .CDTMAP2
+.CDTMAP2 ANOP                                                           00000120
+         MEND                                                           00000940
+****************************************************************        00002601
+*                                                                       00002601
+PARM     DSECT
+DEBUG    DS    A                       DEBUG LEVEL
+OPTION   DS    A                       OPTION KEYWORD
+RETAREA  DS    A                       ADDR OPTION PARAM STRUCT
+SEPRTR   DS    A                       ADDR OF SEPARATOR CHAR
+***************************************************************
+*                                                             *
+*        PARAMETER LIST                                       *
+*                                                             *
+***************************************************************
+OPTPARM  DSECT
+MAXLEN   DS    F                       MAX LENGTH
+USELEN   DS    F                       USE LENGTH
+BUFFER   DS    A                       ADDR OF BUFFER
+*
+CTSFOPT  CSECT
+CTSFOPT  AMODE 31
+*IS10188 CTSFOPT  RMODE 24       (FOR CTSADBG)
+CTSFOPT  RMODE ANY                                              IS10188
+*
+*        INITALIZE
+*
+         BEGIN *,R12
+         CTSEQUR
+         CTSLEVEL
+         LR    R10,R1
+         USING PARM,R10
+         L     R11,DEBUG               R11-> DEBUG LEVEL (4 BYTES)
+         XC    DEBUGL,DEBUGL           STORE DEBUG LEVEL
+         ICM   R11,15,0(R11)           DEBUG LEVEL
+         BNP   NODEBUG                 SKIP DEBUG LVL IF MINUS
+         STC   R11,DEBUGL              STORE DEBUG LEVEL (1 BYTE)
+NODEBUG  DS    0H
+         CTSADBG 'ENTER DEBUG LEVEL=#',(?R11),                         1
+               LEVEL=(DEBUGL,1,2,3,4,5),RAREA=DBGAREA
+         MVC   RETBUF(4),RETAREA       RETURN AREA
+         MVC   CDTPRTB(4),RETAREA      RETURN BUFFER
+         MVC   OPTADR(4),OPTION
+         L     R11,SEPRTR              ADDR OF SEPARATOR CHAR
+         MVC   SEP(1),0(R11)           SAVE SEPARATOR CHAR
+*
+         L     R10,CDTPRTB
+         CTSADBG 'SEP=$ BUFF=~/~',(SEP,1,?R10,0(R10)),                 1
+               LEVEL=(DEBUGL,4,5),RAREA=DBGAREA
+*
+         L     R10,CVTPTR              LOAD ADDR CVT
+         USING CVT,R10                 ADDRESSABILITY CVT DSECT
+*
+         L     R8,CVTRAC               LOAD ADDR CVT RACF
+         LTR   R8,R8                   ADDR SUPPLIED ?
+         BZ    RET16                   NO, RACF 'DOWN'
+*-------------------------------------------------------------------
+*     PRINT RACF CVT AREA ACCORDING DEBUG LEVEL
+*-------------------------------------------------------------------
+         CLI   DMPDONE,1
+         BE    BYPDMP
+         MVI   DMPDONE,1
+         LR    R9,R8
+         LA    R9,1000(R9)
+         CTSADBG TYPE=SNAP,ID=1,HDR='** RACF CVT **',                  1
+               ADDR=(0(R8),0(R9)),                                     2
+               LEVEL=(DEBUGL,5),RAREA=DBGAREA
+         DROP  R10
+*
+*-------------------------------------------------------------------
+*     RCVT PROCESSING
+*-------------------------------------------------------------------
+*
+BYPDMP   DS    0H
+         USING RCVT,R8                 ADDRESSABILITY CVT RACF DSECT
+*
+         CTSADBG 'RCVTID=_ RELEASE=_',                                 1
+               (RCVTID,4,RCVTVRMN,4),                                  2
+               LEVEL=(DEBUGL,1,2,3,4,5),RAREA=DBGAREA
+*---------------------------------------------------------------
+*     BLOCK ID  - SHOULD BE 'RCVT'
+*---------------------------------------------------------------
+         CLC   =CL4'RCVT',RCVTID       CHECK BLOCK ID
+         BNE   RET16                   INVALID BLOCK ID
+         TM    RCVTSTAT,RCVTRNA        RACF ACTIVE ?
+         BO    RET16                   NO
+         TM    RCVTFLGS,RCVTROFF       RACF ACTIVE ?
+         BO    RET16                   NO
+*----------------------------------------------------------------
+*   FIELD PROCESSING
+*----------------------------------------------------------------
+         LA    R5,PRMTABLE             FIELD'S PARAMETER TABLE
+         L     R9,OPTADR               ADDR OF REQUESTED FIELD
+PRML1    DS    0H
+*
+         CTSADBG 'INTERNAL TABLE FIELD=_ REQUESTED FIELD=_',           1
+               (0(R5),8,0(R9),8),                                      2
+               LEVEL=(DEBUGL,4,5),RAREA=DBGAREA
+*
+         CLC   0(8,R5),0(R9)           FOUND REQUESTED FIELD ?
+         BE    PRMLF                   Y, PASS
+         CLC   =CL8'********',0(R9)    END-OF-TABLE ?
+         BE    RET4                    FIELD NOT FOUND
+         LA    R5,12(R5)               INCR ADDR OF TABLE
+         B     PRML1
+PRMLF    DS    0H
+         L     R5,8(R5)                GET ADDR OF LABEL
+         BR    R5                      BRANCH TO LABEL
+*
+*  ADSP
+*
+LADSP    DS    0H
+         TM    RCVTSTAT,RCVTNADS
+         BO    PUT_NO                  NO
+         B     PUT_YES                 YES
+*
+*  APPLAUDIT
+*
+LAPLAUD  DS    0H
+         TM    RCVTFL2X,RCVTAAPL
+         BO    PUT_YES                 YES
+         B     PUT_NO                  NO
+*
+*  CATDSNS
+*
+LCATDSNS DS    0H
+         TM    RCVTFLG2,RCVTCATD
+         BZ    RET0                    CATDSNS IS OFF
+         TM    RCVTFL2X,RCVTCATF
+         BO    PUT_FAIL                FAILURE
+         B     PUT_WARN                WARNING
+*
+*  CMDVIOL
+*
+LCMDVIOL DS    0H
+         TM    RCVTEROP,RCVTAVIO
+         BO    PUT_NO                  NO
+         B     PUT_YES                 YES
+*
+*  COMPATMODE
+*
+LCOMPTM  DS    0H
+         TM    RCVTFL2X,RCVTCMPM
+         BO    PUT_YES                 YES
+         B     PUT_NO                  NO
+*
+*  EGN
+*
+LEGN     DS    0H
+         TM    RCVTSTAT,RCVTEGN
+         BO    PUT_YES                 YES
+         B     PUT_NO                  NO
+*
+*  NOERASE
+*
+LNOERS   DS    0H
+         TM    RCVTFLG1+1,RCVTEOS
+         BO    PUT_NO                  NO
+         B     PUT_YES                 YES
+*
+*  ERASE.ALL
+*
+LERALL   DS    0H
+         TM    RCVTFLG1+1,RCVTEOS
+         BZ    PUT_NO                  (RET0) ERASE INACTIVE
+         TM    RCVTFLG1+1,RCVTEOSA
+         BO    PUT_YES                 YES
+         B     PUT_NO                  NO
+*
+*  ERASE.SECLEVEL
+*
+LERSLV   DS    0H
+         TM    RCVTFLG1+1,RCVTEOS
+         BZ    RET0                    ERASE INACTIVE
+         TM    RCVTFLG1+1,RCVTEOSL
+         BO    GETSECL                 GET SEC LEVEL NAME
+         B     RET0
+GETSECL  DS    0H                      GET SEC LEVEL NAME
+         MVC   ERSSCLV(1),RCVTSLVL     SECURITY LEVEL
+         CLI   ERSSCLV,0
+         BE    RET0
+         CTSCALL PUTSCLV,(DEBUGL,ERSSCLV,RETBUF),LINK=INT
+         B     RET
+*
+*  GENERICOWNER
+*
+LGOWNR   DS    0H
+         TM    RCVTFLG2,RCVTGNOW
+         BO    PUT_YES                 YES
+         B     PUT_NO                  NO
+*
+*  GRPLIST
+*
+LGRPLT   DS    0H
+         TM    RCVTOPTX,RCVTLGRP
+         BO    PUT_YES                 YES
+         B     PUT_NO                  NO
+*
+*  INACTIVE
+*
+LINACT   DS    0H
+         SR    R5,R5
+         IC    R5,RCVTINAC
+         ST    R5,NUMFLD
+         CTSCALL PUTNMFD,(DEBUGL,NUMFLD,RETBUF),LINK=INT
+         B     RET
+*
+*  INITSTATS
+*
+LINSTT   DS    0H
+         TM    RCVTSTAT,RCVTNLS
+         BO    PUT_NO                  NO
+         B     PUT_YES                 YES
+*
+*  JES.BATCHALLRACF
+*
+LJBAT    DS    0H
+         TM    RCVTSTA1,RCVTJALL
+         BO    PUT_YES                 YES
+         B     PUT_NO                  NO
+*
+*  JES.EARLYVERIFY
+*
+LJVRF    DS    0H
+         TM    RCVTSTA1,RCVTJCHK
+         BO    PUT_YES                 YES
+         B     PUT_NO                  NO
+*
+*  JES.XBMALLRACF
+*
+LJXBM    DS    0H
+         TM    RCVTSTA1,RCVTJXAL
+         BO    PUT_YES                 YES
+         B     PUT_NO                  NO
+*
+*  JES.NJEUSERID
+*
+LJUID    DS    0H
+         MVC   TXTFLD(8),RCVTJSYS
+         SETLEN TXTFLD,8,PTFLDPL       CALCULATE LENGTH OF FIELD
+         MVC   PTFLDPT,=A(TXTFLD)      FIELD ADDR
+         MVC   PTFLDPB,=A(RETBUF)      RET BUFFER ADDR
+         LA    R1,PTFLDP
+         CTSCALL PUTPARM,,LINK=INT
+         B     RET
+*
+*  JES.UNDEFINEDUSER
+*
+LJUUSR   DS    0H
+         MVC   TXTFLD(8),RCVTJUND
+         SETLEN TXTFLD,8,PTFLDPL       CALCULATE LENGTH OF FIELD
+         MVC   PTFLDPT,=A(TXTFLD)      FIELD ADDR
+         MVC   PTFLDPB,=A(RETBUF)      RET BUFFER ADDR
+         LA    R1,PTFLDP
+         CTSCALL PUTPARM,,LINK=INT
+         B     RET
+*
+*  MLACTIVE
+*
+LMLACTVE DS    0H
+         TM    RCVTFLG2,RCVTMLAC
+         BZ    RET0                    MLACTIVE IS OFF
+         TM    RCVTFL2X,RCVTMLAF
+         BO    PUT_FAIL                FAILURE
+         B     PUT_WARN                WARNING
+*
+*  MLQUIET
+*
+LMLQUIET DS    0H
+         TM    RCVTFLG2,RCVTMLQT
+         BO    PUT_YES                 YES
+         B     PUT_NO                  NO
+*
+*  MLS
+*
+LMLS     DS    0H
+         TM    RCVTFLG2,RCVTMLS
+         BZ    RET0                    MLS IS OFF
+         TM    RCVTFL2X,RCVTMLSF
+         BO    PUT_FAIL                FAILURE
+         B     PUT_WARN                WARNING
+*
+*  MLSTABLE
+*
+LMLSTBL  DS    0H
+         TM    RCVTFLG2,RCVTMLST
+         BO    PUT_YES                 YES
+         B     PUT_NO                  NO
+*
+*  NOMODEL
+*
+LNOMODEL DS    0H
+         TM    RCVTMDEL,B'11100000'
+         BM    PUT_NO                  NO
+         BZ    PUT_YES                 YES
+         B     PUT_NO                  NO
+*
+*  MODEL.GDG
+*
+LMDLGDG  DS    0H
+         TM    RCVTMDEL,RCVTMGDG
+         BO    PUT_YES                 YES
+         B     PUT_NO                  NO
+*
+*  MODEL.GROUP
+*
+LMDLGRP  DS    0H
+         TM    RCVTMDEL,RCVTMGRP
+         BO    PUT_YES                 YES
+         B     PUT_NO                  NO
+*
+*  MODEL.USER
+*
+LMDLUSR  DS    0H
+         TM    RCVTMDEL,RCVTMUSR
+         BO    PUT_YES                 YES
+         B     PUT_NO                  NO
+*
+*  OPERAUDIT
+*
+LOPRAUD  DS    0H
+         TM    RCVTAUOP,RCVTAOPR
+         BO    PUT_YES                 YES
+         B     PUT_NO                  NO
+*
+*  PASSWORD.HISTORY
+*
+LPWDHST  DS    0H
+         SR    R5,R5
+         IC    R5,RCVTHIST
+         ST    R5,NUMFLD
+         CTSCALL PUTNMFD,(DEBUGL,NUMFLD,RETBUF),LINK=INT
+         B     RET
+*
+*  PASSWORD.INTERVAL
+*
+LPWDINT  DS    0H
+         SR    R5,R5
+         IC    R5,RCVTPINV
+         ST    R5,NUMFLD
+         CTSCALL PUTNMFD,(DEBUGL,NUMFLD,RETBUF),LINK=INT
+         B     RET
+*
+*  PASSWORD.REVOKE
+*
+LPWDRVK  DS    0H
+         SR    R5,R5
+         IC    R5,RCVTRVOK
+         ST    R5,NUMFLD
+         CTSCALL PUTNMFD,(DEBUGL,NUMFLD,RETBUF),LINK=INT
+         B     RET
+*
+*  PASSWORD.WARNING
+*
+LPWDWRN  DS    0H
+         SR    R5,R5
+         IC    R5,RCVTWARN
+         ST    R5,NUMFLD
+         CTSCALL PUTNMFD,(DEBUGL,NUMFLD,RETBUF),LINK=INT
+         B     RET
+*                                                                WS2557
+*  PASSWORD.MIXEDCASE                                            WS2557
+*                                                                WS2557
+LPWDMIXC DS    0H                                                WS2557
+         L     R5,RCVTVRMN                                       WS2557
+         C     R5,ZOSV17               IS RACF ZOS 1.7 ?         WS2557
+         BL    PUT_NO                  NO, LOWER ZOS VERSION     WS2557
+         TM    RCVTFLG3,RCVTPLC        IS PASSWORD LOWER CASE?   WS2557
+         BO    PUT_YES                 YES, PASSWORD LOWER CASE  WS2557
+         B     PUT_NO                  NO, PASSWORD UPPER CASE   WS2557
+*
+*  PREFIX
+*
+LPREFX   DS    0H
+         SR    R5,R5
+         IC    R5,RCVTQLLN
+         LTR   R5,R5
+         BZ    RET0                    NOPREFIX
+         MVC   TXTFLD(8),RCVTQUAL
+         BCTR  R5,0                    PREFIX LEN - 1 ( PERIOD )
+         ST    R5,PTFLDPL              FIELD LENGTH
+         MVC   PTFLDPT,=A(TXTFLD)      FIELD ADDR
+         MVC   PTFLDPB,=A(RETBUF)      RET BUFFER ADDR
+         LA    R1,PTFLDP
+         CTSCALL PUTPARM,,LINK=INT
+         B     RET
+*
+*  PROTECTALL
+*
+LPROTCT  DS    0H
+         TM    RCVTFLG1+1,RCVTPRO
+         BZ    RET0                    PROTECTALL INACTIVE
+         TM    RCVTFLG1+1,RCVTPROF
+         BO    PUT_WARN                WARNING
+         B     PUT_FAIL                FAILURES
+*
+*  REALDSN
+*
+LREALDSN DS    0H
+         TM    RCVTSTA1,RCVTRDSN
+         BO    PUT_YES                 YES
+         B     PUT_NO                  NO
+*
+*  RETPD
+*
+LRETPD   DS    0H
+         SR    R5,R5
+         ICM   R5,X'3',RCVTRTPD
+         LTR   R5,R5
+         BZ    RETPD0
+         ST    R5,NUMFLD
+         CTSCALL PUTNMFD,(DEBUGL,NUMFLD,RETBUF),LINK=INT
+         B     RET
+RETPD0   DS    0H
+         MVI   TXTFLD,C'0'
+         LA    R5,1                    LEN = 1
+         ST    R5,PTFLDPL              FIELD LENGTH
+         MVC   PTFLDPT,=A(TXTFLD)      FIELD ADDR
+         MVC   PTFLDPB,=A(RETBUF)      RET BUFFER ADDR
+         LA    R1,PTFLDP
+         CTSCALL PUTPARM,,LINK=INT
+         B     RET
+*
+*  SAUDIT
+*
+LSAUDIT  DS    0H
+         TM    RCVTEROP,RCVTSAUD
+         BO    PUT_NO                  NO
+         B     PUT_YES                 YES
+*
+*  SECLABELAUDIT
+*
+LSLAUDIT DS    0H
+         TM    RCVTFLG2,RCVTAUSL
+         BO    PUT_YES                 YES
+         B     PUT_NO                  NO
+*
+*  SECLABELCONTROL
+*
+LSLCNTRL DS    0H
+         TM    RCVTFLG2,RCVTSLCL
+         BO    PUT_YES                 YES
+         B     PUT_NO                  NO
+*
+*  SECLEVELAUDIT
+*
+LSVAUDIT DS    0H
+         MVC   ERSSCLV(1),RCVTSLAU     SECURITY LEVEL
+         CLI   ERSSCLV,0
+         BE    RET0
+         CTSCALL PUTSCLV,(DEBUGL,ERSSCLV,RETBUF),LINK=INT
+         B     RET
+*
+*  SESSIONINTERVAL
+*
+LSESSINT DS    0H
+         SR    R5,R5
+         ICM   R5,X'3',RCVTSINT
+         ST    R5,NUMFLD
+         CTSCALL PUTNMFD,(DEBUGL,NUMFLD,RETBUF),LINK=INT
+         B     RET
+*
+*  TAPEDSN
+*
+LTPDSN   DS    0H
+         TM    RCVTFLG1,RCVTTDSN
+         BO    PUT_YES                 YES
+         B     PUT_NO                  NO
+*
+*  TERMINAL
+*
+LTERMNL  DS    0H
+         TM    RCVTEROP,RCVTTUAC
+         BO    PUT_NONE                NONE
+         B     PUT_READ                READ
+*
+*  WHEN.PROGRAM
+*
+LWPROGR  DS    0H
+         TM    RCVTFLG1+2,RCVTPROG
+         BO    PUT_YES                 YES
+         B     PUT_NO                  NO
+*                                                                PS0163
+*  ADDCREATOR                                                    PS0163
+*                                                                PS0163
+LCREATR  DS    0H                                                PS0163
+         CLC   =CL3'203',RCVTVRMN      RACF 2.3 OR HIGHER ?      PS0163
+         BH    RET0                    N,RETURN                  PS0163
+*BS10130 DROP  R8                      DROP GENERAL RCVT ADDR    PS0163
+*BS10130 USING RC23,R8                 ADDR RACF23 CVT           PS0163
+*BS10130 TM    RC23FL2X,RC23NADC                                 PS0163
+         TM    RCVTFL2X,RCVTNADC                               BS101303
+         BO    PUT_YES                 YES                       PS0163
+         B     PUT_NO                  NO                        PS0163
+*BS10130 DROP  R8                      DROP RACF23 CVT   ADDR    PS0163
+*BS10130 USING RCVT,R8                 ADDR RACF   CVT           PS0163
+*                                                              WS10074
+*  EXTENDED PASSWORD SUPPORT                                   WS10074
+*                                                              WS10074
+LPWDEXTN DS    0H                                              WS10074
+         TM    RCVTFLG3,RCVTXPWD                               WS10074
+         BO    PUT_YES                 YES                     WS10074
+         B     PUT_NO                  NO                      WS10074
+*
+*  NORULE1,2,3,4,5,6,7,8
+*
+LNORL1   DS    0H
+         MVI   RULEIND,1               RULE INDEX
+         MVI   RULEFLD,1               RULE FIELD NUMBER
+         B     PUT_RULE
+LNORL2   DS    0H
+         MVI   RULEIND,2               RULE INDEX
+         MVI   RULEFLD,1               RULE FIELD NUMBER
+         B     PUT_RULE
+LNORL3   DS    0H
+         MVI   RULEIND,3               RULE INDEX
+         MVI   RULEFLD,1               RULE FIELD NUMBER
+         B     PUT_RULE
+LNORL4   DS    0H
+         MVI   RULEIND,4               RULE INDEX
+         MVI   RULEFLD,1               RULE FIELD NUMBER
+         B     PUT_RULE
+LNORL5   DS    0H
+         MVI   RULEIND,5               RULE INDEX
+         MVI   RULEFLD,1               RULE FIELD NUMBER
+         B     PUT_RULE
+LNORL6   DS    0H
+         MVI   RULEIND,6               RULE INDEX
+         MVI   RULEFLD,1               RULE FIELD NUMBER
+         B     PUT_RULE
+LNORL7   DS    0H
+         MVI   RULEIND,7               RULE INDEX
+         MVI   RULEFLD,1               RULE FIELD NUMBER
+         B     PUT_RULE
+LNORL8   DS    0H
+         MVI   RULEIND,8               RULE INDEX
+         MVI   RULEFLD,1               RULE FIELD NUMBER
+         B     PUT_RULE
+*
+*  RULE1.MINLEN  2,3,4,5,6,7,8
+*
+LRL1MNL  DS    0H
+         MVI   RULEIND,1               RULE INDEX
+         MVI   RULEFLD,2               RULE FIELD NUMBER
+         B     PUT_RULE
+LRL2MNL  DS    0H
+         MVI   RULEIND,2               RULE INDEX
+         MVI   RULEFLD,2               RULE FIELD NUMBER
+         B     PUT_RULE
+LRL3MNL  DS    0H
+         MVI   RULEIND,3               RULE INDEX
+         MVI   RULEFLD,2               RULE FIELD NUMBER
+         B     PUT_RULE
+LRL4MNL  DS    0H
+         MVI   RULEIND,4               RULE INDEX
+         MVI   RULEFLD,2               RULE FIELD NUMBER
+         B     PUT_RULE
+LRL5MNL  DS    0H
+         MVI   RULEIND,5               RULE INDEX
+         MVI   RULEFLD,2               RULE FIELD NUMBER
+         B     PUT_RULE
+LRL6MNL  DS    0H
+         MVI   RULEIND,6               RULE INDEX
+         MVI   RULEFLD,2               RULE FIELD NUMBER
+         B     PUT_RULE
+LRL7MNL  DS    0H
+         MVI   RULEIND,7               RULE INDEX
+         MVI   RULEFLD,2               RULE FIELD NUMBER
+         B     PUT_RULE
+LRL8MNL  DS    0H
+         MVI   RULEIND,8               RULE INDEX
+         MVI   RULEFLD,2               RULE FIELD NUMBER
+         B     PUT_RULE
+*
+*  RULE1.MAXLEN  2,3,4,5,6,7,8
+*
+LRL1MXL  DS    0H
+         MVI   RULEIND,1               RULE INDEX
+         MVI   RULEFLD,3               RULE FIELD NUMBER
+         B     PUT_RULE
+LRL2MXL  DS    0H
+         MVI   RULEIND,2               RULE INDEX
+         MVI   RULEFLD,3               RULE FIELD NUMBER
+         B     PUT_RULE
+LRL3MXL  DS    0H
+         MVI   RULEIND,3               RULE INDEX
+         MVI   RULEFLD,3               RULE FIELD NUMBER
+         B     PUT_RULE
+LRL4MXL  DS    0H
+         MVI   RULEIND,4               RULE INDEX
+         MVI   RULEFLD,3               RULE FIELD NUMBER
+         B     PUT_RULE
+LRL5MXL  DS    0H
+         MVI   RULEIND,5               RULE INDEX
+         MVI   RULEFLD,3               RULE FIELD NUMBER
+         B     PUT_RULE
+LRL6MXL  DS    0H
+         MVI   RULEIND,6               RULE INDEX
+         MVI   RULEFLD,3               RULE FIELD NUMBER
+         B     PUT_RULE
+LRL7MXL  DS    0H
+         MVI   RULEIND,7               RULE INDEX
+         MVI   RULEFLD,3               RULE FIELD NUMBER
+         B     PUT_RULE
+LRL8MXL  DS    0H
+         MVI   RULEIND,8               RULE INDEX
+         MVI   RULEFLD,3               RULE FIELD NUMBER
+         B     PUT_RULE
+*
+*  RULE1.MASK  2,3,4,5,6,7,8
+*
+LRL1MSK  DS    0H
+         MVI   RULEIND,1               RULE INDEX
+         MVI   RULEFLD,4               RULE FIELD NUMBER
+         B     PUT_RULE
+LRL2MSK  DS    0H
+         MVI   RULEIND,2               RULE INDEX
+         MVI   RULEFLD,4               RULE FIELD NUMBER
+         B     PUT_RULE
+LRL3MSK  DS    0H
+         MVI   RULEIND,3               RULE INDEX
+         MVI   RULEFLD,4               RULE FIELD NUMBER
+         B     PUT_RULE
+LRL4MSK  DS    0H
+         MVI   RULEIND,4               RULE INDEX
+         MVI   RULEFLD,4               RULE FIELD NUMBER
+         B     PUT_RULE
+LRL5MSK  DS    0H
+         MVI   RULEIND,5               RULE INDEX
+         MVI   RULEFLD,4               RULE FIELD NUMBER
+         B     PUT_RULE
+LRL6MSK  DS    0H
+         MVI   RULEIND,6               RULE INDEX
+         MVI   RULEFLD,4               RULE FIELD NUMBER
+         B     PUT_RULE
+LRL7MSK  DS    0H
+         MVI   RULEIND,7               RULE INDEX
+         MVI   RULEFLD,4               RULE FIELD NUMBER
+         B     PUT_RULE
+LRL8MSK  DS    0H
+         MVI   RULEIND,8               RULE INDEX
+         MVI   RULEFLD,4               RULE FIELD NUMBER
+         B     PUT_RULE
+*************************************************************
+*  CDT RELATED FIELDS
+*************************************************************
+*
+*  AUDIT
+*
+CDTAUDIT DS    0H
+         MVC   CDTFLBL(8),=CL8'CDTAUDIT'    FIELD LABEL
+         B     PUT_CDT                      PUT CDT RELATED FIELDS
+*
+*  CLASSACT
+*
+CDTCLACT DS    0H
+         MVC   CDTFLBL(8),=CL8'CDTCLACT'    FIELD LABEL
+         B     PUT_CDT                      PUT CDT RELATED FIELDS
+*
+*  RACLIST
+*
+CDTRLST  DS    0H
+         MVC   CDTFLBL(8),=CL8'CDTRLST'     FIELD LABEL
+         B     PUT_CDT                      PUT CDT RELATED FIELDS
+*
+*  STATISTICS
+*
+CDTRSTT  DS    0H
+         MVC   CDTFLBL(8),=CL8'CDTRSTT'     FIELD LABEL
+         B     PUT_CDT                      PUT CDT RELATED FIELDS
+*
+*  GENCMD
+*
+CDTGNCD  DS    0H
+         MVC   CDTFLBL(8),=CL8'CDTGNCD'     FIELD LABEL
+         B     PUT_CDT                      PUT CDT RELATED FIELDS
+*
+*  GENERIC
+*
+CDTGNRC  DS    0H
+         MVC   CDTFLBL(8),=CL8'CDTGNRC'     FIELD LABEL
+         B     PUT_CDT                      PUT CDT RELATED FIELDS
+*
+*  GENLIST
+*
+CDTGNLT  DS    0H
+         MVC   CDTFLBL(8),=CL8'CDTGNLT'     FIELD LABEL
+         B     PUT_CDT                      PUT CDT RELATED FIELDS
+*
+*  GLOBAL
+*
+CDTGLBL  DS    0H
+         MVC   CDTFLBL(8),=CL8'CDTGLBL'     FIELD LABEL
+         B     PUT_CDT                      PUT CDT RELATED FIELDS
+*
+*  LOGOPTIONS.ALWAYS
+*
+CDTLALW  DS    0H
+         MVC   CDTFLBL(8),=CL8'CDTLALW'     FIELD LABEL
+         B     PUT_CDT                      PUT CDT RELATED FIELDS
+*
+*  LOGOPTIONS.NEVER
+*
+CDTLNVR  DS    0H
+         MVC   CDTFLBL(8),=CL8'CDTLNVR'     FIELD LABEL
+         B     PUT_CDT                      PUT CDT RELATED FIELDS
+*
+*  LOGOPTIONS.SUCCESSES
+*
+CDTLSCC  DS    0H
+         MVC   CDTFLBL(8),=CL8'CDTLSCC'     FIELD LABEL
+         B     PUT_CDT                      PUT CDT RELATED FIELDS
+*
+*  LOGOPTIONS.FAILURES
+*
+CDTLFLR  DS    0H
+         MVC   CDTFLBL(8),=CL8'CDTLFLR'     FIELD LABEL
+         B     PUT_CDT                      PUT CDT RELATED FIELDS
+*
+*  LOGOPTIONS.DEFAULT
+*
+CDTLDFT  DS    0H
+         MVC   CDTFLBL(8),=CL8'CDTLDFT'     FIELD LABEL
+         B     PUT_CDT                      PUT CDT RELATED FIELDS
+*************************************************************
+*  FIELD'S PARAMETERS TABLE
+*************************************************************
+PRMTABLE DS    0D
+         DC    CL8'ADSP',A(LADSP)           ADSP
+         DC    CL8'APLAUDIT',A(LAPLAUD)     APPLAUDIT
+         DC    CL8'CATDSNS',A(LCATDSNS)     CATDSNS
+         DC    CL8'CMDVIOL',A(LCMDVIOL)     CMDVIOL
+         DC    CL8'COMPATM',A(LCOMPTM)      COMPATMODE
+         DC    CL8'EGN',A(LEGN)             EGN
+         DC    CL8'NOERASE',A(LNOERS)       NOERASE
+         DC    CL8'ERASEALL',A(LERALL)      ERASE.ALL
+         DC    CL8'ERASESLV',A(LERSLV)      ERASE.SECLEVEL
+         DC    CL8'GENOWNER',A(LGOWNR)      GENERICOWNER
+         DC    CL8'GRPLIST',A(LGRPLT)       GRPLIST
+         DC    CL8'INACTIVE',A(LINACT)      INACTIVE
+         DC    CL8'INISTATS',A(LINSTT)      INITSTATS
+         DC    CL8'JESBAT',A(LJBAT)         JES.BATCHALLRACF
+         DC    CL8'JESVRF',A(LJVRF)         JES.EARLYVERIFY
+         DC    CL8'JESXBM',A(LJXBM)         JES.XBMALLRACF
+         DC    CL8'JESUID',A(LJUID)         JES.NJEUSERID
+         DC    CL8'JESUUSR',A(LJUUSR)       JES.UNDEFINEDUSER
+         DC    CL8'MLACTIVE',A(LMLACTVE)    MLACTIVE
+         DC    CL8'MLQUIET',A(LMLQUIET)     MLQUIET
+         DC    CL8'MLS',A(LMLS)             MLS
+         DC    CL8'MLSTBL',A(LMLSTBL)       MLSTABLE
+         DC    CL8'NOMODEL',A(LNOMODEL)     NOMODEL
+         DC    CL8'MDLGDG',A(LMDLGDG)       MODEL.GDG
+         DC    CL8'MDLGRP',A(LMDLGRP)       MODEL.GROUP
+         DC    CL8'MDLUSR',A(LMDLUSR)       MODEL.USER
+         DC    CL8'OPRAUD',A(LOPRAUD)       OPERAUDIT
+         DC    CL8'PSWDHIST',A(LPWDHST)     PASSWORD.HISTORY
+         DC    CL8'PSWDINT',A(LPWDINT)      PASSWORD.INTERVAL
+         DC    CL8'PSWDRVK',A(LPWDRVK)      PASSWORD.REVOKE
+         DC    CL8'PSWDWRN',A(LPWDWRN)      PASSWORD.WARNING
+         DC    CL8'PSWMIXC',A(LPWDMIXC)     PASSWORD.MIXEDCASE   WS2557
+         DC    CL8'PSWEXTN',A(LPWDEXTN)     EXTENDED PASWORD    WS10074
+         DC    CL8'NORL1',A(LNORL1)         NORULE1
+         DC    CL8'NORL2',A(LNORL2)         NORULE2
+         DC    CL8'NORL3',A(LNORL3)         NORULE3
+         DC    CL8'NORL4',A(LNORL4)         NORULE4
+         DC    CL8'NORL5',A(LNORL5)         NORULE5
+         DC    CL8'NORL6',A(LNORL6)         NORULE6
+         DC    CL8'NORL7',A(LNORL7)         NORULE7
+         DC    CL8'NORL8',A(LNORL8)         NORULE8
+         DC    CL8'RL1MNL',A(LRL1MNL)       RULE1.MINLEN
+         DC    CL8'RL2MNL',A(LRL2MNL)       RULE2.MINLEN
+         DC    CL8'RL3MNL',A(LRL3MNL)       RULE3.MINLEN
+         DC    CL8'RL4MNL',A(LRL4MNL)       RULE4.MINLEN
+         DC    CL8'RL5MNL',A(LRL5MNL)       RULE5.MINLEN
+         DC    CL8'RL6MNL',A(LRL6MNL)       RULE6.MINLEN
+         DC    CL8'RL7MNL',A(LRL7MNL)       RULE7.MINLEN
+         DC    CL8'RL8MNL',A(LRL8MNL)       RULE8.MINLEN
+         DC    CL8'RL1MXL',A(LRL1MXL)       RULE1.MAXLEN
+         DC    CL8'RL2MXL',A(LRL2MXL)       RULE2.MAXLEN
+         DC    CL8'RL3MXL',A(LRL3MXL)       RULE3.MAXLEN
+         DC    CL8'RL4MXL',A(LRL4MXL)       RULE4.MAXLEN
+         DC    CL8'RL5MXL',A(LRL5MXL)       RULE5.MAXLEN
+         DC    CL8'RL6MXL',A(LRL6MXL)       RULE6.MAXLEN
+         DC    CL8'RL7MXL',A(LRL7MXL)       RULE7.MAXLEN
+         DC    CL8'RL8MXL',A(LRL8MXL)       RULE8.MAXLEN
+         DC    CL8'RL1MSK',A(LRL1MSK)       RULE1.MASK
+         DC    CL8'RL2MSK',A(LRL2MSK)       RULE2.MASK
+         DC    CL8'RL3MSK',A(LRL3MSK)       RULE3.MASK
+         DC    CL8'RL4MSK',A(LRL4MSK)       RULE4.MASK
+         DC    CL8'RL5MSK',A(LRL5MSK)       RULE5.MASK
+         DC    CL8'RL6MSK',A(LRL6MSK)       RULE6.MASK
+         DC    CL8'RL7MSK',A(LRL7MSK)       RULE7.MASK
+         DC    CL8'RL8MSK',A(LRL8MSK)       RULE8.MASK
+         DC    CL8'PREFIX',A(LPREFX)        PREFIX
+         DC    CL8'PROTCT',A(LPROTCT)       PROTECTALL
+         DC    CL8'REALDSN',A(LREALDSN)     REALDSN
+         DC    CL8'RETPD',A(LRETPD)         RETPD
+         DC    CL8'SAUDIT',A(LSAUDIT)       SAUDIT
+         DC    CL8'SLBAUDIT',A(LSLAUDIT)    SECLABELAUDIT
+         DC    CL8'SLBCNTRL',A(LSLCNTRL)    SECLABELCONTROL
+         DC    CL8'SLVAUDIT',A(LSVAUDIT)    SECLEVELAUDIT
+         DC    CL8'SESSINT',A(LSESSINT)     SESSIONINTERVAL
+         DC    CL8'TPDSN',A(LTPDSN)         TAPEDSN
+         DC    CL8'TERMNL',A(LTERMNL)       TERMINAL
+         DC    CL8'WPROGR',A(LWPROGR)       WHEN.PROGRAM
+         DC    CL8'CREATR',A(LCREATR)       ADDCREATOR           PS0163
+*--------------------------------------------------------------------
+*  CDT RELATED FIELDS
+*--------------------------------------------------------------------
+         DC    CL8'AUDIT',A(CDTAUDIT)       AUDIT
+         DC    CL8'CLSACT',A(CDTCLACT)      CLASSACT
+         DC    CL8'GENCMD',A(CDTGNCD)       GENCMD
+         DC    CL8'GENERIC',A(CDTGNRC)      GENERIC
+         DC    CL8'GENLIST',A(CDTGNLT)      GENLIST
+         DC    CL8'GLOBAL',A(CDTGLBL)       GLOBAL
+         DC    CL8'LOGOPAW',A(CDTLALW)      LOGOPTIONS.ALWAYS
+         DC    CL8'LOGOPNV',A(CDTLNVR)      LOGOPTIONS.NEVER
+         DC    CL8'LOGOPSC',A(CDTLSCC)      LOGOPTIONS.SUCCESSES
+         DC    CL8'LOGOPFL',A(CDTLFLR)      LOGOPTIONS.FAILURES
+         DC    CL8'LOGOPDF',A(CDTLDFT)      LOGOPTIONS.DEFAULT
+         DC    CL8'RACLIST',A(CDTRLST)      RACLIST
+         DC    CL8'RACSTAT',A(CDTRSTT)      STATISTICS
+         DC    CL8'********',A(0)
+*--------------------------------------------------------------------
+*    GENERAL PROGS - PUT VALUES
+*--------------------------------------------------------------------
+PUT_NO   DS    0H                      PUT FLAG "NO"
+         CTSCALL PUTPARM,(DEBUGL,1,NOTXT,RETBUF),LINK=INT
+         B     RET
+*--------------------------------------------------------------------
+PUT_YES  DS    0H                      PUT FLAG "YES"
+         CTSCALL PUTPARM,(DEBUGL,1,YESTXT,RETBUF),LINK=INT
+         B     RET
+*--------------------------------------------------------------------
+PUT_FAIL DS    0H                      PUT "FAILURE"
+         CTSCALL PUTPARM,(DEBUGL,8,FAILTXT,RETBUF),LINK=INT
+         B     RET
+*--------------------------------------------------------------------
+PUT_WARN DS    0H                      PUT "WARNING"
+         CTSCALL PUTPARM,(DEBUGL,7,WARNTXT,RETBUF),LINK=INT
+         B     RET
+*--------------------------------------------------------------------
+PUT_RULE DS    0H                      PUT  "RULES"
+         MVC   PSWDRULE(80),RCVTSNTX
+         CTSCALL PUTRULE,(DEBUGL,RULEIND,RULEFLD,PSWDRULE,RETBUF),     X
+               LINK=INT
+         B     RET
+*--------------------------------------------------------------------
+PUT_NONE DS    0H                      PUT FLAG "NONE"
+         CTSCALL PUTPARM,(DEBUGL,4,NONETXT,RETBUF),LINK=INT
+         B     RET
+*--------------------------------------------------------------------
+PUT_READ DS    0H                      PUT FLAG "NONE"
+         CTSCALL PUTPARM,(DEBUGL,4,READTXT,RETBUF),LINK=INT
+         B     RET
+*--------------------------------------------------------------------
+PUT_CDT  DS    0F                      PUT CDT RELATED FIELDS
+         LA    R1,CDTPLP
+         CTSCALL PUTCDTP,,LINK=INT
+         B     RET
+*--------------------------------------------------------------------
+*    RETURN CODES
+*--------------------------------------------------------------------
+RET0     DS    0H                      0-O.K
+         SR    R15,R15
+         B     RET
+*
+RET4     DS    0H                      GET FIELD IS NOT SUPPORTED
+         LA    R15,4
+         B     RET
+*
+RET16    DS    0H                      RACF NOT ACTIVE
+         LA    R15,16
+         B     RET
+*
+RET      DS    0H
+         CTSADBG 'EXITING WITH RC=~',(?R15),                           1
+               LEVEL=(DEBUGL,1,2,3,4,5)
+         BRTRN (15)
+         LTORG
+DBGAREA  DS    32D                     DEBUG MACRO AREA
+RETBUF   DS    F                       ADDR OF RETURN AREA
+OPTADR   DS    F                       ADDR OF OPTION FIELD
+ERSSCLV  DC    X'00'                   ERASE SECURITY LEVEL
+DEBUGL   DC    XL1'0'                  DEBUG LEVEL
+PSWDRULE DS    CL80                    PASSWORD RULES AREA
+RULEIND  DS    X                       RULE INDEX
+RULEFLD  DS    X                       RULE FIELD NUMBER
+TXTFLD   DS    CL256                   TEXT FIELD
+CDTFLBL  DS    CL8                     FIELD LABEL
+NUMFLD   DS    F                       NUMERIC FIELD
+SEP      DS    CL1                     SEPARATOR
+DMPDONE  DC    XL1'0'                  DUMP RCVT FLAG
+         DS    0F
+ZOSV17   DC    CL4'7720'               FMID OF ZOS VER 1.7       WS2557
+*
+*  PARAMETERS LIST FOR PUT FIELDS
+*
+PTFLDP   DS    0F
+PTFLDDBG DC    A(DEBUGL)
+PTFLDPL  DS    A                       FIELD LENGTH
+PTFLDPT  DS    A                       FIELD PTR
+PTFLDPB  DS    A                       RETURN BUFFER
+*
+*  PARAMETERS LIST FOR CDT FIELD PROCESSING
+*
+CDTPLP   DS    0F
+CDTPDBG  DC    A(DEBUGL)               DEBUG LEVEL
+CDTPLBL  DC    A(CDTFLBL)              FIELD LABEL
+CDTPRTB  DS    A                       RETURN BUFFER
+*
+*  TEXT PARAMETERS
+*
+YESTXT   DC    CL1'Y'
+NOTXT    DC    CL1'N'
+FAILTXT  DC    CL8'FAILURES'
+WARNTXT  DC    CL7'WARNING'
+NONETXT  DC    CL4'NONE'
+READTXT  DC    CL4'READ'
+*
+         DROP ,
+***************************************************************
+*                                                             *
+*        PUT VALUE TO OUTPUT AREA                             *
+*                                                             *
+***************************************************************
+PUTPARM  BEGIN
+         LR    R11,R1                  ADDR OF PARAMETER LIST
+         USING PTPARM,R11
+         L     R2,PTPDBG
+         SR    R5,R5
+         IC    R5,0(R2)
+         STC   R5,DEBUGP               DEBUG LEVEL
+         L     R2,PTPBUF               ADDR TO RETURN AREA
+         L     R2,0(R2)                ADDR OF RETURN AREA
+*
+         CTSADBG 'BUF ADDR=~',(?R2),                                   1
+               LEVEL=(DEBUGP,3,4,5),RAREA=DBGAREA2
+*
+         USING OPTPARM,R2
+*
+         CTSADBG 'RETAREA MAX LEN=# USE LEN=# BUF ADDR=~',             1
+               (MAXLEN,USELEN,BUFFER),                                 2
+               LEVEL=(DEBUGP,3,4,5),RAREA=DBGAREA2
+*
+         L     R3,PTPLEN               PARAMETER LENGTH
+         ST    R3,VALLEN               SAVE VAL LENGTH
+         L     R4,PTPVAL               ADDR OF PARAMETER VALUE
+*
+         CTSADBG 'VALUE=#/_',(?R3,0(R4),?R3),                          1
+               LEVEL=(DEBUGP,3,4,5),RAREA=DBGAREA2
+*
+         LTR   R3,R3                   LENGTH = 0 ?
+         BZ    PTPRMOK                 YES, NOTHING TO DO
+*
+         L     R5,MAXLEN               MAX LENGTH OF RETURN AREA
+         L     R6,USELEN               USED LENGTH OF RETURN AREA
+         LR    R8,R6                   KEEP USED LENGTH
+         LTR   R8,R8                   USED LENGTH = 0 ?
+         BZ    PUTPFRST                Y, GOTO PUT FIRST PARAMETER
+*
+         LA    R3,1(R3)                ADD 1 TO VAL LENGTH
+PUTPFRST DS    0H
+*
+*   OVERFLOW CHECKING
+*
+         AR    R6,R3                   USELEN + VAL LEN
+         CR    R6,R5                   NEW LENGTH > MAX LENGTH ?
+         BH    PTPRMOF                 Y, OVERFLOW !
+*
+         L     R7,BUFFER               ADDR OF RETURN BUFFER
+         AR    R7,R8                   PUT ADDRRESS
+         ST    R6,USELEN               UPDATE USED LENGTH
+         LTR   R8,R8                   PREVIOS USED LENGTH = 0 ?
+         BZ    PUTPVAL                 Y, GOTO PUT PARAMETER VALUE
+*
+*   PUT SEPARATOR
+*
+         L     R10,=A(SEP)             ADDR OF SEPARATOR
+         MVC   0(1,R7),0(R10)          PUT SEPARATOR
+*        MVI   0(R7),C','              PUT SEPARATOR
+         LA    R7,1(R7)                INCR PUT ADDR
+PUTPVAL  DS    0H
+         BCTR  R3,0                    DECR FOR EX COMMAND
+         EX    R3,MOVVAL               MOVE VALUE TO BUFFER
+*
+         L     R3,VALLEN               VAL LENGTH
+         CTSADBG 'AT ~ BUFFER=#/_ SOURCE=#/_',                         1
+               (?R7,?R3,0(R7),?R3,?R3,0(R4),?R3),                      2
+               LEVEL=(DEBUGP,3,4,5),RAREA=DBGAREA2
+*
+         B     PTPRMOK
+PTPRMOF  DS    0H                      OVERFLOW !
+         LA    R15,8
+         B     PTPRMRT
+PTPRMOK  DS    0H
+         SR    R15,R15
+         B     PTPRMRT
+PTPRMRT  DS    0H
+         BRTRN (15)
+MOVVAL   MVC   0(0,R7),0(R4)
+DEBUGP   DS    X                       DEBUG LEVEL
+DBGAREA2 DS    32D                     DEBUG MACRO AREA
+VALLEN   DS    F                       VAL LENGTH
+         LTORG
+         ORG   ,
+         DROP ,
+***************************************************************
+*                                                             *
+*        PUT ERASE SECLEVEL NAME                              *
+*                                                             *
+***************************************************************
+PUTSCLV  BEGIN
+         SR    R5,R5
+         L     R2,0(R1)                DEBUG LEVEL ADDR
+         IC    R5,0(R2)
+         STC   R5,DEBUGS               DEBUG LEVEL
+         L     R2,4(R1)                ADDR OF SEC. LEVEL
+         SR    R11,R11
+         IC    R11,0(R2)               SEC LEVEL
+         L     R2,8(R1)                ADDR OF RET BUFFER
+         ST    R2,ARETBUF
+*
+         CTSADBG 'ERASE SEC LEVEL=~',                                  X
+               (?R11),RAREA=DBGAREA3,LEVEL=(DEBUGS,4,5)
+*
+         XC    RCFAREA(30),RCFAREA
+         XC    AREARACF,AREARACF       RACF RETURN AREA ADDR
+         MVC   RCFALEN,RCFLENDF        RET AREA MINIMUM LENGTH
+*
+         LA    R12,GETSECDT            ADDR OF ICHEINTY
+GETSCLV1 DS    0H
+         ICHEINTY MF=(E,(R12))         INVOKE ACCESS TO RACF DATA BASE
+*
+         LR    R2,R15
+         L     R3,56(R12)              REASON CODE OF BASE SEGMENT
+         L     R4,52(R12)              RETURN CODE OF BASE SEGMENT
+         CTSADBG 'RACF RC(R15)=~ RET CODE=~ REASON CODE=~',            X
+               (?R2,?R4,?R3),                                          X
+               RAREA=DBGAREA3,LEVEL=(DEBUGS,4,5)
+*
+         LTR   R15,R15                 ACCESS SUCCESSFUL ?
+         BNZ   PUTSLC                  ERROR. RETURN SEC LEVL CODE
+*
+         LR    R2,R12                  ADDRESS OF ICHEINTY MACRO LIST
+         L     R2,60(R2)               ADDRESS OF RACF RET AREA
+         ST    R2,AREARACF             RACF RETURN AREA
+*
+         CTSADBG 'RACF RET.AREA ADDR=~',                               X
+               (?R2),RAREA=DBGAREA3,LEVEL=(DEBUGS,5)
+*
+         LTR   R2,R2                   CHECK LENGTH OF RACF RETURN AREA
+         BZ    PUTSLC                  RET AREA IS EMPTY,PUT LEVL CODE
+         L     R2,0(R2)                LENGTH OF AREA
+         ST    R2,LARRACF
+*
+         CTSADBG 'RACF RET.AREA LEN=~',                                X
+               (?R2),RAREA=DBGAREA3,LEVEL=(DEBUGS,5)
+*
+*
+* SNAP RACF RETURN AREA
+*
+         L     R5,AREARACF             RACF RET AREA ADDR
+         LR    R4,R5
+         A     R5,LARRACF              RACF RET AREA LENGTH
+         CTSADBG TYPE=SNAP,ID=5,                                       X
+               HDR='** RACF RETURN AREA **',                           X
+               ADDR=(0(R4),0(R5)),LEVEL=(DEBUGS,5),RAREA=DBGAREA3
+*
+*---------------------------------------------------------------
+*
+         LA    R12,LEVCNT              LEVELS COUNT
+         LA    R12,12(R12)             BRANCH TO FIELD LENGTH
+         L     R4,0(R12)               FIELD LENGTH
+         LTR   R4,R4
+         BZ    PUTSLC                  LEN=0. RETURN SEC LEVL CODE
+         L     R5,4(R12)               FIELD PTR
+         LTR   R5,R5
+         BZ    PUTSLC                  PTR=0. RETURN SEC LEVL CODE
+         ICM   R8,X'F',0(R5)           LEVELS COUNT
+         LTR   R8,R8
+         BZ    PUTSLC                  CNT=0. RETURN SEC LEVL CODE
+*
+         CTSADBG 'LEVELS COUNT LEN=# VAL=~/$',                         X
+               (?R4,?R5,0(R5),?R4),                                    X
+               RAREA=DBGAREA3,LEVEL=(DEBUGS,4,5)
+*
+         LA    R12,LEVVALS             LEVELS VALUES
+         LA    R12,12(R12)             BRANCH TO FIELD LENGTH
+         L     R4,0(R12)               FIELD LENGTH
+         LTR   R4,R4
+         BZ    PUTSLC                  LEN=0. RETURN SEC LEVL CODE
+         L     R5,4(R12)               FIELD PTR
+         LTR   R5,R5
+         BZ    PUTSLC                  PTR=0. RETURN SEC LEVL CODE
+         CTSADBG 'LEVELS VALS LEN=# VAL=~/$/_',                        X
+               (?R4,?R5,0(R5),?R4,0(R5),?R4),                          X
+               RAREA=DBGAREA3,LEVEL=(DEBUGS,4,5)
+*
+*  SEARCH SECLEVEL NAME
+*  ( R8 - SEC LEVELS COUNT, R5 - PTR TO VALUES, R11 - REQUESTED SECLV)
+*
+PUTSCL1  DS    0H
+         ICM   R9,X'F',0(R5)           GET TOTAL FIELD LENGTH
+         LA    R5,4(R5)                BRANCH OVER THE FIELD LENGTH
+         SR    R10,R10
+         ICM   R10,X'3',0(R5)          GET SEC LEVELS CODE
+*
+         CTSADBG '# TOTAL LEN=# SEC CODE=# LOKING FOR CODE=#',         X
+               (?R8,?R9,?R10,?R11),                                    X
+               RAREA=DBGAREA3,LEVEL=(DEBUGS,4,5)
+*
+         CR    R10,R11                 COMPARE SEC, LEVELS
+         BE    PUTSCL1F                SEC LEVEL FOUND
+         AR    R5,R9                   BRANCH OVER THE CURRENT INFO
+         BCTR  R8,0                    SEC LEVELS COUNT - 1
+         LTR   R8,R8
+         BZ    PUTSLC                  END-OF-SEC-LEVEL0LIST.PUT CODE
+         B     PUTSCL1
+PUTSCL1F DS    0H                      SEC LEVEL FOUND
+         LA    R5,2(R5)                BRANCH OVER THE SECLVL CODE
+         BCTR  R9,0                    TOTAL LEN - 1
+         BCTR  R9,0                    TOTAL LEN - 1
+         ST    R9,SCLVLEN              SEC LEVEL NAME LEN
+         ST    R5,SCLVLTXT             SEC LEVEL TEXT ADDR
+         LA    R1,PUTPLST              ADDR OF PARAMETER LIST
+         CTSCALL PUTPARM,,LINK=INT
+         B     PUTSLRT
+PUTSLC   DS    0H
+*
+*   CONVERT SEC LEVEL CODE TO TEXT
+*
+         CVD   R11,PACDEC
+         UNPK  SCLVT(2),PACDEC+6(2)
+         OI    SCLVT+1,X'F0'           FIX UP LAST DIGIT
+         MVC   SCLVLEN(4),=F'2'        SEC LEVEL NAME LEN
+         MVC   SCLVLTXT(4),=A(SCLVT)   SEC LEVEL TEXT ADDR
+         LA    R1,PUTPLST              ADDR OF PARAMETER LIST
+         CTSCALL PUTPARM,,LINK=INT
+         B     PUTSLRT
+*
+PUTSLRT  DS    0H
+         L     R2,AREARACF             RACF RETURN AREA ADDR
+         LTR   R2,R2                   RACF RET AREA WAS OBTAINED ?
+         BNZ   PUTSLFR                 NO, RETURN
+         SR    R15,R15
+         B     PUTSLRT1
+PUTSLFR  DS    0H
+         L     R5,LARRACF              RACF RETURN AREA LENGTH
+         FREEMAIN RC,LV=(R5),A=(R2)
+         LTR   R15,R15
+         BZ    PUTSLRT1
+         LA    R15,24                  FREEMAIN FAILED
+PUTSLRT1 DS    0H
+         BRTRN (15)
+*
+DEBUGS   DS    X                       DEBUG LEVEL
+*
+*  PARAMETERS LIST FOR PUT SECURITY LEVEL NAME
+*
+PUTPLST  DS    0F
+SCLVDBG  DC    A(DEBUGS)
+SCLVLEN  DS    A
+SCLVLTXT DS    A
+ARETBUF  DS    A
+*
+*  EXTRACT FIELDS FROM RACF DATA BASE STUFF
+*
+GETSECDT ICHEINTY LOCATE,RELEASE=1.9,WKAREA=RCFAREA,                   1
+               DATAMAP=NEW,WKSP=0,CLASS=SECDATA,                       2
+               ACTIONS=(LEVCNT,LEVVALS),                               3
+               TYPE='GEN',ENTRY=SECLEVEL,MF=L
+SECDATA  DC    CL8'SECDATA'
+SECLEVEL DC    AL1(8)
+         DC    CL8'SECLEVEL'
+LEVCNT   ICHEACTN FLDATA=(8,D001),RELEASE=1.9,MF=L,FIELD=MEMCNT
+LEVVALS  ICHEACTN FLDATA=(8,D001),RELEASE=1.9,MF=L,FIELD=MEMLST
+D001     DS    D
+*
+*   RETURN AREA FOR EXTRACT INFO FROM RACF DATA BASE
+*
+RCFAREA  DS   0F
+RCFALEN  DS   F                        LENGTH OF AREA
+RCFRBA   DS   CL6                      RBA RETURN AREA
+RCFFLGS  DS   CL1                      FLAGS
+RCFRES1  DS   CL1                      RESERVED
+RCFDDSC  DS   F                        DUPLICATE DATASET NAME COUNT
+RCFRES2  DS   CL8                      RESERVED
+RCFDLEN  DS   F                        RETURNED DATA LEN ( TOTAL )
+RCFDTLEN DS   F                        RETURNED DATA LEN
+RCFDATLN DS   CL2                      RETDATA
+RCFAREAE DS   CL1                      RESERVED
+*
+RCFLENDF DC   F'30'                    RET AREA MINIMUM LENGTH
+AREARACF DS   F                        RACF RETURN AREA ADDR
+LARRACF  DS   F                        RACF RETURN AREA LENGTH
+DBGAREA3 DS   32D                      DEBUG MACRO AREA
+PACDEC   DS   D
+SCLVT    DS   CL2
+*
+         LTORG
+         ORG   ,
+         DROP ,
+***************************************************************
+*                                                             *
+*        PUT NUMERIC FIELD VALUE                              *
+*                                                             *
+***************************************************************
+PUTNMFD  BEGIN
+         SR    R5,R5
+         L     R2,0(R1)
+         IC    R5,0(R2)
+         STC   R5,DEBUGF               DEBUG LEVEL
+         L     R2,4(R1)                ADDR OF NUM FIELD
+         L     R11,0(R2)               NUM FIELD VALUE
+         L     R2,8(R1)                ADDR OF RET BUFFER
+         ST    R2,ARETBUF2
+*
+         CTSADBG 'NUM FIELD=#',                                        X
+               (?R11),RAREA=DBGAREA4,LEVEL=(DEBUGF,4,5)
+*
+*   CONVERT NUM FIELD TO TEXT
+*
+         LTR   R11,R11
+         BZ    PUTNMFR0
+         CVD   R11,PACDEC2
+         UNPK  PACDECT2(16),PACDEC2(8)
+         OI    PACDECT2+15,X'F0'       FIX UP LAST DIGIT
+*
+         CTSADBG 'PACDECT2=$/_',                                       X
+               (PACDECT2,16,PACDECT2,16),                              X
+               RAREA=DBGAREA4,LEVEL=(DEBUGF,4,5)
+*
+*
+*  CALCULATE DATA LENGTH WITHOUT LEADING ZEROES
+*
+PTDHEX2  DS    0H
+         LA    R1,PACDECT2+15          ADDR OF LAST BYTE
+         LR    R11,R1
+         LA    R12,16                  MAX FIELD LENGTH
+         BCTR  R12,0                   DECR FOR EXECUTE
+         EX    R12,SRCHNZ              SEARCH FIRST NON ZERO BYTE
+         LR    R8,R1                   KEEP START ADDR OF DATA
+         SR    R11,R1                  DATA LENGTH - 1
+         LA    R11,1(R11)              ADD 1
+         ST    R11,PUTPLEN2            FIELD LENGTH
+         ST    R8,PUTPVAL2             FIELD ADDR ADDR
+*
+         CTSADBG 'RETURNED FIELD=#/$/_',                               X
+               (?R11,0(R8),?R11,0(R8),?R11),                           X
+               RAREA=DBGAREA4,LEVEL=(DEBUGF,4,5)
+*
+         LA    R1,PUTPLST2             ADDR OF PARAMETER LIST
+         CTSCALL PUTPARM,,LINK=INT
+         B     PUTNMFR
+*
+PUTNMFR0 DS    0H
+         SR    R15,R15
+         B     PUTNMFR
+PUTNMFR  DS    0H
+         BRTRN (15)
+*
+*  PARAMETERS LIST FOR PUT NUMERIC FIELD VALUE
+*
+PUTPLST2 DS    0F
+PUTPLDB2 DC    A(DEBUGF)
+PUTPLEN2 DS    A
+PUTPVAL2 DS    A
+ARETBUF2 DS    A
+*
+NZEROTAB DC    256X'FF'
+         ORG   NZEROTAB+C'0'
+         DC    X'00'
+         ORG   ,
+*
+SRCHNZ   TRT   PACDECT2(0),NZEROTAB    SEARCH FIRST NON ZERO BYTE
+DEBUGF   DS    X                       DEBUG LEVEL
+DBGAREA4 DS   32D                      DEBUG MACRO AREA
+PACDEC2  DS    D
+PACDECT2 DS    CL16
+         LTORG
+         ORG ,
+         DROP ,
+***************************************************************
+*                                                             *
+*        PUT PASSWORD RULES VALUES                            *
+*                                                             *
+***************************************************************
+PUTRULE  BEGIN
+         SR    R5,R5
+         L     R2,0(R1)
+         IC    R5,0(R2)
+         STC   R5,DEBUGW               DEBUG LEVEL
+         L     R2,4(R1)                ADDR OF RULE INDEX
+         SR    R3,R3
+         IC    R3,0(R2)                LOAD RULE INDEX
+         L     R2,8(R1)                ADDR OF RULE FILED NUMBER
+         SR    R4,R4
+         IC    R4,0(R2)                LOAD RULE FIELD NUMBER
+         L     R5,12(R1)               ADDR OF PASSWORD SYNTAX FIELD
+         L     R2,16(R1)               ADDR OF RET BUFFER
+         ST    R2,ARETBUF3             STORE BUFFER ADDR
+         ST    R2,PUTLNBUF             STORE BUFFER ADDR
+*
+         CTSADBG 'RULE INDEX=# RULE FIELD NUMBER=#',(?R3,?R4),         1
+               LEVEL=(DEBUGW,4,5),RAREA=DBGAREA5
+*
+         LA    R6,1                    LOOP COUNTER
+PUTRLL1  DS    0H
+         CR    R6,R3                   CHECK REQUESTED RULE INDEX
+         BE    PUTRLL2                 RULE INDEX LOCATED
+         LA    R5,10(R5)               ICR ADDR OF RULES
+         LA    R6,1(R6)                ADD 1 TO LOOP COUNTER
+         C     R6,=F'8'                GRATHER MAX RULE NUMBER ?
+         BNH   PUTRLL1                 N, LOOP
+         B     PUTRLL30                INVALID RULE INDEX
+*
+*  RULE INDEX LOCATED. PUT DATA
+*  R5 - PTR TO RULE SYNTAX AREA
+*
+PUTRLL2  DS    0H
+         USING RCVTSNTD,R5
+         MVC   CRULE(10),0(R5)
+         LTR   R4,R4
+         BZ    PUTRLL32                INVALID INDEX OF FIELD
+         C     R4,=F'4'
+         BH    PUTRLL32                INVALID INDEX OF FIELD
+         BCTR  R4,0                    DECR INDEX OF FIELD
+         SLL   R4,2                    INDEX OF FIELD * 2
+         B     PUTRLLP(R4)
+PUTRLLP  B     PUTRLF                  PUT FLAG
+         B     PUTRLML                 PUT MIN PASSWORD LENGTH
+         B     PUTRLXL                 PUT MAX PASSWORD LENGTH
+         B     PUTRLMK                 PUT MASK
+*
+PUTRLF   DS    0H                      PUT FLAG
+         SR    R7,R7
+         SR    R8,R8
+         IC    R7,RCVTSLEN             STARTING LENGTH VALUE
+         IC    R8,RCVTELEN             ENDING   LENGTH VALUE
+*
+         CTSADBG 'MIN LEN=# MAX LEN=#',(?R7,?R8),                      1
+               LEVEL=(DEBUGW,4,5),RAREA=DBGAREA5
+*
+         LTR   R7,R7
+         BNZ   PUTFN                   OBTAINED LENGTH NORULE=N
+         LTR   R8,R8
+         BNZ   PUTFN                   OBTAINED LENGTH NORULE=N
+         B     PUTFY                   LENGTHS = 0; NORULE=Y
+*
+PUTRLML  DS    0H                      PUT MIN PASSWORD LENGTH
+         SR    R7,R7
+         IC    R7,RCVTSLEN             STARTING LENGTH VALUE
+*
+         CTSADBG 'MIN LEN=#',(?R7),                                    1
+               LEVEL=(DEBUGW,4,5),RAREA=DBGAREA5
+*
+         LTR   R7,R7
+         BZ    PUTZERO                 LENGTH=0
+         ST    R7,RULELEN              STORE LENGTH
+         B     PUTLEN
+*
+PUTRLXL  DS    0H                      PUT MAX PASSWORD LENGTH
+         SR    R8,R8
+         IC    R8,RCVTELEN             ENDING   LENGTH VALUE
+*
+         CTSADBG 'MAX LEN=#',(?R7),                                    1
+               LEVEL=(DEBUGW,4,5),RAREA=DBGAREA5
+*
+         LTR   R8,R8
+         BZ    PUTZERO                 LENGTH=0
+         ST    R8,RULELEN              STORE LENGTH
+         B     PUTLEN
+*
+PUTRLMK  DS    0H                      PUT MASK
+         MVC   CMASK(8),=CL8'        '
+         SR    R8,R8
+         IC    R8,RCVTELEN             ENDING   LENGTH VALUE
+         LTR   R8,R8                   LENGTH = 0
+         BZ    PUTRLMK1                Y, PASS
+         BCTR  R8,0                    DECR FOR EX COMMAND
+         EX    R8,MVRMSK               MOVE RULE MASK
+PUTRLMK1 DS    0H
+         TR    CMASK(8),MASKTBL
+*
+         CTSADBG 'MASK=_',(CMASK,8),                                   1
+               LEVEL=(DEBUGW,4,5),RAREA=DBGAREA5
+*
+         MVC   PUTPLEN3(4),=F'8'
+         MVC   PUTPVAL3(4),=A(CMASK)
+         LA    R1,PUTPLST3
+         CTSCALL PUTPARM,,LINK=INT
+         B     PUTRLLR
+*
+*    NORULE=N
+*
+PUTFN    DS    0H                      NORULE=N
+         MVC   PUTPLEN3(4),=F'1'
+         MVC   PUTPVAL3(4),=A(RULEN)
+         LA    R1,PUTPLST3
+         CTSCALL PUTPARM,,LINK=INT
+         B     PUTRLLR
+*
+*    NORULE=Y
+*
+PUTFY    DS    0H                      NORULE=Y
+         MVC   PUTPLEN3(4),=F'1'
+         MVC   PUTPVAL3(4),=A(RULEY)
+         LA    R1,PUTPLST3
+         CTSCALL PUTPARM,,LINK=INT
+         B     PUTRLLR
+*
+*    MIN, MAX LEN = 0
+*
+PUTZERO  DS    0H                      LENGTH=0
+*        MVC   PUTPLEN3(4),=F'1'
+*        MVC   PUTPVAL3(4),=A(LNZERO)
+*        LA    R1,PUTPLST3
+*        CTSCALL PUTPARM,,LINK=INT
+*        B     PUTRLLR
+         B     PUTRLLR0
+*
+*    MIN, MAX LEN
+*
+PUTLEN   DS    0H                      MIN, MAX LENGTH
+         LA    R1,PUTLENG
+         CTSCALL PUTNMFD,,LINK=INT
+         B     PUTRLLR
+*
+PUTRLLR0 DS    0H
+         SR    R15,R15
+         B     PUTRLLR
+PUTRLL30 DS    0H                      INVALID RULE INDEX
+         LA    R15,30
+         B     PUTRLLR
+*
+PUTRLL32 DS    0H                      INVALID INDEX OF FIELD
+         LA    R15,32
+         B     PUTRLLR
+PUTRLLR  DS    0H
+         BRTRN (15)
+*
+MASKTBL  DC    256AL1(*-MASKTBL)
+         ORG   MASKTBL+X'00'
+         DC    C'*'
+         ORG   MASKTBL+X'40'
+         DC    C'*'
+         ORG   ,
+*
+*  PARAMETERS LIST FOR PUT FIELD VALUE
+*
+PUTPLST3 DS    0F
+PUTPLDB3 DC    A(DEBUGW)
+PUTPLEN3 DS    A
+PUTPVAL3 DS    A
+ARETBUF3 DS    A
+*
+*  PARAMETERS LIST FOR PUT NUMERIC FIELDS
+*
+PUTLENG  DS    0F
+PUTLNDBG DC    A(DEBUGW)               ADDR OF DEBUG LEVEL
+PUTLNADR DC    A(RULELEN)              ADDR OF NUMERIC FIELD
+PUTLNBUF DS    A
+*
+MVRMSK   MVC   CMASK(0),CRULE+2        MOVE RULE MASK
+DEBUGW   DS    X                       DEBUG LEVEL
+CRULE    DS    CL10                    CURRENT RULE
+CMASK    DS    CL8                     CURRENT RULE MASK
+RULEY    DC    CL1'Y'
+RULEN    DC    CL1'N'
+LNZERO   DC    CL1'0'
+RULELEN  DS    F
+DBGAREA5 DS    32D                     DEBUG MACRO AREA
+         LTORG
+         ORG ,
+         DROP ,
+***************************************************************
+*                                                             *
+*        PUT CDT RELATED FIELDS                               *
+*                                                             *
+***************************************************************
+PUTCDTP  BEGIN *,R12,R11
+         SR    R5,R5
+         L     R2,0(R1)
+         IC    R5,0(R2)
+         STC   R5,DEBUGM               DEBUG LEVEL
+         L     R2,4(R1)                ADDR OF CDT LABEL FIELD
+         MVC   KWD(8),0(R2)            SAVE IT
+         L     R2,8(R1)                ADDR OF RET BUFFER
+         ST    R2,RETBF4               STORE BUFFER ADDR
+*
+         CTSADBG 'CDT LABEL FIELD=_ BUFF=~',(KWD,8,?R2),               1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*
+         L     R10,CVTPTR              LOAD ADDR CVT
+         USING CVT,R10                 ADDRESSABILITY CVT DSECT
+         L     R8,CVTRAC               LOAD ADDR CVT RACF
+         USING RCVT,R8                 ADDRESSABILITY CVT RACF DSECT
+*BS10130 MVC   RELEASE(4),RCVTVRMN     RACF RELEASE
+*
+*--------------------------------------------------------------------
+*    CDT MASKS
+*--------------------------------------------------------------------
+*BS10130 CLC   RELEASE(3),=CL3'201'    RACF 2.2 OR HIGHER ?      PS0163
+*BS10130 BH    RCF22M                                            PS0163
+*BS10130 B     RETM40                  VERSION UNSUPPORTED       WS2557
+*
+* WS2557 THE FOLLOWING CTSADBGS WERE COMMENTED, SINCE
+* WS2557 RACF 2.2 AND BELOW ARE NOT SUPPORTED ANY MORE
+*
+* WS2557 CTSADBG 'RACLISTED CLASSES=$',(RCVTLRCL,16),                 1
+* WS2557       LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*
+* WS2557 CTSADBG 'GENLISTED CLASSES=$',(RCVTLGNL,16),                 1
+* WS2557       LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*
+* WS2557 CTSADBG 'STATISTCS CLASSES=$',(RCVTLCST,16),                 1
+* WS2557       LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*
+* WS2557 CTSADBG 'AUDITING  CLASSES=$',(RCVTLCAU,16),                 1
+* WS2557       LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*
+* WS2557 CTSADBG 'PROTECTN  CLASSES=$',(RCVTLCPR,16),                 1
+* WS2557       LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*
+* WS2557 CTSADBG 'GENERIC   CLASSES=$',(RCVTLCGE,16),                 1
+* WS2557       LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*
+* WS2557 CTSADBG 'GEN CMD   CLASSES=$',(RCVTLCGC,16),                 1
+* WS2557       LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*
+* WS2557 CTSADBG 'FASTPATH  CLASSES=$',(RCVTLFPT,16),                 1
+* WS2557       LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*
+* WS2557 CTSADBG 'LOGOPTIONS.ALWAYS  CLASSES=$',(RCVTLGAL,16),        1
+* WS2557       LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*
+* WS2557 CTSADBG 'LOGOPTIONS.NEVER   CLASSES=$',(RCVTLNVR,16),        1
+* WS2557       LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*
+* WS2557 CTSADBG 'LOGOPTIONS.SUCCESS CLASSES=$',(RCVTLGSU,16),        1
+* WS2557       LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*
+* WS2557 CTSADBG 'LOGOPTIONS.FAILURE CLASSES=$',(RCVTLGFL,16),        1
+* WS2557       LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*
+* WS2557 B     CDTSTRT
+*
+*BS10130 RCF22M   DS    0H
+*BS10130 DROP  R8
+*BS10130 USING RC22,R8                 ADDRESSABILITY CVT RACF DSECT
+*BS10130
+*BS10130 CTSADBG 'RACLISTED CLASSES=$',(RC22VRCL,128),                 1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*BS10130
+*BS10130 CTSADBG 'GENLISTED CLASSES=$',(RC22VGNL,128),                 1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*BS10130
+*BS10130 CTSADBG 'STATISTCS CLASSES=$',(RC22VCST,128),                 1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*BS10130
+*BS10130 CTSADBG 'AUDITING  CLASSES=$',(RC22VCAU,128),                 1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*BS10130
+*BS10130 CTSADBG 'PROTECTN  CLASSES=$',(RC22VCPR,128),                 1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*BS10130
+*BS10130 CTSADBG 'GENERIC   CLASSES=$',(RC22VCGE,128),                 1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*BS10130
+*BS10130 CTSADBG 'GEN CMD   CLASSES=$',(RC22VCGC,128),                 1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*BS10130
+*BS10130 CTSADBG 'FASTPATH  CLASSES=$',(RC22VFPT,128),                 1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*BS10130
+*BS10130 CTSADBG 'LOGOPTIONS.ALWAYS  CLASSES=$',(RC22VLGA,128),        1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*BS10130
+*BS10130 CTSADBG 'LOGOPTIONS.NEVER   CLASSES=$',(RC22VLNV,128),        1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*BS10130
+*BS10130 CTSADBG 'LOGOPTIONS.SUCCESS CLASSES=$',(RC22VLGS,128),        1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*BS10130
+*BS10130 CTSADBG 'LOGOPTIONS.FAILURE CLASSES=$',(RC22VLGF,128),        1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*BS10130
+*BS10130 B     CDTSTRT
+*
+         CTSADBG 'RACLISTED CLASSES=$',(RCVTVRCL,128),         BS10130 1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6               BS10130
+*                                                              BS10130
+         CTSADBG 'GENLISTED CLASSES=$',(RCVTVGNL,128),         BS10130 1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6               BS10130
+*                                                              BS10130
+         CTSADBG 'STATISTCS CLASSES=$',(RCVTVCST,128),         BS10130 1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6               BS10130
+*                                                              BS10130
+         CTSADBG 'AUDITING  CLASSES=$',(RCVTVCAU,128),         BS10130 1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6               BS10130
+*                                                              BS10130
+         CTSADBG 'PROTECTN  CLASSES=$',(RCVTVCPR,128),         BS10130 1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6               BS10130
+*                                                              BS10130
+         CTSADBG 'GENERIC   CLASSES=$',(RCVTVCGE,128),         BS10130 1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6               BS10130
+*                                                              BS10130
+         CTSADBG 'GEN CMD   CLASSES=$',(RCVTVCGC,128),         BS10130 1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6               BS10130
+*                                                              BS10130
+         CTSADBG 'FASTPATH  CLASSES=$',(RCVTVFPT,128),         BS10130 1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6               BS10130
+*                                                              BS10130
+         CTSADBG 'LOGOPTIONS.ALWAYS CLASSES=$',(RCVTVLGA,128), BS10130 1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6               BS10130
+*                                                              BS10130
+         CTSADBG 'LOGOPTIONS.NEVER  CLASSES=$',(RCVTVLNV,128), BS10130 1
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6               BS10130
+*                                                              BS10130
+         CTSADBG 'LOGOPTIONS.SUCCESS CLASSES=$',(RCVTVLGS,128), BS101301
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6               BS10130
+*                                                              BS10130
+         CTSADBG 'LOGOPTIONS.FAILURE CLASSES=$',(RCVTVLGF,128), BS101301
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6               BS10130
+*
+*********************************************************************
+*
+*  CDT PROCESSING
+*
+*********************************************************************
+*BS10130 CDTSTRT  DS    0H
+*BS10130 DROP  R8
+*BS10130 USING RCVT,R8                 ADDRESSABILITY CVT RACF DSECT
+*BS10130 MVC   CDTPTR(4),RCVTCDTP      PTR TO CLASS DESC TABLE
+*BS10130 CLC   RELEASE(3),=CL3'201'    RACF 2.2 OR HIGHER ?      PS0163
+*BS10130 BH    CDTST22                                           PS0163
+*BS10130 B     RETM40                  VERSION UNSUPPROTED       WS2557
+* WS2557 LA    R2,CDTOPT19
+* WS2557 B     CDTLOOP1
+*BS10130 CDTST22  DS    0H                      RACF 2.2
+*BS10130 LA    R2,CDTOPT22             RACF 2.2
+         LA    R2,CDTOPT               INTERNAL OPTIONS TABLE. BS10130
+*BS10130 B     CDTLOOP1
+CDTLOOP1 DS    0H
+         USING CDTMPD,R2               CDTMAP TABLE                     00000070
+*
+         CTSADBG 'INTERNAL TABLE FIELD=_ REQUESTED FIELD=_',           1
+               (CDTMPDK,8,KWD,8),                                      2
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*
+         CLC   =CL8'********',CDTMPDK  END-OF-TABLE ?
+         BE    RETM34                  ADDINFO KEYWORD NOT FOUND
+         CLC   CDTMPDK(8),KWD          ADDINFO KEYWORD
+         BNE   CDTLOOP2
+         MVC   MASKOFF(4),CDTMPDF      RCVT MASK OFFSET
+         MVC   MASKLEN(4),CDTMPDLN     RCVT MASK LEN
+         LR    R6,R8                   LOAD RCVT ADDR
+         A     R6,MASKOFF
+         ST    R6,MASKADR              MASK ADDRESS
+*BS10130 LR    R6,R8                   LOAD RCVT ADDR
+*BS10130 CLC   RELEASE(3),=CL3'201'    RACF 2.2 OR HIGHER ?      PS0163
+*BS10130 BH    CDTAM22                                           PS0163
+*BS10130 B     RETM40                  VERSION UNSUPPROTED       WS2557
+* WS2557 LA    R6,RCVTLCPR-RCVT(R6)    ADDR OF CLASS ACT MASK
+* WS2557 B     CDTAMP
+CDTAM22  DS    0H                      RACF 2.2
+*BS10130 LA    R6,RC22VCPR-RC22(R6)    RACF 2.2 ADDR OF CLASS ACT MASK
+         LA    R6,RCVTVCPR             ADDR OF CLASS ACT MASK  BS10130
+*BS10130 B     CDTAMP
+*BS10130 CDTAMP   DS    0H
+         ST    R6,ACTADRM              SAVE CLASS ACTIVE MASK ADDR
+*
+         CTSADBG 'RCVT=~ MASKOFF=~ MASKADDR=~ ACTMASK ADDR=~',         1
+               (?R8,MASKOFF,MASKADR,ACTADRM),                          2
+               LEVEL=(DEBUGM,4,5),RAREA=DBGAREA6
+*
+         L     R3,CDTMPDLB             GET ADDR OF LABEL
+         BR    R3                      BRANCH TO LABEL
+*
+CDTLOOP2 DS    0H
+         LA    R6,CDTMPF               DSECT LENGTH
+         AR    R2,R6                   INCR TABLE ADDR
+         B     CDTLOOP1
+         DROP  R2
+*
+*--------------------------------------------------------------------
+*    AUDIT CLASSES
+*--------------------------------------------------------------------
+*
+AUDITL   DS    0H
+AUDITG   TM    RCVTAUOP,RCVTAGRO       AUDIT=GROUP
+         BZ    AUDITU
+         MVC   PUTPLEN4(4),=F'5'       FIELD LENGTH
+         MVC   PUTPVAL4(4),=A(GROUP)   FIELD ADDR
+         LA    R1,PUTPLST4             ADDR OF PARAMETER LIST
+         CTSCALL PUTPARM,,LINK=INT     PUT DATA
+         LTR   R15,R15
+         BNZ   RETM
+*
+AUDITU   DS    0H                      AUDIT=USER
+         TM    RCVTAUOP,RCVTAUSE
+         BZ    AUDITDS
+         MVC   PUTPLEN4(4),=F'4'       FIELD LENGTH
+         MVC   PUTPVAL4(4),=A(USER)    FIELD ADDR
+         LA    R1,PUTPLST4             ADDR OF PARAMETER LIST
+         CTSCALL PUTPARM,,LINK=INT     PUT DATA
+         LTR   R15,R15
+         BNZ   RETM
+*
+AUDITDS  DS    0H                      AUDIT=DATASET
+         TM    RCVTAUOP,RCVTADAT
+         BZ    PUTCDTF                 PUT FROM CDT TABLE
+         MVC   PUTPLEN4(4),=F'7'       FIELD LENGTH
+         MVC   PUTPVAL4(4),=A(DATASET) FIELD ADDR
+         LA    R1,PUTPLST4             ADDR OF PARAMETER LIST
+         CTSCALL PUTPARM,,LINK=INT     PUT DATA
+         LTR   R15,R15
+         BNZ   RETM
+         B     PUTCDTF                 PUT FROM CDT TABLE
+*
+*--------------------------------------------------------------------
+*    GENERIC CLASSES
+*--------------------------------------------------------------------
+*
+GENRICL  DS    0H
+GENRICDS DS    0H
+         TM    RCVTSTA1,RCVTDGEN
+         BZ    PUTCDTF                 PUT FROM CDT TABLE
+         MVC   PUTPLEN4(4),=F'7'       FIELD LENGTH
+         MVC   PUTPVAL4(4),=A(DATASET) FIELD ADDR
+         LA    R1,PUTPLST4             ADDR OF PARAMETER LIST
+         CTSCALL PUTPARM,,LINK=INT     PUT DATA
+         LTR   R15,R15
+         BNZ   RETM
+*BS10130 CTSCALL GETCDT,(DEBUGM,CDTPTR,MASKADR,MASKLEN,ARETBUF4,       1
+               GNRCLIST,ACTADRM,RELEASE),LINK=INT
+         CTSCALL GETCDT,(DEBUGM,MASKADR,MASKLEN,ARETBUF4,      BS10130 1
+               GNRCLIST,ACTADRM),LINK=INT                      BS10130
+         B     RETM
+*
+*--------------------------------------------------------------------
+*    GENERIC CMD CLASSES
+*--------------------------------------------------------------------
+*
+GENCMDL  DS    0H
+GENCMDDS DS    0H
+         TM    RCVTSTA1,RCVTDGCM
+         BZ    PUTCDTF                 PUT FROM CDT TABLE
+         MVC   PUTPLEN4(4),=F'7'       FIELD LENGTH
+         MVC   PUTPVAL4(4),=A(DATASET) FIELD ADDR
+         LA    R1,PUTPLST4             ADDR OF PARAMETER LIST
+         CTSCALL PUTPARM,,LINK=INT     PUT DATA
+         LTR   R15,R15
+         BNZ   RETM
+         B     PUTCDTF                 PUT FROM CDT TABLE
+*
+*--------------------------------------------------------------------
+*    LOGOPTIONS.ALWAYS CLASSES
+*--------------------------------------------------------------------
+*
+LOGALWS  DS    0H
+LOGALWDS DS    0H                      LOGOPTIONS.ALWAYS=DATASET
+         TM    RCVTLOGD,RCVTDLGA
+         BZ    PUTCDTF                 PUT FROM CDT TABLE
+         MVC   PUTPLEN4(4),=F'7'       FIELD LENGTH
+         MVC   PUTPVAL4(4),=A(DATASET) FIELD ADDR
+         LA    R1,PUTPLST4             ADDR OF PARAMETER LIST
+         CTSCALL PUTPARM,,LINK=INT     PUT DATA
+         LTR   R15,R15
+         BNZ   RETM
+         B     PUTCDTF                 PUT FROM CDT TABLE
+*
+*--------------------------------------------------------------------
+*    LOGOPTIONS.NEVER  CLASSES
+*--------------------------------------------------------------------
+*
+LOGNEVR  DS    0H
+LOGNVRDS DS    0H                      LOGOPTIONS.NEVER=DATASET
+         TM    RCVTLOGD,RCVTDLGN
+         BZ    PUTCDTF                 PUT FROM CDT TABLE
+         MVC   PUTPLEN4(4),=F'7'       FIELD LENGTH
+         MVC   PUTPVAL4(4),=A(DATASET) FIELD ADDR
+         LA    R1,PUTPLST4             ADDR OF PARAMETER LIST
+         CTSCALL PUTPARM,,LINK=INT     PUT DATA
+         LTR   R15,R15
+         BNZ   RETM
+         B     PUTCDTF                 PUT FROM CDT TABLE
+*
+*--------------------------------------------------------------------
+*    LOGOPTIONS.SUCCESSES  CLASSES
+*--------------------------------------------------------------------
+*
+LOGSCSS  DS    0H
+LOGSCSDS DS    0H                      LOGOPTIONS.SUCCESSES=DATASET
+         TM    RCVTLOGD,RCVTDLGS
+         BZ    PUTCDTF                 PUT FROM CDT TABLE
+         MVC   PUTPLEN4(4),=F'7'       FIELD LENGTH
+         MVC   PUTPVAL4(4),=A(DATASET) FIELD ADDR
+         LA    R1,PUTPLST4             ADDR OF PARAMETER LIST
+         CTSCALL PUTPARM,,LINK=INT     PUT DATA
+         LTR   R15,R15
+         BNZ   RETM
+         B     PUTCDTF                 PUT FROM CDT TABLE
+*
+*--------------------------------------------------------------------
+*    LOGOPTIONS.FAILURES  CLASSES
+*--------------------------------------------------------------------
+*
+LOGFLRS  DS    0H
+LOGFLRDS DS    0H                      LOGOPTIONS.FAILURES=DATASET
+         TM    RCVTLOGD,RCVTDLGF
+         BZ    PUTCDTF                 PUT FROM CDT TABLE
+         MVC   PUTPLEN4(4),=F'7'       FIELD LENGTH
+         MVC   PUTPVAL4(4),=A(DATASET) FIELD ADDR
+         LA    R1,PUTPLST4             ADDR OF PARAMETER LIST
+         CTSCALL PUTPARM,,LINK=INT     PUT DATA
+         LTR   R15,R15
+         BNZ   RETM
+         B     PUTCDTF                 PUT FROM CDT TABLE
+*
+*--------------------------------------------------------------------
+*    LOGOPTIONS.DEFAULT   CLASSES
+*
+* IF     NO  LOGOPTIONS.ALWAYS   CLASSES
+*    AND NO  LOGOPTIONS.NEVER    CLASSES
+*    AND NO  LOGOPTIONS.SUCCESS  CLASSES
+*    AND NO  LOGOPTIONS.FAILURES CLASSES
+*    THIS IS LOGOPTIONS.DEFAULT  CLASSES
+*--------------------------------------------------------------------
+*
+LOGDFLT  DS    0H
+LOGDFLDS DS    0H                      LOGOPTIONS.DEFAULT=DATASET
+         TM    RCVTLOGD,RCVTDLGA       LOGOPTIONS.ALWAYS ?
+         BO    LOGDFCDT                PUT FROM CDT TABLE
+         TM    RCVTLOGD,RCVTDLGN       LOGOPTIONS.NEVER ?
+         BO    LOGDFCDT                PUT FROM CDT TABLE
+         TM    RCVTLOGD,RCVTDLGS       LOGOPTIONS.SUCCESSES ?
+         BO    LOGDFCDT                PUT FROM CDT TABLE
+         TM    RCVTLOGD,RCVTDLGF       LOGOPTIONS.FAILURE ?
+         BO    LOGDFCDT                PUT FROM CDT TABLE
+         MVC   PUTPLEN4(4),=F'7'       FIELD LENGTH
+         MVC   PUTPVAL4(4),=A(DATASET) FIELD ADDR
+         LA    R1,PUTPLST4             ADDR OF PARAMETER LIST
+         CTSCALL PUTPARM,,LINK=INT     PUT DATA
+         LTR   R15,R15
+         BNZ   RETM
+LOGDFCDT DS    0H
+*BS10130 CLC   RELEASE(3),=CL3'201'    RACF 2.2 OR HIGHER ?      PS0163
+*BS10130 BH    CDTDF22                                           PS0163
+*BS10130 B     RETM40                  VERSION UNSUPPORTED       WS2557
+* WS2557 MVC   INTMSK(L'RCVTLGAL),RCVTLGAL-RCVT(R8) LOGOPTIONS.ALWAYS
+* WS2557 OC    INTMSK(L'RCVTLGAL),RCVTLNVR-RCVT(R8) LOGOPTIONS.NEVER
+* WS2557 OC    INTMSK(L'RCVTLGAL),RCVTLGSU-RCVT(R8) LOGOPTIONS.SUCCESS
+* WS2557 OC    INTMSK(L'RCVTLGAL),RCVTLGFL-RCVT(R8) LOGOPTIONS.FAILURES
+* WS2557 XC    INTMSK(L'RCVTLGAL),FFMSK             XOR MASK
+* WS2557 MVC   MASKADR(4),=A(INTMSK)   INTERNAL MASK ADDR
+* WS2557 B     PUTCDTF                 PUT FROM CDT TABLE
+*
+*BS10130 CDTDF22  DS    0H                      RACF 2.2 OR HIGHER
+*BS10130 MVC   INTMSK(L'RC22VLGA),RC22VLGA-RC22(R8) LOGOPTIONS.ALWAYS
+*BS10130 OC    INTMSK(L'RC22VLNV),RC22VLNV-RC22(R8) LOGOPTIONS.NEVER
+*BS10130 OC    INTMSK(L'RC22VLGS),RC22VLGS-RC22(R8) LOGOPTIONS.SUCCESS
+*BS10130 OC    INTMSK(L'RC22VLGF),RC22VLGF-RC22(R8) LOGOPTIONS.FAILURES
+*BS10130 XC    INTMSK(L'RC22VLGA),FFMSK             XOR MASK
+***   BS10130 - START
+         MVC   INTMSK(L'RCVTVLGA),RCVTVLGA-RCVT(R8) LOGOPTIONS.ALWAYS
+         OC    INTMSK(L'RCVTVLNV),RCVTVLNV-RCVT(R8) LOGOPTIONS.NEVER
+         OC    INTMSK(L'RCVTVLGS),RCVTVLGS-RCVT(R8) LOGOPTIONS.SUCCESS
+         OC    INTMSK(L'RCVTVLGF),RCVTVLGF-RCVT(R8) LOGOPTIONS.FAILURES
+         XC    INTMSK(L'RCVTVLGA),FFMSK             XOR MASK
+***   BS10130 - END
+         MVC   MASKADR(4),=A(INTMSK)   INTERNAL MASK ADDR
+         B     PUTCDTF                 PUT FROM CDT TABLE
+*
+*--------------------------------------------------------------------
+*    RACLISTED   CLASSES
+*--------------------------------------------------------------------
+*
+RACLSTL  DS    0H
+*BS10130 CTSCALL GETCDT,(DEBUGM,CDTPTR,MASKADR,MASKLEN,ARETBUF4,       1
+               GRACLIST,ACTADRM,RELEASE),LINK=INT
+         CTSCALL GETCDT,(DEBUGM,MASKADR,MASKLEN,ARETBUF4,      BS10130 1
+               GRACLIST,ACTADRM),LINK=INT                      BS10130
+         B     RETM
+*
+*--------------------------------------------------------------------
+*    GENLISTED   CLASSES
+*--------------------------------------------------------------------
+*
+GENLSTL  DS    0H
+*BS10130 CTSCALL GETCDT,(DEBUGM,CDTPTR,MASKADR,MASKLEN,ARETBUF4,       1
+               GGENLIST,ACTADRM,RELEASE),LINK=INT
+         CTSCALL GETCDT,(DEBUGM,MASKADR,MASKLEN,ARETBUF4,      BS10130 1
+               GGENLIST,ACTADRM),LINK=INT                      BS10130
+         B     RETM
+*
+*--------------------------------------------------------------------
+*    CLASSACTIVE CLASSES
+*--------------------------------------------------------------------
+*
+CLSACTL  DS    0H
+*
+*  GROUP
+*
+         MVC   PUTPLEN4(4),=F'5'       FIELD LENGTH
+         MVC   PUTPVAL4(4),=A(GROUP)   FIELD ADDR
+         LA    R1,PUTPLST4             ADDR OF PARAMETER LIST
+         CTSCALL PUTPARM,,LINK=INT     PUT DATA
+         LTR   R15,R15
+         BNZ   RETM
+*
+*  USER
+*
+         MVC   PUTPLEN4(4),=F'4'       FIELD LENGTH
+         MVC   PUTPVAL4(4),=A(USER)    FIELD ADDR
+         LA    R1,PUTPLST4             ADDR OF PARAMETER LIST
+         CTSCALL PUTPARM,,LINK=INT     PUT DATA
+         LTR   R15,R15
+         BNZ   RETM
+*
+*  DATASET
+*
+         MVC   PUTPLEN4(4),=F'7'       FIELD LENGTH
+         MVC   PUTPVAL4(4),=A(DATASET) FIELD ADDR
+         LA    R1,PUTPLST4             ADDR OF PARAMETER LIST
+         CTSCALL PUTPARM,,LINK=INT     PUT DATA
+         LTR   R15,R15
+         BNZ   RETM
+         B     PUTCDTF                 PUT FROM CDT TABLE
+*
+*--------------------------------------------------------------------
+*    GLOBAL CLASSES
+*--------------------------------------------------------------------
+*
+GLBCLSL  DS    0H
+         TM    RCVTFLG1,RCVTFPDS
+         BZ    GLBCLSP                 PUT FROM CDT TABLE
+         MVC   PUTPLEN4(4),=F'7'       FIELD LENGTH
+         MVC   PUTPVAL4(4),=A(DATASET) FIELD ADDR
+         LA    R1,PUTPLST4             ADDR OF PARAMETER LIST
+         CTSCALL PUTPARM,,LINK=INT     PUT DATA
+         LTR   R15,R15
+         BNZ   RETM
+GLBCLSP  DS    0H                      PUT FROM CDT TABLE
+*BS10130 CTSCALL GETCDT,(DEBUGM,CDTPTR,MASKADR,MASKLEN,ARETBUF4,       1
+               GLOBLIST,ACTADRM,RELEASE),LINK=INT
+         CTSCALL GETCDT,(DEBUGM,MASKADR,MASKLEN,ARETBUF4,      BS10130 1
+               GLOBLIST,ACTADRM),LINK=INT                      BS10130
+         B     RETM
+*
+*--------------------------------------------------------------------
+*    PUT FIELDS FROM CDT TABLE
+*--------------------------------------------------------------------
+PUTCDTF  DS    0H
+*BS10130 CTSCALL GETCDT,(DEBUGM,CDTPTR,MASKADR,MASKLEN,ARETBUF4,       1
+               0,ACTADRM,RELEASE),LINK=INT
+         CTSCALL GETCDT,(DEBUGM,MASKADR,MASKLEN,ARETBUF4,      BS10130 1
+               0,ACTADRM),LINK=INT                             BS10130
+         B     RETM
+*--------------------------------------------------------------------
+*
+RETM34   DS    0H                      ADDINFO KEYWORD NOT FOUND
+         LA    R15,34
+         B     RETM
+RETM40   DS    0H                      VERSION NOT SUPPORTED     WS2557
+         LA    R15,40
+         B     RETM
+RETM     DS    0H
+         BRTRN (15)
+*
+DEBUGM   DS    X                       DEBUG LEVEL
+DBGAREA6 DS    32D                     DEBUG MACRO AREA
+MASKADR  DS    F                       RCVT MASK ADDRESS
+MASKOFF  DS    F                       RCVT MASK OFFSET
+MASKLEN  DS    F                       RCVT MASK LEN
+*BS10130 CDTPTR   DS    F                       PTR TO CLASS DESC TABLE
+ACTADRM  DS    F                       ACTIVE CLASSES MASK ADDR
+*BS10130 RELEASE  DS    CL4                     RACF RELEASE
+KWD      DS    CL8                     CDT LABEL FIELD
+GRACLIST DC    CL8'RACLIST'
+GGENLIST DC    CL8'GENLIST'
+GLOBLIST DC    CL8'GLOBAL'
+GNRCLIST DC    CL8'GENERIC'
+INTMSK   DS    CL256                   LOGOPTIONS.DEFAULT MASK
+FFMSK    DC    256X'FF'                FULL 'FF' MASK
+GROUP    DC    CL5'GROUP'
+USER     DC    CL4'USER'
+DATASET  DC    CL7'DATASET'
+*
+*  CDT PROCESSING TABLE  RACF 1.9, RACF 2.1
+*
+* WS2557 CDTOPT19 DS    0D
+* WS2557 CDTMAP START,RCVT
+* WS2557 CDTMAP CDTAUDIT,AUDITL,RCVTLCAU     AUDIT
+* WS2557 CDTMAP CDTCLACT,CLSACTL,RCVTLCPR    CLASSACT
+* WS2557 CDTMAP CDTGNCD,GENCMDL,RCVTLCGC     GENCMD
+* WS2557 CDTMAP CDTGNRC,GENRICL,RCVTLCGE     GENERIC
+* WS2557 CDTMAP CDTGNLT,GENLSTL,RCVTLGNL     GENLIST
+* WS2557 CDTMAP CDTGLBL,GLBCLSL,RCVTLFPT     GLOBAL
+* WS2557 CDTMAP CDTLALW,LOGALWS,RCVTLGAL     LOGOPTIONS.ALWAYS
+* WS2557 CDTMAP CDTLNVR,LOGNEVR,RCVTLNVR     LOGOPTIONS.NEVER
+* WS2557 CDTMAP CDTLSCC,LOGSCSS,RCVTLGSU     LOGOPTIONS.SUCCESSES
+* WS2557 CDTMAP CDTLFLR,LOGFLRS,RCVTLGFL     LOGOPTIONS.FAILURES
+* WS2557 CDTMAP CDTLDFT,LOGDFLT,RCVTLGFL     LOGOPTIONS.DEFAULT
+* WS2557 CDTMAP CDTRLST,RACLSTL,RCVTLRCL     RACLIST
+* WS2557 CDTMAP CDTRSTT,PUTCDTF,RCVTLCST     STATISTICS
+* WS2557 CDTMAP END
+*BS10130
+*BS10130 CDT PROCESSING TABLE  RACF 2.2
+*BS10130
+*BS10130 CDTOPT22 DS    0D
+*BS10130 CDTMAP START,RC22
+*BS10130 CDTMAP CDTAUDIT,AUDITL,RC22VCAU     AUDIT
+*BS10130 CDTMAP CDTCLACT,CLSACTL,RC22VCPR    CLASSACT
+*BS10130 CDTMAP CDTGNCD,GENCMDL,RC22VCGC     GENCMD
+*BS10130 CDTMAP CDTGNRC,GENRICL,RC22VCGE     GENERIC
+*BS10130 CDTMAP CDTGNLT,GENLSTL,RC22VGNL     GENLIST
+*BS10130 CDTMAP CDTGLBL,GLBCLSL,RC22VFPT     GLOBAL
+*BS10130 CDTMAP CDTLALW,LOGALWS,RC22VLGA     LOGOPTIONS.ALWAYS
+*BS10130 CDTMAP CDTLNVR,LOGNEVR,RC22VLNV     LOGOPTIONS.NEVER
+*BS10130 CDTMAP CDTLSCC,LOGSCSS,RC22VLGS     LOGOPTIONS.SUCCESSES
+*BS10130 CDTMAP CDTLFLR,LOGFLRS,RC22VLGF     LOGOPTIONS.FAILURES
+*BS10130 CDTMAP CDTLDFT,LOGDFLT,RC22VLGF     LOGOPTIONS.DEFAULT
+*BS10130 CDTMAP CDTRLST,RACLSTL,RC22VRCL     RACLIST
+*BS10130 CDTMAP CDTRSTT,PUTCDTF,RC22VCST     STATISTICS
+*BS10130 CDTMAP END
+*                                                              BS10130
+*  CDT PROCESSING TABLE                                        BS10130
+*                                                              BS10130
+CDTOPT   DS    0D                                              BS10130
+         CDTMAP START,RCVT                                     BS10130
+         CDTMAP CDTAUDIT,AUDITL,RCVTVCAU     AUDIT             BS10130
+         CDTMAP CDTCLACT,CLSACTL,RCVTVCPR    CLASSACT          BS10130
+         CDTMAP CDTGNCD,GENCMDL,RCVTVCGC     GENCMD            BS10130
+         CDTMAP CDTGNRC,GENRICL,RCVTVCGE     GENERIC           BS10130
+         CDTMAP CDTGNLT,GENLSTL,RCVTVGNL     GENLIST           BS10130
+         CDTMAP CDTGLBL,GLBCLSL,RCVTVFPT     GLOBAL            BS10130
+         CDTMAP CDTLALW,LOGALWS,RCVTVLGA     LOGOPTIONS.ALWAYS BS10130
+         CDTMAP CDTLNVR,LOGNEVR,RCVTVLNV     LOGOPTIONS.NEVER  BS10130
+         CDTMAP CDTLSCC,LOGSCSS,RCVTVLGS     LOGOPTIONS.SUCCESSES10130
+         CDTMAP CDTLFLR,LOGFLRS,RCVTVLGF     LOGOPTIONS.FAILURESS10130
+         CDTMAP CDTLDFT,LOGDFLT,RCVTVLGF     LOGOPTIONS.DEFAULTBS10130
+         CDTMAP CDTRLST,RACLSTL,RCVTVRCL     RACLIST           BS10130
+         CDTMAP CDTRSTT,PUTCDTF,RCVTVCST     STATISTICS        BS10130
+         CDTMAP END                                            BS10130
+*
+*  PARAMETERS LIST FOR PUT FIELD VALUE
+*
+PUTPLST4 DS    0F
+PUTPLDB4 DC    A(DEBUGM)               DEBUG LEVEL
+PUTPLEN4 DS    A                       FIELD LENGTH
+PUTPVAL4 DS    A                       FIELD ADDR
+ARETBUF4 DC    A(RETBF4)               RET BUFFER
+*
+RETBF4   DS    A                       BUFFER ADDR
+*
+         LTORG
+         DROP ,
+***************************************************************
+*                                                             *
+*        GET CDT CLASSES ACCORDING MASK                       *
+*                                                             *
+***************************************************************
+GETCDT   BEGIN
+         USING GETCDTDL,R1             PARAMETERS ADDRESSABILITY
+         L     R2,GETCDTDL             DEBUG LEVEL ADDR
+         SR    R3,R3
+         IC    R3,0(R2)                DEBUG LEVEL
+         STC   R3,DEBUGG
+*BS10130 L     R5,GETCDTPR             PTR TO CLASS DESC TABLE FIELD
+*BS10130 L     R5,0(R5)                PTR TO CLASS DESC TABLE
+         L     R6,GETCDTMA             MASK ADDR FIELD
+         L     R6,0(R6)                MASK ADDR
+         L     R7,GETCDTML             MASK LEN FIELD
+         L     R7,0(R7)                MASK LEN
+         LTR   R7,R7
+         BZ    RETG38                  INVALID MASK LENGTH
+         C     R7,=F'254'
+         BH    RETG38                  INVALID MASK LENGTH
+         ST    R7,MSKLEN               SAVE MASK LEN
+         BCTR  R7,0                    DECR FOR EX COMMAND
+         L     R8,GETCDTRB             RETUTN BUFFER
+         MVC   ARETBUF5(4),0(R8)       RET BUFFER
+         L     R3,GETCDTLT             RACLIST/GENLIST PARAMETER
+         ST    R3,LIST
+         L     R3,GETCDTAC             ACTVIVE CLASSES MASK ADDR
+         ST    R3,ACTMADR              ACTIVE CLASSES MASK ADDR
+*BS10130 L     R3,GETCDTRL             RACF RELEASE
+*BS10130 ST    R3,RCFREL               SAVE IT
+*BS10130 MVC   RCFRELS,0(R3)           SAVE RELEASE VALUE
+*
+*--------------------------------------------------------------------
+*    CDT PROCESSING
+*--------------------------------------------------------------------
+*
+         SR    R8,R8                   MASK COUNTER
+*
+*BS10130 CTSADBG 'CDT PTR=~ MASK ADDR=~ LEN=# ADDIT.MASK=~ R/G/LST=~', 1
+               (?R5,?R6,?R7,?R8,LIST),                                 2
+               LEVEL=(DEBUGG,4,5),RAREA=DBGAREA7
+         L     R15,LIST                                        BS10130
+         CTSADBG 'MASK ADDR=~ LEN=# ADDIT.MASK=~ R/G/LST=_',   BS10130 1
+               (?R6,?R7,ACTMADR,0(R15),8),                     BS10130 2
+               LEVEL=(DEBUGG,4,5),RAREA=DBGAREA7               BS10130
+*                                                              BS10130
+**  INITIALZE THE AREAS FOR RACROUTE                           BS10130
+*                                                              BS10130
+         MVC   CLASSNM,=CL8' '                                 BS10130
+         LA    R0,CDTAREA                                      BS10130
+         LA    R1,CDTAREAL                                     BS10130
+         SLR   R15,R15                                         BS10130
+         MVCL  R0,R14               CLEAR RETURN AREA FOR CDT  BS10130
+*
+         LA    R5,CDTAREA                                      BS10130
+         USING CNST,R5                                         BS10130
+         USING CNSX,R4                                         BS10130
+*
+*BS10130 LTR   R5,R5                   CDT PTR SUPPLIED ?
+*BS10130 BZ    RETG0                   N, PASS
+*BS10130 USING CDT19,R5
+CDTMNXT0 DS    0H
+*BS10130 LA    R4,CDT19PST-CDT19(R5)
+*BS10130 SR    R9,R9
+*BS10130 ICM   R9,X'3',CDT19LN         LOAD CDTLEN
+         CTSADBG 'RACROUTE NEXT: CLASS = _',(CLASSNM,8),       BS10130 X
+               LEVEL=(DEBUGG,10),RAREA=DBGAREA7                BS10130
+         RACROUTE REQUEST=STAT,COPY=CDTAREA,COPYLEN=CDTAREAL,  BS10130 X
+               NEXT=CLASSNM,WORKA=RACRWA,                      BS10130 X
+               RELEASE=7709,MF=(E,RACRL)                       BS10130
+SAFPC    USING SAFP,RACRL                                      BS10130
+         CTSADBG 'RACROUTE RC:  R15 = #  RC/RS = ~/~   CLASS = _', 130 X
+               (?R15,SAFPC.SAFPRRET,SAFPC.SAFPRREA,CLASSNM,8), BS10130 X
+               LEVEL=(DEBUGG,10),RAREA=DBGAREA7                BS10130
+         DROP  SAFPC                                           BS10130
+*
+         LH    R1,CNSTLGT              LENGTH OF RETURNED CDT. BS10130
+         CHI   R1,0                   HAVE WE REACHED THE END? BS10130
+         BE    RETG0                   ..YES - RETURN          BS10130
+         AHI   R8,1                    CDT COUNTER (FOR DIAGS). BS10130
+*
+*BS10130 CTSADBG '_ FULL CDT  =$',(CDT19CLS,8,0(R5),?R9),             1
+         CTSADBG '_ FULL CDT  =$',                             BS10130 1
+               (CLASSNM,8,CDTAREA,CDTAREAL),                   BS10130 2
+               LEVEL=(DEBUGG,10),RAREA=DBGAREA7
+*BS10130 CTSADBG '_ FULL CDT  =_',(CDT19CLS,8,0(R5),?R9),             1
+         CTSADBG '_ FULL CDT  =_',                             BS10130 1
+               (CLASSNM,8,CDTAREA,CDTAREAL),                   BS10130 2
+               LEVEL=(DEBUGG,10),RAREA=DBGAREA7
+*
+         L     R4,CNSTCNSX             R4 -> ENTRY EXTENSION.  BS10130
+*
+*BS10130 CLC   RCFRELS(3),=CL3'201'    RACF 2.2 OR HIGHER ?      PS0163
+*BS10130 BNH   CDTMNX19                N, PASS                   PS0163
+*BS10130 L     R4,0(R4)                RACF 2.2 CDT TAILOR ADDRESS
+*
+*BS10130 CDTMNX19 DS    0H
+*BS10130 CTSADBG '_ RCVT  MASK=$',(CDT19CLS,8,0(R6),MSKLEN),         1
+         CTSADBG '_ RCVT  MASK=$',(CNSTNAME,8,0(R6),MSKLEN),   BS10130 1
+               LEVEL=(DEBUGG,5,6,7,8),RAREA=DBGAREA7
+*BS10130 CTSADBG '_ POSIT MASK=$',(CDT19CLS,8,0(R4),MSKLEN),         1
+         CTSADBG '_ POSIT MASK=$',(CNSTNAME,8,CNSTVMSK,MSKLEN), BS101301
+               LEVEL=(DEBUGG,5,6,7,8),RAREA=DBGAREA7
+*
+CDTMNXT1 DS    0H
+         EX    R7,MVPSTM               MOVE POSIT MASK TO INTERNAL VAR
+         EX    R7,ANDRCVTM             AND  RCVT  MASK
+         BZ    CDTMNXT3                APPROPRIATE POSIT NUMBER=0,NEXT
+*
+*   CHECK REQUESTED MODE
+*
+         L     R3,LIST                 GENLIST/RACLIST PARAMETER
+         LTR   R3,R3                   SUPPLIED ?
+         BZ    CDTMNXTP                N, PASS
+*
+*   MODE DEPENDENT CHECKING
+*
+         CTSADBG '#/CLS=_ MODE=_',                                     1
+               (?R8,CNSTNAME,8,0(R3),8),                       BS10130 2
+               LEVEL=(DEBUGG,4,5),RAREA=DBGAREA7
+*BS10130       (?R8,CDT19CLS,8,0(R3),8),                              2
+*
+         CLC   =CL8'RACLIST',0(R3)     RACLIST REQUEST ?
+         BE    CDTMNXRL                YES
+         CLC   =CL8'GENLIST',0(R3)     GENLIST REQUEST ?
+         BE    CDTMNXGL                YES
+         CLC   =CL8'GLOBAL',0(R3)      GLOBAL REQUEST ?
+         BE    CDTMNXGB                YES
+         CLC   =CL8'GENERIC',0(R3)     GENERIC REQUEST ?
+         BE    CDTMNXGR                YES
+         B     CDTMNXTP
+*
+*   1. CHECK GENLIST ALLOWED BIT
+*   2. FOR RACF1.9 REMOVE GINFOMAN CLASS FROM GENLIST
+*
+CDTMNXGL DS    0H
+*
+         CTSADBG '#/CLS=_ MISC MASK=$  (08)',                          1
+               (?R8,CNSTNAME,8,CNSTMFLG,1),                    BS10130 2
+               LEVEL=(DEBUGG,4,5),RAREA=DBGAREA7
+*BS10130       (?R8,CDT19CLS,8,CDT19MSC,1),                           2
+*
+*BS10130 TM    CDT19MSC,X'08'          MISC. FLAGS(GENLIST ALLOWED)
+         TM    CNSTMFLG,CNSTGENL       GENLIST ALLOWED ?       BS10130
+         BZ    CDTMNXT3                GENLIST DISALLOWED
+*BS10130 CLC   =CL8'GINFOMAN',CDT19CLS
+*BS10130 BNE   CDTMNXTP                NO GINFOMAN CLASS
+*BS10130 L     R10,RCFREL              RACF RELEASE
+*BS10130 CLC   =CL3'109',0(R10)        RACF 1.9 ?
+*BS10130 BE    CDTMNXT3                Y, PASS
+         B     CDTMNXTP
+*
+*   1. CHECK RACLIST ALLOWED BIT
+*   2. FOR RACLISTED CLASSES ADDITIONAL CHECKING CLASS ACTIVE/NOACTIVE
+*
+CDTMNXRL DS    0H
+*
+         CTSADBG '#/CLS=_ MISC MASK=$   (10)',                         1
+               (?R8,CNSTNAME,8,CNSTMFLG,1),                    BS10130 2
+               LEVEL=(DEBUGG,4,5),RAREA=DBGAREA7
+*BS10130       (?R8,CDT19CLS,8,CDT19MSC,1),                           2
+*
+*BS10130 TM    CDT19MSC,X'10'          MISC. FLAGS(RACLIST ALLOWED)
+         TM    CNSTMFLG,CNSTRACL       RACLIST ALLOWED ?       BS10130
+         BZ    CDTMNXT3                RACLIST DISALLOWED
+*
+         L     R11,ACTMADR
+         L     R11,0(R11)              ACTIVE MASK ADDR
+         EX    R7,ANDACTM              AND  ACTIVE MASK
+         BZ    CDTMNXT3                CLASS NOT ACTIVE
+         B     CDTMNXTP
+*
+*  ADDITIONAL CHECKING FOR GLOBAL CLASSES
+*  1. CHECK GROUPING CLASS BIT
+*
+CDTMNXGB DS    0H
+*
+         CTSADBG '#/CLS=_ MISC MASK=$    (80)',                        1
+               (?R8,CNSTNAME,8,CNSTMFLG,1),                    BS10130 2
+               LEVEL=(DEBUGG,4,5),RAREA=DBGAREA7
+*BS10130       (?R8,CDT19CLS,8,CDT19MSC,1),                           2
+*
+*BS10130 TM    CDT19MSC,X'80'          MISC. FLAGS/GROUPING CLASS
+         TM    CNSTMFLG,CNSTRGRP       GROUPING CLASS ?        BS10130
+         BO    CDTMNXT3                Y, PASS
+         B     CDTMNXTP
+*
+*  ADDITIONAL CHECKING FOR GENERIC CLASSES
+*  1. CHECK GROUPING CLASS BIT
+*
+CDTMNXGR DS    0H
+*
+         CTSADBG '#/CLS=_ MISC MASK=$    (80)',                        1
+               (?R8,CNSTNAME,8,CNSTMFLG,1),                    BS10130 2
+               LEVEL=(DEBUGG,4,5),RAREA=DBGAREA7
+*BS10130       (?R8,CDT19CLS,8,CDT19MSC,1),                           2
+*
+*BS10130 TM    CDT19MSC,X'80'          MISC. FLAGS/GROUPING CLASS
+         TM    CNSTMFLG,CNSTRGRP       GROUPING CLASS ?        BS10130
+         BO    CDTMNXT3                Y, PASS
+         B     CDTMNXTP
+*
+*  PUT CLASS TO OUTPUT BUFFER
+*
+CDTMNXTP DS    0H                      PUT CLASS TO OUTPUT
+*BS10130 CTSADBG '#/>>> CLASS=_',(?R8,CDT19CLS,8),                    1
+         CTSADBG '#/>>> CLASS=_',(?R8,CNSTNAME,8),             BS10130 1
+               LEVEL=(DEBUGG,4,5),RAREA=DBGAREA7
+*
+*    CALCULATE REAL LENGTH OF CLASS NAME
+*
+*BS10130 MVC   CLASS(8),CDT19CLS       MOVE CLASS NAME
+         MVC   CLASS(8),CNSTNAME       MOVE CLASS NAME         BS10130
+         LA    R10,CLASS               START CLASS NAME ADDR
+         LA    R1,CLASS+8              MAX CLASS NAME ADDR
+         TRT   CLASS(8),BLANKTAB
+         SR    R1,R10
+         LTR   R1,R1                   LENGTH = 0 ?
+         BZ    CDTMNXT3                GET NEXT FROM CDT
+         ST    R1,PUTPLEN5             FIELD LENGTH
+         LA    R1,PUTPLST5             PUT PROGR PARAMETER LIST ADDR
+         CTSCALL PUTPARM,,LINK=INT     PUT DATA
+         LTR   R15,R15
+         BNZ   RETG
+*
+*  GET NEXT ENTRY FROM CDT
+*
+CDTMNXT3 DS    0H
+*BS10130 SR    R10,R10
+*BS10130 ICM   R10,X'3',CDT19LN        LOAD CDTLEN
+*BS10130 LTR   R10,R10                 END-OF-CDT-TABLE
+*BS10130 BZ    RETG0
+*BS10130 AR    R5,R10                  INCR ADDR OF CDT TABLE
+*BS10130 SR    R10,R10                 AND CHECK LEN OF CDT
+*BS10130 ICM   R10,X'3',CDT19LN        LOAD CDTLEN
+*BS10130 LTR   R10,R10                 END-OF-CDT-TABLE
+*BS10130 BZ    RETG0
+         B     CDTMNXT0
+*
+RETG0    DS    0H                      OK
+         SR    R15,R15
+         B     RETG
+RETG38   DS    0H                      INVALID MASK LENGTH
+         LA    R15,38
+         B     RETG
+RETG     DS    0H
+         BRTRN (15)
+         LTORG
+DBGAREA7 DS    32D                     DEBUG MACRO AREA
+POSITM   DS    CL256                   POSIT MASK
+DEBUGG   DS    X                       DEBUG LEVEL
+MSKLEN   DS    F                       MASK LEN
+ACTMADR  DS    F                       ACTIVE CLASSES MASK ADDR
+RCFREL   DS    F                       RACF RELEASE FIELD ADDR
+RCFRELS  DS    CL8                     RACF RELEASE FIELD VALUE
+LIST     DS    A                       GENLIST/RACLIST PARAMETER
+CLASS    DS    CL8                     CLASS NAME
+MVPSTM   MVC   POSITM(0),0(R4)         MOVE POSIT MASK TO INTERNAL VAR
+ANDRCVTM NC    POSITM(0),0(R6)         AND  RCVT  MASK
+ANDACTM  NC    POSITM(0),0(R11)        AND  ACTIVE MASK
+*
+BLANKTAB DC    256AL1(00)
+         ORG   BLANKTAB+X'40'
+         DC    X'FF'
+         ORG   ,
+*
+*
+*  PARAMETERS LIST FOR PUT FIELD VALUE
+*
+PUTPLST5 DS    0F
+PUTPLDB5 DC    A(DEBUGG)               DEBUG LEVEL
+PUTPLEN5 DS    A                       FIELD LENGTH
+PUTPVAL5 DC    A(CLASS)                FIELD ADDR
+ARETBUF5 DS    A                       RET BUFFER
+*
+CLASSNM  DC    CL8' '                  CLASS NAME FOR RACROUTE BS10130
+*                                                              BS10130
+**  AREA FOR CDT                                               BS10130
+         DS    0D                                              BS10130
+CDTAREA  DS    CL(CNSTCBLN)    AREA FOR CNST PORTION           BS10130
+         DS    0D,CL(CNSXCBLN) AREA FOR CNSX PORTION           BS10130
+CDTAREAL EQU   *-CDTAREA       LENGTH OF CDT ENTRY             BS10130
+**  END OF CDT AREA                                            BS10130
+*
+RACRL    RACROUTE REQUEST=STAT,COPY=,COPYLEN,CLASS=,           BS10130 X
+               RELEASE=7709,MF=L                               BS10130
+*
+RACRWA   DS    XL512                   WORK AREA FOR RACCROUTE BS10130
+*
+         DROP  ,
+***************************************************************
+*                                                             *
+*        CDT RELATED FIELDS TABLE                             *
+*        ( SEE CDTMAP MACRO )                                 *
+***************************************************************
+CDTMPD   DSECT                                                          00000070
+CDTMPDK  DS    CL8                     KEYWORD
+CDTMPDLB DS    A                       PROGRAM LABEL
+CDTMPDF  DS    F                       RCVT MASK OFFSET
+CDTMPDLN DS    F                       MASK LENGTH
+CDTMPF   EQU   *-CDTMPD                DSECT LENGTH
+*
+***************************************************************
+*                                                             *
+*        GET CDT PARAMETER LIST                               *
+*                                                             *
+***************************************************************
+GETCDTPL DSECT                                                          00000070
+GETCDTDL DS    A                       DEBUG LEVEL
+*BS10130 GETCDTPR DS    A                       CDT TABLE PTR
+GETCDTMA DS    A                       MASK ADDRESS
+GETCDTML DS    A                       MASK LENGTH
+GETCDTRB DS    A                       RETURN BUFFER
+GETCDTLT DS    A                       RACLIST/GENLIST PARAMETER
+GETCDTAC DS    A                       ACTIVE MASK ADDR
+*BS10130 GETCDTRL DS    A                       RACF RELEASE
+*
+***************************************************************
+*                                                             *
+*        PUT VALUE TO OUTPUT AREA PROG PARAMETER LIST         *
+*                                                             *
+***************************************************************
+         DROP ,
+PTPARM   DSECT
+PTPDBG   DS    A
+PTPLEN   DS    A
+PTPVAL   DS    A
+PTPBUF   DS    A
+*
+***************************************************************
+*                                                             *
+*        SYSTEM CONTROL BLOCKS MAPPING                        *
+*                                                             *
+***************************************************************
+         PRINT GEN
+*
+         CVT   DSECT=YES,LIST=YES
+*
+         ICHPRCVT                      RACF
+         ICHPCNST                      CDT                     BS10130
+         ICHSAFP                       RACROUTE PARM LIST DSECT BS10130
+*BS10130 ICHPRC22                      RACF 2.2
+*BS10130 ICHPRC23                      RACF 2.3                  PS0163
+*
+*BS10130 CDT19    DSECT
+*BS10130 CDT19LN  DS    AL2             LENGTH OF DESCRIPTOR
+*BS10130 CDT19ID  DS    AL1(128)        ID
+*BS10130 CDT19CLS DS    CL8'$$FDSFAC'   CLASS NAME
+*BS10130 CDT19GRP DS    CL8' '          GROUP MEMBER XREF NULL
+*BS10130 CDT19PFL DS    AL1(39)         MAXIMUM RESOURCE NAME LENGTH
+*BS10130 CDT19F1  DS    B'11100000'     FIRST CHAR FLAGS
+*BS10130 CDT19F2  DS    B'11110000'     OTHER CHAR FLAGS
+*BS10130 CDT19UAC DS    B'00000000'     DFTUACC FLAGS
+*BS10130 CDT19MSC DS    B'01000000'     MISC. FLAGS
+*BS10130 CDT19PST DS    3B'0'           POSIT MASK
+*BS10130          DS    B'01000000'     POSIT MASK
+*BS10130          DS    12B'0'          POSIT MASK
+*BS10130 CDT19GPR DS    AL4(0)          GENLIST POINTER
+*BS10130 CDT19LPR DS    AL4(0)          RACLIST POINTER
+*BS10130 CDT19RC  DS    AL1(4)          SET THE DEFAULT RETURN CODE
+*BS10130 CDT19B1M DS    B'00000000'     B1 MISC. FLAGS
+*BS10130 CDT19KEY DS    AL1(0)          SET THE KEYQUAL VALUE
+*BS10130 CDT19ORG DS    AL1(39)         ORIGINAL MAX NAME LENGTH
+*BS10130 CDT19ALG DS    XL4'00'         ALLIGN TO DWORD BDY
+*BS10130 CDT19OK  DS    XL8'00'         STOKEN FOR RACLIST DATA SPACE
+*BS10130 *
+*BS10130 CDT22    DSECT
+*BS10130 CDT22LN  DS    AL2             LENGTH OF DESCRIPTOR
+*BS10130 CDT22ID  DS    AL1(128)        ID
+*BS10130 CDT22CLS DS    CL8'$$FDSFAC'   CLASS NAME
+*BS10130 CDT22GRP DS    CL8' '          GROUP MEMBER XREF NULL
+*BS10130 CDT22PFL DS    AL1(39)         MAXIMUM RESOURCE NAME LENGTH
+*BS10130 CDT22F1  DS    B'11100000'     FIRST CHAR FLAGS
+*BS10130 CDT22F2  DS    B'11110000'     OTHER CHAR FLAGS
+*BS10130 CDT22UAC DS    B'00000000'     DFTUACC FLAGS
+*BS10130 CDT22MSC DS    B'01000000'     MISC. FLAGS
+*BS10130 CDT22PST DS    3B'0'           POSIT MASK
+*BS10130          DS    B'01000000'     POSIT MASK
+*BS10130          DS    124B'0'         POSIT MASK
+*BS10130 CDT22GPR DS    AL4(0)          GENLIST POINTER
+*BS10130 CDT22LPR DS    AL4(0)          RACLIST POINTER
+*BS10130 CDT22RC  DS    AL1(4)          SET THE DEFAULT RETURN CODE
+*BS10130 CDT22B1M DS    B'00000000'     B1 MISC. FLAGS
+*BS10130 CDT22KEY DS    AL1(0)          SET THE KEYQUAL VALUE
+*BS10130 CDT22ORG DS    AL1(39)         ORIGINAL MAX NAME LENGTH
+*BS10130 CDT22ALG DS    XL4'00'         ALLIGN TO DWORD BDY
+*BS10130 CDT22OK  DS    XL8'00'         STOKEN FOR RACLIST DATA SPACE
+         END

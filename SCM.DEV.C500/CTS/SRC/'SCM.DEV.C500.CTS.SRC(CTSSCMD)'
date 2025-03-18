@@ -1,0 +1,465 @@
+         TITLE 'CTSSCMD - INVOKE TSS COMMANDS'
+*
+****************************************************************
+****                                                        ****
+****     CONTROL-SA  RELEASE 1.4.0                          ****
+****                                                        ****
+****     LICENCED MATERIAL - NEW DIMENSION SOFTWARE LTD.    ****
+****                                                        ****
+****************************************************************
+*
+****************************************************************
+*                                                              *
+* TITLE            : INVOKE TSS COMMANDS                       *
+*                                                              *
+* FILE NAME        : CTSSCMD                                   *
+*                                                              *
+* AUTHOR           : ALEXANDER SHVARTSMAN                      *
+*                                                              *
+* CREATION DATE    : 18/06/96                                  *
+*                                                              *
+* DESCRIPTION      : INVOKE TSS COMMANDS                       *
+*                                                              *
+* NOTE             : RETURN BUFFER STRUCTURE:                  *
+*                    MESSAGE1"NULL_CHAR"MESSAGE2"NULL_CHAR",...*
+*                                                              *
+****************************************************************
+*
+****************************************************************
+* MOD.ID   WHO      WHEN     DESCRIPTION                       *
+* -------- -------- -------- --------------------------------- *
+* SAS2IBMN NURITY   12/12/16 RESOLVE USING WARNING.            *
+*                                                              *
+****************************************************************
+*
+PRM      DSECT                         PARAMETERS
+PRMDBG   DS    A      (INPUT)          ADDR DEBUG LEVEL ( F )
+PRMMODE  DS    A      (INPUT)          MODE
+PRMCMD   DS    A      (INPUT)          COMMAND
+PRMCMDLN DS    A      (INPUT)          COMMAND LENGTH
+PRMHNDLE DS    A      (OUTPUT)         RETURNED HANDLE
+PRMRTBF  DS    A      (OUTPUT)         RETURNED BUFFER WITH RESULTS
+PRMRC    DS    A      (OUTPUT)         RETURN CODE
+PRMRSN   DS    A      (OUTPUT)         REASON CODE
+*
+PHANDLE  DSECT
+PHXPL    DS    A                       PARAMETER LIST
+PHBUF    DS    A                       CURRENT RETURN BUFFER
+PHMSG    DS    A                       CURRENT MESSAGE BUFFER
+*
+PRTBUF   DSECT                         RETURNED BUFFER WITH RESULTS
+PRTBUFXL DS    F                       RETURNED BUFFER MAX LENGTH
+PRTBUFLN DS    F                       RETURNED BUFFER USE LENGTH
+PRTBUFT  DS    C                       RETURNED BUFFER
+*
+*--------------------------------------------------------------*
+*        INITIALIZE
+*--------------------------------------------------------------*
+CTSSCMD  CSECT
+CTSSCMD  RMODE ANY
+CTSSCMD  AMODE ANY
+*
+         BEGIN *,R12
+         CTSEQUR
+         CTSLEVEL
+*
+         LR    R8,R1
+         ST    R8,PARMADDR
+         USING PRM,R8                  R8 -> PARAMETERS LIST.
+*
+         L     R4,PRMDBG               R4 -> DEBUG LEVEL (4 BYTES)
+         XC    DBGLEVEL,DBGLEVEL       STORE DEBUG LEVEL
+         ICM   R4,15,0(R4)             DEBUG LEVEL
+         ST    R4,DBGLVF               SAVE IT
+         BNP   NODEBUG                 SKIP DEBUG LVL IF MINUS
+         STC   R4,DBGLEVEL             STORE DEBUG LEVEL (1 BYTE)
+NODEBUG  DS    0H
+         L     R4,PRMHNDLE              RETURNED HANDLE
+         ST    R4,AHANDLE               KEEP IT
+         L     R4,PRMRTBF               RETURNED BUFFER WITH RESULTS
+         ST    R4,ARMRTBF               RETURNED BUFFER WITH RESULTS
+         L     R4,PRMMODE
+*
+         CTSADBG 'ENTER MODE=_ DEBUG LEVEL=#',                         X
+               (0(R4),8,DBGLVF),                                       X
+               LEVEL=(DBGLEVEL,1,2,3,4,5),RAREA=RAREA1
+*
+         USING TXPL,R2                 TSS EXTENDED PARAMETER LIST
+         USING TXPLRETH,R3             RETURN BUFFER HEADER
+         USING TXPLLINE,R4             RETURNED DATA LINE
+         L     R6,PRMRC                ADDR RC
+         XC    0(4,R6),0(R6)           CLEAN RC
+         L     R6,PRMRSN               ADDR REASON CODE
+         XC    0(4,R6),0(R6)           CLEAN REASON CODE
+         XC    REASONCD,REASONCD       REASONE CODE
+         MVC   PMODE(8),0(R4)          KEEP MODE
+*
+         CLC   =CL8'CMD',0(R4)
+         BE    CMDM                    CMD    MODE
+         CLC   =CL8'GETMSG',0(R4)      GETMSG MODE
+         BE    GETMSGM
+         CLC   =CL8'FREE',0(R4)        FREE   MODE
+         BE    FREEM
+         B     RET24                   INVALID MODE
+*****************************************************************
+*   CMD MODE
+*****************************************************************
+CMDM     DS    0H
+         L     R5,AHANDLE         HANDLE ADDR
+         USING PHANDLE,R5
+         XC    PHXPL,PHXPL        CLEAR PARAMETER LIST ADDR
+         XC    PHBUF,PHBUF        CLEAR RET BUF ADDR
+         XC    PHMSG,PHMSG        CLEAR RET MSG ADDR
+*
+*        GET ACEE
+*
+         LA    R1,PGETACEE
+         CTSCALL CTSALGN
+*
+         L     R10,ACEE1
+         LR    R11,R10
+         USING ACEE,R11
+*
+         SR    R7,R7
+         ICM   R7,B'0111',ACEELEN
+         DROP  R11
+         AR    R7,R10
+         CTSADBG TYPE=SNAP,ID=5,                                       X
+               HDR='** ACEE **',                                       X
+               ADDR=(0(R10),0(R7)),LEVEL=(DBGLEVEL,1,2,3),RAREA=RAREA1
+*
+         CTSADBG 'ACEE1=_',(0(R10),4),                                 X
+               LEVEL=(DBGLEVEL,1,2,3,4,5),RAREA=RAREA1
+*
+         SLR   R7,R7                   NO MESSAGE
+         XC    WORKAREA(LWORK),WORKAREA   CLEAN WORKAREA
+*
+* LOCATE MVS SECURITY CONTROL BLOCK (ACEE) FOR ACTIVE USER.
+* MUST BE PASSED TO TSSAUTH
+* THIS ENSURES THAT THE USER HAS SIGNED ON TO TOP SECRET
+*
+         L     R6,ACEE1           LOCATE ACEE1
+         LTR   R6,R6
+         BZ    RET8               OR ELSE EXIT
+         CLC   =C'ACEE',0(R6)     VALIDATE ACEE1
+         BNE   RET8               OR ELSE EXIT
+*
+* PARSE THE INPUT BUFFER LOOKING FOR THE FUNCTION.
+* YOU NEED TO SUPPLY BUFFER CONTENTS AND LENGTH OF INCOMING
+* TSS COMMAND FROM USER.
+*
+         L     R3,PRMCMD          LOCATE BUFFER
+         ST    R3,@BUFFER         SAVE FOR LATER
+         L     R2,PRMCMDLN        BUFFER LENGTH ADDR
+         L     R2,0(R2)           BUFFER LENGTH
+         STH   R2,BUFLENTH        SAVE FOR LATER
+*
+         CTSADBG 'CMD=#/_',(?R2,0(R3),?R2),                            X
+               LEVEL=(DBGLEVEL,1,2,3,4,5),RAREA=RAREA1
+*
+* INVOKE THE ACTUAL TSS COMMAND.
+* COMMAND BUFFER MUST INCLUDE THE CHARACTERS 'TSS' IN FRONT
+*
+TSS01000 DS    0H
+         LA    R2,TSSTXPL         R2 @ TSS EXTENDED PARAMETER LIST
+         L     R5,AHANDLE         HANDLE ADDR
+         USING PHANDLE,R5
+         ST    R2,PHXPL           SAVE PARAMETER LIST ADDR
+         XC    PHBUF,PHBUF        CLEAR RET BUF ADDR
+         XC    PHMSG,PHMSG        CLEAR RET MSG ADDR
+         DROP  R5
+*
+         MVC   TXPLID,=C'TXPL'    MOVE IN ID
+         ST    R6,TXPLACEE        MOVE IN @ ACEE
+         MVC   TXPLCLEN,BUFLENTH  NEED BUFFER LENGTH
+         MVC   TXPLCBUF,@BUFFER   AND ADDRESS
+*
+* ATTACH THE TSS COMMAND.
+*
+         LR    R1,R2              R1 @ TXPL
+         MVC   ATTACH(ATTACHL),ATTACHX MF=L
+         LA    R0,TSSECB          R0 @ ECB
+         ATTACH EP=TSS,ECB=(0),SHSPV=1,SF=(E,ATTACH)
+         ST    R15,REASONCD       REASONE CODE
+         LTR   R15,R15
+         BNZ   RET16              ATTACH FAILED
+         ST    R1,TSSTCB          SAVE @ TCB
+*
+* WAIT FOR COMMAND TO COMPLETE.
+*
+         WAIT  ECB=TSSECB
+*
+* GET RID OF TSS TCB.
+*
+         DETACH TSSTCB            GET RID OF TCB
+         ST    R15,REASONCD       REASONE CODE
+         LTR   R15,R15
+         BNZ   RET16              DETACH FAILED
+*
+* MUST NOW SEND OUTPUT FROM TSS COMMAND TO THE TERMINAL.
+* ONE MESSAGE AT A TIME
+*
+         ICM   R3,15,TXPLRET      -> RETURN BUFFER
+         L     R5,AHANDLE         HANDLE ADDR
+         USING PHANDLE,R5
+         ST    R3,PHBUF           ADDR OF RETURN BUFFER
+         XC    PHMSG,PHMSG        CLEAR RET MSG ADDR
+         LTR   R3,R3
+         BZ    RET0               N, RETURN
+         LA    R4,TXPLHLEN(R3)    R4 @ FIRST MSG IN NEW BUFFER
+         ST    R4,PHMSG
+         DROP  R5
+         B     RET0
+*****************************************************************
+*   GET NEXT MESSAGE
+*****************************************************************
+GETMSGM  DS    0H
+         L     R5,AHANDLE         HANDLE ADDR
+         USING PHANDLE,R5
+         L     R3,PHBUF           ADDR OF RETURN BUFFER
+         LTR   R3,R3
+         BZ    RET4               END-OF-MESSAGES
+         L     R4,PHMSG
+TSS02000 DS    0H
+         LH    R15,TXPLDLEN       R15 HAS DATA LENGTH
+*
+         CTSADBG 'GET MSG: BUF ADDR=~ MSG HEADER ADDR=~ MSG LEN=#',    X
+               (?R3,?R4,?R15),                                         X
+               LEVEL=(DBGLEVEL,1,2,3,4,5),RAREA=RAREA1
+*
+         LTR   R15,R15            END OF THIS TSS COMMAND BUFFER?
+         BNZ   TSS05000           N, CONTINUE
+*
+* CURRENT TSS COMMAND BUFFER HAS BEEN EXHAUSTED, DETERMINE IF
+* ANOTHER BUFFER EXISTS.
+*
+TSS03000 DS    0H
+         ICM   R3,15,TXPLNXTR     ANY MORE BUFFERS?
+         L     R5,AHANDLE         HANDLE ADDR
+         USING PHANDLE,R5
+         ST    R3,PHBUF           ADDR OF RETURN BUFFER
+         XC    PHMSG,PHMSG        CLEAR RET MSG ADDR
+         LTR   R3,R3
+         BZ    RET4               END-OF-MESSAGES
+         LA    R4,TXPLHLEN(R3)    R4 @ FIRST MSG IN NEW BUFFER
+         ST    R4,PHMSG
+         DROP  R5
+         B     TSS02000
+*
+* PLACE MESSAGE INTO OUTPUT BUFFER.
+*
+TSS05000 DS    0H
+         LH    R5,TXPLDLEN        R5 HAS DATA LENGTH
+         LTR   R5,R5              END OF THIS TSS COMMAND BUFFER?
+         BZ    TSS03000           Y, GO GET NEXT BUFFER
+         LA    R7,TXPLDATA        N, R7 @ MESSAGE
+*        LA    R7,TXPLDATA-1      N, R7 @ MESSAGE
+         L     R6,ARMRTBF         RETURNED BUFFER WITH RESULTS
+         USING PRTBUF,R6
+         L     R9,PRTBUFXL        RETURNED BUFFER MAX LENGTH
+*
+         CTSADBG 'MSG LEN=# MAX BUFFER LEN=#',(?R5,?R9),               X
+               LEVEL=(DBGLEVEL,1,2,3,4,5),RAREA=RAREA1
+*
+         CR    R5,R9              RET BUFFER OVERFLOW CHECKING
+         BH    RET12              RETURN BUFFER OVERFLOW
+         ST    R5,PRTBUFLN        RETURNED BUFFER USE LENGTH
+         LA    R9,PRTBUFT         RETURNED BUFFER
+         DROP  R6
+*
+* PUT MESSAGE TO RETURN BUFFER
+* ----------------------------
+* R5 - MESSAGE LENGTH
+* R7 - ADDR OF MESSAGE
+* R9 - ADDR OF RETURN BUFFER
+*
+*
+         CTSADBG 'MSG AT=~ #/_',(?R7,?R5,0(R7),?R5),                   X
+               LEVEL=(DBGLEVEL,1,2,3,4,5),RAREA=RAREA1
+*
+         CTSCALL PPUTMSG,,LINK=INT PUT MESSAGE TO RETURN BUFFER
+         LA    R4,2(R5,R4)        R4 @ NEXT MESSAGE
+         L     R5,AHANDLE         HANDLE ADDR
+         USING PHANDLE,R5
+         ST    R4,PHMSG
+         DROP  R5
+         B     RET0               RETURN
+*****************************************************************
+*   FREE MESSAGE BUFFER
+*****************************************************************
+*
+* SUBROUTINE TO PERFORM CLEANUP FROM THE TSS COMMAND. SPECIFICALLY,
+* TO FREEMAIN ANY EXTRA BUFFERS GETMAINED BY THE TSS COMMAND.
+*
+FREEM    DS    0H
+         L     R5,AHANDLE         HANDLE ADDR
+         USING PHANDLE,R5
+         L     R2,PHXPL           PARAMETER LIST ADDR
+         DROP  R5
+         LTR   R2,R2
+         BZ    RET0               NO PARAMETER LIST FOUND
+*????    ICM   R3,15,TXPLRET      -> RETURN BUFFER(SEE AFTER ATTACH !)
+         L     R3,TXPLRET         R3 @ FIRST BUFFER
+         LTR   R3,R3
+         BZ    RET0               NO BUFFER FOUND
+TSS07100 DS    0H
+*
+         CTSADBG 'FREE ADDR=~ LEN=# NEXT ADDR=~',                      X
+               (?R3,TXPLRLEN,TXPLNXTR),                                X
+               LEVEL=(DBGLEVEL,1,2,3,4,5),RAREA=RAREA1
+*
+         L     R0,TXPLRLEN        R0 HAS LENGTH OF BUFFER
+         LR    R1,R3              R1 @ CURRENT BUFFER
+         L     R3,TXPLNXTR        R3 @ NEXT BUFFER
+         FREEMAIN RU,LV=(R0),SP=TXPLSP,A=(R1) FREE THIS BUFFER
+         LTR   R15,R15
+         BZ    *+8                RC = 0
+         ST    R15,REASONCD       REASONE CODE
+         LTR   R3,R3              ANY MORE BUFFER'S?
+         BNZ   TSS07100           Y, LOOP FREEING BUFFERS
+*
+*  END OF FREEING LOOP
+*
+         L     R15,REASONCD
+         LTR   R15,R15
+         BNZ   RET20              FREEMAIN FAILED
+         B     RET0
+*---------------------------------------------------------------*
+*        FINISH
+*---------------------------------------------------------------*
+RET0     DS    0H
+         SR    R15,R15
+         B     RETURN
+*
+RET4     DS    0H
+         LA    R15,4     END-OF-MESSAGES
+         B     RETURN
+*
+RET8     DS    0H        TSS0201E TOP SECRET SECURITY IS NOT ACTIVE
+         LA    R15,8
+         B     RETURN
+*
+RET12    DS    0H        RET BUFFER OVERFLOW
+         LA    R15,12
+         B     RETURN
+*
+RET16    DS    0H        ATTACH/DETACH FAILED
+         LA    R15,16
+         B     RETURN
+*
+RET20    DS    0H        FREEMAIN FAILED
+         LA    R15,20
+         B     RETURN
+*
+RET24    DS    0H        INVALID MODE
+         LA    R15,24
+         B     RETURN
+*
+RETURN   DS    0H
+         CTSADBG 'EXIT RC=# REASON=#',                                 X
+               (?R15,REASONCD),                                        X
+               LEVEL=(DBGLEVEL,1,2,3,4,5),RAREA=RAREA1
+*SAS2IBMN L     R5,PARMADDR
+*SAS2IBMN USING PRM,R5
+         L     R6,PRMRC
+         ST    R15,0(R6)           SAVE RETURN CODE
+         L     R6,PRMRSN           REASON CODE ADDR
+         MVC   0(4,R6),REASONCD
+*
+RETURNF  DS    0H
+         BRTRN (15)
+*
+* CONSTANTS ETC.
+*
+RAREA1   DS    32D
+MODE     DC    CL8'CHECK'          LOGIN MODE
+PMODE    DS    CL8                 PROGRAM MODE
+AHANDLE  DS    F                   HANDLE
+ARMRTBF  DS    F                   RETURNED BUFFER WITH RESULTS
+DBGLVF   DS    F                   DEBUF LEVEL
+RCROUT   DS    F                   ROUTER RC
+RCRACF   DS    F                   RACF RC
+RSNRACF  DS    F                   RACF RESON
+ACEE1    DS    A                   ADDR ACEE
+PARMADDR DS    A                   PARAMETER ADDRESS
+REASONCD DS    F                   REASONE CODE
+DBGLEVEL DS    X                   DEBUG LEVEL
+FILE     DS    X                   USE FILE FLAG
+FOPEN    DS    X                   FILE OPEN FLAG
+PGETACEE DS    0D                  GET ACEE PARAMETER LIST
+         DC    A(MODE)             MODE - "CHECK"
+         DC    A(DBGLVF)           DEBUG LEVEL
+         DC    A(RCROUT)           ROUTER RC
+         DC    A(RCRACF)           RACF RC
+         DC    A(RSNRACF)          RACF RESON
+         DC    A(ACEE1)            ACEE
+ATTACHX  ATTACH SF=L
+ATTACHL  EQU   *-ATTACHX
+*
+         LTORG
+*
+* WORKAREA.
+*
+WORKAREA DS    0D
+@RETURN  DS    A
+@BUFFER  DS    A                  ADDRESS OF COMMAND BUFFER
+BUFLENTH DS    H                  LENGTH OF BUFFER
+TSSTXPL  DS    5F                 TSS EXTENDED PARAMETER LIST
+TSSTCB   DS    A                  TSS COMMAND'S TCB
+TSSECB   DS    A                  ECB FROM ATTACH
+TSSFUNC  DS    CL8
+TSSPSWD  DS    CL8
+ATTACH   ATTACH SF=L
+LWORK    EQU   *-WORKAREA
+         DROP  ,
+*
+* PUT MESSAGE TO RETURN BUFFER
+* ----------------------------
+* R5 - MESSAGE LENGTH
+* R7 - ADDR OF MESSAGE
+* R9 - ADDR OF RETURN BUFFER
+*
+PPUTMSG  BEGIN
+         LR    R4,R9              TARGET ADDR
+         LR    R6,R7              SOURCE ADDR
+         LR    R7,R5              R5,R7 LENGTH
+         MVCL  R4,R6
+         MVI   0(R4),0            MESSAGE SEPARATOR ( "C" NULL_CHAR)
+         BRTRN
+*
+*
+*---------------------------------------------------------------*
+*        CONTROL BLOCKS MAPPING
+*---------------------------------------------------------------*
+         IHAACEE
+*
+* DSECTS.
+*
+TXPL     DSECT
+*
+* TSS COMMAND EXTENDED PARAMETER LIST.
+*
+TXPLID   DS    CL4                CONTROL BLOCK IDENTIFIER (TXPL)
+TXPLCBUF DS    A                  @ COMMAND INPUT BUFFER
+TXPLCLEN DS    H                  LENGTH OF COMMAND BUFFER
+TXPLRSV1 DS    H                  RESERVED
+TXPLRET  DS    A                  @ FIRST RETURN AREA
+TXPLACEE DS    A                  @ CALLER'S ACEE
+TXPLLEN  EQU   *-TXPL             LENGTH OF PARAMETER LIST
+*
+* RETURN DATA AREA HEADER.
+*
+TXPLRETH DSECT ;                  RETURN DATA AREA HEADER
+TXPLNXTR DS    A                  @ NEXT RETURN AREA, OR ZERO
+TXPLRLEN DS    A                  LENGTH OF THIS RETURN AREA
+TXPLNXTL DS    A                  @ NEXT LINE IN THIS AREA
+TXPLRSV2 DS    A                  RESERVED
+TXPLSP   EQU   1                  SUBPOOL FOR GETMAIN/FREEMAIN
+TXPLHLEN EQU   *-TXPLRETH         LENGTH OF HEADER
+*
+* RETURN DATA LINE FORMAT.
+*
+TXPLLINE DSECT ;                  RETURN DATA LINE FORMAT
+TXPLDLEN DS    H                  LENGTH OF THIS LINE
+TXPLDATA DS    C                  DATA LINE
+         END
