@@ -1,0 +1,705 @@
+/* REXX */
+/* trace all */
+/****************************************************************/
+/***                                                          ***/
+/***   SA-AGENT VERSION 4.0.XX                                ***/
+/***                                                          ***/
+/***   (C) Copyright 2020 SailPoint Technologies, Inc.,       ***/
+/***   All rights reserved.                                   ***/
+/***                                                          ***/
+/****************************************************************/
+
+/****************************************************************/
+/***                                                          ***/
+/***   Called by : ACF2_Cmd2Mem C routine                     ***/
+/***                                                          ***/
+/***   Description:                                           ***/
+/***                                                          ***/
+/***   This REXX,CTSBC2M, calls the relevant REXX, per the    ***/
+/***   rectype parameter passed by ACF2_Cmd2Mem.              ***/
+/***   When rectype="RULE", calls CTSBRLST to issue both      ***/
+/***      SET R(***) & L LIKE(-) and SET(RULE) & L LIKE(-).   ***/
+/***   When rectype="X(ROL)" call CTSBXREF to issue 2 cmds:   ***/
+/***      SET X(ROL)                                          ***/
+/***      L LIKE(-) SYSID(xx) or MSYSID(nn) or without SYSID. ***/
+/***   When rectype="X(SGP)" calls CTSBXREF to issue          ***/
+/***      SET X(SGP)                                          ***/
+/***      L LIKE(-) SYSID(xx) or MSYSID(nn) or without SYSID. ***/
+/***                                                          ***/
+/***   When return from the relevant REXX, place the ACF2     ***/
+/***   command output into stem variables (via the OUTRAP     ***/
+/***   function) to be processed by the CTSCGRO routine.      ***/
+/***                                                          ***/
+/***   Return codes:                                          ***/
+/***   0 - ok.                                                ***/
+/***   4 - not found.                                         ***/
+/***   8 - error.                                             ***/
+/***                                                          ***/
+/****************************************************************/
+
+/****************************************************************/
+/* Mod.Id   Who      When      Description                      */
+/* -------  -------  --------  ---------------------------------*/
+/* WS10078S SeligT   29/03/20  Support Aggregation of Rules,    */
+/*                             X(ROL), and X(SGP)               */
+/* BS10108  NuritY   09/09/20  When the ACF2 commands fail, the */
+/*                             commands are not returned (Selig)*/
+/* BS10108T ThomaS   01/10/20  Add MSYSID(-) to CTSBXREF LIST   */
+/* WS10079A AvnerL   16/12/20  Support SYSID in RECTYPE.        */
+/* WS10079N NuritY   16/12/20  1.  ---  " ---                   */
+/*                             2. Replace PUSH (LIFO) with      */
+/*                                QUEUE (FIFO)                  */
+/*                             3. Identiy NOT FOUND.            */
+/* IS10184  AvnerL   31/08/21  improve scripts performance      */
+/****************************************************************/
+
+/****************************************************************/
+/***                                                          ***/
+/***       Initialization                                     ***/
+/***                                                          ***/
+/****************************************************************/
+
+arg rectype recparm rlstoken ddn diag
+ADDRESS TSO
+ "PROFILE NOPREFIX"
+
+/*  Create a private stack for the commands       IS10184N */
+QSTACK                                         /* IS10184N */
+start_stack = RC                               /* IS10184N */
+NEWSTACK    /* new stack so that we do not        iS10184N */
+            /* lines remaining in current stack   IS10184N */
+
+CMD.0 = 0
+GROMSG.0 = 0
+PERM.0 = 0
+OUT.0 = 0
+dattim = DATE('O') TIME()
+
+/****************************************************************/
+/***                                                          ***/
+/***       Call the appropriate ACF2 command generation REXX  ***/
+/***                                                          ***/
+/****************************************************************/
+
+if rectype = "RULE"
+  /* BS10108 then call CTSBRLST rectype recparm cmdvar msg */
+  then call CTSBRLST                                  /* BS10108 */
+/* WS10079A else if rectype = "X(ROL)" */
+else if substr(rectype,1,6) = "X(ROL)"                /*WS10079A*/
+  /* BS10108 then call CTSBXREF rectype recparm cmdvar msg  */
+  then call CTSBXREF                                  /* BS10108 */
+/*WS10079A else if rectype = "X(SGP)" */
+else if substr(rectype,1,6) = "X(SGP)"                /*WS10079A*/
+  /* BS10108  then call CTSBXREF rectype recparm cmdvar msg */
+  then call CTSBXREF                                  /* BS10108 */
+else do
+  call Put2Stem OUT "Input parm error: rectype value undefined" rectype
+  /* WS10079N FINAL_RC = 4  */
+  FINAL_RC = 8                                         /* WS10079N */
+  SIGNAL GOHOME;
+end
+
+/* Check the return code from CTSBRLST or CTSBXREF */
+if result \= 0
+  then do
+    call Put2Stem OUT "Error encountered: " msg
+    /* Ws10079N FINAL_RC = 4  */
+    FINAL_RC = 8                                      /* WS10079N */
+    SIGNAL GOHOME;
+  end
+
+/****************************************************************/
+/***                                                          ***/
+/***       CTSBRLST or CTSBXREF ended successfully;           ***/
+/***       Save the ACF2 commands from CTSBRLST/CTSBXREF      ***/
+/***                                                          ***/
+/****************************************************************/
+
+dtmsg = ' 'dattim 'CTSBC2M *** *** start of ACF2 commands *** ***'
+call Put2Stem CMD dtmsg
+/* WS10079N rev = REVERSE(cmdvar)   */
+start = 1
+
+do i = 1 to 100
+  /* WS10079N sc = INDEX(rev,';',start)           */
+  sc = INDEX(cmdvar,';',start)                       /* WS10079N */
+  if sc = 0 then leave
+  /* WS10079N token = substr(rev,start,sc-start)  */
+  /* WS10079N command = REVERSE(token)            */
+  /* WS10079N message = ' 'command                */
+  token = substr(cmdvar,start,sc-start)              /* WS10079N */
+  message = ' 'token                                 /* WS10079N */
+  call Put2Stem CMD message
+  start = sc+1
+end
+
+dtmsg = ' 'dattim 'CTSBC2M *** *** end of ACF2 commands *** ***'
+call Put2Stem CMD dtmsg
+
+/****************************************************************/
+/***                                                          ***/
+/***       Call ACF2 and trap the ACF2 output                 ***/
+/***                                                          ***/
+/****************************************************************/
+
+X = OUTTRAP("PERM.","*", CONCAT )
+CALL CTS2CMD "CTSAEXC ACF"
+X = OUTTRAP('OFF')
+CMD_RC = RESULT
+
+/*  WS10079N - start */
+/****************************************************************/
+/***                                                          ***/
+/***       If the ACF2 commands returned rc 4, check if       ***/
+/***       it is because the entity was not found and set     ***/
+/***       the return code accordingly.                       ***/
+/***                                                          ***/
+/***       An internal procedure for each entity type is      ***/
+/***       called to identify the NOT FOUND condition         ***/
+/***       for the specific type. The routine will get        ***/
+/***       selected messages from the output:                 ***/
+/***       - For XREF entities, the routine will get the      ***/
+/***         messages from the beginning of the output        ***/
+/***         which should contain the NOT FOUND  message.     ***/
+/***       - For RULE, we may have 1 or 2 NOT FOUND           ***/
+/***         messges, depending on the commands that were     ***/
+/***         issued  (for 1 specific rule, or for all rules   ***/
+/***         and all types). The message may appear at the    ***/
+/***         beginning or at the end of the report.           ***/
+/***                                                          ***/
+/***       Return codes returned by the internal routines:    ***/
+/***       0 - ok. (ignore the error).                        ***/
+/***       4 - not found.                                     ***/
+/***       8 - real error (if not NOT FOUND we asume that     ***/
+/***           ACF2 returned rc=4 because of an error)        ***/
+/***                                                          ***/
+/****************************************************************/
+
+NF_RC = 0
+
+if (CMD_RC = 4)
+  then do
+    if (PERM.0 = 0)
+      then CMD_RC = 8          /* Nothing returned from acf - error */
+      else do
+        /*  Copy part of the returned data to a stack to be used  */
+        /*  by the internal procudures to check not-found         */
+        if (PERM.0 < 5) then j = PERM.0
+                        else j = 5
+        NEWSTACK
+        do  i = 1 to j by 1
+          QUEUE PERM.i
+        end
+        if (rectype = "RULE")
+          then do
+            if (PERM.0 >= 6)
+              then do
+                if (PERM.0 > 6)
+                  then do
+                    i = PERM.0 - 1
+                    QUEUE PERM.i
+                   end
+                i = PERM.0
+                QUEUE PERM.i
+                call CTSNFRUL  /* Analyze LIST rule output  */
+              end
+          end
+          else call CTSNFXRF    /* Analyze LIST X(xxx) output */
+
+        NF_RC = result
+        if (NF_RC = 0) then CMD_RC = 0
+        DELSTACK
+      end
+  end
+/*  WS10079N - end   */
+
+/****************************************************************/
+/***                                                          ***/
+/***       If the ACF2 commands were successful, call         ***/
+/***       CTSAVAR which will call CTSCGRO.                   ***/
+/***                                                          ***/
+/****************************************************************/
+
+if CMD_RC = 0
+  then do
+     IF ( DATATYPE(PERM.0,N) )
+       THEN DO
+          X = OUTTRAP("GROMSG.","*", CONCAT )
+          /*IS10184 ADDRESS TSO
+          "CTSAVAR PGM2CALL(CTSCGRO) PERM" rlstoken*/
+          /* IS10184 - do ADDRESS LINK */
+          ADDRESS LINK "CTSAVAR PGM2CALL(CTSCGRO) PERM" rlstoken
+          X = OUTTRAP('OFF')
+          /* WS10079N IF RC <> 0 THEN FINAL_RC = 4  */
+          IF RC <> 0 THEN FINAL_RC = 8                /* WS10079N */
+          ELSE FINAL_RC = 0
+       END
+     ELSE
+       DO
+          call Put2Stem GROMSG "ACF2 returned without any output"
+          /* WS10079N FINAL_RC = 4    */
+          FINAL_RC = 8                                /* WS10079N */
+       END
+     if diag = 'Y'
+       then do
+          do i = 1 to CMD.0 by 1
+             call Put2Stem OUT CMD.i
+          end
+       end
+     do i = 1 to GROMSG.0 by 1
+        call Put2Stem OUT GROMSG.i
+     end
+  end
+
+/****************************************************************/
+/***                                                          ***/
+/***       If the ACF2 commands failed, return all possible   ***/
+/***       error information to the user, for example: ACF2   ***/
+/***       command rc, ACF2 command output, etc.              ***/
+/***                                                          ***/
+/****************************************************************/
+
+/* WS10079N  else if CMD_RC \= 0  */
+/* WS10079N   then do */
+else do                                                  /* WS10079N */
+     do i = 1 to CMD.0 by 1
+        call Put2Stem OUT CMD.i
+     end
+
+     call Put2Stem OUT "ACF2 returned with rc =" CMD_RC
+
+     if (CMD_RC = 4) & (NF_RC = 4)  /* If not found         WS10079N */
+       then FINAL_RC = 4            /* return NOT FOUND rc  WS10079N */
+       else FINAL_RC = 8            /* else return error rc WS10079N */
+
+     IF ( DATATYPE(PERM.0,N) )
+       THEN DO
+          dtmsg = dattim '*** end of LIST command output ***'
+          call Put2Stem PERM dtmsg
+          /* WS10079N if PERM.0 <= 50    */
+          if (FINAL_RC = 4) | (PERM.0 <= 50)           /* WS10079N */
+            then do
+               do i = 1 to PERM.0 by 1
+                  call Put2Stem OUT PERM.i
+               end
+            end
+          else
+            do
+               "EXECIO" CMD.0 "DISKW SYSPRINT  ( STEM CMD.  FINIS "
+               "EXECIO" PERM.0 "DISKW SYSPRINT ( STEM PERM. FINIS "
+               call Put2Stem OUT "ACF2 output can be found in SYSPRINT"
+            end
+       END
+     ELSE call Put2Stem OUT "ACF2 returned without any output"
+
+     /* WS10079N FINAL_RC = 4   */
+  end
+
+/****************************************************************/
+/***                                                          ***/
+/***       Return to the caller.                              ***/
+/***                                                          ***/
+/****************************************************************/
+
+GOHOME:
+
+IF ( DATATYPE(OUT.0,N) ) THEN
+    "EXECIO" OUT.0 "DISKW " ddn " ( STEM OUT. FINIS "
+
+/*  Delete our stacks                             IS10184N */
+QSTACK           /* Get number of active stacks   IS10184N */
+end_stack = RC                                 /* IS10184N */
+IF (end_stack - start_stack) > 0               /* IS10184N */
+  THEN DO                                      /* IS10184N */
+    DO (end_stack - start_stack)               /* IS10184N */
+     DELSTACK    /* delete one data stack         IS10184N */
+    END                                        /* IS10184N */
+END                                            /* IS10184N */
+
+RETURN FINAL_RC
+
+
+/****************************************************************/
+/***                                                          ***/
+/***       Put2Stem subroutine:                               ***/
+/***       Add a line to a stem and update the stem.0 counter ***/
+/***                                                          ***/
+/****************************************************************/
+
+Put2Stem:
+parse arg stem line
+interpret "IF ( DATATYPE("stem".0,N) ) THEN "stem".0 = "stem".0 + 1"
+interpret "IF (\DATATYPE("stem".0,N) ) THEN "stem".0 = 1"
+interpret "K="stem".0"
+interpret " "stem".K="'line'" "
+return;
+
+
+/* IS10184 -  remove - duplicte   */
+/****************************************************************/
+/***                                                          ***/
+/***       Put2Stem subroutine:                               ***/
+/***       Add a line to a stem and update the stem.0 counter ***/
+/***                                                          ***/
+/****************************************************************/
+
+/*Put2Stem:                                                           */
+/*parse arg stem line                                                 */
+/*interpret "IF ( DATATYPE("stem".0,N) ) THEN "stem".0 = "stem".0 + 1"*/
+/*interpret "IF (\DATATYPE("stem".0,N) ) THEN "stem".0 = 1"           */
+/*interpret "K="stem".0"                                              */
+/*interpret " "stem".K="'line'" "                                     */
+/*return;                                                             */
+
+
+
+/****************************************************************/
+/***                                                          ***/
+/***    CTSBRLST procedure                                    ***/
+/***                                                          ***/
+/***    Description : Issue ACF2 LIST commands to acquire     ***/
+/***                  access and/or resource rule             ***/
+/***                  information and then return the         ***/
+/***                  commands to the caller, CTSBC2M,        ***/
+/***                  in the cmdvar variable.                 ***/
+/***                                                          ***/
+/****************************************************************/
+
+CTSBRLST: procedure expose rectype recparm cmdvar msg
+/* WS10079N ADDRESS TSO  */
+/* Ws10079N  "PROFILE NOPREFIX"  */
+
+if recparm = "" or recparm = "#"
+  then do
+    msg = "CTSBRLST input parm error - recparm null"
+    BRLST_RC = 4
+    /* BS10108 SIGNAL GOHOME;   */
+    SIGNAL BRLSTRET;                                    /* BS10108 */
+  end
+
+PARSE VAR recparm RESNAME '/' RESTYPE
+
+cmdvar = ""
+if RESNAME = ""  & RESTYPE = ""     /* neither argument present */
+  then do
+    /* WS10079N PUSH "END"                       */
+    /* WS10079N cmdvar = cmdvar';END'            */
+    /* WS10079N PUSH "LIST LIKE(-)"              */
+    /* WS10079N cmdvar = cmdvar';LIST LIKE(-)'   */
+    /* WS10079N PUSH "SET RULE"                  */
+    /* WS10079N cmdvar = cmdvar';SET RULE'       */
+    /* WS10079N PUSH "LIST LIKE(-)"              */
+    /* WS10079N cmdvar = cmdvar';LIST LIKE(-)'   */
+    /* WS10079N PUSH "SET R(***)"                */
+    /* WS10079N cmdvar = cmdvar';SET R(***)'     */
+    QUEUE "SET R(***)"                                /* WS10079N */
+    cmdvar = 'SET R(***)'                             /* WS10079N */
+    QUEUE "LIST LIKE(-)"                              /* WS10079N */
+    cmdvar = cmdvar';LIST LIKE(-)'                    /* WS10079N */
+    QUEUE "SET RULE"                                  /* WS10079N */
+    cmdvar = cmdvar';SET RULE'                        /* WS10079N */
+    QUEUE "LIST LIKE(-)"                              /* WS10079N */
+    cmdvar = cmdvar';LIST LIKE(-)'                    /* WS10079N */
+    QUEUE "END"                                       /* WS10079N */
+    cmdvar = cmdvar';END'                             /* WS10079N */
+  end
+
+else if RESNAME \= "" & RESTYPE = ""    /* only RESNAME present */
+  then do
+    /* WS10079N PUSH "END"                         */
+    /* WS10079N cmdvar = cmdvar';END'              */
+    /* WS10079N RSNM = 'LIST 'RESNAME              */
+    /* WS10079N PUSH RSNM                          */
+    /* WS10079N cmdvar = cmdvar';LIST 'RESNAME     */
+    /* WS10079N PUSH "SET RULE"                    */
+    /* WS10079N cmdvar = cmdvar';SET RULE'         */
+    QUEUE "SET RULE"                                  /* WS10079N */
+    cmdvar = 'SET RULE'                               /* WS10079N */
+    QUEUE 'LIST' RESNAME                              /* WS10079N */
+    cmdvar = cmdvar';LIST 'RESNAME                    /* WS10079N */
+    QUEUE "END"                                       /* WS10079N */
+    cmdvar = cmdvar';END'                             /* WS10079N */
+  end
+
+else if RESNAME \= "" & RESTYPE \= "" /* both arguments present */
+  then do
+  /* WS10079N   PUSH "END"                                   */
+  /* WS10079N   cmdvar = cmdvar';END'                        */
+  /* WS10079N   RSNM = 'LIST 'RESNAME                        */
+  /* WS10079N   PUSH RSNM                                    */
+  /* WS10079N   cmdvar = cmdvar';LIST 'RESNAME               */
+  /* WS10079N   RSRC = 'SET R(' || RESTYPE || ')'            */
+  /* WS10079N   PUSH RSRC                                    */
+  /* WS10079N   cmdvar = cmdvar';SET R(' || RESTYPE || ')'   */
+    RSRC = 'SET R(' || RESTYPE || ')'                 /* WS10079N */
+    QUEUE RSRC                                        /* WS10079N */
+    cmdvar = RSRC                                     /* WS10079N */
+    QUEUE 'LIST' RESNAME                              /* WS10079N */
+    cmdvar = cmdvar';LIST 'RESNAME                    /* WS10079N */
+    QUEUE "END"                                       /* WS10079N */
+    cmdvar = cmdvar';END'                             /* WS10079N */
+  end
+
+else if RESNAME = "" & RESTYPE \= ""    /* only RESTYPE present */
+  then do
+    msg = "CTSBRLST input parm error - restype without resname"
+    BRLST_RC = 4
+    /* BS10108 SIGNAL GOHOME;   */
+    SIGNAL BRLSTRET;                                    /* BS10108 */
+  end
+
+BRLST_RC = 0
+
+/****************************************************************/
+/***                                                          ***/
+/***       Return to the caller                               ***/
+/***                                                          ***/
+/****************************************************************/
+
+/* BS10108 GOHOME:  */
+BRLSTRET:                                               /* BS10108 */
+RETURN BRLST_RC
+
+
+
+
+
+/****************************************************************/
+/***                                                          ***/
+/***    CTSBXREF procedure                                    ***/
+/***                                                          ***/
+/***    Description : Issue ACF2 LIST commands to acquire     ***/
+/***                  X(ROL) or X(SGP) information and        ***/
+/***                  then return the commands to the         ***/
+/***                  caller, CTSBC2M, in the cmdvar          ***/
+/***                  variable.                               ***/
+/***                                                          ***/
+/****************************************************************/
+
+CTSBXREF: procedure expose rectype recparm cmdvar msg
+/* WS10079N ADDRESS TSO   */
+/* WS10079N  "PROFILE NOPREFIX"     */
+
+/****************************************************************/
+/***                                                          ***/
+/***   There are several possible callers to this REXX:       ***/
+/***   1) All or Single X(ROL) - get all or a specific Role.  ***/
+/***      Four ACF2 commands will be issued:                  ***/
+/***      ACF                                                 ***/
+/***       SET X(ROL)                                         ***/
+/***       LIST LIKE(-) or LIST role-name                     ***/
+/***            SYSID(xx) or MSYSID(xx) or without SYSID      ***/
+/***            xx - may be - or a SYSID name.                ***/
+/***      END                                                 ***/
+/***                                                          ***/
+/***   2) All or Single X(SGP) - get all or a specific Source.***/
+/***      Four ACF2 commands will be issued:                  ***/
+/***      ACF                                                 ***/
+/***       SET X(SGP)                                         ***/
+/***       LIST LIKE(-) or LIST source-name                   ***/
+/***            SYSID(xx) or MSYSID(xx) or without SYSID      ***/
+/***            xx - may be - or a SYSID name.                ***/
+/***      END                                                 ***/
+/***                                                          ***/
+/****************************************************************/
+
+cmdvar = ""
+/** handling the SYSID is mutual to X(ROL) and X(SGP) WS10079A **/
+PARSE VAR rectype type '/' sysid
+
+/*WS10079A if rectype = "X(ROL)"  */
+if (type = "X(ROL)") | (type = "X(SGP)")  /*WS10079T*/     /*WS10079N*/
+  then do
+    /* WS10079N PUSH "END"                    */
+    /* WS10079N cmdvar = cmdvar';END'         */
+    set = "SET" type sysid                             /* WS10079N */
+    QUEUE set                                          /* WS10079N */
+    cmdvar = set                                       /* WS10079N */
+    if recparm = "" or recparm = "#"
+      then do
+        msg = "CTSBXREF input parm error - recparm null"
+        BXREF_RC = 4
+        /* BS10108 SIGNAL GOHOME;  */
+        SIGNAL BXREFRET;                               /* BS10108 */
+      end
+    else if recparm = '-'
+      then do
+        /* BS10108T PUSH "LIST LIKE(-)"            */
+        /*WS10079A PUSH "LIST LIKE(-) MSYSID(-)"   * BS10108T */
+        QUEUE "LIST LIKE(-)"                           /* WS10079N */
+        /* BS10108T cmdvar = cmdvar';LIST LIKE(-)' */
+        /*WS10079A cmdvar=cmdvar';LIST LIKE(-) MSYSID(-)' * BS10108T */
+        cmdvar = cmdvar';LIST LIKE(-)'               /* WS10079N */
+      end
+    else do
+      /* BS10108T PUSH "LIST " recparm             */
+      /*WS10079A PUSH "LIST " recparm " MSYSID(-)"      * BS10108T */
+      QUEUE "LIST " recparm                            /* WS10079N */
+      /* BS10108T cmdvar = cmdvar';LIST 'recparm*/
+      /*WS10079A cmdvar=cmdvar';LIST 'recparm' MSYSID(-)' * BS10108T */
+      cmdvar = cmdvar';LIST 'recparm                   /* WS10079N */
+    end
+    /* WS10079N PUSH "SET X(ROL)"  */
+    /* Ws10079N cmdvar = cmdvar';SET X(ROL)'  */
+    QUEUE "END"                                        /* WS10079N */
+    cmdvar = cmdvar';END'                              /* WS10079N */
+  end
+/*  WS10079N  - the seciton below is removed. X(ROL) and X(SGP)    */
+/*              have the same commands syntax so both are          */
+/*              handled above.                                     */
+/*                                                                 */
+/*else if rectype = "X(SGP)"                                       */
+/*then do                                                          */
+/*  PUSH "END"                                                     */
+/*  cmdvar = cmdvar';END'                                          */
+/*  if recparm = ""                                                */
+/*    then do                                                      */
+/*      msg = "CTSBXREF input parm error - recparm null"           */
+/*      BXREF_RC = 4                                               */
+/*      /@ BS10108 SIGNAL GOHOME;  @/                              */
+/*      SIGNAL BXREFRET;                               /@ BS10108 @*/
+/*    end                                                          */
+/*  else if recparm = '-'                                          */
+/*    then do                                                      */
+/*      /@ BS10108T PUSH "LIST LIKE(-)"            @/              */
+/*      /@WS10079A PUSH "LIST LIKE(-) MSYSID(-)"    * BS10108T @/  */
+/*      PUSH "LIST LIKE(-) " sysid                 /@ WS10079A @/  */
+/*      /@ BS10108T cmdvar = cmdvar';LIST LIKE(-)' @/              */
+/*      /@WS10079A cmdvar=cmdvar';LIST LIKE(-) MSYSID(-)'* BS10108T*/
+/*      cmdvar = cmdvar';LIST LIKE(-) ' sysid       /@ WS10079A @/ */
+/*    end                                                          */
+/*  else do                                                        */
+/*    /@ BS10108T PUSH "LIST " recparm             @/              */
+/*    /@WS10079A PUSH "LIST " recparm " MSYSID(-)"      * BS10108T */
+/*    PUSH "LIST " recparm susid                       /@ WS10079A */
+/*    /@ BS10108T cmdvar = cmdvar';LIST 'recparm@/                 */
+/*    /@WS10079A cmdvar=cmdvar';LIST 'recparm' MSYSID(-)'* BS10108T*/
+/*    cmdvar = cmdvar';LIST 'recparm sysid             /@ WS10079A */
+/*  end                                                            */
+/*  PUSH "SET X(SGP)"                                              */
+/*  cmdvar = cmdvar';SET X(SGP)'                                   */
+/*end                                                              */
+/*  WS10079N - end of removed code.                                */
+
+else do
+  msg = "CTSBXREF input parm error - rectype value undefined" rectype
+  BXREF_RC = 4
+  /* BS10108 SIGNAL GOHOME;  */
+  SIGNAL BXREFRET;                                     /* BS10108 */
+end
+
+BXREF_RC = 0
+
+/****************************************************************/
+/***                                                          ***/
+/***       Return to the caller                               ***/
+/***                                                          ***/
+/****************************************************************/
+
+/* BS10108 GOHOME:   */
+BXREFRET:                                              /* BS10108 */
+RETURN BXREF_RC
+
+/*  WS10079N - start */
+/****************************************************************/
+/***                                                          ***/
+/***    CTSNFXRF procedure                                    ***/
+/***                                                          ***/
+/***    Description : Look for a NOT FOUND message in stack.  ***/
+/***                                                          ***/
+/***    Input:  A stack contaiing selected messages.          ***/
+/***                                                          ***/
+/***    Return codes:                                         ***/
+/***    0 - N/A                                               ***/
+/***    4 - NOT FOUND.                                        ***/
+/***    8 - no NOT FOUND message.                             ***/
+/***                                                          ***/
+/***                                                          ***/
+/***    Sample messages for XREF:                             ***/
+/***      ACF0A005 RECORD(S) NOT FOUND                        ***/
+/***                                                          ***/
+/***                                                          ***/
+/****************************************************************/
+
+CTSNFXRF: procedure
+
+nfxrf_rc = 8
+
+do QUEUED()
+  PULL line
+  if (substr(line,1,9) = "ACF0A005 ")
+    then do
+      nfxrf_rc = 4
+      LEAVE
+    end
+end
+
+RETURN nfxrf_rc
+
+/****************************************************************/
+/***                                                          ***/
+/***    CTSNFRUL procedure                                    ***/
+/***                                                          ***/
+/***    Description : Look for NOT FOUND messages in stack.   ***/
+/***                                                          ***/
+/***    Input:  A stack contaiing selected messages.          ***/
+/***                                                          ***/
+/***    Return codes:                                         ***/
+/***    0 - found.                                            ***/
+/***    4 - NOT FOUND.                                        ***/
+/***    8 - no NOT FOUND message.                             ***/
+/***                                                          ***/
+/***                                                          ***/
+/***  Sample messages:                                        ***/
+/***  1. When first type NOT FOUND but the second is found.   ***/
+/***    ACF03005 RULE RECORD NOT FOUND                        ***/
+/***    ACF75052 RESOURCE RULE ISFCMD STORED BY...            ***/
+/***    $KEY(ISFCMD) TYPE(SDF)                                ***/
+/***     - UID(**DEV) SERVICE(READ) ALLOW                     ***/
+/***     - UID(**QA) SERVICE(READ) ALLOW                      ***/
+/***    ACF75051 TOTAL RECORD LENGTH= 220 BYTES..             ***/
+/***                                                          ***/
+/***                                                          ***/
+/***  2. When first type is found but the second NOT FOUND.   ***/
+/***     ACF75052 RESOURCE RULE ISFCMD STORED BY TLVAL...     ***/
+/***     $KEY(ISFCMD) TYPE(SDF)                               ***/
+/***      - UID(**DEV) SERVICE(READ) ALLOW                    ***/
+/***      - UID(**QA) SERVICE(READ) ALLOW                     ***/
+/***     ACF75051 TOTAL RECORD LENGTH= 220 BYTES...           ***/
+/***                                                          ***/
+/***     ACF03005 RULE RECORD NOT FOUND                       ***/
+/***                                                          ***/
+/***                                                          ***/
+/***  3. When both are not found                              ***/
+/***     ACF04005 RECORD(S) NOT FOUND    - for resource rules ***/
+/***     ACF03005 RULE RECORD NOT FOUND  - for dataset rules. ***/
+/***                                                          ***/
+/***                                                          ***/
+/****************************************************************/
+
+CTSNFRUL: procedure
+
+nfrul_rc = 8
+nf = 0
+fnd = 0
+
+do QUEUED()
+  PULL line
+  if (substr(line,1,9)="ACF04005 ") | (substr(line,1,9)="ACF03005 ")
+    then nf = nf + 1               /* we have a NOT FOUND message */
+  else if (substr(line,1,9)="ACF75052 ")
+    then fnd = fnd + 1             /* We have a rule.             */
+
+  if (nf > 0) & (fnd > 0)          /* one type was not found - ok */
+    then do
+      nfrul_rc = 0
+      LEAVE
+    end
+end
+
+/* if NOT FOUND and no rule -> NOT FOUND  */
+if (nfrul_rc = 8) & (nf > 0) & (fnd = 0)
+  then nfrul_rc = 4
+
+RETURN nfrul_rc
+/* WS10079N - end */
